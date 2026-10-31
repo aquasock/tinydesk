@@ -1,14 +1,33 @@
-# The Arduino Nano ESP32: the shared application (ports/esp_idf/app) with
-# the desktop on the built-in USB Serial/JTAG port (link_usj.c), and the
-# static buffers of TinyDesk and TinyDesk Shell in PSRAM (extram.lf).
+# The Arduino Nano ESP32: the shared application (ports/esp_idf/app), with
+# the static buffers of TinyDesk and TinyDesk Shell in PSRAM (extram.lf).
+#
+# Two desktop links are built from this directory:
+#
+#   link_usj.c  the desktop as terminal output on the USB-C port (default)
+#   link_lcd.c  the desktop drawn on an ILI9340 panel, input still over USB
+#
+# The panel link is chosen with -DTD_LINK=lcd. Both provide the same four
+# functions from link.h, so nothing outside this directory changes.
 include("${CMAKE_CURRENT_LIST_DIR}/../../esp_idf/app/app.cmake")
 
+set(TD_LINK "usb" CACHE STRING "desktop link: usb (terminal on USB) or lcd")
+
+if(TD_LINK STREQUAL "lcd")
+    set(TD_LINK_SRCS "link_lcd.c" "ili9340.c" "vt.c")
+    set(TD_LINK_REQ esp_driver_spi esp_driver_gpio)
+    message(STATUS "tinydesk link: ILI9340 panel (input over USB)")
+else()
+    set(TD_LINK_SRCS "link_usj.c")
+    set(TD_LINK_REQ "")
+    message(STATUS "tinydesk link: terminal on USB Serial/JTAG")
+endif()
+
 idf_component_register(
-    SRCS "link_usj.c" ${TD_ESP_APP_SRCS}
+    SRCS ${TD_LINK_SRCS} ${TD_ESP_APP_SRCS}
     EMBED_TXTFILES "${TD_BOARD_BUILTIN_CONF}"
     INCLUDE_DIRS "." "${TD_ESP_APP_DIR}"
     LDFRAGMENTS "extram.lf"
-    REQUIRES ${TD_ESP_APP_REQUIRES} esp_driver_usb_serial_jtag
+    REQUIRES ${TD_ESP_APP_REQUIRES} esp_driver_usb_serial_jtag ${TD_LINK_REQ}
 )
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Wextra -Werror)
 

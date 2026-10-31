@@ -59,3 +59,51 @@ This port defines `TD_UPDATE_BOARD="nanoesp32"`, which has no feed on the
 official update site. Without it the port would inherit `esp32s3` as its board
 name and Software Update would offer the UART build, replacing a working
 firmware with one this board cannot display.
+
+## Drawing on an SPI panel
+
+`-DTD_LINK=lcd` swaps the desktop link for `link_lcd.c`, which renders the
+desktop on an ILI9340 panel (Adafruit 2.2" PiTFT HAT, 320x240) instead of
+printing it to the terminal. Input still arrives over USB, so the desktop is
+driven from a PC terminal while it draws on the panel:
+
+```
+idf.py -DTD_LINK=lcd build
+idf.py -p PORT flash
+```
+
+Nothing in the desktop core changes: `vt.c` is a small terminal emulator that
+turns TinyDesk's ANSI stream into a cell grid, and `ili9340.c` writes changed
+rows to the panel's GRAM. The default `-DTD_LINK=usb` keeps `link_usj.c`.
+
+| signal | Nano pin | GPIO | PiTFT HAT (2x20) |
+| --- | --- | --- | --- |
+| SCK | D13 | 48 | 23 |
+| MOSI | D11 | 38 | 19 |
+| MISO | D12 | 47 | 21 |
+| CS | D10 | 21 | 24 |
+| D/C | **D9** | 18 | **22** (GPIO25) |
+| 3V3 | 3V3 | — | 1 |
+| 5V | **VBUS** | — | 2 |
+| GND | GND | — | 6, 9, 14, 20, 25 |
+
+Three things about this wiring cost time once already:
+
+- **D/C is pin 22, not 18.** Pin 18 on a Pi header is GPIO24; this HAT routes
+  D/C to GPIO25. With D/C on the wrong pin the panel lights but stays blank,
+  because every byte looks like a command.
+- **5 V comes from VBUS, not VIN.** The Nano's VIN is a 6-21 V input to the
+  buck converter, and the datasheet states there is no 5 V pin. The HAT has no
+  regulator of its own: 3.3 V feeds the display logic and 5 V feeds only the
+  backlight anode, so both rails are required.
+- **No reset or backlight wires.** The HAT generates RESET from its own
+  supervisor (IC1), and its backlight NPN is pulled up so it is on whenever
+  5 V is present. Both are set to `-1` in `ili9340.h`.
+
+The panel gives 40x15 cells at 8x16. That is the floor of what TinyDesk
+supports (`TD_MIN_COLS 40`, `TD_MIN_ROWS 12`), so windows are cramped; a
+smaller font in `tools`-generated `font8x16.h` would trade legibility for room.
+
+The display-ID register (0x04) reads back as zero on this module even though
+the panel draws correctly, so the probe result is not a reliable wiring check
+here; visible pixels are.
