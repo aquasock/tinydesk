@@ -116,6 +116,9 @@ and from the host, on the same LAN:
 - the shared instance learns the path and it **refreshes on each announce**
 - an LXMF message is DELIVERED (DIRECT in 1 s, OPPORTUNISTIC in 29 s)
 - the node's delivery callback fires with the message content
+- **Sideband connects to it** (operator-confirmed, 2026-11-01) -- the client the
+  old TinyNode existed for, so the replacement is real rather than
+  protocol-compatible-in-principle
 
 ### Three bugs in the announce scheduler
 
