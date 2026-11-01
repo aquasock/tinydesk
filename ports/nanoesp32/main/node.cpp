@@ -18,6 +18,9 @@
  */
 #include "node.h"
 
+#include <stdio.h>
+#include "tdsh.h"
+
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -659,10 +662,59 @@ static void node_task(void *arg)
 
 /* ---- public --------------------------------------------------------- */
 
+/* `node` in the desktop's Terminal: the status surface. Prints what the
+ * service knows, from the same state the log and the UI read. */
+static int cmd_node(tdsh_session_t *session, int argc, char **argv)
+{
+    (void)session;
+    if (argc > 1)
+    {
+        printf("usage: node\n");
+        return 1;
+    }
+    /* Printed for the Terminal on the panel, and echoed to node_log so the
+     * same lines reach USB -- the panel is 40x15 and reading it back for a
+     * bench check is not practical. */
+    char buf[160];
+    snprintf(buf, sizeof(buf), "node:    %s", node_state_text());
+    printf("%s\n", buf);
+    node_log("%s", buf);
+    snprintf(buf, sizeof(buf), "ip:      %s", s_ip[0] ? s_ip : "(none)");
+    printf("%s\n", buf);
+    node_log("%s", buf);
+    snprintf(buf, sizeof(buf), "identity %s", s_identity_hex[0] ? s_identity_hex : "(not yet)");
+    printf("%s\n", buf);
+    node_log("%s", buf);
+    if (s_stats.rssi_dbm)
+    {
+        snprintf(buf, sizeof(buf), "rssi:    %d dBm", (int)s_stats.rssi_dbm);
+        printf("%s\n", buf);
+        node_log("%s", buf);
+    }
+    return 0;
+}
+
+static const tdsh_command_t s_node_cmd = {
+    .name = "node",
+    .usage = "node",
+    .help = "Show the Reticulum node's state, address and identity",
+    .fn = cmd_node,
+    .flags = 0,
+};
+
 void node_start(void)
 {
     if (s_state != NODE_OFF)
         return;
+    /* Registered here rather than in the shared app so the command exists
+     * exactly when the service does. */
+    {
+        int rc = tdsh_register_command(&s_node_cmd);
+        /* Verify by looking it up again: rc=0 means accepted, the lookup
+         * means it is in the table the Terminal reads. */
+        const tdsh_command_t *found = tdsh_command_find("node");
+        node_log("node: shell command registered rc=%d found=%d", rc, found != nullptr);
+    }
     s_state = NODE_WIFI;
     xTaskCreate(node_task, "rns", 32768, NULL, 4, NULL);
 }
