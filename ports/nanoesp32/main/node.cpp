@@ -2118,8 +2118,24 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
      * back puts Z through its whole range. Y therefore usually completes
      * during X's turn and is skipped without complaint. */
     const double ut_per_count = 100.0 / 6842.0;
+    /* 97 percent of a full turn.
+     *
+     * min/max takes the midpoint of whatever arc was swept, and for a circle
+     * that midpoint is only the true centre when the whole circle is covered.
+     * Over a symmetric arc of half-angle t the span is R(1-cos t) and the
+     * residual bias is R(1+cos t)/2, so coverage maps directly onto error:
+     *
+     *   70% of a turn -> 30% of R left as bias, about 14 uT
+     *   92%          ->  8%, about 3.7 uT
+     *   97%          ->  3%, about 1.4 uT
+     *
+     * The first run stopped every axis at a 70 percent gate -- the bar filled,
+     * the tool said "covered", and the operator stopped -- giving radius 81,
+     * 70 and 72 percent and |B| 36.8 uT, worse than before the run. The gate
+     * was the bug, not the rotation, so it is now high enough that reaching it
+     * means the axis really was swept. */
     const int32_t axis_target =
-        (int32_t)(2.0 * BENCH_FIELD_UT / ut_per_count * 0.70);
+        (int32_t)(2.0 * BENCH_FIELD_UT / ut_per_count * 0.97);
     static const char *axis_name[3] = {"X", "Y", "Z"};
     static const char *axis_how[3] = {
         "Keep the board FLAT on the table and turn it slowly all the way\n"
@@ -2136,8 +2152,9 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
         mag_cal_spans(span);
         if (span[ax] >= axis_target)
         {
-            printf("\n  Axis %s already covered (%ld counts) -- skipping.\n",
-                   axis_name[ax], (long)span[ax]);
+            printf("\n  Axis %s already reached %ld of %ld counts from the "
+                   "motion so far -- skipping.\n",
+                   axis_name[ax], (long)span[ax], (long)axis_target);
             continue;
         }
 
