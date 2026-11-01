@@ -54,14 +54,43 @@ static int stream_read(void *cookie, char *buf, int len)
     return link_read((uint8_t *)buf, len);
 }
 
+/* ONLCR, done here because there is no tty to do it.
+ *
+ * The shell's line editor emits CRLF itself, but command output arrives from
+ * printf as a bare LF. With no line discipline a bare LF moves the cursor down
+ * a line and leaves it in the same column, so the next prompt starts where the
+ * previous output ended -- the prompt appears indented by the length of the
+ * line above it. Both sinks make that assumption: vt.c treats '\n' as a line
+ * feed and '\r' separately, and a terminal in raw mode does the same.
+ *
+ * So every LF that is not already preceded by a CR gets one. State is kept
+ * across calls because a write can end mid-pair. */
+static bool s_prev_cr;
+
 static int stream_write(void *cookie, const char *buf, int len)
 {
     (void)cookie;
-    /* A sink that accepted nothing (cable just pulled, panel not ready) must
-     * not look like an error to stdio: report the bytes consumed so the shell
-     * does not retry into a spin. link_write already drops what it cannot
-     * send. */
-    link_write((const uint8_t *)buf, len);
+    uint8_t out[192];
+    size_t n = 0;
+    for (int i = 0; i < len; ++i)
+    {
+        const char c = buf[i];
+        if (n + 2 >= sizeof out)
+        {
+            /* A sink that accepted nothing (cable just pulled, panel not
+             * ready) must not look like an error to stdio, so the return value
+             * below reports the whole chunk regardless; link_write drops what
+             * it cannot send. */
+            link_write(out, (int)n);
+            n = 0;
+        }
+        if (c == '\n' && !s_prev_cr)
+            out[n++] = '\r';
+        out[n++] = (uint8_t)c;
+        s_prev_cr = (c == '\r');
+    }
+    if (n > 0)
+        link_write(out, (int)n);
     return len;
 }
 
