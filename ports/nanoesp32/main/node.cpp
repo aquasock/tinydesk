@@ -23,6 +23,11 @@
 #include <stdio.h>
 #include "tdsh.h"
 
+/* tdsh_bridge_esp.h declares this without an extern "C" guard, and this file
+ * is C++, so including it yields a mangled name that never links. Declared
+ * here instead of editing a header shared with the C sources. */
+extern "C" bool tdsh_bridge_break_requested(void);
+
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -1782,6 +1787,23 @@ static void node_task(void *arg)
     int nsensors = sensors_begin();
     node_log("sensors: %d of 4 configured", nsensors);
 
+    /* Hard-iron offsets from the last `magcal` run. Absent or unreadable
+     * leaves the field uncorrected, which the command reports as such rather
+     * than pretending the reading is calibrated. */
+    {
+        struct mag_offsets o = mag_cal_offsets();
+        if (mag_cal_load())
+        {
+            struct mag_offsets n = mag_cal_offsets();
+            node_log("mag: offsets loaded X %d Y %d Z %d", n.x, n.y, n.z);
+        }
+        else
+        {
+            node_log("mag: no calibration (X %d Y %d Z %d); run `magcal`",
+                     o.x, o.y, o.z);
+        }
+    }
+
     uint32_t elapsed = 0;
     uint32_t next_announce = (ANNOUNCE_MIN_S +
                               (esp_random() % (ANNOUNCE_MAX_S - ANNOUNCE_MIN_S)));
@@ -1794,6 +1816,9 @@ static void node_task(void *arg)
          * 480 B/s and a 32-byte read every 2 s would leave the buffer
          * overrunning and the clock tens of seconds stale. */
         sensors_poll_gps();
+        /* Calibration samples only while a run is active; the command that
+         * starts one blocks in its own task and reads progress from here. */
+        mag_cal_poll();
         if ((elapsed % 40) == 0)         /* every 2 s: the slow sensors */
             sensors_refresh();
 
@@ -1893,6 +1918,221 @@ static void node_task(void *arg)
 
 /* `node` in the desktop's Terminal: the status surface. Prints what the
  * service knows, from the same state the log and the UI read. */
+/* ---- magnetometer calibration command -------------------------------- */
+
+/* Read one line from the shell's stdin, which blocks until the user types.
+ * The Terminal sends CR for Enter, and the shell's own reader accepts CR or
+ * LF, so both terminate here. Ctrl+C aborts rather than being buffered. */
+static bool shell_read_line(const char *prompt, char *buf, size_t cap)
+{
+    if (prompt)
+    {
+        fputs(prompt, stdout);
+        fflush(stdout);
+    }
+    size_t n = 0;
+    for (;;)
+    {
+        int c = getchar();
+        if (c == EOF)
+            return false;
+        if (c == 0x03)                  /* Ctrl+C */
+        {
+            fputc('\n', stdout);
+            return false;
+        }
+        if (c == '\r' || c == '\n')
+            break;
+        if (cap > 0 && n + 1 < cap)
+            buf[n++] = (char)c;
+    }
+    if (cap > 0)
+        buf[n] = '\0';
+    return true;
+}
+
+/* Current field as one line, so the before and after readings cannot drift
+ * apart in wording.
+ *
+ * Read from the shared snapshot, never by touching the bus: this runs in the
+ * shell task, and the node task owns the I2C bus. A read here would race the
+ * background sensor refresh. The snapshot is refreshed every two seconds,
+ * which is current enough to judge a calibration. */
+static void magcal_readings(char *out, size_t n)
+{
+    const struct sensor_snapshot *sp = sensors_latest();
+    const double x = sp->mag_x_ut;
+    const double y = sp->mag_y_ut;
+    const double z = sp->mag_z_ut;
+    const double b = sqrt(x * x + y * y + z * z);
+    char h[24];
+    if (sqrt(x * x + y * y) >= 5.0)      /* else the bearing is noise */
+    {
+        double deg = atan2(y, x) * 180.0 / (double)M_PI;
+        if (deg < 0.0) deg += 360.0;
+        snprintf(h, sizeof h, "%5.1f deg", deg);
+    }
+    else
+        snprintf(h, sizeof h, "   --   ");
+    snprintf(out, n,
+             "X %+6.1f  Y %+6.1f  Z %+6.1f uT   |B| %5.1f uT   bearing %s",
+             x, y, z, b, h);
+}
+
+static void magcal_progress_line(uint32_t elapsed_ms)
+{
+    int32_t span[3];
+    mag_cal_spans(span);
+    /* A tumble covers the sphere when all three spans are large and similar;
+     * the smallest span is the honest progress figure. */
+    int32_t lo = span[0];
+    if (span[1] < lo) lo = span[1];
+    if (span[2] < lo) lo = span[2];
+    const int bars = (int)(lo / 300);
+    char meter[24];
+    int k = 0;
+    for (int i = 0; i < 12 && k < (int)sizeof meter - 1; ++i)
+        meter[k++] = (i < bars) ? '#' : '.';
+    meter[k] = '\0';
+    printf("  %4.1fs  %5lu samples  [%s]  span %ld/%ld/%ld\n",
+           (double)elapsed_ms / 1000.0, (unsigned long)mag_cal_samples(),
+           meter, (long)span[0], (long)span[1], (long)span[2]);
+    fflush(stdout);
+}
+
+static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
+{
+    (void)session;
+    char line[64];
+
+    if (argc > 1 && strcmp(argv[1], "show") == 0)
+    {
+        struct mag_offsets o = mag_cal_offsets();
+        char rd[128];
+        magcal_readings(rd, sizeof rd);
+        printf("offsets: X %d  Y %d  Z %d\n", o.x, o.y, o.z);
+        printf("reading: %s\n", rd);
+        return 0;
+    }
+
+    if (argc > 1 && strcmp(argv[1], "clear") == 0)
+    {
+        struct mag_offsets zero = {0, 0, 0};
+        mag_cal_set_offsets(&zero);
+        remove("/fs/mag_cal");
+        printf("offsets cleared; the reading is now uncorrected\n");
+        return 0;
+    }
+
+    if (argc > 1)
+    {
+        printf("usage: magcal [show|clear]\n");
+        return 1;
+    }
+
+    /* ---- guided run ---- */
+    struct mag_offsets before = mag_cal_offsets();
+    char rd_before[128];
+    magcal_readings(rd_before, sizeof rd_before);
+
+    printf("\n");
+    printf("Magnetometer calibration\n");
+    printf("=========================================================\n");
+    printf("Hard-iron offsets correct for the metal around the sensor:\n");
+    printf("the field sweeps a sphere as you turn the board, and the\n");
+    printf("midpoint of each axis is the offset the metal adds.\n");
+    printf("\n");
+    printf("offsets now  : X %d  Y %d  Z %d%s\n", before.x, before.y, before.z,
+           (before.x == 0 && before.y == 0 && before.z == 0) ? "  (none saved)" : "");
+    printf("reading now  : %s\n", rd_before);
+    printf("\nexpected |B| : about 48 uT in Arizona. Well under that means\n");
+    printf("               the offsets are missing, or there is a magnet\n");
+    printf("               or steel within about 20 cm.\n");
+    printf("\n");
+    printf("Before you start:\n");
+    printf("  * clear 20 cm around the board: no steel, magnets, speakers,\n");
+    printf("    power supply or the monitor\n");
+    printf("  * you will turn it through every orientation for 30 s,\n");
+    printf("    upside down included -- a flat spin will be rejected\n");
+    printf("\n");
+
+    if (!shell_read_line("Step 1/3. Press Enter to start sampling, Ctrl+C to cancel: ",
+                         line, sizeof line))
+    {
+        printf("cancelled; offsets unchanged\n");
+        return 1;
+    }
+
+    if (!mag_cal_begin())
+    {
+        printf("cannot start: the magnetometer is not answering\n");
+        return 1;
+    }
+
+    printf("\nStep 2/3. Tumbling for 30 seconds -- keep turning.\n");
+    printf("  80 Hz sampling, so keep the motion steady rather than fast.\n\n");
+    fflush(stdout);
+
+    const uint32_t total_ms = 30000;
+    uint32_t elapsed = 0;
+    uint32_t next_report = 0;
+    while (elapsed < total_ms)
+    {
+        vTaskDelay(pdMS_TO_TICKS(250));
+        elapsed += 250;
+        if (elapsed >= next_report)
+        {
+            magcal_progress_line(elapsed);
+            next_report += 2500;
+        }
+        if (tdsh_bridge_break_requested())
+        {
+            mag_cal_abort();
+            printf("\ncancelled; offsets unchanged\n");
+            return 1;
+        }
+    }
+
+    struct mag_offsets found;
+    char report[192];
+    const bool ok = mag_cal_finish(&found, report, sizeof report);
+
+    printf("\nStep 3/3. Sampling stopped.\n");
+    printf("  %s\n", report);
+
+    if (!ok)
+    {
+        printf("\nOffsets NOT changed. Run `magcal` again and turn the board\n");
+        printf("through more orientations, including upside down.\n");
+        return 1;
+    }
+
+    mag_cal_set_offsets(&found);
+    char rd_after[128];
+    magcal_readings(rd_after, sizeof rd_after);
+    printf("\n  new offsets : X %d  Y %d  Z %d\n", found.x, found.y, found.z);
+    printf("  reading now : %s\n", rd_after);
+    printf("\nIf |B| is now near 48 uT the fit worked. Leave the board flat and\n");
+    printf("turn it; the bearing should change smoothly with the turn.\n");
+    printf("\n");
+
+    if (!shell_read_line("Save these offsets to flash? [Y/n]: ", line, sizeof line))
+    {
+        printf("not saved; they apply until the next reboot\n");
+        return 0;
+    }
+    if (line[0] == 'n' || line[0] == 'N')
+    {
+        printf("not saved; they apply until the next reboot\n");
+        return 0;
+    }
+    if (mag_cal_save())
+        printf("saved to /fs/mag_cal\n");
+    else
+        printf("!! could not write /fs/mag_cal; they apply until reboot\n");
+    return 0;
+}
+
 static int cmd_node(tdsh_session_t *session, int argc, char **argv)
 {
     (void)session;
@@ -2010,6 +2250,15 @@ static const tdsh_command_t s_node_cmd = {
     .flags = 0,
 };
 
+static const tdsh_command_t s_magcal_cmd = {
+    .name = "magcal",
+    .usage = "magcal [show|clear]",
+    .help = "Walk through magnetometer calibration; 'show' reads the current "
+            "offsets, 'clear' drops them",
+    .fn = cmd_magcal,
+    .flags = 0,
+};
+
 void node_start(void)
 {
     if (s_state != NODE_OFF)
@@ -2022,6 +2271,9 @@ void node_start(void)
          * means it is in the table the Terminal reads. */
         const tdsh_command_t *found = tdsh_command_find("node");
         node_log("node: shell command registered rc=%d found=%d", rc, found != nullptr);
+        int rc2 = tdsh_register_command(&s_magcal_cmd);
+        const tdsh_command_t *found2 = tdsh_command_find("magcal");
+        node_log("node: magcal registered rc=%d found=%d", rc2, found2 != nullptr);
     }
     s_state = NODE_WIFI;
     xTaskCreate(node_task, "rns", 32768, NULL, 4, NULL);

@@ -19,6 +19,7 @@
 #include "sensors.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -147,22 +148,199 @@ static bool mag_begin(void)
     return true;
 }
 
-static bool mag_read(double *x, double *y, double *z)
+/* Raw counts, before any offset. Calibration works on these because the
+ * offsets it computes are expressed in counts, not microtesla. */
+static bool mag_raw(int16_t raw[3])
 {
     uint8_t d[6];
     if (!rd(ADDR_MAG, 0x28, d, 6))          /* 28h..2Dh, little-endian */
         return false;
-    int16_t raw[3];
     raw[0] = (int16_t)((d[1] << 8) | d[0]);
     raw[1] = (int16_t)((d[3] << 8) | d[2]);
     raw[2] = (int16_t)((d[5] << 8) | d[4]);
-    const double lsb_per_gauss = 6842.0;    /* +-4 gauss full scale */
-    const double ut_per_lsb = 100.0 / lsb_per_gauss;
-    *x = raw[0] * ut_per_lsb;
-    *y = raw[1] * ut_per_lsb;
-    *z = raw[2] * ut_per_lsb;
     return true;
 }
+
+/* Hard-iron offsets, subtracted from the raw counts before scaling. Zero
+ * until a calibration has been run and saved; loaded from flash at boot. */
+static struct mag_offsets s_mag_off = {0, 0, 0};
+
+static bool mag_read(double *x, double *y, double *z)
+{
+    int16_t raw[3];
+    if (!mag_raw(raw))
+        return false;
+    const double lsb_per_gauss = 6842.0;    /* +-4 gauss full scale */
+    const double ut_per_lsb = 100.0 / lsb_per_gauss;
+    *x = (double)(raw[0] - s_mag_off.x) * ut_per_lsb;
+    *y = (double)(raw[1] - s_mag_off.y) * ut_per_lsb;
+    *z = (double)(raw[2] - s_mag_off.z) * ut_per_lsb;
+    return true;
+}
+
+/* ---- hard-iron calibration ------------------------------------------ */
+
+/* Sampled from the node task rather than from the command that starts it:
+ * that task already owns the I2C bus, so calibration cannot collide with the
+ * periodic sensor refresh. 80 Hz output rate while sampling so a tumble is
+ * densely covered; the normal 10 Hz is restored when the run ends. */
+#define MAG_CTRL1_10HZ 0x70
+#define MAG_CTRL1_80HZ 0x7C
+
+static bool s_mag_cal_active;
+static uint32_t s_mag_cal_n;
+static int16_t s_mag_min[3];
+static int16_t s_mag_max[3];
+
+struct mag_offsets mag_cal_offsets(void) { return s_mag_off; }
+void mag_cal_set_offsets(const struct mag_offsets *o)
+{
+    if (!o) return;
+    s_mag_off = *o;
+}
+bool mag_cal_active(void) { return s_mag_cal_active; }
+uint32_t mag_cal_samples(void) { return s_mag_cal_n; }
+
+void mag_cal_spans(int32_t out[3])
+{
+    if (!out) return;
+    for (int i = 0; i < 3; ++i)
+        out[i] = (int32_t)s_mag_max[i] - (int32_t)s_mag_min[i];
+}
+
+bool mag_cal_begin(void)
+{
+    if (s_mag_cal_active)
+        return false;
+    int16_t probe[3];
+    if (!mag_raw(probe))               /* part must answer before we start */
+        return false;
+    s_mag_cal_active = true;
+    s_mag_cal_n = 0;
+    for (int i = 0; i < 3; ++i)
+    {
+        s_mag_min[i] = 32767;
+        s_mag_max[i] = -32768;
+    }
+    wr(ADDR_MAG, 0x20, MAG_CTRL1_80HZ);
+    return true;
+}
+
+void mag_cal_poll(void)
+{
+    if (!s_mag_cal_active)
+        return;
+    int16_t raw[3];
+    if (!mag_raw(raw))
+        return;
+    for (int i = 0; i < 3; ++i)
+    {
+        if (raw[i] < s_mag_min[i]) s_mag_min[i] = raw[i];
+        if (raw[i] > s_mag_max[i]) s_mag_max[i] = raw[i];
+    }
+    ++s_mag_cal_n;
+}
+
+void mag_cal_abort(void)
+{
+    if (!s_mag_cal_active)
+        return;
+    s_mag_cal_active = false;
+    wr(ADDR_MAG, 0x20, MAG_CTRL1_10HZ);
+}
+
+bool mag_cal_finish(struct mag_offsets *out, char *report, size_t n)
+{
+    if (report && n) report[0] = '\0';
+    if (!s_mag_cal_active)
+    {
+        if (report && n) snprintf(report, n, "no calibration running");
+        return false;
+    }
+    s_mag_cal_active = false;
+    wr(ADDR_MAG, 0x20, MAG_CTRL1_10HZ);
+
+    if (s_mag_cal_n < 100)
+    {
+        if (report && n)
+            snprintf(report, n, "too few samples (%lu); rotate for longer",
+                     (unsigned long)s_mag_cal_n);
+        return false;
+    }
+
+    int32_t span[3];
+    mag_cal_spans(span);
+    int32_t min_span = span[0], max_span = span[0];
+    for (int i = 1; i < 3; ++i)
+    {
+        if (span[i] < min_span) min_span = span[i];
+        if (span[i] > max_span) max_span = span[i];
+    }
+
+    struct mag_offsets o;
+    o.x = (int16_t)(((int32_t)s_mag_min[0] + s_mag_max[0]) / 2);
+    o.y = (int16_t)(((int32_t)s_mag_min[1] + s_mag_max[1]) / 2);
+    o.z = (int16_t)(((int32_t)s_mag_min[2] + s_mag_max[2]) / 2);
+
+    /* A tumble that covered the sphere gives roughly equal spans. A small span
+     * means that axis was never rotated, so its offset would be meaningless. */
+    if (min_span < 1000 || max_span > min_span * 3)
+    {
+        if (report && n)
+            snprintf(report, n,
+                     "POOR FIT (n=%lu span %ld/%ld/%ld): rotate through all "
+                     "orientations, including upside down",
+                     (unsigned long)s_mag_cal_n, (long)span[0], (long)span[1],
+                     (long)span[2]);
+        return false;
+    }
+
+    if (out) *out = o;
+    const double ut_per_lsb = 100.0 / 6842.0;
+    const double radius_ut =
+        (double)((span[0] + span[1] + span[2]) / 6) * ut_per_lsb;
+    if (report && n)
+        snprintf(report, n,
+                 "n=%lu, span %ld/%ld/%ld counts, radius ~%.1f uT",
+                 (unsigned long)s_mag_cal_n, (long)span[0], (long)span[1],
+                 (long)span[2], radius_ut);
+    return true;
+}
+
+/* Persisted as three integers in text, not a binary struct: a future change to
+ * the struct should fail to parse rather than be misread as offsets. */
+#define MAG_CAL_FILE "/fs/mag_cal"
+
+bool mag_cal_save(void)
+{
+    FILE *fp = fopen(MAG_CAL_FILE, "w");
+    if (!fp)
+        return false;
+    fprintf(fp, "%d %d %d\n", s_mag_off.x, s_mag_off.y, s_mag_off.z);
+    fclose(fp);
+    return true;
+}
+
+bool mag_cal_load(void)
+{
+    FILE *fp = fopen(MAG_CAL_FILE, "r");
+    if (!fp)
+        return false;
+    int x = 0, y = 0, z = 0;
+    int got = fscanf(fp, "%d %d %d", &x, &y, &z);
+    fclose(fp);
+    if (got != 3)
+        return false;
+    /* Bounded so a corrupt file cannot shift the reading into nonsense. */
+    if (x < -32768 || x > 32767 || y < -32768 || y > 32767 ||
+        z < -32768 || z > 32767)
+        return false;
+    s_mag_off.x = (int16_t)x;
+    s_mag_off.y = (int16_t)y;
+    s_mag_off.z = (int16_t)z;
+    return true;
+}
+
 
 /* ---- BMP581 --------------------------------------------------------- */
 

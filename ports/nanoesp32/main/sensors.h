@@ -18,6 +18,7 @@
 #define SENSORS_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 struct sensor_snapshot
@@ -73,6 +74,36 @@ void sensors_poll_gps(void);
 /* Re-read all four into the shared snapshot. Called from the node task on a
  * timer so a telemetry request never waits on a conversion. */
 void sensors_refresh(void);
+
+/* ---- magnetometer hard-iron calibration ------------------------------
+ *
+ * Offsets are learned by tumbling the board so the field sweeps a sphere; the
+ * midpoint of each axis's range is the offset the surrounding metal adds. They
+ * describe the metal around the sensor, so moving the board to a different
+ * mount invalidates them.
+ *
+ * Sampling runs in the node task (mag_cal_poll), not in whatever command
+ * started it, because that task owns the I2C bus and a command must not read
+ * the sensor concurrently. A command starts the run, then polls
+ * mag_cal_samples() and mag_cal_spans() for progress while the user tumbles.
+ */
+struct mag_offsets
+{
+    int16_t x, y, z;
+};
+
+bool     mag_cal_begin(void);          /* false if absent or already running */
+void     mag_cal_poll(void);           /* from the node task, every tick */
+bool     mag_cal_active(void);
+uint32_t mag_cal_samples(void);
+void     mag_cal_spans(int32_t out[3]);
+bool     mag_cal_finish(struct mag_offsets *out, char *report, size_t n);
+void     mag_cal_abort(void);
+void     mag_cal_set_offsets(const struct mag_offsets *o);
+struct mag_offsets mag_cal_offsets(void);
+bool     mag_cal_save(void);           /* to /fs/mag_cal */
+bool     mag_cal_load(void);           /* from /fs/mag_cal */
+
 
 /* The most recent snapshot, refreshed in the background at a fixed interval
  * so a telemetry request never blocks on an 8.3 ms humidity conversion. */
