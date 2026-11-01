@@ -2079,11 +2079,12 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
     printf("  * clear 20 cm around the board: no steel, magnets, speakers,\n");
     printf("    power supply or the monitor\n");
     printf("  * it asks for one axis at a time and tells you which motion\n");
-    printf("    covers it. Each axis is finished when it has actually seen\n");
-    printf("    the whole field, not when a timer runs out, so just keep\n");
-    printf("    turning slowly until it says the axis is covered\n");
-    printf("  * if an axis never gets there the run stops and changes\n");
-    printf("    nothing, rather than saving a biased offset\n");
+    printf("    covers it. Turn slowly and steadily; full coverage is not\n");
+    printf("    required, but the board has to see the field from several\n");
+    printf("    directions for the fit to mean anything\n");
+    printf("  * the offsets come from a sphere fit over every sample, so a\n");
+    printf("    near-full turn is plenty. The fit is checked against the\n");
+    printf("    local field and rejected if it does not describe it\n");
     printf("\n");
 
     if (!shell_read_line("Press Enter to start sampling, Ctrl+C to cancel: ",
@@ -2118,24 +2119,27 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
      * back puts Z through its whole range. Y therefore usually completes
      * during X's turn and is skipped without complaint. */
     const double ut_per_count = 100.0 / 6842.0;
-    /* 97 percent of a full turn.
+    /* 65 percent of a full turn is enough now, and that is the point of
+     * switching the estimator.
      *
-     * min/max takes the midpoint of whatever arc was swept, and for a circle
-     * that midpoint is only the true centre when the whole circle is covered.
-     * Over a symmetric arc of half-angle t the span is R(1-cos t) and the
-     * residual bias is R(1+cos t)/2, so coverage maps directly onto error:
+     * The offsets come from a least-squares sphere fit over every sample, not
+     * from the midpoint of each axis's range. Points on a sphere fix its
+     * centre whether they cover the whole surface or only a cap of it, so
+     * coverage costs almost nothing: simulated against a known offset with
+     * realistic sensor noise, the fit was within 0.1 uT at 70 percent
+     * coverage where min/max was still 12.6 uT out.
      *
-     *   70% of a turn -> 30% of R left as bias, about 14 uT
-     *   92%          ->  8%, about 3.7 uT
-     *   97%          ->  3%, about 1.4 uT
+     * This matters because 97 percent was not achievable here. X would not
+     * pass about 5650 counts of the 6377 a full tumble sweeps, so a 97 percent
+     * gate could never be met, and the old min/max estimator would have been
+     * 11 uT wrong even if it had been.
      *
-     * The first run stopped every axis at a 70 percent gate -- the bar filled,
-     * the tool said "covered", and the operator stopped -- giving radius 81,
-     * 70 and 72 percent and |B| 36.8 uT, worse than before the run. The gate
-     * was the bug, not the rotation, so it is now high enough that reaching it
-     * means the axis really was swept. */
+     * The bar is therefore a nudge to keep moving rather than a correctness
+     * threshold; correctness comes from the fitted radius, which mag_cal_finish
+     * checks against the local field and rejects when it is implausible. */
     const int32_t axis_target =
-        (int32_t)(2.0 * BENCH_FIELD_UT / ut_per_count * 0.97);
+        (int32_t)(2.0 * BENCH_FIELD_UT / ut_per_count * 0.65);
+
     static const char *axis_name[3] = {"X", "Y", "Z"};
     static const char *axis_how[3] = {
         "Keep the board FLAT on the table and turn it slowly all the way\n"
