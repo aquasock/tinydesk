@@ -661,16 +661,27 @@ static void node_task(void *arg)
             s_lxmf->process_outbound();
         }
 
+        /* elapsed counts 50 ms ticks, so seconds elapsed is elapsed / 20.
+         * Comparing ticks against a value in seconds -- which an earlier
+         * version did -- makes the interval twenty times too short, and that
+         * version also reset the timer without ever announcing, so the node
+         * announced once at boot and never again. Both are fixed here. */
+        uint32_t seconds_up = elapsed / 20;
         if (!s_announced_once)
         {
             s_announced_once = true;
         }
-        else if (elapsed >= next_announce || s_announce_requested)
+        else if (seconds_up >= next_announce || s_announce_requested)
         {
             s_announce_requested = false;
             elapsed = 0;
             next_announce = (ANNOUNCE_MIN_S +
                              (esp_random() % (ANNOUNCE_MAX_S - ANNOUNCE_MIN_S)));
+            if (s_lxmf_up && s_lxmf)
+            {
+                s_lxmf->announce();
+                node_log("lxmf: re-announced (next in %us)", (unsigned)next_announce);
+            }
         }
 
         if (s_persist_requested)
@@ -702,9 +713,18 @@ static void node_task(void *arg)
 static int cmd_node(tdsh_session_t *session, int argc, char **argv)
 {
     (void)session;
+    if (argc > 1 && strcmp(argv[1], "announce") == 0)
+    {
+        /* Announces are the only way a peer learns this address, and the
+         * scheduled ones are hours apart, so there has to be a way to ask. */
+        node_announce_now();
+        printf("announce requested\n");
+        node_log("node: announce requested from shell");
+        return 0;
+    }
     if (argc > 1)
     {
-        printf("usage: node\n");
+        printf("usage: node [announce]\n");
         return 1;
     }
     /* Printed for the Terminal on the panel, and echoed to node_log so the
@@ -731,8 +751,8 @@ static int cmd_node(tdsh_session_t *session, int argc, char **argv)
 
 static const tdsh_command_t s_node_cmd = {
     .name = "node",
-    .usage = "node",
-    .help = "Show the Reticulum node's state, address and identity",
+    .usage = "node [announce]",
+    .help = "Show the node's state, or announce it to the mesh",
     .fn = cmd_node,
     .flags = 0,
 };

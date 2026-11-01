@@ -97,7 +97,50 @@ recovered by dumping flash at the `storage` partition and reading the strings
 out. A build-time fallback exists for a bench image with no way to write a file
 yet — `-DTD_WIFI_SSID=... -DTD_WIFI_PASSWORD=...`.
 
-## State: where it stops
+## State: working
+
+The node is complete for its purpose. Verified on hardware, live over USB:
+
+```
+state=wifi_up ip=10.10.0.35 rssi=-38
+rns: identity from file (ok)          14f4ab99..., same across reboots
+rns: interface start=1
+lxmf: starting router
+lxmf: announced, delivery address 89f609774be9dc1b2640bc5f23d81714
+state=ready ip=10.10.0.35 free=8238664
+lxmf: message from 1a60e414..., 19 bytes
+```
+
+and from the host, on the same LAN:
+
+- the shared instance learns the path and it **refreshes on each announce**
+- an LXMF message is DELIVERED (DIRECT in 1 s, OPPORTUNISTIC in 29 s)
+- the node's delivery callback fires with the message content
+
+### Three bugs in the announce scheduler
+
+All three meant the node announced once at boot and then never again:
+
+1. The re-announce branch reset its counters and **never called `announce()`**.
+2. `elapsed` counts 50 ms ticks but `next_announce` is in seconds, so the
+   interval was 20x too short -- invisible, because of (1).
+3. `LXMRouter::_announce_interval` defaults to `0`, which disables the
+   library's own auto-announce, so nothing covered the gap.
+
+A one-shot announce is enough to appear in a path table but not enough to be
+seen: Sideband lists announces as they arrive, and a node that announced hours
+ago is invisible even though its path entry is still valid for seven days.
+
+`node announce` in the Terminal forces one on demand.
+
+### A sampling error worth recording
+
+`rx` read 0 through three successful sends, which looked like a broken
+callback. It was not: every heartbeat inspected came from a boot that finished
+before the message was sent. Capture and send in the same run, and the callback
+fires immediately.
+
+## Historical: where it used to stop
 
 Working on hardware, each verified by reading `/fs/node.log` out of flash:
 
