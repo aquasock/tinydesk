@@ -107,3 +107,20 @@ smaller font in `tools`-generated `font8x16.h` would trade legibility for room.
 The display-ID register (0x04) reads back as zero on this module even though
 the panel draws correctly, so the probe result is not a reliable wiring check
 here; visible pixels are.
+
+## Link selection
+
+Two desktop links are built from this directory and chosen at configure time:
+
+| `-DTD_LINK=` | File(s) | Desktop appears on |
+| --- | --- | --- |
+| `usb` (default) | `link_usj.c` | The USB-C port, as a terminal |
+| `lcd` | `link_lcd.c`, `vt.c`, `ili9340.c` | The ILI9340 panel; input still over USB |
+
+Both provide the same four functions from `link.h`, so nothing outside this
+directory changes.
+
+Both were tested on hardware on 2026-10-31. `usb` renders the desktop at 80x20
+and 110x40, responds to mouse and keyboard, and `idfinfo` in the Terminal window
+reports `ESP-IDF v5.3.1, cores 2, revision 2`. `lcd` was the build under test
+for the panel work and runs the same desktop on the 320x240 display at 40x15.
