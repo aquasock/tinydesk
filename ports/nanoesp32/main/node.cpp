@@ -2208,6 +2208,66 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
 extern "C" void link_set_console_columns(int cols);
 extern "C" int link_console_columns(void);
 
+/* Write /fs/etc/wifi.conf.
+ *
+ * Credentials used to arrive only as -DTD_WIFI_SSID / -DTD_WIFI_PASSWORD on
+ * the build command, which meant the network lived in CMake's cache: a plain
+ * `idf.py build` silently produced a board with no network, and clearing the
+ * cache once took the node off the air. The file is the durable form and this
+ * command is how it gets written.
+ *
+ * The node task reads the file once at start and exits if it is absent, so a
+ * change needs a restart. Saying so is better than appearing to apply it. */
+static int cmd_wifi(tdsh_session_t *session, int argc, char **argv)
+{
+    (void)session;
+
+    if (argc > 1 && strcmp(argv[1], "clear") == 0)
+    {
+        if (remove(WIFI_CONF) == 0)
+            printf("removed %s; restart to come up without a network\n", WIFI_CONF);
+        else
+            printf("no %s to remove\n", WIFI_CONF);
+        return 0;
+    }
+
+    if (argc > 1)
+    {
+        if (argc < 3)
+        {
+            printf("usage: wifi <ssid> <password>\n"
+                   "       wifi            show what is configured\n"
+                   "       wifi clear      remove the configuration\n");
+            return 1;
+        }
+        /* The file lives under /fs, which is the shell's own root, so make
+         * sure /etc exists before opening it. */
+        mkdir("/fs/etc", 0755);
+        FILE *fp = fopen(WIFI_CONF, "w");
+        if (!fp)
+        {
+            printf("!! cannot write %s\n", WIFI_CONF);
+            return 1;
+        }
+        fprintf(fp, "ssid = %s\npassword = %s\n", argv[1], argv[2]);
+        fclose(fp);
+        printf("saved to %s\n", WIFI_CONF);
+        printf("restart to apply: the node reads this once at start\n");
+        return 0;
+    }
+
+    /* Status, without echoing the password back to the terminal. */
+    char ssid[64], pass[96];
+    if (read_wifi_conf(ssid, sizeof ssid, pass, sizeof pass))
+        printf("ssid:     %s\npassword: %s\n", ssid,
+               pass[0] ? "(set)" : "(empty)");
+    else
+        printf("no credentials in %s\n", WIFI_CONF);
+    printf("state:    %s\n", node_state_text());
+    printf("ip:       %s\n", s_ip[0] ? s_ip : "(none)");
+    return 0;
+}
+
 static int cmd_cols(tdsh_session_t *session, int argc, char **argv)
 {
     (void)session;
@@ -2344,6 +2404,14 @@ static const tdsh_command_t s_node_cmd = {
     .flags = 0,
 };
 
+static const tdsh_command_t s_wifi_cmd = {
+    .name = "wifi",
+    .usage = "wifi [<ssid> <password> | clear]",
+    .help = "Show, set or clear the WiFi credentials written to " WIFI_CONF,
+    .fn = cmd_wifi,
+    .flags = 0,
+};
+
 static const tdsh_command_t s_cols_cmd = {
     .name = "cols",
     .usage = "cols [20..500]",
@@ -2379,6 +2447,9 @@ void node_start(void)
         int rc3 = tdsh_register_command(&s_cols_cmd);
         const tdsh_command_t *found3 = tdsh_command_find("cols");
         node_log("node: cols registered rc=%d found=%d", rc3, found3 != nullptr);
+        int rc4 = tdsh_register_command(&s_wifi_cmd);
+        const tdsh_command_t *found4 = tdsh_command_find("wifi");
+        node_log("node: wifi registered rc=%d found=%d", rc4, found4 != nullptr);
     }
     s_state = NODE_WIFI;
     xTaskCreate(node_task, "rns", 32768, NULL, 4, NULL);

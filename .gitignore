@@ -33,3 +33,8 @@ __pycache__/
 .idea/
 .DS_Store
 Thumbs.db
+
+# WiFi credentials written by `wifi` at runtime live in /fs/etc/wifi.conf on
+# the device, not here. Never commit a local copy.
+ports/*/wifi.conf
+wifi.conf
