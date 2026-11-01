@@ -108,19 +108,38 @@ The display-ID register (0x04) reads back as zero on this module even though
 the panel draws correctly, so the probe result is not a reliable wiring check
 here; visible pixels are.
 
-## Link selection
+## The desktop link
 
-Two desktop links are built from this directory and chosen at configure time:
+This port is **remote-first**: the panel is the display and USB is not a
+tether. Only `link_lcd.c` (with `vt.c` and `ili9340.c`) is built. The desktop
+stream goes to the panel and nothing is echoed back to USB; USB carries input
+for bench work, so a headless unit needs no host attached.
 
-| `-DTD_LINK=` | File(s) | Desktop appears on |
-| --- | --- | --- |
-| `usb` (default) | `link_usj.c` | The USB-C port, as a terminal |
-| `lcd` | `link_lcd.c`, `vt.c`, `ili9340.c` | The ILI9340 panel; input still over USB |
+`link_usj.c` is still in the tree — it serves the desktop as terminal output on
+the USB-C port, at whatever size the terminal reports — and is useful for bench
+debugging. Add it to `TD_LINK_SRCS` in `main/CMakeLists.txt` to build that
+variant instead. It was tested on hardware on 2026-10-31 at 80x20 and 110x40.
 
-Both provide the same four functions from `link.h`, so nothing outside this
-directory changes.
+## Buffer sizes
 
-Both were tested on hardware on 2026-10-31. `usb` renders the desktop at 80x20
-and 110x40, responds to mouse and keyboard, and `idfinfo` in the Terminal window
-reports `ESP-IDF v5.3.1, cores 2, revision 2`. `lcd` was the build under test
-for the panel work and runs the same desktop on the 320x240 display at 40x15.
+The library defaults are `TD_MAX_COLS 256`, `TD_MAX_ROWS 96` and 200 lines of
+terminal scrollback, sized for a maximised window on a monitor. At 8 bytes a
+cell that is 393 KB of screen buffers plus 303 KB of terminal.
+
+This panel is 40x15 cells, so the maxima are set to that in `CMakeLists.txt`:
+
+```
+TD_MAX_COLS=40  TD_MAX_ROWS=15  TD_VT_SCROLLBACK=8
+```
+
+`.ext_ram.bss` measured **773,448 bytes** with the defaults and **90,408** with
+those values — 667 KB saved, and the remainder is the shell and app statics, not
+the desktop buffers.
+
+Two details that matter if these are ever changed:
+
+- They must be **cache variables set before `project()`**. The `tinydesk`
+  component is configured before `main/`, so setting them in
+  `main/CMakeLists.txt` silently does nothing — the build keeps the old value.
+- Keep them in step with `LCD_W`/`LCD_H` in `main/ili9340.h` and
+  `FONT_W`/`FONT_H` in `main/font8x16.h`: the grid is the quotient of the two.

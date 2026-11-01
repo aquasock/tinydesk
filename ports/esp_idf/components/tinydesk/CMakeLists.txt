@@ -65,7 +65,14 @@ idf_component_register(
 # ESP32; all apps open need about 115): 96 without PSRAM (14 KB of internal
 # RAM), the default 128 with it. A window that still does not fit, or gets
 # no timer, is closed with a message instead of opening with missing parts.
-if(CONFIG_SPIRAM)
+# A port whose display is fixed and small can override the maxima, so the
+# buffers are sized for what it can show rather than for a maximised desktop
+# window: -DTD_MAX_COLS=40 -DTD_MAX_ROWS=15 -DTD_VT_SCROLLBACK=8. ports/nanoesp32
+# does this for its 320x240 panel, which costs about 13 KB instead of 680 KB.
+if(TD_MAX_COLS)
+    set(TD_SCREEN_LIMITS TD_MAX_COLS=${TD_MAX_COLS} TD_MAX_ROWS=${TD_MAX_ROWS}
+                          TD_VT_SCROLLBACK=${TD_VT_SCROLLBACK})
+elseif(CONFIG_SPIRAM)
     set(TD_SCREEN_LIMITS TD_MAX_COLS=256 TD_MAX_ROWS=96 TD_VT_SCROLLBACK=200)
 else()
     set(TD_SCREEN_LIMITS TD_MAX_COLS=80 TD_MAX_ROWS=25 TD_VT_SCROLLBACK=12 TD_MAX_WIDGETS=96)

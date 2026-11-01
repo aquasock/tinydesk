@@ -28,6 +28,10 @@
 #define RX_BUFFER 8192
 #define REPLY_MAX 32
 
+/* The desktop goes to the panel only. This board is remote-first: USB is not a
+ * tether, so nothing is echoed back to it. Input still arrives over USB for
+ * bench work, but a headless unit needs no host attached. */
+
 static const char *TAG = "link_lcd";
 
 static char s_reply[REPLY_MAX];

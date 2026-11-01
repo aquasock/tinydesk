@@ -18,6 +18,20 @@ get_filename_component(TD_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
 set(TDSH_SDK_ROOT "${TD_ROOT}/third_party/tdsh")
 
 set(IDF_TARGET "esp32s3" CACHE STRING "tinydesk target")
+
+# Screen and terminal buffer limits, in cells. The library defaults
+# (256x96, 200 lines of terminal scrollback) are sized for a maximised
+# desktop window on a monitor: about 680 KB of buffers. This panel is
+# 320x240, which is 40x15 cells at 8x16, so the maxima are set to what the
+# display can show and the scrollback to a useful-but-cheap ring: about
+# 13 KB instead of 680 KB.
+#
+# These must be cache variables set BEFORE project(), because the tinydesk
+# component is configured before main/ and reads them then. Keep in step
+# with LCD_W/LCD_H in main/ili9340.h and FONT_W/FONT_H in main/font8x16.h.
+set(TD_MAX_COLS     40 CACHE STRING "screen cells across (320 px / 8)")
+set(TD_MAX_ROWS     15 CACHE STRING "screen cells down (240 px / 16)")
+set(TD_VT_SCROLLBACK 8 CACHE STRING "terminal scrollback lines")
 list(APPEND EXTRA_COMPONENT_DIRS
     "${TDSH_SDK_ROOT}/ports/esp_idf/components"
     "${TD_ROOT}/ports/esp_idf/components")
