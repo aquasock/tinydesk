@@ -18,6 +18,8 @@
  */
 #include "node.h"
 
+#include "sensors.h"
+
 #include <stdio.h>
 #include "tdsh.h"
 
@@ -50,6 +52,8 @@
 
 #include "esp_random.h"
 #include "esp_system.h"
+#include "driver/gpio.h"
+#include "driver/i2c_master.h"
 
 #include <sys/stat.h>
 
@@ -237,6 +241,189 @@ static RNS::Reticulum s_reticulum({RNS::Type::NONE});
 static RNS::Identity s_identity({RNS::Type::NONE});
 static RNS::Interface s_udp({RNS::Type::NONE});
 static bool s_announced_once;
+
+/* ---- I2C bus ------------------------------------------------------- */
+
+/* The sensors share A4/A5 (GPIO 11/12) with nothing else: the panel is on SPI
+ * and the controller is not fitted in this build. One probe per address is
+ * enough to inventory the bus, and logging every hit means a new sensor
+ * shows up in the boot record rather than being discovered late. */
+#define I2C_PORT_SENSORS I2C_NUM_0
+#define I2C_SDA_GPIO     GPIO_NUM_11
+#define I2C_SCL_GPIO     GPIO_NUM_12
+#define I2C_HZ           100000
+
+static bool s_i2c_ready;
+
+static i2c_master_bus_handle_t s_i2c_bus;
+
+static bool sensors_i2c_init(void)
+{
+    if (s_i2c_bus)
+        return true;
+    /* The modern master-bus API. The legacy driver/i2c.h path panicked on
+     * this build (rst:0xc RTC_SW_CPU_RST, a software reset) and is deprecated
+     * in IDF 5.3 anyway. */
+    i2c_master_bus_config_t bus = {
+        .i2c_port = I2C_NUM_0,
+        .sda_io_num = I2C_SDA_GPIO,
+        .scl_io_num = I2C_SCL_GPIO,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags = {.enable_internal_pullup = true},
+    };
+    esp_err_t err = i2c_new_master_bus(&bus, &s_i2c_bus);
+    if (err != ESP_OK)
+    {
+        node_log("i2c: bus init failed (%s)", esp_err_to_name(err));
+        s_i2c_bus = NULL;
+        return false;
+    }
+    return true;
+}
+
+/* Other translation units need the same bus handle; the driver is refcounted
+ * by ESP-IDF for handles, so handing it out is safe. */
+i2c_master_bus_handle_t sensors_bus(void)
+{
+    return s_i2c_bus;
+}
+
+/* Probe 0x08..0x77 and log every address that acknowledges.
+ *
+ * This is the plain form, and it is the one that reported the bus correctly
+ * (0x1c 0x44 0x47). An "improved" version added a 2 ms settle before each
+ * address and promptly reported 27-30 addresses that changed every pass; the
+ * delay let the lines float long enough for the probe to see false ACKs. Do
+ * not add pacing here. */
+static int sensors_i2c_scan(void)
+{
+    if (!sensors_i2c_init())
+        return -1;
+    char found[160];
+    int n = 0;
+    size_t used = 0;
+    found[0] = '\0';
+    for (uint8_t a = 0x08; a < 0x78; a++)
+    {
+        if (i2c_master_probe(s_i2c_bus, a, 20) != ESP_OK)
+            continue;
+        n++;
+        if (used < sizeof(found) - 8)
+            used += (size_t)snprintf(found + used, sizeof(found) - used, "%s0x%02x",
+                                     used ? " " : "", a);
+    }
+    node_log("i2c: %d device(s): %s", n, n ? found : "none");
+    return n;
+}
+
+/* A bare address probe is not trustworthy here: on this bus it ACKed 27-30
+ * addresses that changed on every pass, which is a floating-line artefact.
+ * Reading a known ID register is definitive -- it only succeeds if a real
+ * device answered with real data. */
+static bool i2c_read_reg(uint8_t addr, uint8_t reg, uint8_t *out)
+{
+    if (!s_i2c_bus)
+        return false;
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = addr,
+        .scl_speed_hz = I2C_HZ,
+    };
+    i2c_master_dev_handle_t dev = NULL;
+    if (i2c_master_bus_add_device(s_i2c_bus, &dev_cfg, &dev) != ESP_OK)
+        return false;
+    esp_err_t err = i2c_master_transmit_receive(dev, &reg, 1, out, 1, 100);
+    i2c_master_bus_rm_device(dev);
+    return err == ESP_OK;
+}
+
+/* Read the two bus lines directly. If SDA is held low by a device that
+ * brown-outed or lost its supply, every other device goes silent too -- which
+ * looks exactly like "nothing is fitted" and is not. */
+static void i2c_line_state(const char *when)
+{
+    gpio_set_direction((gpio_num_t)I2C_SDA_GPIO, GPIO_MODE_INPUT);
+    gpio_set_direction((gpio_num_t)I2C_SCL_GPIO, GPIO_MODE_INPUT);
+    vTaskDelay(pdMS_TO_TICKS(2));
+    int sda = gpio_get_level((gpio_num_t)I2C_SDA_GPIO);
+    int scl = gpio_get_level((gpio_num_t)I2C_SCL_GPIO);
+    node_log("i2c lines %s: SDA=%d SCL=%d (1/1 = idle and healthy)", when, sda, scl);
+}
+
+/* Free a bus that a device is holding low: clock SCL up to nine times with
+ * SDA released, then issue a STOP. This is the standard recovery and it costs
+ * nothing to try before concluding a device is missing. */
+static void i2c_bus_recover(void)
+{
+    gpio_set_direction((gpio_num_t)I2C_SDA_GPIO, GPIO_MODE_INPUT_OUTPUT_OD);
+    gpio_set_direction((gpio_num_t)I2C_SCL_GPIO, GPIO_MODE_INPUT_OUTPUT_OD);
+    gpio_set_level((gpio_num_t)I2C_SDA_GPIO, 1);
+    for (int i = 0; i < 9; i++)
+    {
+        gpio_set_level((gpio_num_t)I2C_SCL_GPIO, 0);
+        esp_rom_delay_us(5);
+        gpio_set_level((gpio_num_t)I2C_SCL_GPIO, 1);
+        esp_rom_delay_us(5);
+    }
+    /* STOP: SDA low then high while SCL is high. */
+    gpio_set_level((gpio_num_t)I2C_SDA_GPIO, 0);
+    esp_rom_delay_us(5);
+    gpio_set_level((gpio_num_t)I2C_SCL_GPIO, 1);
+    esp_rom_delay_us(5);
+    gpio_set_level((gpio_num_t)I2C_SDA_GPIO, 1);
+    esp_rom_delay_us(5);
+    gpio_set_direction((gpio_num_t)I2C_SDA_GPIO, GPIO_MODE_INPUT);
+    gpio_set_direction((gpio_num_t)I2C_SCL_GPIO, GPIO_MODE_INPUT);
+}
+
+/* Confirm the bus is sane by reading the IDs of the devices that are known to
+ * be fitted. If these read correctly, a silent address really is silent. */
+static void sensors_identify(void)
+{
+    uint8_t v = 0;
+    if (i2c_read_reg(0x1c, 0x0F, &v))
+        node_log("i2c: LIS3MDL WHO_AM_I=0x%02x (expect 0x3d)", v);
+    else
+        node_log("i2c: LIS3MDL at 0x1c did not answer");
+
+    if (i2c_read_reg(0x47, 0x01, &v))
+        node_log("i2c: BMP581 chip_id=0x%02x (expect 0x50)", v);
+    else
+        node_log("i2c: BMP581 at 0x47 did not answer");
+
+    if (i2c_read_reg(0x10, 0x00, &v))
+        node_log("i2c: GPS at 0x10 answered, reg0=0x%02x", v);
+    else
+        node_log("i2c: GPS at 0x10 did not answer a register read");
+
+    if (i2c_read_reg(0x52, 0xFA, &v))
+        node_log("i2c: Wii adapter at 0x52 answered, id0=0x%02x (expect 0x00)", v);
+    else
+        node_log("i2c: Wii adapter at 0x52 did not answer");
+}
+
+/* The GPS is the one device that can be slow to appear: an MTK3333 does not
+ * answer until its own boot completes, and the one-shot scan runs immediately.
+ * Probe it repeatedly for the first half minute and log the first time it
+ * answers, which separates "not fitted" from "late". */
+static void gps_watch(uint8_t addr, int attempts, int delay_ms)
+{
+    if (!s_i2c_bus)
+        return;
+    for (int i = 0; i < attempts; i++)
+    {
+        if (i2c_master_probe(s_i2c_bus, addr, 50) == ESP_OK)
+        {
+            node_log("i2c: 0x%02x answered on attempt %d (after %d ms)",
+                     addr, i + 1, i * delay_ms);
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    }
+    node_log("i2c: 0x%02x never answered in %d probes over %d ms",
+             addr, attempts, attempts * delay_ms);
+}
 
 /* ---- storage adapter ------------------------------------------------ */
 
@@ -555,6 +742,14 @@ static void node_task(void *arg)
                  exists_abs ? (long)pst.st_size : -1L);
     }
 
+    /* Inventory the sensor bus before anything else claims it, so a missing
+     * device is visible in the boot record. */
+    /* Inventory with the plain probe scan -- this is the form that reported
+     * the bus correctly. Register reads follow for the devices we know how to
+     * identify, since a real register value is stronger evidence than an ACK. */
+    sensors_i2c_scan();
+    sensors_identify();
+
     node_log("rns: constructing");
     s_reticulum = RNS::Reticulum();
     node_log("rns: constructed");
@@ -647,6 +842,12 @@ static void node_task(void *arg)
     s_state = NODE_READY;
     node_log("state=ready ip=%s free=%u", s_ip, (unsigned)esp_get_free_heap_size());
 
+    /* Watched after the node is up, so the probes cannot delay Reticulum. The
+     * GPS is the only device that may still be booting during the scan. */
+    gps_watch(0x10, 10, 3000);
+    int nsensors = sensors_begin();
+    node_log("sensors: %d of 4 configured", nsensors);
+
     uint32_t elapsed = 0;
     uint32_t next_announce = (ANNOUNCE_MIN_S +
                               (esp_random() % (ANNOUNCE_MAX_S - ANNOUNCE_MIN_S)));
@@ -655,6 +856,9 @@ static void node_task(void *arg)
     for (;;)
     {
         s_reticulum.loop();
+        if ((elapsed % 40) == 0)         /* every 2 s */
+            sensors_refresh();
+
         if (s_lxmf_up)
         {
             s_lxmf->process_inbound();
@@ -697,6 +901,13 @@ static void node_task(void *arg)
             /* Path count is the mesh-visibility signal: it goes up when an
              * announce from a peer arrives over the UDP interface, so a
              * non-zero value proves the radio path works both ways. */
+            {
+                const struct sensor_snapshot *sn = sensors_latest();
+                node_log("sensors: env=%d %.1fC/%.1f%% press=%d %.1fhPa mag=%d gps=%d fix=%d",
+                         (int)sn->have_env, sn->temperature_c, sn->humidity_pct,
+                         (int)sn->have_pressure, sn->pressure_hpa,
+                         (int)sn->have_mag, (int)sn->have_gps, (int)sn->gps_fix);
+            }
             node_log("alive t=%lus free=%u paths=%u rx=%u",
                      (unsigned long)(elapsed / 20),
                      (unsigned)esp_get_free_heap_size(),
@@ -745,6 +956,39 @@ static int cmd_node(tdsh_session_t *session, int argc, char **argv)
         snprintf(buf, sizeof(buf), "rssi:    %d dBm", (int)s_stats.rssi_dbm);
         printf("%s\n", buf);
         node_log("%s", buf);
+    }
+
+    const struct sensor_snapshot *sn = sensors_latest();
+    if (sn->have_env)
+    {
+        snprintf(buf, sizeof(buf), "env:     %.1f C, %.1f %%RH", sn->temperature_c, sn->humidity_pct);
+        printf("%s\n", buf);
+        node_log("%s", buf);
+    }
+    if (sn->have_pressure)
+    {
+        snprintf(buf, sizeof(buf), "press:   %.1f hPa", sn->pressure_hpa);
+        printf("%s\n", buf);
+        node_log("%s", buf);
+    }
+    if (sn->have_mag)
+    {
+        snprintf(buf, sizeof(buf), "mag:     %.1f, %.1f, %.1f uT",
+                 sn->mag_x_ut, sn->mag_y_ut, sn->mag_z_ut);
+        printf("%s\n", buf);
+        node_log("%s", buf);
+    }
+    if (sn->gps_fix)
+    {
+        snprintf(buf, sizeof(buf), "gps:     %.6f, %.6f, %.0f m, %u sat",
+                 sn->gps_lat, sn->gps_lon, sn->gps_alt_m, (unsigned)sn->gps_sats);
+        printf("%s\n", buf);
+        node_log("%s", buf);
+    }
+    else
+    {
+        printf("gps:     no fix\n");
+        node_log("gps:     no fix");
     }
     return 0;
 }

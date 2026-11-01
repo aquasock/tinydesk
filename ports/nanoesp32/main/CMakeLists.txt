@@ -9,12 +9,12 @@
 include("${CMAKE_CURRENT_LIST_DIR}/../../esp_idf/app/app.cmake")
 
 idf_component_register(
-    SRCS "link_lcd.c" "ili9340.c" "vt.c" "node.cpp" ${TD_ESP_APP_SRCS}
+    SRCS "link_lcd.c" "ili9340.c" "vt.c" "node.cpp" "sensors.cpp" ${TD_ESP_APP_SRCS}
     EMBED_TXTFILES "${TD_BOARD_BUILTIN_CONF}"
     INCLUDE_DIRS "." "${TD_ESP_APP_DIR}"
     LDFRAGMENTS "extram.lf"
     REQUIRES ${TD_ESP_APP_REQUIRES} esp_driver_usb_serial_jtag esp_driver_spi esp_driver_gpio
-             esp_wifi esp_netif esp_event nvs_flash rns lxm
+             esp_wifi esp_netif esp_event nvs_flash driver esp_driver_i2c rns lxm
 )
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Wextra -Werror)
 # microReticulum is C++ with exceptions; node.cpp includes its headers.
