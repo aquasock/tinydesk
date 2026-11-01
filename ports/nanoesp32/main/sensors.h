@@ -52,6 +52,12 @@ int sensors_begin(void);
  * false and their fields untouched. */
 void sensors_read(struct sensor_snapshot *out);
 
+/* Poll the GPS only. The receiver streams NMEA continuously at about
+ * 480 bytes/s, so it has to be drained far more often than the other three
+ * are read: at one 32-byte chunk per 2 s the module's buffer overruns and the
+ * sentences parsed are tens of seconds old. Call this from the main loop. */
+void sensors_poll_gps(void);
+
 /* Re-read all four into the shared snapshot. Called from the node task on a
  * timer so a telemetry request never waits on a conversion. */
 void sensors_refresh(void);

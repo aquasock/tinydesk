@@ -419,9 +419,52 @@ const struct sensor_snapshot *sensors_latest(void)
 /* Background refresh, called from the node task. The interval is set so the
  * snapshot is fresh enough for a telemetry request without the request ever
  * waiting on the humidity conversion. */
+void sensors_poll_gps(void)
+{
+    gps_poll();
+    s_snapshot.gps_fix = s_gps.fix;
+    s_snapshot.gps_sats = s_gps.sats;
+    s_snapshot.gps_lat = s_gps.lat;
+    s_snapshot.gps_lon = s_gps.lon;
+    s_snapshot.gps_alt_m = s_gps.alt;
+    s_snapshot.gps_unix = s_gps.have_time ? s_gps.unix_time : 0;
+}
+
 void sensors_refresh(void)
 {
-    struct sensor_snapshot next = s_snapshot;
-    sensors_read(&next);
-    s_snapshot = next;
+    /* The slow parts only. The GPS is drained by sensors_poll_gps() on every
+     * loop tick, because a 1 Hz NMEA stream cannot be kept up with at this
+     * cadence and would otherwise be read tens of seconds late. */
+    double t, h;
+    if (sht45_read(&t, &h))
+    {
+        s_snapshot.have_env = true;
+        s_snapshot.temperature_c = t;
+        s_snapshot.humidity_pct = h;
+    }
+    else
+        s_snapshot.have_env = false;
+
+    double p, pt;
+    if (bmp_read(&p, &pt))
+    {
+        s_snapshot.have_pressure = true;
+        s_snapshot.pressure_hpa = p;
+        s_snapshot.pressure_temp_c = pt;
+    }
+    else
+        s_snapshot.have_pressure = false;
+
+    double x, y, z;
+    if (mag_read(&x, &y, &z))
+    {
+        s_snapshot.have_mag = true;
+        s_snapshot.mag_x_ut = x;
+        s_snapshot.mag_y_ut = y;
+        s_snapshot.mag_z_ut = z;
+    }
+    else
+        s_snapshot.have_mag = false;
+
+    s_snapshot.have_gps = true;
 }

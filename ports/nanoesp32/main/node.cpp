@@ -856,7 +856,11 @@ static void node_task(void *arg)
     for (;;)
     {
         s_reticulum.loop();
-        if ((elapsed % 40) == 0)         /* every 2 s */
+        /* The GPS is drained every tick: its NMEA stream runs at about
+         * 480 B/s and a 32-byte read every 2 s would leave the buffer
+         * overrunning and the clock tens of seconds stale. */
+        sensors_poll_gps();
+        if ((elapsed % 40) == 0)         /* every 2 s: the slow sensors */
             sensors_refresh();
 
         if (s_lxmf_up)
@@ -903,10 +907,34 @@ static void node_task(void *arg)
              * non-zero value proves the radio path works both ways. */
             {
                 const struct sensor_snapshot *sn = sensors_latest();
-                node_log("sensors: env=%d %.1fC/%.1f%% press=%d %.1fhPa mag=%d gps=%d fix=%d",
+                /* Set the wall clock from GPS whenever it is meaningfully out.
+                 * There is no RTC on this board, so without this the system
+                 * clock sits at 1970 + uptime: every LXMF message carries that
+                 * timestamp, and microStore's sweep drops records that look
+                 * like the future (FLS-005). The reference policy is the same
+                 * one the standalone node used: correct when more than 2 s
+                 * out, so the clock is not being reset on every sample. */
+                node_log("clock: system=%ld gps=%lu", (long)time(NULL),
+                         (unsigned long)sn->gps_unix);
+                if (sn->gps_unix > 1700000000)
+                {
+                    long sys_now = (long)time(NULL);
+                    long drift = (long)sn->gps_unix - sys_now;
+                    if (drift > 2 || drift < -2)
+                    {
+                        struct timeval tv = {
+                            .tv_sec = (time_t)sn->gps_unix,
+                            .tv_usec = 0,
+                        };
+                        settimeofday(&tv, NULL);
+                        node_log("clock: set from GPS, was %ld drift %lds", sys_now, drift);
+                    }
+                }
+                node_log("sensors: env=%d %.1fC/%.1f%% press=%d %.1fhPa mag=%d gps=%d fix=%d unix=%lu",
                          (int)sn->have_env, sn->temperature_c, sn->humidity_pct,
                          (int)sn->have_pressure, sn->pressure_hpa,
-                         (int)sn->have_mag, (int)sn->have_gps, (int)sn->gps_fix);
+                         (int)sn->have_mag, (int)sn->have_gps, (int)sn->gps_fix,
+                         (unsigned long)sn->gps_unix);
             }
             node_log("alive t=%lus free=%u paths=%u rx=%u",
                      (unsigned long)(elapsed / 20),
