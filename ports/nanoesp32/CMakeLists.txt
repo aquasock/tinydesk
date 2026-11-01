@@ -34,7 +34,8 @@ set(TD_MAX_ROWS     15 CACHE STRING "screen cells down (240 px / 16)")
 set(TD_VT_SCROLLBACK 8 CACHE STRING "terminal scrollback lines")
 list(APPEND EXTRA_COMPONENT_DIRS
     "${TDSH_SDK_ROOT}/ports/esp_idf/components"
-    "${TD_ROOT}/ports/esp_idf/components")
+    "${TD_ROOT}/ports/esp_idf/components"
+    "${CMAKE_CURRENT_LIST_DIR}/components")
 
 # The firmware version shown by Software Update and `ota status`.
 # Override for a test build: set TD_VERSION=0.1.6 before idf.py build.

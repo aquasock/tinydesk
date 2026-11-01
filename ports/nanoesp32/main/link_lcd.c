@@ -22,6 +22,7 @@
 #include "freertos/FreeRTOS.h"
 #include "rs485.h"
 #include "font8x16.h"
+#include "node.h"
 #include "ili9340.h"
 #include "vt.h"
 
@@ -63,6 +64,11 @@ bool link_init(void)
     s_ready = true;
     ESP_LOGI(TAG, "panel %dx%d px, %dx%d cells",
              LCD_W, LCD_H, vt_cols(), vt_rows());
+
+    /* Reticulum runs beside the desktop. It is started here because this is
+     * the port's own entry point; its task waits for the filesystem before
+     * reading credentials, and a failure leaves the desktop working. */
+    node_start();
     return true;
 }
 

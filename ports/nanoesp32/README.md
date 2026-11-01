@@ -108,6 +108,13 @@ The display-ID register (0x04) reads back as zero on this module even though
 the panel draws correctly, so the probe result is not a reliable wiring check
 here; visible pixels are.
 
+## Reticulum
+
+This firmware also runs microReticulum, replacing the standalone TinyNode
+board: WiFi, a persisted identity and a UDP interface beside the desktop. See
+`NODE.md` for what it took to build an Arduino library on bare ESP-IDF and for
+the filesystem contract that Reticulum depends on.
+
 ## The desktop link
 
 This port is **remote-first**: the panel is the display and USB is not a
