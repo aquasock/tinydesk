@@ -36,6 +36,8 @@
 
 #include <microReticulum.h>
 #include <microReticulum/Transport.h>
+#include <LXMF/LXMRouter.h>
+#include <LXMF/LXMessage.h>
 #include <microReticulum/Utilities/OS.h>
 
 /* microStore, for the prefixed filesystem adapter below. */
@@ -64,6 +66,11 @@ static const char *TAG = "node";
  * a fixed interval makes every node in earshot announce together. */
 #define ANNOUNCE_MIN_S (90u * 60u)
 #define ANNOUNCE_MAX_S (300u * 60u)
+
+/* The LXMF router: what gives the node an address peers can message. */
+static LXMF::LXMRouter *s_lxmf;
+static bool s_lxmf_up;
+static uint32_t s_messages_rx;
 
 static volatile node_state_t s_state = NODE_OFF;
 static char s_identity_hex[33];
@@ -620,6 +627,23 @@ static void node_task(void *arg)
         return;
     }
 
+    /* LXMF on top of the Reticulum instance. The router needs the instance
+     * and the interface up first: it creates a destination on the delivery
+     * aspect and announces it, so a router started earlier would announce
+     * into nothing. */
+    node_log("lxmf: starting router");
+    s_lxmf = new LXMF::LXMRouter(s_identity, "/lxmf", false);
+    s_lxmf->set_display_name("TinyNode Nano");
+    s_lxmf->register_delivery_callback([](LXMF::LXMessage &msg) {
+        s_messages_rx++;
+        node_log("lxmf: message from %s, %u bytes", msg.source_hash().toHex().c_str(),
+                 (unsigned)msg.content().size());
+    });
+    s_lxmf->announce();
+    s_lxmf_up = true;
+    node_log("lxmf: announced, delivery address %s",
+             s_lxmf->delivery_destination().hash().toHex().c_str());
+
     s_state = NODE_READY;
     node_log("state=ready ip=%s free=%u", s_ip, (unsigned)esp_get_free_heap_size());
 
@@ -631,6 +655,11 @@ static void node_task(void *arg)
     for (;;)
     {
         s_reticulum.loop();
+        if (s_lxmf_up)
+        {
+            s_lxmf->process_inbound();
+            s_lxmf->process_outbound();
+        }
 
         if (!s_announced_once)
         {
@@ -654,8 +683,14 @@ static void node_task(void *arg)
         elapsed += 1;
         if ((elapsed % 1200) == 0)          /* every 60 s */
         {
-            node_log("alive t=%lus free=%u", (unsigned long)(elapsed / 20),
-                     (unsigned)esp_get_free_heap_size());
+            /* Path count is the mesh-visibility signal: it goes up when an
+             * announce from a peer arrives over the UDP interface, so a
+             * non-zero value proves the radio path works both ways. */
+            node_log("alive t=%lus free=%u paths=%u rx=%u",
+                     (unsigned long)(elapsed / 20),
+                     (unsigned)esp_get_free_heap_size(),
+                     (unsigned)RNS::Transport::path_table().size(),
+                     (unsigned)s_messages_rx);
         }
     }
 }
