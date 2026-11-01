@@ -89,6 +89,13 @@ target_compile_definitions(${COMPONENT_LIB} PRIVATE
     RNS_USE_FS
     USTORE_USE_POSIXFS
     USTORE_USE_STDIOFS
+    # The file-backed known-destination store does not retain here: announces
+    # validate and enter the path table, but Identity::recall() never returns
+    # the key again, so every reply fails with "identity not known". With this
+    # at 0 the library picks its BasicHeapStore instead and recall works. The
+    # table is a few dozen small entries, so RAM costs little and nothing is
+    # written to flash on every announce. Path persistence is unaffected.
+    RNS_PERSIST_KNOWN_DESTINATIONS=0
 )
 
 # microReticulum includes MsgPack.h and reaches for its own dependencies by

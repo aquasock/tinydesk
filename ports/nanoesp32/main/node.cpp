@@ -29,12 +29,20 @@
 
 #include "driver/usb_serial_jtag.h"
 #include "esp_event.h"
+#include "esp_heap_caps.h"
+#include "esp_littlefs.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
+
+#include <math.h>
+#include <memory>
+#include <string>
+#include <time.h>
 
 #include <microReticulum.h>
 #include <microReticulum/Transport.h>
@@ -240,6 +248,7 @@ static bool wifi_start(const char *ssid, const char *password)
 static RNS::Reticulum s_reticulum({RNS::Type::NONE});
 static RNS::Identity s_identity({RNS::Type::NONE});
 static RNS::Interface s_udp({RNS::Type::NONE});
+static bool s_udp_ready;
 static bool s_announced_once;
 
 /* ---- I2C bus ------------------------------------------------------- */
@@ -683,6 +692,853 @@ static void node_log(const char *fmt, ...)
     }
 }
 
+/* ---- LXMF telemetry -------------------------------------------------- *
+ *
+ * Sideband drives a node through message fields, not chat text, so this is
+ * the standard form of the same readings the `node` command prints:
+ *
+ *   FIELD_COMMANDS  (0x09) in   [ {COMMAND: argument}, ... ]
+ *   FIELD_TELEMETRY (0x02) out  {SID: value} as one msgpack map
+ *
+ * The byte layout is not invented here -- it is what the client unpacks
+ * (sbapp/sideband/sense.py, LXMF-007 to LXMF-009 in the reference). TIME is
+ * an integer, LOCATION is a list of big-endian struct blobs that the client
+ * scales back down (1e6, 1e6, 1e2, 1e2, 1e2, 1e2), RAM and NVM are
+ * [[label, [capacity, used]]], MAGNETIC_FIELD is three floats, and pressure,
+ * temperature and humidity are one float each.
+ *
+ * microLXMF stores field keys and values as raw msgpack and re-emits them
+ * with packRawBytes(), so both halves of this map are packed here. Handing
+ * the library a native value would nest a second msgpack object inside the
+ * field and the client would see nothing it recognises.
+ */
+
+#define LXMF_FIELD_TELEMETRY 0x02
+#define LXMF_FIELD_COMMANDS  0x09
+
+#define LXMF_CMD_TELEMETRY_REQUEST 0x01
+#define LXMF_CMD_PING              0x02
+#define LXMF_CMD_ECHO              0x03
+
+#define SID_TIME           0x01
+#define SID_LOCATION       0x02
+#define SID_PRESSURE       0x03
+#define SID_TEMPERATURE    0x07
+#define SID_HUMIDITY       0x08
+#define SID_MAGNETIC_FIELD 0x09
+#define SID_RAM            0x14
+#define SID_NVM            0x15
+#define SID_RNS_TRANSPORT  0x19
+
+/* A msgpack writer over a caller-owned buffer. Every put fails soft and
+ * latches ok=false, so a caller checks once at the end rather than after
+ * every field. The buffer is fixed: a telemetry map is a few hundred bytes
+ * and a heap allocation here would be a heap allocation in the delivery
+ * callback, which is the last place that should fragment. */
+struct Mpw
+{
+    uint8_t *buf;
+    size_t cap;
+    size_t len;
+    bool ok;
+
+    void put(uint8_t b)
+    {
+        if (len < cap)
+            buf[len++] = b;
+        else
+            ok = false;
+    }
+    void put_be(uint32_t v, int bytes)
+    {
+        for (int i = bytes - 1; i >= 0; --i)
+            put((uint8_t)(v >> (8 * i)));
+    }
+    void put_u64(uint64_t v)
+    {
+        for (int i = 7; i >= 0; --i)
+            put((uint8_t)(v >> (8 * i)));
+    }
+    void blob(const void *d, size_t n)
+    {
+        if (n == 0)
+            return;
+        if (len + n > cap)
+        {
+            ok = false;
+            return;
+        }
+        memcpy(buf + len, d, n);
+        len += n;
+    }
+};
+
+static void mp_map(Mpw &w, unsigned n)
+{
+    if (n < 16)
+        w.put((uint8_t)(0x80 | n));
+    else
+    {
+        w.put(0xde);
+        w.put_be(n, 2);
+    }
+}
+
+static void mp_arr(Mpw &w, unsigned n)
+{
+    if (n < 16)
+        w.put((uint8_t)(0x90 | n));
+    else
+    {
+        w.put(0xdc);
+        w.put_be(n, 2);
+    }
+}
+
+/* Sensor ids are all below 0x80, so this writes the bare byte that is both
+ * the fixint encoding of the id and the map key the client expects. */
+static void mp_uint(Mpw &w, uint32_t v)
+{
+    if (v < 0x80)
+        w.put((uint8_t)v);
+    else
+    {
+        w.put(0xce);
+        w.put_be(v, 4);
+    }
+}
+
+static void mp_f64(Mpw &w, double d)
+{
+    uint64_t bits;
+    memcpy(&bits, &d, sizeof(bits));
+    w.put(0xcb);
+    w.put_u64(bits);
+}
+
+static void mp_bin(Mpw &w, const void *d, size_t n)
+{
+    if (n < 256)
+    {
+        w.put(0xc4);
+        w.put((uint8_t)n);
+    }
+    else
+    {
+        w.put(0xc5);
+        w.put_be((uint32_t)n, 2);
+    }
+    w.blob(d, n);
+}
+
+static void mp_str(Mpw &w, const char *s)
+{
+    size_t n = strlen(s);
+    if (n < 32)
+        w.put((uint8_t)(0xa0 | n));
+    else
+    {
+        w.put(0xd9);
+        w.put((uint8_t)n);
+    }
+    w.blob(s, n);
+}
+
+static void mp_bool(Mpw &w, bool v)
+{
+    w.put(v ? 0xc3 : 0xc2);
+}
+
+/* The fixed-width big-endian blobs LOCATION is made of. */
+static void mp_be32_bin(Mpw &w, int32_t v)
+{
+    uint8_t b[4] = {(uint8_t)(v >> 24), (uint8_t)(v >> 16), (uint8_t)(v >> 8), (uint8_t)v};
+    mp_bin(w, b, sizeof(b));
+}
+
+static void mp_be16_bin(Mpw &w, uint16_t v)
+{
+    uint8_t b[2] = {(uint8_t)(v >> 8), (uint8_t)v};
+    mp_bin(w, b, sizeof(b));
+}
+
+/* A msgpack reader, just wide enough to walk a FIELD_COMMANDS list. */
+struct Mpr
+{
+    const uint8_t *p;
+    const uint8_t *end;
+};
+
+static bool mp_take(Mpr &r, size_t n)
+{
+    if ((size_t)(r.end - r.p) < n)
+    {
+        r.p = r.end;
+        return false;
+    }
+    r.p += n;
+    return true;
+}
+
+static bool mp_read_be(Mpr &r, size_t n, uint64_t *out)
+{
+    if ((size_t)(r.end - r.p) < n)
+    {
+        r.p = r.end;
+        return false;
+    }
+    uint64_t v = 0;
+    for (size_t i = 0; i < n; ++i)
+        v = (v << 8) | r.p[i];
+    r.p += n;
+    *out = v;
+    return true;
+}
+
+static bool mp_skip_items(Mpr &r, uint32_t n);
+static bool mp_skip_pairs(Mpr &r, uint32_t n);
+static bool mp_skip(Mpr &r);
+
+static bool mp_skip_items(Mpr &r, uint32_t n)
+{
+    for (uint32_t i = 0; i < n; ++i)
+        if (!mp_skip(r))
+            return false;
+    return true;
+}
+
+static bool mp_skip_pairs(Mpr &r, uint32_t n)
+{
+    for (uint32_t i = 0; i < n; ++i)
+        if (!mp_skip(r) || !mp_skip(r))
+            return false;
+    return true;
+}
+
+/* Skip one object of any type. Needed because a command we do not implement
+ * still has an argument that has to be stepped over, not guessed at. */
+static bool mp_skip(Mpr &r)
+{
+    if (r.p >= r.end)
+        return false;
+    uint8_t b = *r.p++;
+    if (b <= 0x7f || b >= 0xe0)
+        return true;                                    /* fixint */
+    if ((b & 0xf0) == 0x80)
+        return mp_skip_pairs(r, b & 0x0f);              /* fixmap */
+    if ((b & 0xf0) == 0x90)
+        return mp_skip_items(r, b & 0x0f);              /* fixarray */
+    if ((b & 0xe0) == 0xa0)
+        return mp_take(r, b & 0x1f);                    /* fixstr */
+
+    uint64_t n = 0;
+    switch (b)
+    {
+    case 0xc0: case 0xc2: case 0xc3: return true;       /* nil, bool */
+    case 0xc4: if (!mp_read_be(r, 1, &n)) return false; return mp_take(r, (size_t)n);
+    case 0xc5: if (!mp_read_be(r, 2, &n)) return false; return mp_take(r, (size_t)n);
+    case 0xc6: if (!mp_read_be(r, 4, &n)) return false; return mp_take(r, (size_t)n);
+    case 0xc7: if (!mp_read_be(r, 1, &n)) return false; return mp_take(r, (size_t)n + 1);
+    case 0xc8: if (!mp_read_be(r, 2, &n)) return false; return mp_take(r, (size_t)n + 1);
+    case 0xc9: if (!mp_read_be(r, 4, &n)) return false; return mp_take(r, (size_t)n + 1);
+    case 0xca: return mp_take(r, 4);                    /* float32 */
+    case 0xcb: return mp_take(r, 8);                    /* float64 */
+    case 0xcc: case 0xd0: return mp_take(r, 1);
+    case 0xcd: case 0xd1: return mp_take(r, 2);
+    case 0xce: case 0xd2: return mp_take(r, 4);
+    case 0xcf: case 0xd3: return mp_take(r, 8);
+    case 0xd4: return mp_take(r, 2);                    /* fixext */
+    case 0xd5: return mp_take(r, 3);
+    case 0xd6: return mp_take(r, 5);
+    case 0xd7: return mp_take(r, 9);
+    case 0xd8: return mp_take(r, 17);
+    case 0xd9: if (!mp_read_be(r, 1, &n)) return false; return mp_take(r, (size_t)n);
+    case 0xda: if (!mp_read_be(r, 2, &n)) return false; return mp_take(r, (size_t)n);
+    case 0xdb: if (!mp_read_be(r, 4, &n)) return false; return mp_take(r, (size_t)n);
+    case 0xdc: if (!mp_read_be(r, 2, &n)) return false; return mp_skip_items(r, (uint32_t)n);
+    case 0xdd: if (!mp_read_be(r, 4, &n)) return false; return mp_skip_items(r, (uint32_t)n);
+    case 0xde: if (!mp_read_be(r, 2, &n)) return false; return mp_skip_pairs(r, (uint32_t)n);
+    case 0xdf: if (!mp_read_be(r, 4, &n)) return false; return mp_skip_pairs(r, (uint32_t)n);
+    default: return false;
+    }
+}
+
+/* Read one integer of any width. Rewinds on failure so the caller can fall
+ * back to mp_skip() without losing a byte. */
+static bool mp_read_int(Mpr &r, int64_t *out)
+{
+    const uint8_t *save = r.p;
+    if (r.p >= r.end)
+        return false;
+    uint8_t b = *r.p++;
+    if (b <= 0x7f)
+    {
+        *out = b;
+        return true;
+    }
+    if (b >= 0xe0)
+    {
+        *out = (int8_t)b;
+        return true;
+    }
+
+    size_t n;
+    bool sign = false;
+    switch (b)
+    {
+    case 0xcc: n = 1; break;
+    case 0xcd: n = 2; break;
+    case 0xce: n = 4; break;
+    case 0xcf: n = 8; break;
+    case 0xd0: n = 1; sign = true; break;
+    case 0xd1: n = 2; sign = true; break;
+    case 0xd2: n = 4; sign = true; break;
+    case 0xd3: n = 8; sign = true; break;
+    default:
+        r.p = save;
+        return false;
+    }
+
+    uint64_t v = 0;
+    if (!mp_read_be(r, n, &v))
+    {
+        r.p = save;
+        return false;
+    }
+    if (!sign)
+        *out = (int64_t)v;
+    else if (n == 1)
+        *out = (int8_t)v;
+    else if (n == 2)
+        *out = (int16_t)v;
+    else if (n == 4)
+        *out = (int32_t)v;
+    else
+        *out = (int64_t)v;
+    return true;
+}
+
+/* Read the payload of a bin or str object. Rewinds on failure, like
+ * mp_read_int(). */
+static bool mp_read_blob(Mpr &r, const uint8_t **d, size_t *n)
+{
+    const uint8_t *save = r.p;
+    if (r.p >= r.end)
+        return false;
+    uint8_t b = *r.p++;
+    uint64_t len = 0;
+
+    if ((b & 0xe0) == 0xa0)
+        len = b & 0x1f;
+    else if (b == 0xc4 || b == 0xd9)
+    {
+        if (!mp_read_be(r, 1, &len))
+        {
+            r.p = save;
+            return false;
+        }
+    }
+    else if (b == 0xc5 || b == 0xda)
+    {
+        if (!mp_read_be(r, 2, &len))
+        {
+            r.p = save;
+            return false;
+        }
+    }
+    else if (b == 0xc6 || b == 0xdb)
+    {
+        if (!mp_read_be(r, 4, &len))
+        {
+            r.p = save;
+            return false;
+        }
+    }
+    else
+    {
+        r.p = save;
+        return false;
+    }
+
+    if ((size_t)(r.end - r.p) < (size_t)len)
+    {
+        r.p = save;
+        return false;
+    }
+    *d = r.p;
+    *n = (size_t)len;
+    r.p += len;
+    return true;
+}
+
+/* Read an array or map header. */
+static bool mp_read_count(Mpr &r, bool is_map, uint32_t *out)
+{
+    const uint8_t *save = r.p;
+    if (r.p >= r.end)
+        return false;
+    uint8_t b = *r.p++;
+    uint64_t n = 0;
+
+    if (is_map && (b & 0xf0) == 0x80)
+    {
+        *out = b & 0x0f;
+        return true;
+    }
+    if (!is_map && (b & 0xf0) == 0x90)
+    {
+        *out = b & 0x0f;
+        return true;
+    }
+    if (is_map && (b == 0xde || b == 0xdf))
+    {
+        if (!mp_read_be(r, b == 0xde ? 2 : 4, &n))
+        {
+            r.p = save;
+            return false;
+        }
+        *out = (uint32_t)n;
+        return true;
+    }
+    if (!is_map && (b == 0xdc || b == 0xdd))
+    {
+        if (!mp_read_be(r, b == 0xdc ? 2 : 4, &n))
+        {
+            r.p = save;
+            return false;
+        }
+        *out = (uint32_t)n;
+        return true;
+    }
+    r.p = save;
+    return false;
+}
+
+struct node_commands
+{
+    bool telemetry;
+    bool ping;
+    bool echo;
+    RNS::Bytes echo_text;
+};
+
+/* FIELD_COMMANDS is a list of single-key dicts, one command each. An entry
+ * we cannot read is stepped over rather than aborting the list: an unknown
+ * command should not cost us the requests we do understand. */
+static void parse_commands(const RNS::Bytes &field, struct node_commands *out)
+{
+    out->telemetry = false;
+    out->ping = false;
+    out->echo = false;
+    out->echo_text.clear();
+
+    Mpr r = {field.data(), field.data() + field.size()};
+    uint32_t items = 0;
+    if (!mp_read_count(r, false, &items))
+        return;
+
+    for (uint32_t i = 0; i < items; ++i)
+    {
+        uint32_t pairs = 0;
+        if (!mp_read_count(r, true, &pairs))
+        {
+            if (!mp_skip(r))
+                return;
+            continue;
+        }
+        for (uint32_t j = 0; j < pairs; ++j)
+        {
+            int64_t key = -1;
+            if (!mp_read_int(r, &key))
+            {
+                if (!mp_skip(r) || !mp_skip(r))
+                    return;
+                continue;
+            }
+            if (key == LXMF_CMD_ECHO)
+            {
+                const uint8_t *d = nullptr;
+                size_t n = 0;
+                if (mp_read_blob(r, &d, &n))
+                {
+                    out->echo = true;
+                    out->echo_text = RNS::Bytes(d, n);
+                }
+                else if (!mp_skip(r))
+                    return;
+            }
+            else
+            {
+                if (key == LXMF_CMD_TELEMETRY_REQUEST)
+                    out->telemetry = true;
+                else if (key == LXMF_CMD_PING)
+                    out->ping = true;
+                if (!mp_skip(r))
+                    return;
+            }
+        }
+    }
+}
+
+/* Pack the current readings as a FIELD_TELEMETRY map. Returns the length
+ * written, or 0 if the buffer was too small. */
+/* compact=true builds a map small enough to travel in one encrypted packet
+ * (packed_size <= 159), which needs no path to the peer and therefore works
+ * the moment a request arrives. compact=false is the full report, which has
+ * to go over a link. */
+static size_t telemetry_pack(uint8_t *buf, size_t cap, bool compact)
+{
+    const struct sensor_snapshot *sn = sensors_latest();
+    const uint32_t now = (uint32_t)time(nullptr);
+
+    /* The two numbers a remote operator otherwise cannot see. Internal 8-bit
+     * heap, not PSRAM: that is the pool Reticulum and the desktop both draw
+     * from for small allocations. */
+    const size_t heap_total = heap_caps_get_total_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+    const size_t heap_free = heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+
+    size_t fs_total = 0, fs_used = 0;
+    if (esp_littlefs_info(TDSH_PARTITION_LABEL, &fs_total, &fs_used) != ESP_OK)
+        fs_total = fs_used = 0;
+
+    unsigned entries = compact ? 1 : 3;  /* TIME, and RAM + RNS_TRANSPORT */
+    if (!compact && sn->gps_fix)
+        entries++;
+    if (sn->have_pressure)
+        entries++;
+    if (sn->have_env)
+        entries += 2;                    /* temperature and humidity */
+    if (!compact && sn->have_mag)
+        entries++;
+    if (!compact && fs_total > 0)
+        entries++;                       /* NVM */
+
+    Mpw w = {buf, cap, 0, true};
+    mp_map(w, entries);
+
+    /* The client validates this one and drops the whole map when it is not
+     * a number, so it is always written, even at 1970. */
+    mp_uint(w, SID_TIME);
+    mp_uint(w, now);
+
+    if (!compact && sn->gps_fix)
+    {
+        /* The PA1010D driver reports position and altitude only; speed,
+         * bearing and accuracy have no source here and go out as zero. */
+        mp_uint(w, SID_LOCATION);
+        mp_arr(w, 7);
+        mp_be32_bin(w, (int32_t)llround(sn->gps_lat * 1e6));
+        mp_be32_bin(w, (int32_t)llround(sn->gps_lon * 1e6));
+        mp_be32_bin(w, (int32_t)llround(sn->gps_alt_m * 1e2));
+        mp_be32_bin(w, 0);                          /* speed, cm/s */
+        mp_be32_bin(w, 0);                          /* bearing, 1e-2 deg */
+        mp_be16_bin(w, 0);                          /* accuracy, cm */
+        mp_uint(w, now);
+    }
+
+    if (sn->have_pressure)
+    {
+        mp_uint(w, SID_PRESSURE);
+        mp_f64(w, sn->pressure_hpa);
+    }
+    if (sn->have_env)
+    {
+        mp_uint(w, SID_TEMPERATURE);
+        mp_f64(w, sn->temperature_c);
+        mp_uint(w, SID_HUMIDITY);
+        mp_f64(w, sn->humidity_pct);
+    }
+    if (!compact && sn->have_mag)
+    {
+        mp_uint(w, SID_MAGNETIC_FIELD);
+        mp_arr(w, 3);
+        mp_f64(w, sn->mag_x_ut);
+        mp_f64(w, sn->mag_y_ut);
+        mp_f64(w, sn->mag_z_ut);
+    }
+
+    /* Label 0x00 is the client's own "Storage" bucket. Capacity must be
+     * non-zero: the renderer divides used by it. */
+    if (!compact)
+    {
+    mp_uint(w, SID_RAM);
+    mp_arr(w, 1);
+    mp_arr(w, 2);
+    mp_uint(w, 0);
+    mp_arr(w, 2);
+    mp_uint(w, (uint32_t)heap_total);
+    mp_uint(w, (uint32_t)(heap_total - heap_free));
+
+    if (!compact && fs_total > 0)
+    {
+        mp_uint(w, SID_NVM);
+        mp_arr(w, 1);
+        mp_arr(w, 2);
+        mp_uint(w, 0);
+        mp_arr(w, 2);
+        mp_uint(w, (uint32_t)fs_total);
+        mp_uint(w, (uint32_t)fs_used);
+    }
+
+    }   /* !compact */
+
+    if (!compact)
+    {
+        RNS::Bytes ident = s_identity.hash();
+        const uint32_t rxb = (uint32_t)RNS::Transport::traffic_rxb();
+        const uint32_t txb = (uint32_t)RNS::Transport::traffic_txb();
+        const uint32_t rxs = RNS::Transport::packets_received();
+        const uint32_t txs = RNS::Transport::packets_sent();
+
+        mp_uint(w, SID_RNS_TRANSPORT);
+        mp_map(w, 13);
+        mp_str(w, "transport_enabled");
+        mp_bool(w, true);
+        mp_str(w, "transport_identity");
+        mp_bin(w, ident.data(), ident.size());
+        mp_str(w, "transport_uptime");
+        mp_uint(w, (uint32_t)(esp_timer_get_time() / 1000000));
+        mp_str(w, "traffic_rxb");
+        mp_uint(w, rxb);
+        mp_str(w, "traffic_txb");
+        mp_uint(w, txb);
+        mp_str(w, "speed_rx");
+        mp_f64(w, 0.0);
+        mp_str(w, "speed_tx");
+        mp_f64(w, 0.0);
+        mp_str(w, "speed_rx_inst");
+        mp_uint(w, rxs);
+        mp_str(w, "speed_tx_inst");
+        mp_uint(w, txs);
+        mp_str(w, "memory_used");
+        mp_uint(w, (uint32_t)(heap_total - heap_free));
+        mp_str(w, "ifstats");
+        mp_map(w, 6);
+        mp_str(w, "rss");
+        mp_uint(w, 0);
+        mp_str(w, "rxb");
+        mp_uint(w, rxb);
+        mp_str(w, "txb");
+        mp_uint(w, txb);
+        mp_str(w, "rxs");
+        mp_uint(w, rxs);
+        mp_str(w, "txs");
+        mp_uint(w, txs);
+        mp_str(w, "interfaces");
+        mp_arr(w, 1);
+        mp_map(w, 9);
+        mp_str(w, "name");
+        mp_str(w, "UDP [TinyNode]");
+        mp_str(w, "short_name");
+        mp_str(w, "UDP");
+        mp_str(w, "status");
+        mp_bool(w, s_udp_ready);
+        mp_str(w, "mode");
+        mp_uint(w, RNS::Type::Interface::MODE_GATEWAY);
+        mp_str(w, "type");
+        mp_str(w, "UDPInterface");
+        mp_str(w, "bitrate");
+        mp_uint(w, 0);
+        mp_str(w, "rxs");
+        mp_uint(w, rxs);
+        mp_str(w, "txs");
+        mp_uint(w, txs);
+        mp_str(w, "path_table");
+        mp_arr(w, 0);
+        mp_str(w, "link_count");
+        mp_uint(w, 0);
+    }
+
+    return w.ok ? w.len : 0;
+}
+
+/* Peer public keys, learned from announces we accepted.
+ *
+ * This exists because Identity::recall() does not work on this build: an
+ * announce is validated and added to the path table (announce handler fires,
+ * paths_added() climbs) but neither the known-destination store nor the
+ * announce-packet fallback inside recall() ever returns the key again, so
+ * every reply died on "identity for <peer> not known". Keeping the key that
+ * the announce callback already handed us makes the node able to answer any
+ * peer it has heard, which is all the node needs; the store is still worth
+ * fixing, but that is a microReticulum problem, not a node one.
+ *
+ * Fixed size and no heap: this runs in the delivery path.
+ */
+#define MAX_PEERS 12
+
+struct peer_entry
+{
+    RNS::Bytes hash;
+    RNS::Bytes pubkey;
+};
+
+static peer_entry s_peers[MAX_PEERS];
+static size_t s_peer_count;
+static uint32_t s_announces_accepted;
+
+static void remember_peer(const RNS::Bytes &hash, const RNS::Bytes &pubkey)
+{
+    if (hash.size() != 16 || pubkey.size() == 0)
+        return;
+    for (size_t i = 0; i < s_peer_count; ++i)
+    {
+        if (s_peers[i].hash == hash)
+        {
+            s_peers[i].pubkey = pubkey;
+            return;
+        }
+    }
+    /* Ring: a peer we have not heard from in a full rotation is dropped rather
+     * than evicting on every announce, which would thrash in a busy mesh. */
+    if (s_peer_count < MAX_PEERS)
+    {
+        s_peers[s_peer_count].hash = hash;
+        s_peers[s_peer_count].pubkey = pubkey;
+        ++s_peer_count;
+    }
+    else
+    {
+        static size_t next_slot;
+        s_peers[next_slot].hash = hash;
+        s_peers[next_slot].pubkey = pubkey;
+        next_slot = (next_slot + 1) % MAX_PEERS;
+    }
+}
+
+/* An identity for a peer, from the library store if it works and from our own
+ * table otherwise. Returns a falsy Identity when the peer is unknown. */
+static RNS::Identity peer_identity(const RNS::Bytes &hash)
+{
+    RNS::Identity known = RNS::Identity::recall(hash);
+    if (known)
+        return known;
+
+    for (size_t i = 0; i < s_peer_count; ++i)
+    {
+        if (s_peers[i].hash == hash && s_peers[i].pubkey.size() > 0)
+        {
+            RNS::Identity peer(false);
+            peer.load_public_key(s_peers[i].pubkey);
+            if (peer)
+                return peer;
+        }
+    }
+    return RNS::Identity(false);
+}
+
+static void lxmf_send_text(const RNS::Bytes &peer_hash, const std::string &text)
+{
+    RNS::Identity peer = peer_identity(peer_hash);
+    if (!peer)
+    {
+        node_log("reply: identity for %s not known", peer_hash.toHex().c_str());
+        return;
+    }
+    RNS::Destination dest(peer, RNS::Type::Destination::OUT,
+                          RNS::Type::Destination::SINGLE, "lxmf", "delivery");
+    LXMF::LXMessage reply(dest, s_lxmf->delivery_destination(),
+                          RNS::Bytes((const uint8_t *)text.data(), text.size()),
+                          RNS::bytesFromString("re"));
+    s_lxmf->handle_outbound(reply);
+}
+
+static void lxmf_send_telemetry(const RNS::Bytes &peer_hash)
+{
+    /* Reply with the compact map, in one packet.
+     *
+     * The full report is ~495 bytes, which cannot travel opportunistically,
+     * so the router sends it over a link -- and link delivery in this stack
+     * currently fails on the far end ("Could not assemble LXMF message").
+     * A reply nobody can read is worse than a smaller one that arrives, so
+     * what goes back is the subset that fits an encrypted packet: TIME with
+     * temperature, humidity and pressure. LOCATION and MAGNETIC_FIELD are the
+     * two that would push it over.
+     *
+     * The full map is still what `node telemetry` packs, so once link
+     * delivery is fixed the only change here is dropping the compact flag. */
+    const bool have_path = false;
+
+    static uint8_t tel[768];
+    size_t n = telemetry_pack(tel, sizeof(tel), true);
+    if (n == 0)
+    {
+        node_log("telemetry: pack overflow");
+        return;
+    }
+
+    RNS::Identity peer = peer_identity(peer_hash);
+    if (!peer)
+    {
+        node_log("telemetry: identity for %s not known", peer_hash.toHex().c_str());
+        return;
+    }
+    RNS::Destination dest(peer, RNS::Type::Destination::OUT,
+                          RNS::Type::Destination::SINGLE, "lxmf", "delivery");
+
+    /* Content and title stay empty: a message that carries only telemetry is
+     * not shown as a chat message by the client. */
+    LXMF::LXMessage reply(dest, s_lxmf->delivery_destination(), RNS::Bytes(), RNS::Bytes(),
+                          have_path ? LXMF::Type::Message::DIRECT
+                                    : LXMF::Type::Message::OPPORTUNISTIC);
+
+    /* The field value must itself be msgpack-encoded *bytes*, not the map.
+     * microLXMF writes fields with packRawBytes(), so whatever is stored here
+     * lands in the payload verbatim: handing it the bare map makes the outer
+     * msgpack parse it into a dictionary on the far end, and the client's
+     * Telemeter.from_packed() rejects it with "packed data must be type
+     * 'bytes'". Wrapping the map in a bin header is exactly what the Python
+     * reference produces, since it packs the field value with umsgpack.packb
+     * and the outer packer then emits it as a bin. */
+    static uint8_t field_value[800];
+    Mpw fv = {field_value, sizeof(field_value), 0, true};
+    mp_bin(fv, tel, n);
+    if (!fv.ok)
+    {
+        node_log("telemetry: field buffer overflow");
+        return;
+    }
+
+    static const uint8_t field_key[1] = {LXMF_FIELD_TELEMETRY};
+    reply.fields_set(RNS::Bytes(field_key, sizeof(field_key)),
+                     RNS::Bytes(field_value, fv.len));
+    if (!have_path)
+        RNS::Transport::request_path(peer_hash);
+    s_lxmf->handle_outbound(reply);
+    node_log("telemetry: queued %u bytes (%s) for %s", (unsigned)n,
+             have_path ? "full/link" : "compact/packet", peer_hash.toHex().c_str());
+}
+
+/* Counts announces that survived validation and were added to the path
+ * table. Unlike Transport::announces_received() -- which counts packets that
+ * arrived -- this only moves when an announce was accepted, so the two
+ * together separate "the network is silent" from "announces arrive and are
+ * rejected", which look identical from the outside. */
+
+/* Announce handlers are called from inside the path-table insert, before the
+ * filesystem has flushed the new record. Anything here must therefore be
+ * cheap and must not read the stores back: a get() at this point sees a
+ * half-written record, and doing it re-entrantly from the insert callback
+ * takes the Reticulum task down with it. Caching the key is safe -- it comes
+ * from the callback itself, not from storage. */
+class NodeAnnounceHandler : public RNS::AnnounceHandler
+{
+public:
+    NodeAnnounceHandler() : RNS::AnnounceHandler() {}
+
+    void received_announce(const RNS::Bytes &destination_hash,
+                           const RNS::Identity &announced_identity,
+                           const RNS::Bytes &app_data) override
+    {
+        ++s_announces_accepted;
+        remember_peer(destination_hash, announced_identity.get_public_key());
+        node_log("announce: %s accepted peers=%u app=%s", destination_hash.toHex().c_str(),
+                 (unsigned)s_peer_count, app_data.toString().c_str());
+    }
+};
+
+static RNS::HAnnounceHandler s_announce_handler;
+
 static void node_task(void *arg)
 {
     /* Reset reason first: it separates a panic in the last boot from a
@@ -757,6 +1613,10 @@ static void node_task(void *arg)
     s_reticulum.start();
     node_log("rns: started");
 
+    s_announce_handler = std::make_shared<NodeAnnounceHandler>();
+    RNS::Transport::register_announce_handler(s_announce_handler);
+    node_log("rns: announce handler registered");
+
     /* Identity: recalled from flash so the destination hash is stable across
      * reboots, which is the whole point of a node having an address. */
     /* Identity::from_file() on a MISSING file returns an object that is
@@ -795,6 +1655,22 @@ static void node_task(void *arg)
     }
     node_log("identity=%s", s_identity_hex);
 
+    /* A crypto health line. Signature verification sits on the path of every
+     * announce and every inbound message, and a broken verifier does not
+     * report an error -- it just makes the network look empty, with zero
+     * paths and no known peers forever. A sign/verify round trip here makes
+     * that one kind of failure visible in a single line. */
+    {
+        static const uint8_t probe_data[] = "sign-verify self test";
+        RNS::Bytes probe(probe_data, sizeof(probe_data) - 1);
+        RNS::Bytes other((const uint8_t *)"sign-verify self tesT", sizeof(probe_data) - 1);
+        RNS::Bytes sig = s_identity.sign(probe);
+        bool ok = s_identity.validate(sig, probe);
+        bool rejects = !s_identity.validate(sig, other);
+        node_log("crypto: ed25519 sig=%u verify=%d tampered_rejected=%d",
+                 (unsigned)sig.size(), (int)ok, (int)rejects);
+    }
+
     node_log("rns: free heap=%u", (unsigned)esp_get_free_heap_size());
     node_log("rns: creating interface");
     try
@@ -805,6 +1681,7 @@ static void node_task(void *arg)
         RNS::Transport::register_interface(s_udp);
         node_log("rns: interface registered");
         bool up = s_udp.start();
+        s_udp_ready = up;
         node_log("rns: interface start=%d", (int)up);
     }
     catch (const std::exception &e)
@@ -833,6 +1710,38 @@ static void node_task(void *arg)
         s_messages_rx++;
         node_log("lxmf: message from %s, %u bytes", msg.source_hash().toHex().c_str(),
                  (unsigned)msg.content().size());
+
+        /* Commands arrive in a field, not the content: a telemetry request
+         * from the client carries an empty body, which is also why clients
+         * do not show it as a chat message. */
+        static const uint8_t cmd_key[1] = {LXMF_FIELD_COMMANDS};
+        const RNS::Bytes *cmds = msg.fields_get(RNS::Bytes(cmd_key, sizeof(cmd_key)));
+        if (!cmds)
+            return;
+
+        struct node_commands c;
+        parse_commands(*cmds, &c);
+        node_log("lxmf: commands tel=%d ping=%d echo=%d fields=%u",
+                 (int)c.telemetry, (int)c.ping, (int)c.echo,
+                 (unsigned)msg.fields_count());
+
+        if (c.telemetry)
+            lxmf_send_telemetry(msg.source_hash());
+        if (c.ping)
+            lxmf_send_text(msg.source_hash(), "Ping reply");
+        if (c.echo)
+            lxmf_send_text(msg.source_hash(), "Echo reply: " + c.echo_text.toString());
+    });
+    s_lxmf->register_sent_callback([](LXMF::LXMessage &m) {
+        node_log("lxmf: sent %s (%u bytes, method %u)", m.hash().toHex().c_str(),
+                 (unsigned)m.packed_size(), (unsigned)m.method());
+    });
+    s_lxmf->register_delivered_callback([](LXMF::LXMessage &m) {
+        node_log("lxmf: delivered %s", m.hash().toHex().c_str());
+    });
+    s_lxmf->register_failed_callback([](LXMF::LXMessage &m) {
+        node_log("lxmf: FAILED %s after %u attempts", m.hash().toHex().c_str(),
+                 (unsigned)m.delivery_attempts());
     });
     s_lxmf->announce();
     s_lxmf_up = true;
@@ -936,11 +1845,21 @@ static void node_task(void *arg)
                          (int)sn->have_mag, (int)sn->have_gps, (int)sn->gps_fix,
                          (unsigned long)sn->gps_unix);
             }
-            node_log("alive t=%lus free=%u paths=%u rx=%u",
+            node_log("alive t=%lus free=%u paths=%u acc=%u ann=%u rx=%u pkts=%u/%u",
                      (unsigned long)(elapsed / 20),
                      (unsigned)esp_get_free_heap_size(),
-                     (unsigned)RNS::Transport::path_table().size(),
-                     (unsigned)s_messages_rx);
+                     /* paths_added() is maintained by Transport itself; an
+                      * earlier version called size() on the path store and
+                      * printed bytes of a path string instead. */
+                     (unsigned)RNS::Transport::paths_added(),
+                     (unsigned)s_announces_accepted,
+                     (unsigned)RNS::Transport::announces_received(),
+                     (unsigned)s_messages_rx,
+                     (unsigned)RNS::Transport::packets_received(),
+                     (unsigned)RNS::Transport::packets_sent());
+            s_stats.announces_heard = RNS::Transport::announces_received();
+            s_stats.packets_in = RNS::Transport::packets_received();
+            s_stats.packets_out = RNS::Transport::packets_sent();
         }
     }
 }
@@ -961,9 +1880,28 @@ static int cmd_node(tdsh_session_t *session, int argc, char **argv)
         node_log("node: announce requested from shell");
         return 0;
     }
+    if (argc > 1 && strcmp(argv[1], "telemetry") == 0)
+    {
+        /* Dry run: pack the map and report its size without sending. The
+         * size is what decides opportunistic versus link delivery, and the
+         * pack is otherwise only exercised by a client request. */
+        static uint8_t probe[768];
+        size_t n = telemetry_pack(probe, sizeof(probe), false);
+        if (n == 0)
+        {
+            printf("telemetry: pack failed\n");
+            node_log("telemetry: pack failed (dry run)");
+            return 1;
+        }
+        char buf[96];
+        snprintf(buf, sizeof(buf), "telemetry: %u bytes", (unsigned)n);
+        printf("%s\n", buf);
+        node_log("%s (dry run)", buf);
+        return 0;
+    }
     if (argc > 1)
     {
-        printf("usage: node [announce]\n");
+        printf("usage: node [announce|telemetry]\n");
         return 1;
     }
     /* Printed for the Terminal on the panel, and echoed to node_log so the
@@ -1023,8 +1961,8 @@ static int cmd_node(tdsh_session_t *session, int argc, char **argv)
 
 static const tdsh_command_t s_node_cmd = {
     .name = "node",
-    .usage = "node [announce]",
-    .help = "Show the node's state, or announce it to the mesh",
+    .usage = "node [announce|telemetry]",
+    .help = "Show the node's state, announce it, or pack a telemetry report",
     .fn = cmd_node,
     .flags = 0,
 };

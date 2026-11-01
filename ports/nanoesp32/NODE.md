@@ -97,6 +97,89 @@ recovered by dumping flash at the `storage` partition and reading the strings
 out. A build-time fallback exists for a bench image with no way to write a file
 yet — `-DTD_WIFI_SSID=... -DTD_WIFI_PASSWORD=...`.
 
+## Telemetry
+
+A client's `TELEMETRY_REQUEST` is answered with `FIELD_TELEMETRY`, the numbered
+sensor map Sideband's own telemetry panel reads. Verified end to end on
+2026-11-01 by sending a real request from a host client and decoding the reply
+with Sideband's `sbapp/sideband/sense.py`:
+
+```
+== DELIVERY ==  from 89f609774be9dc1b2640bc5f23d81714
+   fields: ['0x2']
+   FIELD_TELEMETRY: 33 bytes
+   sensors parsed: ['humidity', 'pressure', 'temperature', 'time']
+   RENDER Timestamp        -> {"UTC": 45}
+   RENDER Ambient Pressure -> {"mbar": 968.56}
+   RENDER Temperature      -> {"c": 26.73}
+   RENDER Relative Humidity-> {"percent": 42.41}
+```
+
+`node telemetry` in the Terminal packs the map and prints its size without
+sending, which is the cheap way to check the encoder after a change.
+
+### The field value has to be msgpack-encoded *bytes*
+
+microLXMF stores message fields as `RNS::Bytes` and re-emits them with
+`packRawBytes()`, so whatever is put in a field lands in the payload verbatim.
+Writing the map itself into the field therefore makes the *outer* msgpack parse
+it into a dictionary on the far end, and the client rejects it:
+
+```
+An error occurred while unpacking telemetry.
+The contained exception was: packed data must be type 'bytes' or 'bytearray'
+```
+
+It looks like a decode bug in the client and is not: the field value must be a
+msgpack **bin** containing the packed map. The Python reference does the same
+thing implicitly, because it packs the field value with `umsgpack.packb()` and
+the outer packer then emits that as a bin. `lxmf_send_telemetry()` wraps the map
+with `mp_bin()` for this reason.
+
+Inbound the rule is the mirror image, which is why it did not show up there:
+`FIELD_COMMANDS` arrives as a raw msgpack array, so `parse_commands()` reads it
+as msgpack directly.
+
+### Why the reply is the compact subset
+
+The full map is about 495 bytes, which cannot travel in one encrypted packet
+(`LORA_ENCRYPTED_PACKET_MDU` is 159), so the router switches to link delivery --
+and link delivery is currently broken against a Python peer:
+
+```
+Could not assemble LXMF message from received data     (607 bytes, method 2)
+```
+
+A reply nobody can read is worse than a smaller one that arrives, so what goes
+back is the subset that fits a packet: `SID_TIME` plus pressure, temperature and
+humidity. `SID_LOCATION` (7 big-endian blobs, ~43 bytes) and
+`SID_MAGNETIC_FIELD` (3 floats) are the two that push it over.
+
+The full map is still what `telemetry_pack(..., compact=false)` builds and what
+`node telemetry` reports, so once link delivery works the change in
+`lxmf_send_telemetry()` is dropping the compact flag.
+
+### Identity recall, and the RAM store
+
+Announces validated and entered the path table, and every reply still died on
+`identity for <peer> not known`. The cause is the file-backed known-destination
+store on this port: it does not retain, so `Identity::recall()` never returns a
+key it was just given. `components/rns/CMakeLists.txt` sets
+`RNS_PERSIST_KNOWN_DESTINATIONS=0`, which selects the library's heap store
+instead; recall works and nothing is written to flash per announce. Path
+persistence is unaffected.
+
+Two further notes from chasing it:
+
+- **An announce handler runs inside the path-table insert**, before the record
+  is flushed. Reading the store back from inside that callback takes the
+  Reticulum task down. `node.cpp` keeps its own small peer-key table
+  (`remember_peer`) so a reply has a key even though the callback cannot read.
+- **`Transport::path_table()` is not the live store.** `has_path()` and the
+  insert path use `new_path_table()`; `size()` on the old table reads nothing
+  useful, and calling `size()` on the path *store* printed bytes of a path
+  string (`paths=1634742062`). Use `Transport::paths_added()` for that number.
+
 ## State: working
 
 The node is complete for its purpose. Verified on hardware, live over USB:

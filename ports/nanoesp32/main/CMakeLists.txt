@@ -15,6 +15,7 @@ idf_component_register(
     LDFRAGMENTS "extram.lf"
     REQUIRES ${TD_ESP_APP_REQUIRES} esp_driver_usb_serial_jtag esp_driver_spi esp_driver_gpio
              esp_wifi esp_netif esp_event nvs_flash driver esp_driver_i2c rns lxm
+             joltwallet__littlefs heap
 )
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Wextra -Werror)
 # microReticulum is C++ with exceptions; node.cpp includes its headers.
