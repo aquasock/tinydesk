@@ -314,6 +314,11 @@ static bool solve4(double A[4][4], double b[4], double out[4])
         for (int j = i + 1; j < 4; ++j)
             sum -= A[i][j] * out[j];
         out[i] = sum / A[i][i];
+        /* A degenerate system can produce inf or nan rather than failing the
+         * pivot test. Those must not reach lround(), which is undefined for
+         * them. */
+        if (!isfinite(out[i]))
+            return false;
     }
     return true;
 }

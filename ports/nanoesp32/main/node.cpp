@@ -2071,43 +2071,71 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
         return 1;
     }
 
-    /* One instruction, one progress number, and the progress number is the
-     * pass condition.
+    /* The run ends when the fit stops changing, not when a number is reached.
      *
-     * Per-axis coverage was the wrong idea: it measures how far each axis
-     * moved, not whether the samples actually span the sphere. A flat spin
-     * moves X and Y a long way while tracing a circle, and a circle does not
-     * fix a sphere -- the fit then lands on a small sphere (radius ~38 uT
-     * instead of 46.6) with an offset about 8 uT wrong.
+     * Two earlier versions got this wrong in different ways. Per-axis
+     * coverage measured how far each axis moved, which is not the same as
+     * spanning the sphere. A target of 95 percent of the nominal field was
+     * worse: if anything within 20 cm compresses the local field, the fitted
+     * radius plateaus BELOW that target and the run can never finish, however
+     * long the operator tumbles -- it just hit the time cap and stopped, which
+     * is exactly what "collected slowly then abruptly ended" was.
      *
-     * The fitted radius is the honest measure. It only approaches the true
-     * field once the samples are spread over enough of the sphere, so
-     * watching it climb IS watching orientation diversity improve. When it
-     * reaches the local field, the fit describes the field and the offsets
-     * are right.
+     * Convergence is the honest signal. As the samples spread over the sphere
+     * the fit settles on a stable centre and radius; while the operator is
+     * still turning into new orientations it keeps moving. So: report the
+     * radius, and finish once it has held still for a few seconds with enough
+     * samples behind it. The value it settles on is then checked against what
+     * is plausible for a local field, which catches a genuinely bad
+     * environment without making a good fit impossible.
      *
-     * So: tumble freely, and stop when the radius says the sphere is known. */
-    const double radius_target = BENCH_FIELD_UT * 0.95;
+     * There is no time cap. Ctrl+C stops it at any point. */
+    const double stable_band = 0.25;   /* uT the radius may drift and count as settled */
+    const int stable_needed = 6;       /* ticks at 1 Hz */
+    const uint32_t min_samples = 300;
 
     printf("\n  Tumble the board slowly through every orientation.\n");
     printf("    Turn it flat, tip it on edge, face down, back up -- not just\n");
     printf("    a flat spin, which traces a circle and cannot fix a sphere.\n");
-    printf("    Keep going until the number below reaches %.1f uT.\n\n",
-           radius_target);
+    printf("    The number below settles once the sphere is known. Ctrl+C stops.\n\n");
     fflush(stdout);
 
     uint32_t elapsed = 0;
     uint32_t next_report = 0;
-    bool covered = false;
-    const uint32_t run_end = elapsed + 180000;   /* generous cap */
-    while (elapsed < run_end)
+    double last_r = -1.0;
+    int stable = 0;
+    bool converged = false;
+    /* Not a stop condition, a failure report: if the radius never settles the
+     * operator needs to be told why rather than left watching a bar. Five
+     * minutes is far longer than a real tumble takes. */
+    const uint32_t warn_at = 300000;
+
+    for (;;)
     {
         vTaskDelay(pdMS_TO_TICKS(250));
         elapsed += 250;
-        if (elapsed >= next_report && (elapsed % 2000) == 0)
+        if (elapsed >= warn_at)
+        {
+            mag_cal_abort();
+            printf("\n  Radius never settled after %lu s (last %.1f uT).\n",
+                   (unsigned long)(elapsed / 1000), last_r);
+            printf("  That usually means the board kept seeing new directions\n");
+            printf("  -- which is fine, just press Ctrl+C sooner. Offsets NOT\n");
+            printf("  changed.\n");
+            return 1;
+        }
+        if (elapsed >= next_report && (elapsed % 1000) == 0)
         {
             const double r = mag_cal_fit_radius_ut();
-            int bars = (int)(r / radius_target * 10.0);
+
+            /* Settled when the radius has barely moved since the last tick. */
+            if (last_r > 0.0 && r > 0.0 && fabs(r - last_r) < stable_band)
+                stable++;
+            else
+                stable = 0;
+            last_r = r;
+
+            int bars = (int)(r / (BENCH_FIELD_UT * 1.2) * 10.0);
             if (bars < 0) bars = 0;
             if (bars > 10) bars = 10;
             char meter[14];
@@ -2115,13 +2143,15 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
             for (int b = 0; b < 10; ++b)
                 meter[k++] = (b < bars) ? '#' : '.';
             meter[k] = '\0';
-            printf("    [%s] %5lu samples  fitted radius %5.1f / %.1f uT\n",
-                   meter, (unsigned long)mag_cal_samples(), r, radius_target);
+            printf("    [%s] %5lu samples  radius %5.1f uT  %s\n",
+                   meter, (unsigned long)mag_cal_samples(), r,
+                   (stable >= stable_needed) ? "settled" : "");
             fflush(stdout);
+
             next_report = elapsed;
-            if (r >= radius_target)
+            if (stable >= stable_needed && mag_cal_samples() >= min_samples)
             {
-                covered = true;
+                converged = true;
                 break;
             }
         }
@@ -2133,34 +2163,53 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
         }
     }
 
-    if (!covered)
+    if (!converged)
     {
         mag_cal_abort();
-        const double r = mag_cal_fit_radius_ut();
-        printf("\n  The fit only reached %.1f uT of %.1f.\n", r, radius_target);
-        printf("  Offsets NOT changed. That means the board did not see the\n");
-        printf("  field from enough directions -- tip it further over, face\n");
-        printf("  down as well as up, not just round and round.\n");
-        if (r > 0.0 && r < BENCH_FIELD_UT * 0.85)
-        {
-            printf("  A radius this small also means a magnet or steel is\n");
-            printf("  within about 20 cm, compressing the field.\n");
-        }
+        printf("\ncancelled; offsets unchanged\n");
         return 1;
     }
-    printf("  Field radius recovered -- offsets are trustworthy.\n");
 
     struct mag_offsets found;
     char report[192];
     const bool ok = mag_cal_finish(&found, report, sizeof report);
 
-    printf("\nAll three axes covered. Sampling stopped.\n");
+    printf("\nFit settled. Sampling stopped.\n");
     printf("  %s\n", report);
+
+    /* The radius is the one number that says whether the fit describes the
+     * real field. A fit through a partial cap converges just as stably as a
+     * good one, so settling alone is not proof -- the value it settled on is.
+     * Under-tumbling and a magnet nearby both pull it low, so the advice
+     * differs: turn further, or move metal away. */
+    {
+        const double r = mag_cal_fit_radius_ut();
+        const double lo = BENCH_FIELD_UT * 0.93, hi = BENCH_FIELD_UT * 1.07;
+        if (r < lo)
+        {
+            printf("\n  Radius %.1f uT is below the %.1f uT expected here.\n",
+                   r, (double)BENCH_FIELD_UT);
+            printf("  Either the board did not see enough directions, or a\n");
+            printf("  magnet or steel is within about 20 cm compressing it.\n");
+            printf("  Check: after saving, |B| should hold steady as you turn.\n");
+        }
+        else if (r > hi)
+        {
+            printf("\n  Radius %.1f uT is above the %.1f uT expected here --\n",
+                   r, (double)BENCH_FIELD_UT);
+            printf("  something magnetic is adding to the field locally.\n");
+        }
+        else
+        {
+            printf("\n  Radius %.1f uT matches the field here (%.1f uT).\n",
+                   r, (double)BENCH_FIELD_UT);
+        }
+    }
 
     if (!ok)
     {
-        printf("\nOffsets NOT changed. Run `magcal` again and turn the board\n");
-        printf("through more orientations, including upside down.\n");
+        printf("\nOffsets NOT changed. Run `magcal` again and tumble it more\n");
+        printf("freely -- face down as well as up, on every edge.\n");
         return 1;
     }
 
