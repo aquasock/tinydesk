@@ -97,9 +97,50 @@ recovered by dumping flash at the `storage` partition and reading the strings
 out. A build-time fallback exists for a bench image with no way to write a file
 yet — `-DTD_WIFI_SSID=... -DTD_WIFI_PASSWORD=...`.
 
-## State
+## State: where it stops
 
-Built and flashed; WiFi associates (`10.10.0.35`, -42 dBm). **Reticulum's
-`start()` has not yet been proven to complete on hardware** — the filesystem
-fix above is the change that addresses the fault and it is untested on the
-board.
+Working on hardware, each verified by reading `/fs/node.log` out of flash:
+
+- WiFi associates: `state=wifi_up ip=10.10.0.35 rssi=-43`
+- The storage adapter registers: `rns: storage /fs init=1`
+- `Reticulum::start()` **completes**: `rns: started`
+- An identity is generated and hashes: `identity=3872c2a7…`
+
+Then it stops, before the UDP interface is created. Two findings from that:
+
+**`Identity::from_file()` on a missing file returns a truthy but
+uninitialised object**, and hashing it faults. The file's existence is now
+checked with `stat()` first. This is worth knowing because the obvious
+`if (!identity) generate()` guard is not enough.
+
+**The identity changes on every boot** and the log always reads "no identity
+file", so `to_file()` is not persisting. `node.log` *does* survive across
+boots, so the mount is writable — the difference is that Reticulum writes
+through `microStore`, and ours is the `MountedFileSystem` in `node.cpp`. That
+adapter, or microStore's `File` buffering around it, is the next thing to
+check: a write that does not close is invisible to the next boot.
+
+Until that is fixed the node cannot keep an address, which is the one property
+a node has to have.
+
+## Diagnosing without a console
+
+`/fs/node.log` is append-only and read by dumping the `storage` partition from
+flash:
+
+```
+esptool --port /dev/ttyACM0 --before usb_reset --after no_reset \
+    read-flash 0x620000 0x200000 /tmp/fs.bin
+strings /tmp/fs.bin | grep -E 'rns:|state=|alive'
+```
+
+Two things to know before trusting that output:
+
+- **Flashing does not erase `storage`.** The merged image ends near 0x210000,
+  so old log lines survive and a first read looks like a crash loop that is
+  really stale history. Erase `0x620000 0x9E0000` and reset before reading.
+- **Your own esptool calls count as boots.** Every `write-flash`, `erase-region`
+  and `usb_reset` resets the chip, so several `== boot` lines after a flash
+  sequence are the harness, not the firmware. Watch the USB device number with
+  `lsusb` instead: a stable number over a minute means the board is not
+  resetting.

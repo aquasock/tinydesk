@@ -41,6 +41,10 @@ target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-missing-field-initializers)
 # Optional build-time WiFi credentials, for a bench image with no way to write
 # /fs/etc/wifi.conf yet. Absent in a normal build, where that file is the only
 # source. Pass with -DTD_WIFI_SSID=... -DTD_WIFI_PASSWORD=...
+if(TD_NODE_WIFI_ONLY)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE TD_NODE_WIFI_ONLY)
+endif()
+
 if(TD_WIFI_SSID)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE TD_WIFI_SSID="${TD_WIFI_SSID}")
     if(TD_WIFI_PASSWORD)

@@ -43,6 +43,7 @@
 #include "UDPInterface.h"
 
 #include "esp_random.h"
+#include "esp_system.h"
 
 #include <sys/stat.h>
 
@@ -174,6 +175,13 @@ static bool wifi_start(const char *ssid, const char *password)
     /* set_config on a STA normally starts the association, but the desktop's
      * shell also owns a WiFi manager, so the connection is requested here
      * explicitly rather than relied upon. */
+    /* Peak transmit current is what browns out a marginal supply, and this
+     * board is also driving a 2.2" backlight. 8.5 dBm is plenty for a node
+     * on the same LAN and roughly halves the peak against the default 20. */
+    int8_t tx = 34;              /* 0.25 dBm units: 34 = 8.5 dBm */
+    e = esp_wifi_set_max_tx_power(tx);
+    node_log("wifi: max_tx=%s", esp_err_to_name(e));
+
     e = esp_wifi_connect();
     node_log("wifi: connect=%s", esp_err_to_name(e));
 
@@ -197,7 +205,6 @@ static bool wifi_start(const char *ssid, const char *password)
             {
                 snprintf(s_ip, sizeof(s_ip), IPSTR, IP2STR(&ip.ip));
                 node_log("state=wifi_up ip=%s rssi=%d", s_ip, ap.rssi);
-                ESP_LOGI(TAG, "wifi up: %s, %d dBm", s_ip, ap.rssi);
                 return true;
             }
         }
@@ -397,6 +404,10 @@ static void node_log(const char *fmt, ...)
 
 static void node_task(void *arg)
 {
+    /* Reset reason first: it separates a panic in the last boot from a
+     * genuine hang, which otherwise look identical in an append-only log. */
+    node_log("== boot, reset_reason=%d ==", (int)esp_reset_reason());
+
     /* Let the desktop paint its first frame before the radio starts. */
     vTaskDelay(pdMS_TO_TICKS(3000));
 
@@ -443,30 +454,64 @@ static void node_task(void *arg)
 
     /* Identity: recalled from flash so the destination hash is stable across
      * reboots, which is the whole point of a node having an address. */
+    /* Identity::from_file() on a MISSING file returns an object that is
+     * truthy but uninitialised, and hashing it faults -- so the file's
+     * existence is checked first rather than trusting the result. */
     node_log("rns: loading identity");
-    s_identity = RNS::Identity::from_file(IDENTITY_FILE);
-    node_log("rns: identity loaded");
+    struct stat id_st;
+    if (stat(IDENTITY_FILE, &id_st) == 0)
+    {
+        s_identity = RNS::Identity::from_file(IDENTITY_FILE);
+        node_log("rns: identity from file (%s)", s_identity ? "ok" : "unreadable");
+    }
+    else
+    {
+        node_log("rns: no identity file, generating");
+    }
     if (!s_identity)
     {
-        ESP_LOGI(TAG, "no identity at %s, generating", IDENTITY_FILE);
         s_identity = RNS::Identity();
         if (!s_identity.to_file(IDENTITY_FILE))
             ESP_LOGW(TAG, "could not persist identity; it will change on reboot");
+        node_log("rns: identity generated");
     }
-    snprintf(s_identity_hex, sizeof(s_identity_hex), "%s",
-             s_identity.hash().toHex().c_str());
+    node_log("rns: hashing identity");
+    {
+        /* Keep the hex string alive while it is copied: toHex() returns a
+         * temporary, and both the Arduino String and std::string variants
+         * hand back a buffer that dies with it. */
+        auto h = s_identity.hash().toHex();
+        node_log("rns: hex len=%u", (unsigned)h.length());
+        snprintf(s_identity_hex, sizeof(s_identity_hex), "%s", h.c_str());
+    }
     node_log("identity=%s", s_identity_hex);
-    ESP_LOGI(TAG, "identity %s", s_identity_hex);
 
+    node_log("rns: free heap=%u", (unsigned)esp_get_free_heap_size());
     node_log("rns: creating interface");
+    try {
     s_udp = new UDPInterface();
+    node_log("rns: interface allocated");
     s_udp.mode(RNS::Type::Interface::MODE_GATEWAY);
     RNS::Transport::register_interface(s_udp);
-    s_udp.start();
+    node_log("rns: interface registered");
+    bool up = s_udp.start();
+    node_log("rns: interface start=%d", (int)up);
+    }
+    catch (const std::exception& e) {
+        node_log("rns: EXCEPTION %s", e.what());
+        s_state = NODE_FAILED;
+        vTaskDelete(NULL);
+        return;
+    }
+    catch (...) {
+        node_log("rns: EXCEPTION (unknown)");
+        s_state = NODE_FAILED;
+        vTaskDelete(NULL);
+        return;
+    }
 
     s_state = NODE_READY;
-    node_log("state=ready ip=%s", s_ip);
-    ESP_LOGI(TAG, "Reticulum ready on %s", s_ip);
+    node_log("state=ready ip=%s free=%u", s_ip, (unsigned)esp_get_free_heap_size());
 
     uint32_t elapsed = 0;
     uint32_t next_announce = (ANNOUNCE_MIN_S +
@@ -480,7 +525,6 @@ static void node_task(void *arg)
         if (!s_announced_once)
         {
             s_announced_once = true;
-            ESP_LOGI(TAG, "first announce");
         }
         else if (elapsed >= next_announce || s_announce_requested)
         {
@@ -498,6 +542,11 @@ static void node_task(void *arg)
 
         vTaskDelay(pdMS_TO_TICKS(50));
         elapsed += 1;
+        if ((elapsed % 1200) == 0)          /* every 60 s */
+        {
+            node_log("alive t=%lus free=%u", (unsigned long)(elapsed / 20),
+                     (unsigned)esp_get_free_heap_size());
+        }
     }
 }
 
@@ -508,7 +557,7 @@ void node_start(void)
     if (s_state != NODE_OFF)
         return;
     s_state = NODE_WIFI;
-    xTaskCreate(node_task, "rns", 16384, NULL, 4, NULL);
+    xTaskCreate(node_task, "rns", 32768, NULL, 4, NULL);
 }
 
 node_state_t node_state(void) { return s_state; }
