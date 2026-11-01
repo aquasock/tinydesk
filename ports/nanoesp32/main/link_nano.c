@@ -46,6 +46,8 @@
 #define WRITE_CHUNK      256
 #define WRITE_TIMEOUT_MS 50
 #define REPLY_MAX        32
+/* Terminal width when nothing has set one. See link_console_columns(). */
+#define CONSOLE_DEFAULT_COLS 80
 /* How long one blocking read waits before returning to check for a sink
  * change. Short enough that a switch is quick, long enough not to spin. */
 #define READ_WAIT_MS     100
@@ -69,111 +71,36 @@ static bool s_on_usb;
  * logging off the console until the console itself starts writing. */
 static bool s_usb_has_console;
 
-/* The host terminal's width, learned by asking it once. Zero means not yet
- * known. The shell's line editor cannot ask for itself: it decides whether it
- * may by testing fileno(stdin), and a funopen() stream reports -1, so it falls
- * back to 80 columns and every wrapped or padded line is wrong. It therefore
- * asks us instead, through tdsh_espidf_set_console_columns(). */
-static int s_usb_columns;
-/* Set once the query has been tried for this attachment, whatever the result:
- * a terminal that cannot answer must cost one wait, not one per prompt. */
-static bool s_usb_columns_tried;
-
 bool link_usb_is_console(void);
 int link_console_columns(void);
+void link_set_console_columns(int cols);
 
-/* Parse one ESC [ <row> ; <col> R report out of buf and return <col>, or 0.
- * The terminal clamps the cursor at its right edge, so after ESC[999C the
- * reported column is the terminal's width. */
-static int parse_report(const char *buf, int len)
-{
-    for (int i = 0; i + 3 < len; ++i)
-    {
-        if (buf[i] != '\x1b' || buf[i + 1] != '[')
-            continue;
-        int j = i + 2;
-        while (j < len && buf[j] >= '0' && buf[j] <= '9')
-            j++;
-        if (j >= len || buf[j] != ';')
-            continue;
-        j++;
-        int cols = 0, digits = 0;
-        while (j < len && buf[j] >= '0' && buf[j] <= '9')
-        {
-            cols = cols * 10 + (buf[j++] - '0');
-            digits++;
-        }
-        if (digits > 0 && j < len && buf[j] == 'R')
-            return cols;
-    }
-    return 0;
-}
-
-/* Ask the terminal for its width.
+/* The console's width.
  *
- * ESC[999C parks the cursor at the terminal's right edge and ESC[6n reports
- * where it is. That park is destructive: the cursor is left at the right
- * margin, so the next prompt printed after it starts at the end of the line
- * and wraps, which is exactly the ragged layout this is here to fix. The
- * cursor is therefore restored with a CR whatever happens -- reply, no reply,
- * or a reply that arrives too late to read.
+ * This is fixed rather than measured, and that is deliberate. Measuring it
+ * means writing ESC[999C (park the cursor at the right edge) and reading the
+ * ESC[row;colR reply, and the only place to read it from is the same USB FIFO
+ * the shell reads its input from. Two attempts at that ate the operator's
+ * keystrokes: the reply window swallowed whatever was typed while it was
+ * open, and the bytes came back out reordered and corrupted. A terminal width
+ * is not worth risking input for.
  *
- * A late reply is not harmless either: those bytes stay in the USB FIFO and
- * would be read as typed input, and ESC[20;80R typed into a line editor is
- * cursor movement. link_read() strips any report it sees for that reason, and
- * learns the width from it if we still do not know it. */
-static void usb_learn_columns(void)
+ * So the width is a number that can be set: `cols <n>` in the shell. It starts
+ * at 80, which is what a terminal that never answers would have to fall back
+ * to anyway. */
+static int s_usb_columns = CONSOLE_DEFAULT_COLS;
+
+void link_set_console_columns(int cols)
 {
-    static const uint8_t ask[] = "\x1b[999C\x1b[6n";
-    static const uint8_t home[] = "\r";
-    if (!usb_serial_jtag_is_connected())
-        return;
-
-    if (usb_serial_jtag_write_bytes(ask, sizeof(ask) - 1,
-                                    pdMS_TO_TICKS(50)) != (int)(sizeof(ask) - 1))
-        return;
-
-    char buf[64];
-    int len = 0;
-    const uint32_t start = xTaskGetTickCount();
-    while (xTaskGetTickCount() - start < pdMS_TO_TICKS(300) &&
-           len < (int)sizeof(buf))
-    {
-        int n = usb_serial_jtag_read_bytes((uint8_t *)buf + len,
-                                           (uint32_t)(sizeof(buf) - (size_t)len),
-                                           pdMS_TO_TICKS(20));
-        if (n <= 0)
-            continue;
-        len += n;
-        if (parse_report(buf, len) > 0)
-            break;
-    }
-
-    /* Undo the park before anything else is printed. */
-    usb_serial_jtag_write_bytes(home, 1, pdMS_TO_TICKS(50));
-
-    const int cols = parse_report(buf, len);
-    if (cols > 0)
-    {
+    if (cols >= 20 && cols <= 500)
         s_usb_columns = cols;
-        ESP_LOGI(TAG, "host terminal reports %d columns", cols);
-    }
-    else
-    {
-        ESP_LOGW(TAG, "host terminal did not report a width; assuming 80");
-    }
 }
 
 int link_console_columns(void)
 {
     if (!s_on_usb)
         return s_panel_ready ? vt_cols() : 0;
-    if (s_usb_columns <= 0 && !s_usb_columns_tried)
-    {
-        s_usb_columns_tried = true;
-        usb_learn_columns();
-    }
-    return s_usb_columns > 0 ? s_usb_columns : 0;
+    return s_usb_columns;
 }
 
 static void panel_blank(void)
@@ -189,8 +116,7 @@ static void on_sink_changed(bool on_usb)
 {
     s_on_usb = on_usb;
     s_reply_len = s_reply_pos = 0;
-    s_usb_columns = 0;          /* re-ask the new terminal */
-    s_usb_columns_tried = false;
+    s_usb_columns = CONSOLE_DEFAULT_COLS;   /* the new sink's default */
     if (on_usb)
     {
         panel_blank();
@@ -248,49 +174,6 @@ bool link_usb_is_console(void)
     return s_on_usb && s_usb_has_console;
 }
 
-/* Strip any cursor-position report from input.
- *
- * A terminal answers ESC[6n with ESC[<row>;<col>R. Nothing a person types
- * produces that, so seeing one means it is a reply we asked for and did not
- * hear in time. Reaching the line editor it would be read as cursor movement
- * and scramble the screen, so it is consumed here -- and used, if the width is
- * still unknown, which is better than throwing the answer away. */
-static int strip_reports(uint8_t *buf, int len)
-{
-    int out = 0;
-    for (int i = 0; i < len; )
-    {
-        if (buf[i] == 0x1b && i + 1 < len && buf[i + 1] == '[')
-        {
-            int j = i + 2;
-            while (j < len && buf[j] >= '0' && buf[j] <= '9')
-                j++;
-            if (j < len && buf[j] == ';')
-            {
-                j++;
-                while (j < len && buf[j] >= '0' && buf[j] <= '9')
-                    j++;
-                if (j < len && buf[j] == 'R')
-                {
-                    if (s_usb_columns <= 0)
-                    {
-                        const int c = parse_report((const char *)buf + i, j - i + 1);
-                        if (c > 0)
-                        {
-                            s_usb_columns = c;
-                            ESP_LOGI(TAG, "late width report: %d columns", c);
-                        }
-                    }
-                    i = j + 1;
-                    continue;
-                }
-            }
-        }
-        buf[out++] = buf[i++];
-    }
-    return out;
-}
-
 int link_read(uint8_t *buf, int cap)
 {
     /* A queued panel size reply goes out before real input: the console is
@@ -322,12 +205,7 @@ int link_read(uint8_t *buf, int cap)
         int n = usb_serial_jtag_read_bytes(buf, (uint32_t)cap,
                                            pdMS_TO_TICKS(READ_WAIT_MS));
         if (n > 0)
-        {
-            n = strip_reports(buf, n);
-            if (n > 0)
-                return n;
-            continue;          /* the whole chunk was a report; keep waiting */
-        }
+            return n;
         if (!usb_serial_jtag_is_connected() && s_on_usb)
             on_sink_changed(false);
     }

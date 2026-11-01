@@ -688,24 +688,14 @@ static void node_log(const char *fmt, ...)
         fclose(fp);
     }
 
-    /* And to USB, but only until the console starts writing there. After that
-     * these lines would land in the middle of the shell's screen and corrupt
-     * it; /fs/node.log keeps every line regardless, and `cat /fs/node.log`
-     * reads it back from the console. The early window -- USB attached but the
-     * shell not yet drawing -- is exactly when a boot log is worth watching
-     * over a cable. */
-    if (usb_serial_jtag_is_connected() && !link_usb_is_console())
-    {
-        int done = 0;
-        while (done < n)
-        {
-            int chunk = n - done > 64 ? 64 : n - done;
-            if (usb_serial_jtag_write_bytes(line + done, (size_t)chunk,
-                                            pdMS_TO_TICKS(20)) != chunk)
-                break;
-            done += chunk;
-        }
-    }
+    /* Not to USB. The console owns this port: the shell reads its input from the
+     * same FIFO and writes its screen to the same stream, and a log line
+     * arriving between those lands in the middle of the operator's line. That
+     * is not theoretical -- gating this on "the console has started drawing"
+     * still let lines through from the node task, and "node:" turned up inside
+     * typed input. Every line goes to /fs/node.log, which `cat node.log`
+     * reads from the console. */
+    (void)0;
 }
 
 /* ---- LXMF telemetry -------------------------------------------------- *
@@ -2209,6 +2199,34 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
     return 0;
 }
 
+/* Console width, for the shell's line editor.
+ *
+ * The width is not measured: asking a terminal means reading the reply from
+ * the same USB FIFO the shell reads input from, and two attempts at that ate
+ * the operator's keystrokes. Setting it by hand costs one command and cannot
+ * corrupt input. */
+extern "C" void link_set_console_columns(int cols);
+extern "C" int link_console_columns(void);
+
+static int cmd_cols(tdsh_session_t *session, int argc, char **argv)
+{
+    (void)session;
+    if (argc < 2)
+    {
+        printf("%d columns\n", link_console_columns());
+        return 0;
+    }
+    const int n = atoi(argv[1]);
+    if (n < 20 || n > 500)
+    {
+        printf("usage: cols [20..500]\n");
+        return 1;
+    }
+    link_set_console_columns(n);
+    printf("console width set to %d columns\n", n);
+    return 0;
+}
+
 static int cmd_node(tdsh_session_t *session, int argc, char **argv)
 {
     (void)session;
@@ -2326,6 +2344,14 @@ static const tdsh_command_t s_node_cmd = {
     .flags = 0,
 };
 
+static const tdsh_command_t s_cols_cmd = {
+    .name = "cols",
+    .usage = "cols [20..500]",
+    .help = "Show or set the console width, so lines wrap where the terminal does",
+    .fn = cmd_cols,
+    .flags = 0,
+};
+
 static const tdsh_command_t s_magcal_cmd = {
     .name = "magcal",
     .usage = "magcal [show|clear]",
@@ -2350,6 +2376,9 @@ void node_start(void)
         int rc2 = tdsh_register_command(&s_magcal_cmd);
         const tdsh_command_t *found2 = tdsh_command_find("magcal");
         node_log("node: magcal registered rc=%d found=%d", rc2, found2 != nullptr);
+        int rc3 = tdsh_register_command(&s_cols_cmd);
+        const tdsh_command_t *found3 = tdsh_command_find("cols");
+        node_log("node: cols registered rc=%d found=%d", rc3, found3 != nullptr);
     }
     s_state = NODE_WIFI;
     xTaskCreate(node_task, "rns", 32768, NULL, 4, NULL);
