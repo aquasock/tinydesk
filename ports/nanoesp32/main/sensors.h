@@ -101,6 +101,12 @@ void     mag_cal_spans(int32_t out[3]);
  * progress: it approaches the local field only once the samples span enough
  * of the sphere. */
 double   mag_cal_fit_radius_ut(void);
+/* Print the sample cloud: centre, per-axis spread, octant coverage, duplicate
+ * runs. Explains a bad fit instead of leaving it to guesswork. */
+void     mag_cal_diagnose(void);
+/* Fraction of samples in the least-populated octant about their centre.
+ * 0.125 is even; below ~0.06 the board never saw that side. */
+double   mag_cal_coverage(void);
 bool     mag_cal_finish(struct mag_offsets *out, char *report, size_t n);
 void     mag_cal_abort(void);
 void     mag_cal_set_offsets(const struct mag_offsets *o);

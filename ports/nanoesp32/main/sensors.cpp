@@ -217,6 +217,17 @@ static int16_t s_mag_max[3];
 static double s_AtA[4][4];
 static double s_Atb[4];
 
+/* Diagnostics: enough to explain a bad fit after the fact rather than
+ * guessing at it. Octants around the running mean say whether the samples
+ * cover the sphere; the duplicate counter says whether the sensor was
+ * returning the same conversion repeatedly. */
+/* Keep the samples themselves so the cloud can be examined afterwards: a fit
+ * that converged on the wrong radius is impossible to explain from the fit
+ * alone, but obvious from the points. 2048 x 6 bytes is 12 KB. */
+#define MAG_DUMP_MAX 2048
+static int16_t s_dump[MAG_DUMP_MAX][3];
+static uint32_t s_dump_n;
+
 struct mag_offsets mag_cal_offsets(void) { return s_mag_off; }
 void mag_cal_set_offsets(const struct mag_offsets *o)
 {
@@ -249,6 +260,7 @@ bool mag_cal_begin(void)
     }
     memset(s_AtA, 0, sizeof s_AtA);
     memset(s_Atb, 0, sizeof s_Atb);
+    s_dump_n = 0;
     wr(ADDR_MAG, 0x20, MAG_CTRL1_80HZ);
     return true;
 }
@@ -275,6 +287,14 @@ void mag_cal_poll(void)
         for (int j = 0; j < 4; ++j)
             s_AtA[i][j] += row[i] * row[j];
     }
+    if (s_dump_n < MAG_DUMP_MAX)
+    {
+        s_dump[s_dump_n][0] = raw[0];
+        s_dump[s_dump_n][1] = raw[1];
+        s_dump[s_dump_n][2] = raw[2];
+        ++s_dump_n;
+    }
+
     ++s_mag_cal_n;
 }
 
@@ -353,6 +373,117 @@ double mag_cal_fit_radius_ut(void)
     if (rsq <= 0)
         return 0.0;
     return sqrt(rsq) * (100.0 / 6842.0);
+}
+
+/* Describe the sample cloud, so a bad fit can be explained instead of guessed
+ * at. Prints one line per fact that would change the diagnosis:
+ *
+ *   centre   the mean, which should sit near the fitted offset
+ *   radius   per-axis spread, which should be similar on all three for a
+ *            sphere and unequal for soft iron
+ *   octants  how the samples are distributed around the centre -- a fit needs
+ *            them on all sides, not in one cap
+ *   dups     consecutive identical readings, which mean the sensor is being
+ *            read faster than it converts
+ */
+/* How evenly the samples are spread around their centre, as the fraction in
+ * the least-populated octant. 0.125 is even; anything under about 0.06 means
+ * the board never really saw that side and a fit through the rest is not
+ * describing the whole field.
+ *
+ * This is the measure that says whether more tumbling will help, which the
+ * fitted radius alone does not: a run can sit at a stable radius while only
+ * ever covering half the sphere. */
+double mag_cal_coverage(void)
+{
+    if (s_dump_n < 20)
+        return 0.0;
+    double mean[3] = {0, 0, 0};
+    for (uint32_t i = 0; i < s_dump_n; ++i)
+        for (int a = 0; a < 3; ++a)
+            mean[a] += s_dump[i][a];
+    for (int a = 0; a < 3; ++a)
+        mean[a] /= s_dump_n;
+
+    uint32_t oct[8] = {0};
+    for (uint32_t i = 0; i < s_dump_n; ++i)
+    {
+        int idx = 0;
+        if (s_dump[i][0] > mean[0]) idx |= 1;
+        if (s_dump[i][1] > mean[1]) idx |= 2;
+        if (s_dump[i][2] > mean[2]) idx |= 4;
+        oct[idx]++;
+    }
+    uint32_t lo = oct[0];
+    for (int i = 1; i < 8; ++i)
+        if (oct[i] < lo) lo = oct[i];
+    return (double)lo / (double)s_dump_n;
+}
+
+void mag_cal_diagnose(void)
+{
+    if (s_dump_n < 10)
+    {
+        printf("  diag: too few samples\n");
+        return;
+    }
+    double mean[3] = {0, 0, 0};
+    for (uint32_t i = 0; i < s_dump_n; ++i)
+        for (int a = 0; a < 3; ++a)
+            mean[a] += s_dump[i][a];
+    for (int a = 0; a < 3; ++a)
+        mean[a] /= s_dump_n;
+
+    double var[3] = {0, 0, 0};
+    for (uint32_t i = 0; i < s_dump_n; ++i)
+        for (int a = 0; a < 3; ++a)
+        {
+            const double d = s_dump[i][a] - mean[a];
+            var[a] += d * d;
+        }
+    for (int a = 0; a < 3; ++a)
+        var[a] = sqrt(var[a] / s_dump_n);
+
+    const double k = 100.0 / 6842.0;
+    printf("  diag: n=%lu  mean %.0f %.0f %.0f counts  sd %.1f %.1f %.1f uT\n",
+           (unsigned long)s_dump_n, mean[0], mean[1], mean[2],
+           var[0] * k, var[1] * k, var[2] * k);
+
+    /* Octants around the mean. A sphere fit needs them all populated. */
+    int32_t oct[8] = {0};
+    for (uint32_t i = 0; i < s_dump_n; ++i)
+    {
+        int idx = 0;
+        if (s_dump[i][0] > mean[0]) idx |= 1;
+        if (s_dump[i][1] > mean[1]) idx |= 2;
+        if (s_dump[i][2] > mean[2]) idx |= 4;
+        oct[idx]++;
+    }
+    printf("  diag: octants %ld %ld %ld %ld %ld %ld %ld %ld (empty=%d)\n",
+           (long)oct[0], (long)oct[1], (long)oct[2], (long)oct[3],
+           (long)oct[4], (long)oct[5], (long)oct[6], (long)oct[7],
+           (int)((oct[0] == 0) + (oct[1] == 0) + (oct[2] == 0) + (oct[3] == 0) +
+                 (oct[4] == 0) + (oct[5] == 0) + (oct[6] == 0) + (oct[7] == 0)));
+
+    /* Duplicate runs. */
+    uint32_t dup = 0, runs = 0, streak = 0;
+    for (uint32_t i = 1; i < s_dump_n; ++i)
+    {
+        if (s_dump[i][0] == s_dump[i - 1][0] && s_dump[i][1] == s_dump[i - 1][1] &&
+            s_dump[i][2] == s_dump[i - 1][2])
+        {
+            dup++;
+            streak++;
+        }
+        else
+        {
+            if (streak > 0) runs++;
+            streak = 0;
+        }
+    }
+    printf("  diag: %lu duplicate samples in %lu runs (%.0f%%)\n",
+           (unsigned long)dup, (unsigned long)runs,
+           s_dump_n ? 100.0 * dup / s_dump_n : 0.0);
 }
 
 bool mag_cal_finish(struct mag_offsets *out, char *report, size_t n)
