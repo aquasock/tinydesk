@@ -29,6 +29,12 @@
 #include "link.h"
 #include "node.h"
 #include "vt.h"
+
+/* The active sink's width: 40 on the panel, the host terminal's own width over
+ * USB. The shell's line editor asks for this because it cannot measure a
+ * funopen() stream -- fileno(stdin) is -1, so its own query is skipped and it
+ * assumes 80 columns, which pads and wraps every line wrongly. */
+int link_console_columns(void);
 #include "tdsh.h"
 #include "tdsh_espidf.h"
 
@@ -105,6 +111,8 @@ void app_main(void)
         ESP_LOGE(TAG, "link init failed: no console and no way to report it");
         return;
     }
+
+    tdsh_espidf_set_console_columns(link_console_columns);
 
     tdsh_espidf_config_t cfg = TDSH_ESP_IDF_CONFIG_DEFAULT();
     cfg.hostname = board_hostname();

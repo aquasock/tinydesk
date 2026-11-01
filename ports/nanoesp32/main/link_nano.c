@@ -69,7 +69,117 @@ static bool s_on_usb;
  * logging off the console until the console itself starts writing. */
 static bool s_usb_has_console;
 
+/* The host terminal's width, learned by asking it once. Zero means not yet
+ * known. The shell's line editor cannot ask for itself: it decides whether it
+ * may by testing fileno(stdin), and a funopen() stream reports -1, so it falls
+ * back to 80 columns and every wrapped or padded line is wrong. It therefore
+ * asks us instead, through tdsh_espidf_set_console_columns(). */
+static int s_usb_columns;
+/* Set once the query has been tried for this attachment, whatever the result:
+ * a terminal that cannot answer must cost one wait, not one per prompt. */
+static bool s_usb_columns_tried;
+
 bool link_usb_is_console(void);
+int link_console_columns(void);
+
+/* Send ESC[999C ESC[6n and read the reply, ESC[<row>;<col>R. The terminal
+ * clamps the cursor at its right edge, so the column reported is the width.
+ * Bytes that are not part of the reply are typed-back input and are kept for
+ * the shell rather than dropped. */
+static void usb_learn_columns(void)
+{
+    static const uint8_t ask[] = "\x1b[999C\x1b[6n";
+    if (!usb_serial_jtag_is_connected())
+        return;
+    if (usb_serial_jtag_write_bytes(ask, sizeof(ask) - 1,
+                                    pdMS_TO_TICKS(50)) != (int)(sizeof(ask) - 1))
+        return;
+
+    /* Collect until the reply arrives or the deadline passes. The wait must
+     * not end on the first empty read: a terminal takes a few milliseconds to
+     * answer, and returning early left the width unknown, which made every
+     * prompt re-ask and stall. */
+    char buf[64];
+    int len = 0;
+    const uint32_t start = xTaskGetTickCount();
+    while (xTaskGetTickCount() - start < pdMS_TO_TICKS(300) &&
+           len < (int)sizeof(buf))
+    {
+        int n = usb_serial_jtag_read_bytes((uint8_t *)buf + len,
+                                           (uint32_t)(sizeof(buf) - (size_t)len),
+                                           pdMS_TO_TICKS(20));
+        if (n <= 0)
+            continue;
+        len += n;
+        /* Stop as soon as a complete report is in hand. */
+        for (int i = 0; i + 1 < len; ++i)
+            if (buf[i] == '\x1b' && buf[i + 1] == '[' && memchr(buf + i, 'R', (size_t)(len - i)))
+                goto got;
+    }
+got:;
+
+    /* Parse ESC [ digits ; digits R, tolerating noise around it. */
+    int cols = 0;
+    for (int i = 0; i + 3 < len; ++i)
+    {
+        if (buf[i] != '\x1b' || buf[i + 1] != '[')
+            continue;
+        int j = i + 2, val = 0, seen = 0;
+        while (j < len && buf[j] >= '0' && buf[j] <= '9')
+            val = val * 10 + (buf[j++] - '0');
+        if (j < len && buf[j] == ';')
+        {
+            j++;
+            while (j < len && buf[j] >= '0' && buf[j] <= '9')
+            {
+                seen = seen * 10 + (buf[j++] - '0');
+            }
+            if (j < len && buf[j] == 'R')
+                cols = seen;
+        }
+        break;
+    }
+
+    /* Anything left that is not the reply is type-ahead. */
+    int consumed = 0;
+    if (cols > 0)
+    {
+        for (int i = 0; i + 3 < len; ++i)
+        {
+            if (buf[i] == '\x1b' && buf[i + 1] == '[')
+            {
+                int j = i + 2;
+                while (j < len && buf[j] != 'R')
+                    j++;
+                consumed = j + 1;
+                break;
+            }
+        }
+    }
+    for (int i = consumed; i < len; ++i)
+    {
+        if (buf[i] != '\r' && buf[i] != '\n' && s_typed_len < sizeof(s_typed))
+            s_typed[s_typed_len++] = buf[i];
+    }
+
+    if (cols > 0)
+    {
+        s_usb_columns = cols;
+        ESP_LOGI(TAG, "host terminal reports %d columns", cols);
+    }
+}
+
+int link_console_columns(void)
+{
+    if (!s_on_usb)
+        return s_panel_ready ? vt_cols() : 0;
+    if (s_usb_columns <= 0 && !s_usb_columns_tried)
+    {
+        s_usb_columns_tried = true;
+        usb_learn_columns();
+    }
+    return s_usb_columns > 0 ? s_usb_columns : 0;
+}
 
 static void panel_blank(void)
 {
@@ -84,6 +194,8 @@ static void on_sink_changed(bool on_usb)
 {
     s_on_usb = on_usb;
     s_reply_len = s_reply_pos = 0;
+    s_usb_columns = 0;          /* re-ask the new terminal */
+    s_usb_columns_tried = false;
     if (on_usb)
     {
         panel_blank();
