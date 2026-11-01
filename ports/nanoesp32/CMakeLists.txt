@@ -19,19 +19,22 @@ set(TDSH_SDK_ROOT "${TD_ROOT}/third_party/tdsh")
 
 set(IDF_TARGET "esp32s3" CACHE STRING "tinydesk target")
 
-# Screen and terminal buffer limits, in cells. The library defaults
-# (256x96, 200 lines of terminal scrollback) are sized for a maximised
-# desktop window on a monitor: about 680 KB of buffers. This panel is
-# 320x240, which is 40x15 cells at 8x16, so the maxima are set to what the
-# display can show and the scrollback to a useful-but-cheap ring: about
-# 13 KB instead of 680 KB.
+# Screen and terminal buffer limits, in cells.
 #
-# These must be cache variables set BEFORE project(), because the tinydesk
-# component is configured before main/ and reads them then. Keep in step
-# with LCD_W/LCD_H in main/ili9340.h and FONT_W/FONT_H in main/font8x16.h.
-set(TD_MAX_COLS     40 CACHE STRING "screen cells across (320 px / 8)")
-set(TD_MAX_ROWS     15 CACHE STRING "screen cells down (240 px / 16)")
-set(TD_VT_SCROLLBACK 8 CACHE STRING "terminal scrollback lines")
+# These are an upper bound, not the layout: the desktop asks the active sink
+# how big the terminal is and sizes itself to the answer, so a small window
+# uses a small grid whatever these say. They must be cache variables set
+# BEFORE project(), because the tinydesk component is configured before main/
+# and reads them then.
+# 160 x 50 is the largest grid a host terminal may fill over USB: 160*50*8 =
+# 64 KB per screen, two screens = 128 KB, all of it in PSRAM through
+# extram.lf. The panel does not use these; its 40 x 15 grid is pinned in
+# link_nano.c from LCD_W/LCD_H, and the desktop re-lays-out on the size the
+# active sink reports. Scrollback is cheap and useful now that there is a real
+# terminal to read it in.
+set(TD_MAX_COLS     160 CACHE STRING "screen cells across, upper bound for a USB terminal")
+set(TD_MAX_ROWS     50 CACHE STRING "screen cells down, upper bound for a USB terminal")
+set(TD_VT_SCROLLBACK 200 CACHE STRING "terminal scrollback lines")
 list(APPEND EXTRA_COMPONENT_DIRS
     "${TDSH_SDK_ROOT}/ports/esp_idf/components"
     "${TD_ROOT}/ports/esp_idf/components"

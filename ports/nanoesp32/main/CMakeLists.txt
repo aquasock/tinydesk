@@ -1,15 +1,15 @@
-# The Arduino Nano ESP32: the shared application (ports/esp_idf/app), with
-# the desktop drawn on the ILI9340 panel and the static buffers of TinyDesk and
-# TinyDesk Shell in PSRAM (extram.lf).
+# The Arduino Nano ESP32: the shared application (ports/esp_idf/app), with the
+# static buffers of TinyDesk and TinyDesk Shell in PSRAM (extram.lf).
 #
-# This board is remote-first: the panel is the display and USB is not a
-# tether, so only link_lcd.c is built. link_usj.c (the desktop as terminal
-# output on USB) is kept in the tree for bench work; build it by adding it to
-# TD_LINK_SRCS below.
+# The desktop has two sinks and picks between them at runtime: USB
+# Serial/JTAG when a host terminal is attached, the ILI9340 panel otherwise.
+# link_nano.c is both. It supersedes link_lcd.c (panel output with USB input)
+# and link_usj.c (USB only, as ports/esp32c6 ships it); those files remain in
+# the tree because they document the two halves, but neither is built.
 include("${CMAKE_CURRENT_LIST_DIR}/../../esp_idf/app/app.cmake")
 
 idf_component_register(
-    SRCS "link_lcd.c" "ili9340.c" "vt.c" "node.cpp" "sensors.cpp" ${TD_ESP_APP_SRCS}
+    SRCS "link_nano.c" "ili9340.c" "vt.c" "node.cpp" "sensors.cpp" ${TD_ESP_APP_SRCS}
     EMBED_TXTFILES "${TD_BOARD_BUILTIN_CONF}"
     INCLUDE_DIRS "." "${TD_ESP_APP_DIR}"
     LDFRAGMENTS "extram.lf"
@@ -34,8 +34,9 @@ target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-missing-field-initializers)
 # the maxima are set to what the display can actually show and the scrollback
 # to a useful-but-cheap ring. Costs about 13 KB instead of about 680 KB.
 #
-# Keep TD_MAX_COLS/ROWS in step with LCD_W/LCD_H in ili9340.h: the grid is
-# LCD_W / FONT_W x LCD_H / FONT_H, which is 40 x 15.
+# The maxima are no longer the panel's size. The panel's grid is 40 x 15
+# (LCD_W / FONT_W by LCD_H / FONT_H in ili9340.h) and is pinned in link_nano.c;
+# the maxima now bound what a host terminal may ask for over USB.
 # TD_MAX_COLS / TD_MAX_ROWS / TD_VT_SCROLLBACK are set in ../CMakeLists.txt,
 # before project(), so the tinydesk component sees them when it configures.
 

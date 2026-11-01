@@ -28,6 +28,10 @@
  * here instead of editing a header shared with the C sources. */
 extern "C" bool tdsh_bridge_break_requested(void);
 
+/* True once the desktop is drawing to USB. Declared here rather than pulled
+ * from link.h, which the desktop and the shell both include. */
+extern "C" bool link_usb_is_desktop(void);
+
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -684,11 +688,14 @@ static void node_log(const char *fmt, ...)
         fclose(fp);
     }
 
-    /* And to USB, so state can be watched live over a serial terminal. Reading
-     * it back out of flash has been the source of several wrong conclusions:
-     * the partition survives a firmware flash, so old lines read as new boots.
-     * USB is free in this build -- the desktop is on the panel. */
-    if (usb_serial_jtag_is_connected())
+    /* And to USB, but only while USB is not carrying the desktop. Once the
+     * desktop has written a frame there, further log lines land in the middle
+     * of its screen and corrupt the display; /fs/node.log keeps every line
+     * regardless, and the desktop's Log Viewer reads it. The early window --
+     * USB attached but the desktop not yet drawing -- is exactly when a boot
+     * log is worth watching over a cable, which is why this is a flag rather
+     * than a blanket disable. */
+    if (usb_serial_jtag_is_connected() && !link_usb_is_desktop())
     {
         int done = 0;
         while (done < n)
@@ -1920,6 +1927,21 @@ static void node_task(void *arg)
  * service knows, from the same state the log and the UI read. */
 /* ---- magnetometer calibration command -------------------------------- */
 
+/* The field this bench sits in, from IGRF-14 evaluated at 33.2939 N,
+ * -111.8810 E, 377 m for 2026. These are the numbers a healthy calibration
+ * should reproduce, and they replace the "about 48 uT" this command used to
+ * quote, which was a guess and three percent high.
+ *
+ *   total   F = 46.6 uT      horizontal H = 23.8 uT
+ *   vertical Z = 40.0 uT      dip = 59.3 deg, declination = 9.6 deg E
+ *
+ * A different site needs different numbers; the dip angle is the part that
+ * transfers, since it depends on latitude rather than on the bench. */
+#define BENCH_FIELD_UT 46.6
+#define BENCH_HORIZ_UT 23.8
+#define BENCH_DIP_DEG  59.3
+
+
 /* Read one line from the shell's stdin, which blocks until the user types.
  * The Terminal sends CR for Enter, and the shell's own reader accepts CR or
  * LF, so both terminate here. Ctrl+C aborts rather than being buffered. */
@@ -1979,24 +2001,32 @@ static void magcal_readings(char *out, size_t n)
              x, y, z, b, h);
 }
 
+/* One row per axis, because the useful question during a run is which axis is
+ * still under-covered, not what the average is. A tumble that only spins the
+ * board flat leaves Z at nearly zero span, and its offset would then be the
+ * midpoint of noise. */
 static void magcal_progress_line(uint32_t elapsed_ms)
 {
     int32_t span[3];
     mag_cal_spans(span);
-    /* A tumble covers the sphere when all three spans are large and similar;
-     * the smallest span is the honest progress figure. */
-    int32_t lo = span[0];
-    if (span[1] < lo) lo = span[1];
-    if (span[2] < lo) lo = span[2];
-    const int bars = (int)(lo / 300);
-    char meter[24];
-    int k = 0;
-    for (int i = 0; i < 12 && k < (int)sizeof meter - 1; ++i)
-        meter[k++] = (i < bars) ? '#' : '.';
-    meter[k] = '\0';
-    printf("  %4.1fs  %5lu samples  [%s]  span %ld/%ld/%ld\n",
-           (double)elapsed_ms / 1000.0, (unsigned long)mag_cal_samples(),
-           meter, (long)span[0], (long)span[1], (long)span[2]);
+    static const char *axis[3] = {"X", "Y", "Z"};
+    printf("  %4.1fs  %5lu samples\n", (double)elapsed_ms / 1000.0,
+           (unsigned long)mag_cal_samples());
+    for (int i = 0; i < 3; ++i)
+    {
+        /* A full turn sweeps 2 * 46.6 uT = 6224 counts at this scale, so a
+         * span of 3000 counts is about half the diameter. The bar fills at
+         * 3000, which is the point where more rotation stops helping much. */
+        int bars = (int)(span[i] / 250);
+        if (bars > 12) bars = 12;
+        char meter[16];
+        int k = 0;
+        for (int b = 0; b < 12; ++b)
+            meter[k++] = (b < bars) ? '#' : '.';
+        meter[k] = '\0';
+        const char *mark = (bars >= 12) ? "ok" : (bars >= 6) ? "   " : " <--";
+        printf("    %s [%s] %5ld%s\n", axis[i], meter, (long)span[i], mark);
+    }
     fflush(stdout);
 }
 
@@ -2045,15 +2075,24 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
     printf("offsets now  : X %d  Y %d  Z %d%s\n", before.x, before.y, before.z,
            (before.x == 0 && before.y == 0 && before.z == 0) ? "  (none saved)" : "");
     printf("reading now  : %s\n", rd_before);
-    printf("\nexpected |B| : about 48 uT in Arizona. Well under that means\n");
-    printf("               the offsets are missing, or there is a magnet\n");
-    printf("               or steel within about 20 cm.\n");
+    printf("\nexpected |B| : %.1f uT here (IGRF-14, 33.29N -111.88E, 2026),\n",
+           (double)BENCH_FIELD_UT);
+    printf("               of which %.1f uT is horizontal and %.1f uT vertical\n",
+           (double)BENCH_HORIZ_UT,
+           sqrt((double)BENCH_FIELD_UT * BENCH_FIELD_UT -
+                (double)BENCH_HORIZ_UT * BENCH_HORIZ_UT));
+    printf("               at a dip of %.1f deg. Readings well under that mean\n",
+           (double)BENCH_DIP_DEG);
+    printf("               the offsets are missing, or there is a magnet or\n");
+    printf("               steel within about 20 cm.\n");
     printf("\n");
     printf("Before you start:\n");
     printf("  * clear 20 cm around the board: no steel, magnets, speakers,\n");
     printf("    power supply or the monitor\n");
-    printf("  * you will turn it through every orientation for 30 s,\n");
-    printf("    upside down included -- a flat spin will be rejected\n");
+    printf("  * it runs in three phases totalling about 36 s, each naming\n");
+    printf("    the motion: flat, on edge, then upside down. Keep turning\n");
+    printf("    for the whole of each phase -- stopping early leaves that\n");
+    printf("    axis uncorrected and the fit biased\n");
     printf("\n");
 
     if (!shell_read_line("Step 1/3. Press Enter to start sampling, Ctrl+C to cancel: ",
@@ -2069,27 +2108,45 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
         return 1;
     }
 
-    printf("\nStep 2/3. Tumbling for 30 seconds -- keep turning.\n");
-    printf("  80 Hz sampling, so keep the motion steady rather than fast.\n\n");
-    fflush(stdout);
+    /* Three phases rather than one "tumble for 30 s": the instruction names the
+     * motion that covers the axis it is missing. A first attempt that only spun
+     * the board flat produced offsets biased by about 18 percent, because Z
+     * barely moved and its offset became the midpoint of noise. */
+    struct { const char *title; const char *how; uint32_t ms; } phases[3] = {
+        {"flat, turning on the table",
+         "lay it flat and turn it slowly all the way round, twice",
+         12000},
+        {"on each long edge",
+         "stand it on one edge, turn it round, then on the other edge and turn",
+         12000},
+        {"upside down",
+         "flip it face down and turn it round", 12000},
+    };
 
-    const uint32_t total_ms = 30000;
     uint32_t elapsed = 0;
     uint32_t next_report = 0;
-    while (elapsed < total_ms)
+    for (int ph = 0; ph < 3; ++ph)
     {
-        vTaskDelay(pdMS_TO_TICKS(250));
-        elapsed += 250;
-        if (elapsed >= next_report)
+        printf("\n  Phase %d of 3 -- %s\n", ph + 1, phases[ph].title);
+        printf("    %s\n\n", phases[ph].how);
+        fflush(stdout);
+        const uint32_t phase_end = elapsed + phases[ph].ms;
+        next_report = elapsed;          /* report at once on entry */
+        while (elapsed < phase_end)
         {
-            magcal_progress_line(elapsed);
-            next_report += 2500;
-        }
-        if (tdsh_bridge_break_requested())
-        {
-            mag_cal_abort();
-            printf("\ncancelled; offsets unchanged\n");
-            return 1;
+            vTaskDelay(pdMS_TO_TICKS(250));
+            elapsed += 250;
+            if (elapsed >= next_report)
+            {
+                magcal_progress_line(elapsed);
+                next_report += 3000;
+            }
+            if (tdsh_bridge_break_requested())
+            {
+                mag_cal_abort();
+                printf("\ncancelled; offsets unchanged\n");
+                return 1;
+            }
         }
     }
 
@@ -2112,7 +2169,27 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
     magcal_readings(rd_after, sizeof rd_after);
     printf("\n  new offsets : X %d  Y %d  Z %d\n", found.x, found.y, found.z);
     printf("  reading now : %s\n", rd_after);
-    printf("\nIf |B| is now near 48 uT the fit worked. Leave the board flat and\n");
+    /* Per-axis radius is the real fit check: a full tumble sweeps each axis
+     * through the field diameter, so span/2 should be the full field on all
+     * three axes, 46.6 uT here.
+     * An axis short of that was under-rotated, and its offset is the midpoint
+     * of a partial range rather than of the sphere. */
+    {
+        int32_t span[3];
+        mag_cal_spans(span);
+        const double ut_per_count = 100.0 / 6842.0;
+        printf("\n  per-axis radius against %.1f uT:\n", (double)BENCH_FIELD_UT);
+        static const char *ax[3] = {"X", "Y", "Z"};
+        for (int i = 0; i < 3; ++i)
+        {
+            const double r = (double)span[i] / 2.0 * ut_per_count;
+            const double pct = r / (double)BENCH_FIELD_UT * 100.0;
+            printf("    %s %.1f uT  (%3.0f%%)%s\n", ax[i], r, pct,
+                   (pct < 85.0) ? "  <-- under-rotated" : "");
+        }
+    }
+    printf("\nIf |B| is now near %.1f uT the fit worked. Leave the board flat and\n",
+           (double)BENCH_FIELD_UT);
     printf("turn it; the bearing should change smoothly with the turn.\n");
     printf("\n");
 

@@ -295,6 +295,23 @@ bool mag_cal_finish(struct mag_offsets *out, char *report, size_t n)
         return false;
     }
 
+    /* A full tumble sweeps each axis through roughly the full field diameter,
+     * so all three spans should be close, not merely within 3x. A first
+     * attempt caught only 2x spread and produced offsets biased by about 18
+     * percent, which passed the loose gate above. 1.6x still admits a real
+     * tumble on a board that was not turned evenly, while rejecting one axis
+     * that was mostly missed. */
+    if (max_span > min_span * 8 / 5)
+    {
+        if (report && n)
+            snprintf(report, n,
+                     "UNCLEVEN (span %ld/%ld/%ld, %.1fx spread): the weakest "
+                     "axis was under-rotated, which biases its offset",
+                     (long)span[0], (long)span[1], (long)span[2],
+                     (double)max_span / (double)min_span);
+        return false;
+    }
+
     if (out) *out = o;
     const double ut_per_lsb = 100.0 / 6842.0;
     const double radius_ut =
