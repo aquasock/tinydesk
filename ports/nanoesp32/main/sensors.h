@@ -108,6 +108,13 @@ void     mag_cal_diagnose(void);
  * 0.125 is even; below ~0.06 the board never saw that side. */
 double   mag_cal_coverage(void);
 bool     mag_cal_finish(struct mag_offsets *out, char *report, size_t n);
+
+/* Centre of the sphere the samples lie on, in counts: the bias still present.
+ * Adding it to the stored offsets removes the rest. */
+bool     mag_cal_residual(int32_t out[3], double *radius_ut, double *scatter_ut);
+/* Largest axis spread among the samples, in uT. Small means the board was
+ * never turned and no fit can be trusted. */
+double   mag_cal_rotation_ut(void);
 void     mag_cal_abort(void);
 void     mag_cal_set_offsets(const struct mag_offsets *o);
 struct mag_offsets mag_cal_offsets(void);

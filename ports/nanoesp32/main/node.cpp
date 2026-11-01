@@ -1993,6 +1993,144 @@ static void magcal_readings(char *out, size_t n)
              x, y, z, b, h);
 }
 
+/* Verify a calibration from the board's own sampling.
+ *
+ * The host-side test is too slow to judge this: polling telemetry over LXMF
+ * takes about three seconds per reading, so a minute of turning yields twenty
+ * clustered samples and no useful fit. The board polls its magnetometer at
+ * 20 Hz, so the same minute gives over a thousand points.
+ *
+ * The run reports |B| spread -- the direct test of whether the offsets work --
+ * and the centre of the sphere the samples lie on, which is the bias still
+ * left. That centre is offered as a correction, so a calibration that came out
+ * imperfect can be finished without redoing it. */
+static int mag_check(void)
+{
+    printf("\n  TURN THE BOARD SLOWLY THROUGH EVERY ORIENTATION.\n");
+    printf("    Flat, on both long edges, face down, and tip it through\n");
+    printf("    vertical. Keep it moving -- a still board tests nothing.\n");
+    printf("    Press Enter when you have been round a few times.\n\n");
+    fflush(stdout);
+
+    if (!mag_cal_begin())
+    {
+        printf("  cannot start: the magnetometer is not answering\n");
+        return 1;
+    }
+
+    double lo = 1e9, hi = -1e9;
+    uint32_t elapsed = 0, next_report = 0;
+    for (;;)
+    {
+        vTaskDelay(pdMS_TO_TICKS(250));
+        elapsed += 250;
+
+        const int k = link_any_key();
+        if (k == 1)
+        {
+            mag_cal_abort();
+            printf("\ncancelled\n");
+            return 1;
+        }
+        if (k != 0)
+        {
+            printf("\n");
+            break;
+        }
+
+        if (elapsed >= next_report && (elapsed % 1000) == 0)
+        {
+            /* Live |B| from the newest sample, so the operator sees it move. */
+            const struct sensor_snapshot *sn = sensors_latest();
+            const double b = sqrt(sn->mag_x_ut * sn->mag_x_ut +
+                                  sn->mag_y_ut * sn->mag_y_ut +
+                                  sn->mag_z_ut * sn->mag_z_ut);
+            if (b > 0.1)
+            {
+                if (b < lo) lo = b;
+                if (b > hi) hi = b;
+                printf("    %4lus  %5lu samples  |B| %5.2f   range %5.2f..%5.2f  spread %5.2f\n",
+                       (unsigned long)(elapsed / 1000),
+                       (unsigned long)mag_cal_samples(), b, lo, hi, hi - lo);
+                fflush(stdout);
+            }
+            next_report = elapsed;
+        }
+    }
+
+    /* Stop sampling; the point cloud stays for the analysis below. */
+    mag_cal_abort();
+
+    const double rot = mag_cal_rotation_ut();
+    printf("\n  samples %lu, largest axis spread %.1f uT\n",
+           (unsigned long)mag_cal_samples(), rot);
+    if (rot < 20.0)
+    {
+        printf("\n  The board barely moved, so this tests nothing.\n");
+        printf("  Run `magcal check` again and turn it right through.\n");
+        return 1;
+    }
+
+    int32_t res[3] = {0, 0, 0};
+    double radius = 0, scatter = 0;
+    if (!mag_cal_residual(res, &radius, &scatter))
+    {
+        printf("\n  Not enough spread of samples to fix a sphere.\n");
+        printf("  Turn it through more orientations and try again.\n");
+        return 1;
+    }
+
+    const double rmag = sqrt((double)res[0] * res[0] + (double)res[1] * res[1] +
+                             (double)res[2] * res[2]) * (100.0 / 6842.0);
+    printf("  |B| range %.2f .. %.2f uT, spread %.2f uT (%.1f%%)\n",
+           lo, hi, hi - lo, (hi - lo) / ((hi + lo) / 2) * 100.0);
+    printf("  sphere radius %.2f uT, scatter %.2f uT\n", radius, scatter);
+    printf("  residual bias %.2f uT\n", rmag);
+    printf("\n");
+
+    if (rmag < 0.7 && (hi - lo) / ((hi + lo) / 2) < 0.03)
+    {
+        printf("  GOOD: |B| is steady in every orientation. Calibration done.\n");
+        return 0;
+    }
+
+    printf("  NOT yet: |B| still varies by %.1f%%, so %.2f uT of bias is left.\n",
+           (hi - lo) / ((hi + lo) / 2) * 100.0, rmag);
+    if (scatter > 1.5)
+    {
+        printf("  Scatter is %.2f uT, above sensor noise, so there is some\n", scatter);
+        printf("  soft-iron distortion as well; a correction will help but\n");
+        printf("  not make it perfect.\n");
+    }
+    /* res is the centre of the sphere the raw samples lie on, which IS the
+     * full hard-iron offset, not an increment on top of the stored one. So it
+     * replaces them; adding would double-count. */
+    printf("\n  Replace the stored offsets with %.0f %.0f %.0f counts? [Y/n]: ",
+           (double)res[0], (double)res[1], (double)res[2]);
+    fflush(stdout);
+
+    char line[64];
+    if (!shell_read_line("", line, sizeof line))
+        return 0;
+    if (line[0] == 'n' || line[0] == 'N')
+    {
+        printf("  not applied\n");
+        return 0;
+    }
+
+    struct mag_offsets o;
+    o.x = (int16_t)res[0];
+    o.y = (int16_t)res[1];
+    o.z = (int16_t)res[2];
+    mag_cal_set_offsets(&o);
+    if (mag_cal_save())
+        printf("  offsets now X %d Y %d Z %d, saved\n", o.x, o.y, o.z);
+    else
+        printf("  offsets now X %d Y %d Z %d (could not save)\n", o.x, o.y, o.z);
+    printf("  Run `magcal check` again to confirm.\n");
+    return 0;
+}
+
 static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
 {
     (void)session;
@@ -2008,6 +2146,9 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
         return 0;
     }
 
+    if (argc > 1 && strcmp(argv[1], "check") == 0)
+        return mag_check();
+
     if (argc > 1 && strcmp(argv[1], "clear") == 0)
     {
         struct mag_offsets zero = {0, 0, 0};
@@ -2019,7 +2160,7 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
 
     if (argc > 1)
     {
-        printf("usage: magcal [show|clear]\n");
+        printf("usage: magcal [show|check|clear]\n");
         return 1;
     }
 
@@ -2052,13 +2193,11 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
     printf("Before you start:\n");
     printf("  * clear 20 cm around the board: no steel, magnets, speakers,\n");
     printf("    power supply or the monitor\n");
-    printf("  * TUMBLE it, do not just spin it. A flat spin traces a circle\n");
-    printf("    and a circle cannot fix a sphere, so the fit comes out small\n");
-    printf("    and the offsets come out wrong. Tip it on edge and face down\n");
-    printf("  * a bar tracks the fitted radius. It only reaches %.1f uT once\n",
-           (double)BENCH_FIELD_UT * 0.95);
-    printf("    the board has seen the field from enough directions, so the\n");
-    printf("    bar reaching the end IS the proof the offsets are right\n");
+    printf("  * TUMBLE it through every orientation, not just a flat spin:\n");
+    printf("    flat, both long edges, face down, back up\n");
+    printf("  * the span line shows how far each axis has swept. Each needs\n");
+    printf("    about %.0f counts for a trustworthy midpoint\n",
+           (double)(2.0 * BENCH_FIELD_UT * 6842.0 / 100.0 * 0.9));
     printf("\n");
 
     if (!shell_read_line("Press Enter to start sampling, Ctrl+C to cancel: ",
@@ -2087,12 +2226,12 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
     printf("\n  Tumble the board slowly through every orientation:\n");
     printf("    flat, on edge, face down, back up. Not just a flat spin --\n");
     printf("    that traces a circle and cannot fix a sphere.\n\n");
-    printf("  Press Enter when the radius stops changing. Ctrl+C cancels.\n\n");
+    printf("  Press Enter when the span numbers stop growing. Ctrl+C cancels.\n\n");
     fflush(stdout);
 
     uint32_t elapsed = 0;
     uint32_t next_report = 0;
-    double last_r = -1.0;
+    /* spans replace the radius readout; last_r no longer needed */
 
     for (;;)
     {
@@ -2114,15 +2253,15 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
 
         if (elapsed >= next_report && (elapsed % 1000) == 0)
         {
-            const double r = mag_cal_fit_radius_ut();
-            /* Movement over the last second: small means settled. Shown, not
-             * acted on. */
-            const double d = (last_r > 0.0 && r > 0.0) ? fabs(r - last_r) : 0.0;
-            last_r = r;
-            printf("    %4lus  %5lu samples  radius %5.1f uT  %+5.2f  cover %3.0f%%\n",
+            /* Spans are what the min/max estimator uses, so they are what
+             * the operator needs to watch: each one stops growing when that
+             * axis has been swept end to end. */
+            int32_t span[3];
+            mag_cal_spans(span);
+            printf("    %4lus  %5lu samples  span %5ld %5ld %5ld\n",
                    (unsigned long)(elapsed / 1000),
-                   (unsigned long)mag_cal_samples(), r, d,
-                   mag_cal_coverage() * 100.0);
+                   (unsigned long)mag_cal_samples(),
+                   (long)span[0], (long)span[1], (long)span[2]);
             fflush(stdout);
             next_report = elapsed;
         }
@@ -2415,9 +2554,9 @@ static const tdsh_command_t s_cols_cmd = {
 
 static const tdsh_command_t s_magcal_cmd = {
     .name = "magcal",
-    .usage = "magcal [show|clear]",
-    .help = "Walk through magnetometer calibration; 'show' reads the current "
-            "offsets, 'clear' drops them",
+    .usage = "magcal [show|check|clear]",
+    .help = "Calibrate the magnetometer: run with no argument to calibrate, "
+            "'check' to verify and correct, 'show' to read, 'clear' to drop",
     .fn = cmd_magcal,
     .flags = 0,
 };

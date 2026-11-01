@@ -53,7 +53,11 @@ static bool rd(uint8_t addr, uint8_t reg, uint8_t *buf, size_t len)
     i2c_master_dev_handle_t dev = NULL;
     if (i2c_master_bus_add_device(bus, &cfg, &dev) != ESP_OK)
         return false;
-    esp_err_t err = i2c_master_transmit_receive(dev, &reg, 1, buf, len, 100);
+    /* The LIS3MDL and BMP581 only auto-increment the register pointer for a
+     * multi-byte read when the sub-address MSB is set, which is what the
+     * standalone node does. Without it a 6-byte read repeats one register. */
+    const uint8_t sub = (len > 1) ? (uint8_t)(reg | 0x80) : reg;
+    esp_err_t err = i2c_master_transmit_receive(dev, &sub, 1, buf, len, 100);
     i2c_master_bus_rm_device(dev);
     return err == ESP_OK;
 }
@@ -486,6 +490,96 @@ void mag_cal_diagnose(void)
            s_dump_n ? 100.0 * dup / s_dump_n : 0.0);
 }
 
+/* Residual offset still present in the samples, in counts, as the centre of
+ * the sphere they lie on. When the biases are already removed the cloud is a
+ * sphere centred on the origin, so whatever centre is left IS the error.
+ *
+ * This turns a failed calibration into a fixable one: adding these counts to
+ * the stored offsets removes the rest, without the operator having to cover
+ * the sphere perfectly. Returns false when the samples cannot fix a sphere. */
+bool mag_cal_residual(int32_t out[3], double *radius_ut, double *scatter_ut)
+{
+    if (s_dump_n < 50)
+        return false;
+
+    /* Fit in uT so the numbers mean something to the caller. */
+    static double A[4][4], b[4], sol[4];
+    memset(A, 0, sizeof A);
+    memset(b, 0, sizeof b);
+    const double k = 100.0 / 6842.0;
+    for (uint32_t i = 0; i < s_dump_n; ++i)
+    {
+        const double x = s_dump[i][0] * k, y = s_dump[i][1] * k, z = s_dump[i][2] * k;
+        const double row[4] = {2.0 * x, 2.0 * y, 2.0 * z, 1.0};
+        const double rhs = x * x + y * y + z * z;
+        for (int a = 0; a < 4; ++a)
+        {
+            b[a] += row[a] * rhs;
+            for (int c = 0; c < 4; ++c)
+                A[a][c] += row[a] * row[c];
+        }
+    }
+    if (!solve4(A, b, sol))
+        return false;
+
+    const double rsq = sol[3] + sol[0] * sol[0] + sol[1] * sol[1] + sol[2] * sol[2];
+    if (rsq <= 0)
+        return false;
+    const double r = sqrt(rsq);
+
+    if (radius_ut) *radius_ut = r;
+    if (scatter_ut)
+    {
+        double acc = 0;
+        for (uint32_t i = 0; i < s_dump_n; ++i)
+        {
+            const double x = s_dump[i][0] * k - sol[0];
+            const double y = s_dump[i][1] * k - sol[1];
+            const double z = s_dump[i][2] * k - sol[2];
+            const double d = sqrt(x * x + y * y + z * z) - r;
+            acc += d * d;
+        }
+        *scatter_ut = sqrt(acc / s_dump_n);
+    }
+
+    out[0] = (int32_t)lround(sol[0] / k);
+    out[1] = (int32_t)lround(sol[1] / k);
+    out[2] = (int32_t)lround(sol[2] / k);
+    return true;
+}
+
+/* How far the board was actually turned: the largest spread of any axis among
+ * the samples, in uT. Without rotation a fit is meaningless, and this is what
+ * says so rather than reporting a confident number from one pose. */
+double mag_cal_rotation_ut(void)
+{
+    if (s_dump_n < 2)
+        return 0.0;
+    int16_t lo[3] = {32767, 32767, 32767}, hi[3] = {-32768, -32768, -32768};
+    for (uint32_t i = 0; i < s_dump_n; ++i)
+        for (int a = 0; a < 3; ++a)
+        {
+            if (s_dump[i][a] < lo[a]) lo[a] = s_dump[i][a];
+            if (s_dump[i][a] > hi[a]) hi[a] = s_dump[i][a];
+        }
+    double best = 0;
+    for (int a = 0; a < 3; ++a)
+    {
+        const double s = (hi[a] - lo[a]) * (100.0 / 6842.0);
+        if (s > best) best = s;
+    }
+    return best;
+}
+
+/* Calibration is the original TinyNode's: the field sweeps a sphere as the
+ * board turns, so the midpoint of each axis's min and max IS the hard-iron
+ * offset. That routine is proven on this hardware, and keeping it identical
+ * means a result that can be compared with the standalone node's.
+ *
+ * Thresholds are P1's, unchanged: 100 samples minimum, and a fit is rejected
+ * when the smallest axis span is under 1000 counts or the largest exceeds
+ * three times the smallest, which is what a board that was only spun flat
+ * produces. */
 bool mag_cal_finish(struct mag_offsets *out, char *report, size_t n)
 {
     if (report && n) report[0] = '\0';
@@ -505,59 +599,42 @@ bool mag_cal_finish(struct mag_offsets *out, char *report, size_t n)
         return false;
     }
 
-    int32_t span[3];
-    mag_cal_spans(span);
-
-    /* Sphere fit first; min/max only if it cannot be solved. */
-    struct mag_offsets o;
+    const int32_t span[3] = {
+        (int32_t)s_mag_max[0] - s_mag_min[0],
+        (int32_t)s_mag_max[1] - s_mag_min[1],
+        (int32_t)s_mag_max[2] - s_mag_min[2],
+    };
+    int32_t min_span = span[0], max_span = span[0];
+    for (int i = 1; i < 3; ++i)
     {
-        double AtA[4][4], Atb[4], sol[4];
-        memcpy(AtA, s_AtA, sizeof AtA);
-        memcpy(Atb, s_Atb, sizeof Atb);
-        if (!solve4(AtA, Atb, sol))
-        {
-            if (report && n)
-                snprintf(report, n,
-                         "POOR FIT: samples do not fix a sphere (tumble more "
-                         "freely, in all directions)");
-            return false;
-        }
-        /* The fit is in raw counts. A centre outside the sensor's range means
-         * the solve drifted, so fall back rather than write nonsense. */
-        if (fabs(sol[0]) > 32767 || fabs(sol[1]) > 32767 || fabs(sol[2]) > 32767)
-        {
-            if (report && n)
-                snprintf(report, n, "POOR FIT: fit centre out of range");
-            return false;
-        }
-        /* A good fit puts the samples on a sphere of the local field's
-         * radius. Anything far from that is a solve that converged on
-         * something else, so it is rejected rather than saved. */
-        const double rsq = sol[3] + sol[0] * sol[0] + sol[1] * sol[1]
-                           + sol[2] * sol[2];
-        const double r_counts = rsq > 0 ? sqrt(rsq) : 0.0;
-        const double r_ut = r_counts * (100.0 / 6842.0);
-        if (r_ut < BENCH_FIELD_UT_MIN || r_ut > BENCH_FIELD_UT_MAX)
-        {
-            if (report && n)
-                snprintf(report, n,
-                         "POOR FIT: radius %.1f uT is implausible for %.1f uT "
-                         "here (a magnet or steel within 20 cm?)",
-                         r_ut, (double)46.6);
-            return false;
-        }
-        o.x = (int16_t)lround(sol[0]);
-        o.y = (int16_t)lround(sol[1]);
-        o.z = (int16_t)lround(sol[2]);
+        if (span[i] < min_span) min_span = span[i];
+        if (span[i] > max_span) max_span = span[i];
     }
 
-    if (out) *out = o;
+    struct mag_offsets o;
+    o.x = (int16_t)(((int32_t)s_mag_min[0] + s_mag_max[0]) / 2);
+    o.y = (int16_t)(((int32_t)s_mag_min[1] + s_mag_max[1]) / 2);
+    o.z = (int16_t)(((int32_t)s_mag_min[2] + s_mag_max[2]) / 2);
+
     const double ut_per_lsb = 100.0 / 6842.0;
     const double radius_ut =
         (double)((span[0] + span[1] + span[2]) / 6) * ut_per_lsb;
+
+    if (min_span < 1000 || max_span > min_span * 3)
+    {
+        if (report && n)
+            snprintf(report, n,
+                     "POOR FIT (n=%lu span %ld/%ld/%ld): rotate through all "
+                     "orientations",
+                     (unsigned long)s_mag_cal_n, (long)span[0], (long)span[1],
+                     (long)span[2]);
+        return false;
+    }
+
+    if (out) *out = o;
     if (report && n)
         snprintf(report, n,
-                 "n=%lu, sphere fit, span %ld/%ld/%ld counts, radius ~%.1f uT",
+                 "n=%lu, span %ld/%ld/%ld counts, radius ~%.1f uT",
                  (unsigned long)s_mag_cal_n, (long)span[0], (long)span[1],
                  (long)span[2], radius_ut);
     return true;
