@@ -28,9 +28,9 @@
  * here instead of editing a header shared with the C sources. */
 extern "C" bool tdsh_bridge_break_requested(void);
 
-/* True once the desktop is drawing to USB. Declared here rather than pulled
- * from link.h, which the desktop and the shell both include. */
-extern "C" bool link_usb_is_desktop(void);
+/* True once the console is writing to USB. Declared here rather than pulled
+ * from link.h. */
+extern "C" bool link_usb_is_console(void);
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -688,14 +688,13 @@ static void node_log(const char *fmt, ...)
         fclose(fp);
     }
 
-    /* And to USB, but only while USB is not carrying the desktop. Once the
-     * desktop has written a frame there, further log lines land in the middle
-     * of its screen and corrupt the display; /fs/node.log keeps every line
-     * regardless, and the desktop's Log Viewer reads it. The early window --
-     * USB attached but the desktop not yet drawing -- is exactly when a boot
-     * log is worth watching over a cable, which is why this is a flag rather
-     * than a blanket disable. */
-    if (usb_serial_jtag_is_connected() && !link_usb_is_desktop())
+    /* And to USB, but only until the console starts writing there. After that
+     * these lines would land in the middle of the shell's screen and corrupt
+     * it; /fs/node.log keeps every line regardless, and `cat /fs/node.log`
+     * reads it back from the console. The early window -- USB attached but the
+     * shell not yet drawing -- is exactly when a boot log is worth watching
+     * over a cable. */
+    if (usb_serial_jtag_is_connected() && !link_usb_is_console())
     {
         int done = 0;
         while (done < n)

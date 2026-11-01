@@ -21,20 +21,14 @@ set(IDF_TARGET "esp32s3" CACHE STRING "tinydesk target")
 
 # Screen and terminal buffer limits, in cells.
 #
-# These are an upper bound, not the layout: the desktop asks the active sink
-# how big the terminal is and sizes itself to the answer, so a small window
-# uses a small grid whatever these say. They must be cache variables set
-# BEFORE project(), because the tinydesk component is configured before main/
-# and reads them then.
-# 160 x 50 is the largest grid a host terminal may fill over USB: 160*50*8 =
-# 64 KB per screen, two screens = 128 KB, all of it in PSRAM through
-# extram.lf. The panel does not use these; its 40 x 15 grid is pinned in
-# link_nano.c from LCD_W/LCD_H, and the desktop re-lays-out on the size the
-# active sink reports. Scrollback is cheap and useful now that there is a real
-# terminal to read it in.
-set(TD_MAX_COLS     160 CACHE STRING "screen cells across, upper bound for a USB terminal")
-set(TD_MAX_ROWS     50 CACHE STRING "screen cells down, upper bound for a USB terminal")
-set(TD_VT_SCROLLBACK 200 CACHE STRING "terminal scrollback lines")
+# This image runs a console, not a desktop, so these are only an upper bound
+# that nothing large uses: the shell's line editor asks the active sink for its
+# width (40 columns on the panel, the host terminal's own width over USB) and
+# the desktop screen buffers are never allocated because nothing references
+# them. Kept at the panel's size so an accidental reference stays cheap.
+set(TD_MAX_COLS     40 CACHE STRING "screen cells across (panel grid)")
+set(TD_MAX_ROWS     15 CACHE STRING "screen cells down (panel grid)")
+set(TD_VT_SCROLLBACK 50 CACHE STRING "terminal scrollback lines")
 list(APPEND EXTRA_COMPONENT_DIRS
     "${TDSH_SDK_ROOT}/ports/esp_idf/components"
     "${TD_ROOT}/ports/esp_idf/components"
