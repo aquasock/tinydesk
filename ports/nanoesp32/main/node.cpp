@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "driver/usb_serial_jtag.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -448,15 +449,41 @@ static microStore::FileSystem s_filesystem;
  * fact; it is also what the desktop reads for its status line. */
 static void node_log(const char *fmt, ...)
 {
-    FILE *fp = fopen("/fs/node.log", "a");
-    if (!fp)
-        return;
+    char line[192];
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(fp, fmt, ap);
+    int n = vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
-    fputc('\n', fp);
-    fclose(fp);
+    if (n <= 0)
+        return;
+    if (n > (int)sizeof(line) - 2)
+        n = (int)sizeof(line) - 2;
+    line[n++] = '\n';
+
+    /* To the file, for a board running headless. */
+    FILE *fp = fopen("/fs/node.log", "a");
+    if (fp)
+    {
+        fwrite(line, 1, (size_t)n, fp);
+        fclose(fp);
+    }
+
+    /* And to USB, so state can be watched live over a serial terminal. Reading
+     * it back out of flash has been the source of several wrong conclusions:
+     * the partition survives a firmware flash, so old lines read as new boots.
+     * USB is free in this build -- the desktop is on the panel. */
+    if (usb_serial_jtag_is_connected())
+    {
+        int done = 0;
+        while (done < n)
+        {
+            int chunk = n - done > 64 ? 64 : n - done;
+            if (usb_serial_jtag_write_bytes(line + done, (size_t)chunk,
+                                            pdMS_TO_TICKS(20)) != chunk)
+                break;
+            done += chunk;
+        }
+    }
 }
 
 static void node_task(void *arg)
