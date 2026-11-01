@@ -254,6 +254,23 @@ int link_write(const uint8_t *buf, int len)
     return len;
 }
 
+/* Any key typed during a long command. Returns 0 for none, 1 for Ctrl+C,
+ * 2 for anything else.
+ *
+ * tdsh_bridge_break_requested() only reports Ctrl+C -- every other key is
+ * stashed for the shell's next read, which is right for a command that ignores
+ * input but wrong for one the operator needs to be able to end. A calibration
+ * run that could only be stopped by a key that also threw the work away left
+ * the operator with no way out, so this reports "something was pressed" and
+ * the caller decides what it means. */
+int link_any_key(void)
+{
+    uint8_t b = 0;
+    if (usb_serial_jtag_read_bytes(&b, 1, 0) <= 0)
+        return 0;
+    return (b == 0x03) ? 1 : 2;
+}
+
 /* Non-blocking Ctrl+C check for a command that is running and owns the
  * console. Anything that is not Ctrl+C is stashed for the shell's next read,
  * which is what keeps type-ahead from being eaten while a command runs. */

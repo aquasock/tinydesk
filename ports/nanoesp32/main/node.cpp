@@ -32,6 +32,9 @@ extern "C" bool tdsh_bridge_break_requested(void);
  * from link.h. */
 extern "C" bool link_usb_is_console(void);
 
+/* Any key typed during a long command: 0 none, 1 Ctrl+C, 2 other. */
+extern "C" int link_any_key(void);
+
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -2071,120 +2074,77 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
         return 1;
     }
 
-    /* The run ends when the fit stops changing, not when a number is reached.
+    /* The operator decides when to stop: "press Enter when the numbers
+     * stabilise". Nothing here ends the run on its own.
      *
-     * Two earlier versions got this wrong in different ways. Per-axis
-     * coverage measured how far each axis moved, which is not the same as
-     * spanning the sphere. A target of 95 percent of the nominal field was
-     * worse: if anything within 20 cm compresses the local field, the fitted
-     * radius plateaus BELOW that target and the run can never finish, however
-     * long the operator tumbles -- it just hit the time cap and stopped, which
-     * is exactly what "collected slowly then abruptly ended" was.
-     *
-     * Convergence is the honest signal. As the samples spread over the sphere
-     * the fit settles on a stable centre and radius; while the operator is
-     * still turning into new orientations it keeps moving. So: report the
-     * radius, and finish once it has held still for a few seconds with enough
-     * samples behind it. The value it settles on is then checked against what
-     * is plausible for a local field, which catches a genuinely bad
-     * environment without making a good fit impossible.
-     *
-     * There is no time cap. Ctrl+C stops it at any point. */
-    const double stable_band = 0.25;   /* uT the radius may drift and count as settled */
-    const int stable_needed = 6;       /* ticks at 1 Hz */
-    const uint32_t min_samples = 300;
-
-    printf("\n  Tumble the board slowly through every orientation.\n");
-    printf("    Turn it flat, tip it on edge, face down, back up -- not just\n");
-    printf("    a flat spin, which traces a circle and cannot fix a sphere.\n");
-    printf("    The number below settles once the sphere is known. Ctrl+C stops.\n\n");
+     * Three earlier versions tried to detect completion automatically --
+     * per-axis span, then a nominal radius target, then convergence plus
+     * octant coverage -- and each managed to either stop early on bad data or
+     * refuse to stop at all. The person turning the board can see whether the
+     * radius has settled; the code cannot see the board. So the code reports
+     * and the person decides, which is also the only version that cannot trap
+     * someone in a loop whose exit condition it failed to reach. */
+    printf("\n  Tumble the board slowly through every orientation:\n");
+    printf("    flat, on edge, face down, back up. Not just a flat spin --\n");
+    printf("    that traces a circle and cannot fix a sphere.\n\n");
+    printf("  Press Enter when the radius stops changing. Ctrl+C cancels.\n\n");
     fflush(stdout);
 
     uint32_t elapsed = 0;
     uint32_t next_report = 0;
     double last_r = -1.0;
-    int stable = 0;
-    bool converged = false;
-    /* Not a stop condition, a failure report: if the radius never settles the
-     * operator needs to be told why rather than left watching a bar. Five
-     * minutes is far longer than a real tumble takes. */
-    const uint32_t warn_at = 300000;
 
     for (;;)
     {
         vTaskDelay(pdMS_TO_TICKS(250));
         elapsed += 250;
-        if (elapsed >= warn_at)
-        {
-            mag_cal_abort();
-            printf("\n  Radius never settled after %lu s (last %.1f uT).\n",
-                   (unsigned long)(elapsed / 1000), last_r);
-            printf("  That usually means the board kept seeing new directions\n");
-            printf("  -- which is fine, just press Ctrl+C sooner. Offsets NOT\n");
-            printf("  changed.\n");
-            return 1;
-        }
-        if (elapsed >= next_report && (elapsed % 1000) == 0)
-        {
-            const double r = mag_cal_fit_radius_ut();
 
-            /* Settled when the radius has barely moved since the last tick. */
-            if (last_r > 0.0 && r > 0.0 && fabs(r - last_r) < stable_band)
-                stable++;
-            else
-                stable = 0;
-            last_r = r;
-
-            int bars = (int)(r / (BENCH_FIELD_UT * 1.2) * 10.0);
-            if (bars < 0) bars = 0;
-            if (bars > 10) bars = 10;
-            char meter[14];
-            int k = 0;
-            for (int b = 0; b < 10; ++b)
-                meter[k++] = (b < bars) ? '#' : '.';
-            meter[k] = '\0';
-            const double cov_pct = mag_cal_coverage() * 100.0;
-            printf("    [%s] %5lu samples  radius %5.1f uT  cover %3.0f%%  %s\n",
-                   meter, (unsigned long)mag_cal_samples(), r, cov_pct,
-                   (stable >= stable_needed && cov_pct >= 6.0) ? "settled" : "");
-            fflush(stdout);
-
-            next_report = elapsed;
-            /* Stability alone is not enough: holding the board still also
-             * stops the radius moving. A run that only ever turned it flat
-             * sat at a stable 38 uT with one octant holding 5 percent of the
-             * samples and Z never swept. Coverage says whether more tumbling
-             * would still help, so both conditions are required. */
-            const double cov = mag_cal_coverage();
-            if (stable >= stable_needed && mag_cal_samples() >= min_samples &&
-                cov >= 0.06)
-            {
-                converged = true;
-                break;
-            }
-        }
-        if (tdsh_bridge_break_requested())
+        const int k = link_any_key();
+        if (k == 1)                       /* Ctrl+C: throw the samples away */
         {
             mag_cal_abort();
             printf("\ncancelled; offsets unchanged\n");
             return 1;
         }
-    }
+        if (k != 0)                       /* Enter or any other key */
+        {
+            printf("\n");
+            break;
+        }
 
-    if (!converged)
-    {
-        mag_cal_abort();
-        printf("\ncancelled; offsets unchanged\n");
-        return 1;
+        if (elapsed >= next_report && (elapsed % 1000) == 0)
+        {
+            const double r = mag_cal_fit_radius_ut();
+            /* Movement over the last second: small means settled. Shown, not
+             * acted on. */
+            const double d = (last_r > 0.0 && r > 0.0) ? fabs(r - last_r) : 0.0;
+            last_r = r;
+            printf("    %4lus  %5lu samples  radius %5.1f uT  %+5.2f  cover %3.0f%%\n",
+                   (unsigned long)(elapsed / 1000),
+                   (unsigned long)mag_cal_samples(), r, d,
+                   mag_cal_coverage() * 100.0);
+            fflush(stdout);
+            next_report = elapsed;
+        }
     }
 
     struct mag_offsets found;
     char report[192];
     const bool ok = mag_cal_finish(&found, report, sizeof report);
 
-    printf("\nFit settled. Sampling stopped.\n");
+    printf("\nSampling stopped.\n");
     printf("  %s\n", report);
+
+    /* Diagnostics matter most when the fit failed, so they print either way. */
     mag_cal_diagnose();
+
+    if (!ok)
+    {
+        printf("\n  That is not enough to fix an offset, so nothing was\n");
+        printf("  changed. Run `magcal` again and tumble further -- and for\n");
+        printf("  longer than a few seconds.\n");
+        return 1;
+    }
 
     /* The radius is what the fit measured. It is NOT compared against the
      * IGRF value for the bench's coordinates: an undisturbed model gives
@@ -2215,30 +2175,6 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
     magcal_readings(rd_after, sizeof rd_after);
     printf("\n  new offsets : X %d  Y %d  Z %d\n", found.x, found.y, found.z);
     printf("  reading now : %s\n", rd_after);
-    /* Per-axis radius is the real fit check: a full tumble sweeps each axis
-     * through the field diameter, so span/2 should be the full field on all
-     * three axes, 46.6 uT here.
-     * An axis short of that was under-rotated, and its offset is the midpoint
-     * of a partial range rather than of the sphere. */
-    {
-        int32_t span[3];
-        mag_cal_spans(span);
-        const double ut_per_count = 100.0 / 6842.0;
-        printf("\n  per-axis radius against %.1f uT:\n", (double)BENCH_FIELD_UT);
-        static const char *ax[3] = {"X", "Y", "Z"};
-        for (int i = 0; i < 3; ++i)
-        {
-            const double r = (double)span[i] / 2.0 * ut_per_count;
-            const double pct = r / (double)BENCH_FIELD_UT * 100.0;
-            printf("    %s %.1f uT  (%3.0f%%)%s\n", ax[i], r, pct,
-                   (pct < 85.0) ? "  <-- under-rotated" : "");
-        }
-    }
-    printf("\nIf |B| is now near %.1f uT the fit worked. Leave the board flat and\n",
-           (double)BENCH_FIELD_UT);
-    printf("turn it; the bearing should change smoothly with the turn.\n");
-    printf("\n");
-
     if (!shell_read_line("Save these offsets to flash? [Y/n]: ", line, sizeof line))
     {
         printf("not saved; they apply until the next reboot\n");
