@@ -49,9 +49,12 @@
 
 static const char *TAG = "node";
 
-#define WIFI_CONF      "/fs/etc/wifi.conf"
-#define IDENTITY_FILE  "/fs/reticulum/identity"
-#define RETICULUM_DIR  "/fs/reticulum"
+#define WIFI_CONF     "/fs/etc/wifi.conf"
+/* Paths handed to microStore are relative to the mount: the MountedFileSystem
+ * prefixes "/fs", so "/identity" lands on /fs/identity. An absolute "/fs/..."
+ * would become "/fs/fs/..." and silently fail to write. */
+#define IDENTITY_FILE "/identity"
+#define RETICULUM_DIR "/reticulum"
 
 /* TinyNode announces on a random 90-300 minute schedule. Same policy here:
  * a fixed interval makes every node in earshot announce together. */
@@ -105,12 +108,16 @@ static bool read_wifi_conf(char *ssid, size_t ssid_len, char *pass, size_t pass_
         char *key = line;
         char *val = eq + 1;
         /* trim */
-        while (*key == ' ' || *key == '\t') key++;
+        while (*key == ' ' || *key == '\t')
+            key++;
         char *ke = key + strlen(key);
-        while (ke > key && (ke[-1] == ' ' || ke[-1] == '\t')) *--ke = '\0';
-        while (*val == ' ' || *val == '\t') val++;
+        while (ke > key && (ke[-1] == ' ' || ke[-1] == '\t'))
+            *--ke = '\0';
+        while (*val == ' ' || *val == '\t')
+            val++;
         char *ve = val + strlen(val);
-        while (ve > val && (ve[-1] == '\n' || ve[-1] == '\r' || ve[-1] == ' ')) *--ve = '\0';
+        while (ve > val && (ve[-1] == '\n' || ve[-1] == '\r' || ve[-1] == ' '))
+            *--ve = '\0';
 
         if (strcmp(key, "ssid") == 0)
             snprintf(ssid, ssid_len, "%s", val);
@@ -238,12 +245,21 @@ static bool s_announced_once;
 
 class MountedFile : public microStore::FileImpl
 {
-public:
-    MountedFile(FILE *fp, const std::string &name) : _fp(fp), _name(name) {}
-    ~MountedFile() override { close(); }
+  public:
+    MountedFile(FILE *fp, const std::string &name)
+        : _fp(fp), _name(name)
+    {
+    }
+    ~MountedFile() override
+    {
+        close();
+    }
 
-protected:
-    const char *name() const override { return _name.c_str(); }
+  protected:
+    const char *name() const override
+    {
+        return _name.c_str();
+    }
     size_t size() const override
     {
         if (!_fp)
@@ -262,10 +278,22 @@ protected:
             _fp = nullptr;
         }
     }
-    int read() override { return _fp ? fgetc(_fp) : -1; }
-    size_t write(uint8_t ch) override { return _fp && fputc(ch, _fp) != EOF ? 1 : 0; }
-    size_t read(uint8_t *buf, size_t n) override { return _fp ? fread(buf, 1, n, _fp) : 0; }
-    size_t write(const uint8_t *buf, size_t n) override { return _fp ? fwrite(buf, 1, n, _fp) : 0; }
+    int read() override
+    {
+        return _fp ? fgetc(_fp) : -1;
+    }
+    size_t write(uint8_t ch) override
+    {
+        return _fp && fputc(ch, _fp) != EOF ? 1 : 0;
+    }
+    size_t read(uint8_t *buf, size_t n) override
+    {
+        return _fp ? fread(buf, 1, n, _fp) : 0;
+    }
+    size_t write(const uint8_t *buf, size_t n) override
+    {
+        return _fp ? fwrite(buf, 1, n, _fp) : 0;
+    }
     int available() override
     {
         if (!_fp)
@@ -285,11 +313,15 @@ protected:
             ungetc(c, _fp);
         return c;
     }
-    size_t tell() override { return _fp ? (size_t)ftell(_fp) : 0; }
+    size_t tell() override
+    {
+        return _fp ? (size_t)ftell(_fp) : 0;
+    }
     long seek(uint32_t pos, microStore::SeekMode mode) override
     {
-        int whence = mode == microStore::SeekModeSet ? SEEK_SET
-                   : mode == microStore::SeekModeCur ? SEEK_CUR : SEEK_END;
+        int whence = mode == microStore::SeekModeSet   ? SEEK_SET
+                     : mode == microStore::SeekModeCur ? SEEK_CUR
+                                                       : SEEK_END;
         return _fp && fseek(_fp, (long)pos, whence) == 0 ? (long)pos : -1;
     }
     void flush() override
@@ -297,17 +329,23 @@ protected:
         if (_fp)
             fflush(_fp);
     }
-    bool isValid() const override { return _fp != nullptr; }
+    bool isValid() const override
+    {
+        return _fp != nullptr;
+    }
 
-private:
+  private:
     FILE *_fp;
     std::string _name;
 };
 
 class MountedFileSystem : public microStore::FileSystemImpl
 {
-public:
-    explicit MountedFileSystem(const char *mount) : _mount(mount) {}
+  public:
+    explicit MountedFileSystem(const char *mount)
+        : _mount(mount)
+    {
+    }
 
     bool init(bool reformatOnFail = true) override
     {
@@ -318,13 +356,17 @@ public:
     microStore::File open(const char *path, microStore::File::Mode mode, const bool create = false) override
     {
         using M = microStore::File;
-        const char *m = mode == M::ModeRead ? "rb"
-                      : mode == M::ModeWrite ? (create ? "wb" : "r+b")
-                      : mode == M::ModeAppend ? "ab"
-                      : mode == M::ModeReadAppend ? "a+b"
-                      : "r+b";
+        const char *m = mode == M::ModeRead         ? "rb"
+                        : mode == M::ModeWrite      ? (create ? "wb" : "r+b")
+                        : mode == M::ModeAppend     ? "ab"
+                        : mode == M::ModeReadAppend ? "a+b"
+                                                    : "r+b";
         FILE *fp = fopen(full(path).c_str(), m);
-        if (!fp && create && mode != M::ModeRead)
+        /* microStore's writeFile() calls open(ModeWrite) with create=false and
+         * expects it to create; "r+b" fails on a missing file, so fall back to
+         * creating. Without this, every Reticulum write -- the identity, the
+         * path store, the transport identity -- silently returns zero bytes. */
+        if (!fp && mode != M::ModeRead)
             fp = fopen(full(path).c_str(), "w+b");
         return microStore::File(fp ? new MountedFile(fp, path) : nullptr);
     }
@@ -334,13 +376,22 @@ public:
         struct stat st;
         return stat(full(path).c_str(), &st) == 0;
     }
-    bool remove(const char *path) override { return ::remove(full(path).c_str()) == 0; }
+    bool remove(const char *path) override
+    {
+        return ::remove(full(path).c_str()) == 0;
+    }
     bool rename(const char *from, const char *to) override
     {
         return ::rename(full(from).c_str(), full(to).c_str()) == 0;
     }
-    bool mkdir(const char *path) override { return ::mkdir(full(path).c_str(), 0755) == 0; }
-    bool rmdir(const char *path) override { return ::rmdir(full(path).c_str()) == 0; }
+    bool mkdir(const char *path) override
+    {
+        return ::mkdir(full(path).c_str(), 0755) == 0;
+    }
+    bool rmdir(const char *path) override
+    {
+        return ::rmdir(full(path).c_str()) == 0;
+    }
     bool isDirectory(const char *path) override
     {
         struct stat st;
@@ -348,7 +399,7 @@ public:
     }
 
     std::list<std::string> listDirectory(const char *path,
-        Callbacks::DirectoryListing callback = nullptr) override
+                                         Callbacks::DirectoryListing callback = nullptr) override
     {
         std::list<std::string> out;
         DIR *d = opendir(full(path).c_str());
@@ -367,10 +418,16 @@ public:
         return out;
     }
 
-    size_t storageSize() override { return 0; }
-    size_t storageAvailable() override { return 0; }
+    size_t storageSize() override
+    {
+        return 0;
+    }
+    size_t storageAvailable() override
+    {
+        return 0;
+    }
 
-private:
+  private:
     std::string full(const char *path) const
     {
         std::string p(path ? path : "");
@@ -440,10 +497,26 @@ static void node_task(void *arg)
     mkdir("/fs/storage", 0755);
     mkdir("/fs/path_store", 0755);
     mkdir("/fs/cache", 0755);
+    mkdir("/fs/reticulum", 0755);
     s_filesystem = new MountedFileSystem("/fs");
     bool fs_ok = s_filesystem.init();
     RNS::Utilities::OS::register_filesystem(s_filesystem);
     node_log("rns: storage /fs init=%d", (int)fs_ok);
+
+    /* Probe the adapter directly, so a write failure is attributed to the
+     * adapter rather than to whatever Reticulum happened to be doing. */
+    {
+        microStore::File probe = s_filesystem.open("/probe.txt",
+                                                   microStore::File::ModeWrite, true);
+        bool ok_open = probe.isValid();
+        size_t wrote = ok_open ? probe.write((const uint8_t *)"probe", 5) : 0;
+        probe.close();
+        struct stat pst;
+        bool exists_abs = stat("/fs/probe.txt", &pst) == 0;
+        node_log("probe: open=%d write=%u file=%d size=%ld", (int)ok_open,
+                 (unsigned)wrote, (int)exists_abs,
+                 exists_abs ? (long)pst.st_size : -1L);
+    }
 
     node_log("rns: constructing");
     s_reticulum = RNS::Reticulum();
@@ -458,8 +531,11 @@ static void node_task(void *arg)
      * truthy but uninitialised, and hashing it faults -- so the file's
      * existence is checked first rather than trusting the result. */
     node_log("rns: loading identity");
+    /* Existence is checked through the mount, matching how it is written. */
+    char id_abs[96];
+    snprintf(id_abs, sizeof(id_abs), "/fs%s", IDENTITY_FILE);
     struct stat id_st;
-    if (stat(IDENTITY_FILE, &id_st) == 0)
+    if (stat(id_abs, &id_st) == 0)
     {
         s_identity = RNS::Identity::from_file(IDENTITY_FILE);
         node_log("rns: identity from file (%s)", s_identity ? "ok" : "unreadable");
@@ -472,8 +548,9 @@ static void node_task(void *arg)
     {
         s_identity = RNS::Identity();
         if (!s_identity.to_file(IDENTITY_FILE))
-            ESP_LOGW(TAG, "could not persist identity; it will change on reboot");
-        node_log("rns: identity generated");
+            node_log("rns: IDENTITY NOT PERSISTED (%s)", IDENTITY_FILE);
+        else
+            node_log("rns: identity written to %s", IDENTITY_FILE);
     }
     node_log("rns: hashing identity");
     {
@@ -488,22 +565,25 @@ static void node_task(void *arg)
 
     node_log("rns: free heap=%u", (unsigned)esp_get_free_heap_size());
     node_log("rns: creating interface");
-    try {
-    s_udp = new UDPInterface();
-    node_log("rns: interface allocated");
-    s_udp.mode(RNS::Type::Interface::MODE_GATEWAY);
-    RNS::Transport::register_interface(s_udp);
-    node_log("rns: interface registered");
-    bool up = s_udp.start();
-    node_log("rns: interface start=%d", (int)up);
+    try
+    {
+        s_udp = new UDPInterface();
+        node_log("rns: interface allocated");
+        s_udp.mode(RNS::Type::Interface::MODE_GATEWAY);
+        RNS::Transport::register_interface(s_udp);
+        node_log("rns: interface registered");
+        bool up = s_udp.start();
+        node_log("rns: interface start=%d", (int)up);
     }
-    catch (const std::exception& e) {
+    catch (const std::exception &e)
+    {
         node_log("rns: EXCEPTION %s", e.what());
         s_state = NODE_FAILED;
         vTaskDelete(NULL);
         return;
     }
-    catch (...) {
+    catch (...)
+    {
         node_log("rns: EXCEPTION (unknown)");
         s_state = NODE_FAILED;
         vTaskDelete(NULL);
@@ -515,7 +595,7 @@ static void node_task(void *arg)
 
     uint32_t elapsed = 0;
     uint32_t next_announce = (ANNOUNCE_MIN_S +
-        (esp_random() % (ANNOUNCE_MAX_S - ANNOUNCE_MIN_S))) ;
+                              (esp_random() % (ANNOUNCE_MAX_S - ANNOUNCE_MIN_S)));
     s_announced_once = false;
 
     for (;;)
@@ -531,7 +611,7 @@ static void node_task(void *arg)
             s_announce_requested = false;
             elapsed = 0;
             next_announce = (ANNOUNCE_MIN_S +
-                (esp_random() % (ANNOUNCE_MAX_S - ANNOUNCE_MIN_S)));
+                             (esp_random() % (ANNOUNCE_MAX_S - ANNOUNCE_MIN_S)));
         }
 
         if (s_persist_requested)
@@ -560,24 +640,40 @@ void node_start(void)
     xTaskCreate(node_task, "rns", 32768, NULL, 4, NULL);
 }
 
-node_state_t node_state(void) { return s_state; }
+node_state_t node_state(void)
+{
+    return s_state;
+}
 
 const char *node_state_text(void)
 {
     switch (s_state)
     {
-    case NODE_WIFI:         return "wifi connecting";
-    case NODE_NO_CONFIG:    return "no wifi credentials";
-    case NODE_WIFI_FAILED:  return "wifi failed";
-    case NODE_RETICULUM:    return "reticulum starting";
-    case NODE_READY:        return "online";
-    case NODE_FAILED:       return "reticulum failed";
-    default:                return "off";
+    case NODE_WIFI:
+        return "wifi connecting";
+    case NODE_NO_CONFIG:
+        return "no wifi credentials";
+    case NODE_WIFI_FAILED:
+        return "wifi failed";
+    case NODE_RETICULUM:
+        return "reticulum starting";
+    case NODE_READY:
+        return "online";
+    case NODE_FAILED:
+        return "reticulum failed";
+    default:
+        return "off";
     }
 }
 
-const char *node_identity_hex(void) { return s_identity_hex; }
-const char *node_ip(void) { return s_ip; }
+const char *node_identity_hex(void)
+{
+    return s_identity_hex;
+}
+const char *node_ip(void)
+{
+    return s_ip;
+}
 
 void node_get_stats(struct node_stats *out)
 {
@@ -585,5 +681,11 @@ void node_get_stats(struct node_stats *out)
         *out = s_stats;
 }
 
-void node_persist(void) { s_persist_requested = true; }
-void node_announce_now(void) { s_announce_requested = true; }
+void node_persist(void)
+{
+    s_persist_requested = true;
+}
+void node_announce_now(void)
+{
+    s_announce_requested = true;
+}
