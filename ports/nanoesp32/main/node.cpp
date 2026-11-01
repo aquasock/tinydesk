@@ -1990,35 +1990,6 @@ static void magcal_readings(char *out, size_t n)
              x, y, z, b, h);
 }
 
-/* One row per axis, because the useful question during a run is which axis is
- * still under-covered, not what the average is. A tumble that only spins the
- * board flat leaves Z at nearly zero span, and its offset would then be the
- * midpoint of noise. */
-static void magcal_progress_line(uint32_t elapsed_ms)
-{
-    int32_t span[3];
-    mag_cal_spans(span);
-    static const char *axis[3] = {"X", "Y", "Z"};
-    printf("  %4.1fs  %5lu samples\n", (double)elapsed_ms / 1000.0,
-           (unsigned long)mag_cal_samples());
-    for (int i = 0; i < 3; ++i)
-    {
-        /* A full turn sweeps 2 * 46.6 uT = 6224 counts at this scale, so a
-         * span of 3000 counts is about half the diameter. The bar fills at
-         * 3000, which is the point where more rotation stops helping much. */
-        int bars = (int)(span[i] / 250);
-        if (bars > 12) bars = 12;
-        char meter[16];
-        int k = 0;
-        for (int b = 0; b < 12; ++b)
-            meter[k++] = (b < bars) ? '#' : '.';
-        meter[k] = '\0';
-        const char *mark = (bars >= 12) ? "ok" : (bars >= 6) ? "   " : " <--";
-        printf("    %s [%s] %5ld%s\n", axis[i], meter, (long)span[i], mark);
-    }
-    fflush(stdout);
-}
-
 static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
 {
     (void)session;
@@ -2078,13 +2049,13 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
     printf("Before you start:\n");
     printf("  * clear 20 cm around the board: no steel, magnets, speakers,\n");
     printf("    power supply or the monitor\n");
-    printf("  * it asks for one axis at a time and tells you which motion\n");
-    printf("    covers it. Turn slowly and steadily; full coverage is not\n");
-    printf("    required, but the board has to see the field from several\n");
-    printf("    directions for the fit to mean anything\n");
-    printf("  * the offsets come from a sphere fit over every sample, so a\n");
-    printf("    near-full turn is plenty. The fit is checked against the\n");
-    printf("    local field and rejected if it does not describe it\n");
+    printf("  * TUMBLE it, do not just spin it. A flat spin traces a circle\n");
+    printf("    and a circle cannot fix a sphere, so the fit comes out small\n");
+    printf("    and the offsets come out wrong. Tip it on edge and face down\n");
+    printf("  * a bar tracks the fitted radius. It only reaches %.1f uT once\n",
+           (double)BENCH_FIELD_UT * 0.95);
+    printf("    the board has seen the field from enough directions, so the\n");
+    printf("    bar reaching the end IS the proof the offsets are right\n");
     printf("\n");
 
     if (!shell_read_line("Press Enter to start sampling, Ctrl+C to cancel: ",
@@ -2100,128 +2071,84 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
         return 1;
     }
 
-    /* One axis at a time, and each axis is done when it has actually seen the
-     * field -- not when a timer runs out.
+    /* One instruction, one progress number, and the progress number is the
+     * pass condition.
      *
-     * That distinction matters. A fixed 30 s tumble tells the user nothing
-     * about whether they covered what was needed; a first attempt spun the
-     * board flat for the whole window, which sweeps X and Y but leaves Z
-     * nearly still, and its offset came out as the midpoint of noise. The
-     * result was 85 percent of the true field with one axis short.
+     * Per-axis coverage was the wrong idea: it measures how far each axis
+     * moved, not whether the samples actually span the sphere. A flat spin
+     * moves X and Y a long way while tracing a circle, and a circle does not
+     * fix a sphere -- the fit then lands on a small sphere (radius ~38 uT
+     * instead of 46.6) with an offset about 8 uT wrong.
      *
-     * So each axis has a target. A full turn sweeps the field diameter, so a
-     * calibrated axis should span 2 * 46.6 uT = 6377 counts; 70 percent of
-     * that is enough for a trustworthy midpoint. The axis is marked done only
-     * when its span gets there, and the user keeps turning until it does.
+     * The fitted radius is the honest measure. It only approaches the true
+     * field once the samples are spread over enough of the sphere, so
+     * watching it climb IS watching orientation diversity improve. When it
+     * reaches the local field, the fit describes the field and the offsets
+     * are right.
      *
-     * The motions follow from the geometry: turning the board flat spins the
-     * field in the X-Y plane, so X and Y both sweep; tipping it face down and
-     * back puts Z through its whole range. Y therefore usually completes
-     * during X's turn and is skipped without complaint. */
-    const double ut_per_count = 100.0 / 6842.0;
-    /* 65 percent of a full turn is enough now, and that is the point of
-     * switching the estimator.
-     *
-     * The offsets come from a least-squares sphere fit over every sample, not
-     * from the midpoint of each axis's range. Points on a sphere fix its
-     * centre whether they cover the whole surface or only a cap of it, so
-     * coverage costs almost nothing: simulated against a known offset with
-     * realistic sensor noise, the fit was within 0.1 uT at 70 percent
-     * coverage where min/max was still 12.6 uT out.
-     *
-     * This matters because 97 percent was not achievable here. X would not
-     * pass about 5650 counts of the 6377 a full tumble sweeps, so a 97 percent
-     * gate could never be met, and the old min/max estimator would have been
-     * 11 uT wrong even if it had been.
-     *
-     * The bar is therefore a nudge to keep moving rather than a correctness
-     * threshold; correctness comes from the fitted radius, which mag_cal_finish
-     * checks against the local field and rejects when it is implausible. */
-    const int32_t axis_target =
-        (int32_t)(2.0 * BENCH_FIELD_UT / ut_per_count * 0.65);
+     * So: tumble freely, and stop when the radius says the sphere is known. */
+    const double radius_target = BENCH_FIELD_UT * 0.95;
 
-    static const char *axis_name[3] = {"X", "Y", "Z"};
-    static const char *axis_how[3] = {
-        "Keep the board FLAT on the table and turn it slowly all the way\n"
-        "      round, two or three times. X sweeps a full circle this way.",
-        "Still flat. Y sweeps at the same time as X, so keep turning.",
-        "Now tip it over: face up, then face down, then back again, a few\n"
-        "      times, turning as you go. Z has to see up AND down.",
-    };
+    printf("\n  Tumble the board slowly through every orientation.\n");
+    printf("    Turn it flat, tip it on edge, face down, back up -- not just\n");
+    printf("    a flat spin, which traces a circle and cannot fix a sphere.\n");
+    printf("    Keep going until the number below reaches %.1f uT.\n\n",
+           radius_target);
+    fflush(stdout);
 
     uint32_t elapsed = 0;
-    for (int ax = 0; ax < 3; ++ax)
+    uint32_t next_report = 0;
+    bool covered = false;
+    const uint32_t run_end = elapsed + 180000;   /* generous cap */
+    while (elapsed < run_end)
     {
-        int32_t span[3];
-        mag_cal_spans(span);
-        if (span[ax] >= axis_target)
+        vTaskDelay(pdMS_TO_TICKS(250));
+        elapsed += 250;
+        if (elapsed >= next_report && (elapsed % 2000) == 0)
         {
-            printf("\n  Axis %s already reached %ld of %ld counts from the "
-                   "motion so far -- skipping.\n",
-                   axis_name[ax], (long)span[ax], (long)axis_target);
-            continue;
-        }
-
-        printf("\n  --- Axis %s ---\n    %s\n\n", axis_name[ax], axis_how[ax]);
-        fflush(stdout);
-
-        /* Generous cap so a stuck run still ends, long enough that a careful
-         * turn is never cut short. */
-        const uint32_t axis_end = elapsed + 60000;
-        uint32_t next_report = elapsed;
-        bool done = false;
-        while (elapsed < axis_end)
-        {
-            vTaskDelay(pdMS_TO_TICKS(250));
-            elapsed += 250;
-            if (elapsed >= next_report && (elapsed % 2000) == 0)
+            const double r = mag_cal_fit_radius_ut();
+            int bars = (int)(r / radius_target * 10.0);
+            if (bars < 0) bars = 0;
+            if (bars > 10) bars = 10;
+            char meter[14];
+            int k = 0;
+            for (int b = 0; b < 10; ++b)
+                meter[k++] = (b < bars) ? '#' : '.';
+            meter[k] = '\0';
+            printf("    [%s] %5lu samples  fitted radius %5.1f / %.1f uT\n",
+                   meter, (unsigned long)mag_cal_samples(), r, radius_target);
+            fflush(stdout);
+            next_report = elapsed;
+            if (r >= radius_target)
             {
-                mag_cal_spans(span);
-                const double f = (double)span[ax] / (double)axis_target;
-                int bars = (int)(f * 10.0);
-                if (bars > 10) bars = 10;
-                char meter[14];
-                int k = 0;
-                for (int b = 0; b < 10; ++b)
-                    meter[k++] = (b < bars) ? '#' : '.';
-                meter[k] = '\0';
-                printf("    %s [%s] %5ld / %ld counts\n", axis_name[ax],
-                       meter, (long)span[ax], (long)axis_target);
-                fflush(stdout);
-                next_report = elapsed;
-            }
-            if (tdsh_bridge_break_requested())
-            {
-                mag_cal_abort();
-                printf("\ncancelled; offsets unchanged\n");
-                return 1;
-            }
-            mag_cal_spans(span);
-            if (span[ax] >= axis_target)
-            {
-                done = true;
+                covered = true;
                 break;
             }
         }
-
-        if (done)
+        if (tdsh_bridge_break_requested())
         {
-            printf("  Axis %s covered.\n", axis_name[ax]);
-            fflush(stdout);
-        }
-        else
-        {
-            /* Not enough rotation. Stop here rather than save offsets that
-             * would be a midpoint of a partial range. */
             mag_cal_abort();
-            printf("\n  Axis %s only reached %ld of %ld counts.\n",
-                   axis_name[ax], (long)span[ax], (long)axis_target);
-            printf("  Offsets NOT changed -- a short axis would be biased.\n");
-            printf("  Run `magcal` again and turn further on axis %s.\n",
-                   axis_name[ax]);
+            printf("\ncancelled; offsets unchanged\n");
             return 1;
         }
     }
+
+    if (!covered)
+    {
+        mag_cal_abort();
+        const double r = mag_cal_fit_radius_ut();
+        printf("\n  The fit only reached %.1f uT of %.1f.\n", r, radius_target);
+        printf("  Offsets NOT changed. That means the board did not see the\n");
+        printf("  field from enough directions -- tip it further over, face\n");
+        printf("  down as well as up, not just round and round.\n");
+        if (r > 0.0 && r < BENCH_FIELD_UT * 0.85)
+        {
+            printf("  A radius this small also means a magnet or steel is\n");
+            printf("  within about 20 cm, compressing the field.\n");
+        }
+        return 1;
+    }
+    printf("  Field radius recovered -- offsets are trustworthy.\n");
 
     struct mag_offsets found;
     char report[192];

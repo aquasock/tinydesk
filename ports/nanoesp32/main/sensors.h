@@ -97,6 +97,10 @@ void     mag_cal_poll(void);           /* from the node task, every tick */
 bool     mag_cal_active(void);
 uint32_t mag_cal_samples(void);
 void     mag_cal_spans(int32_t out[3]);
+/* Fitted sphere radius in uT so far; 0 when not solvable. This is the run's
+ * progress: it approaches the local field only once the samples span enough
+ * of the sphere. */
+double   mag_cal_fit_radius_ut(void);
 bool     mag_cal_finish(struct mag_offsets *out, char *report, size_t n);
 void     mag_cal_abort(void);
 void     mag_cal_set_offsets(const struct mag_offsets *o);

@@ -326,6 +326,30 @@ void mag_cal_abort(void)
     wr(ADDR_MAG, 0x20, MAG_CTRL1_10HZ);
 }
 
+/* Current fitted radius, in uT, from the samples gathered so far. Zero when
+ * the system cannot be solved yet.
+ *
+ * This is the run's progress indicator and its pass condition in one number.
+ * A sphere fit recovers the true field radius only when the samples span
+ * enough of the sphere, so comparing this against the local field measures
+ * orientation diversity directly -- which per-axis span does not. Simulated:
+ * a fit over samples tilted to 20 degrees gives radius 38 uT and an offset
+ * 8.4 uT wrong, while 35 degrees gives 45.7 uT and 1.0 uT wrong. A flat spin
+ * is worse still: it traces a circle, and a circle does not fix a sphere. */
+double mag_cal_fit_radius_ut(void)
+{
+    double AtA[4][4], Atb[4], sol[4];
+    memcpy(AtA, s_AtA, sizeof AtA);
+    memcpy(Atb, s_Atb, sizeof Atb);
+    if (!solve4(AtA, Atb, sol))
+        return 0.0;
+    const double rsq = sol[3] + sol[0] * sol[0] + sol[1] * sol[1]
+                       + sol[2] * sol[2];
+    if (rsq <= 0)
+        return 0.0;
+    return sqrt(rsq) * (100.0 / 6842.0);
+}
+
 bool mag_cal_finish(struct mag_offsets *out, char *report, size_t n)
 {
     if (report && n) report[0] = '\0';
