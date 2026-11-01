@@ -42,6 +42,18 @@ struct sensor_snapshot
     uint8_t gps_sats;
     double gps_lat, gps_lon, gps_alt_m;
     uint32_t gps_unix;     /* UTC seconds from the last valid RMC, 0 if none */
+
+    /* Motion and quality. Speed is metres per second over ground, course is
+     * degrees true, and accuracy is metres, derived from HDOP. Each has its
+     * own flag because a stationary receiver reports no course rather than a
+     * course of zero, and reporting the two as the same thing would turn
+     * "unknown" into a confident north. */
+    double gps_speed_mps;
+    bool gps_have_speed;
+    double gps_course_deg;
+    bool gps_have_course;
+    double gps_accuracy_m;
+    bool gps_have_accuracy;
 };
 
 /* Configure the three register-based parts. The GPS needs no setup. Returns

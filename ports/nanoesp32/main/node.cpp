@@ -91,6 +91,11 @@ static struct node_stats s_stats;
 static volatile bool s_persist_requested;
 static volatile bool s_announce_requested;
 
+/* Whether a telemetry reply carries LOCATION and MAGNETIC_FIELD as well as the
+ * environment triad. Set by `node telemetry full|compact`. Default true: see
+ * lxmf_send_telemetry() for why the bigger map is the default. */
+static volatile bool s_telemetry_full = true;
+
 static void node_log(const char *fmt, ...);
 
 /* ---- WiFi ---------------------------------------------------------- */
@@ -1223,17 +1228,31 @@ static size_t telemetry_pack(uint8_t *buf, size_t cap, bool compact)
 
     if (!compact && sn->gps_fix)
     {
-        /* The PA1010D driver reports position and altitude only; speed,
-         * bearing and accuracy have no source here and go out as zero. */
+        /* Position and altitude come from the fix. Speed and course are
+         * measured values, taken from RMC fields 7 and 8 rather than the
+         * hardcoded zeros this used to send. They still read zero when the
+         * receiver reported nothing, because the array is positional: the
+         * client indexes packed[0] through packed[6] inside a bare except, so
+         * a shorter array would silently discard the whole sensor. A
+         * stationary receiver omits course entirely, which is not the same as
+         * course zero, and this format cannot express that difference.
+         * Accuracy is HDOP times an assumed range error -- an approximation
+         * this project chooses, since the receiver measures HDOP and not
+         * metres -- so it is labelled derived rather than measured. */
         mp_uint(w, SID_LOCATION);
         mp_arr(w, 7);
         mp_be32_bin(w, (int32_t)llround(sn->gps_lat * 1e6));
         mp_be32_bin(w, (int32_t)llround(sn->gps_lon * 1e6));
         mp_be32_bin(w, (int32_t)llround(sn->gps_alt_m * 1e2));
-        mp_be32_bin(w, 0);                          /* speed, cm/s */
-        mp_be32_bin(w, 0);                          /* bearing, 1e-2 deg */
-        mp_be16_bin(w, 0);                          /* accuracy, cm */
-        mp_uint(w, now);
+        mp_be32_bin(w, (int32_t)llround(sn->gps_speed_mps * 1e2));   /* cm/s */
+        mp_be32_bin(w, (int32_t)llround(sn->gps_course_deg * 1e2));  /* 1e-2 deg */
+        {
+            double cm = sn->gps_accuracy_m * 1e2;
+            if (cm < 0.0) cm = 0.0;
+            if (cm > 65535.0) cm = 65535.0;   /* the field is uint16 */
+            mp_be16_bin(w, (uint16_t)llround(cm));
+        }
+        mp_uint(w, sn->gps_unix ? sn->gps_unix : now);
     }
 
     if (sn->have_pressure)
@@ -1291,7 +1310,7 @@ static size_t telemetry_pack(uint8_t *buf, size_t cap, bool compact)
         const uint32_t txs = RNS::Transport::packets_sent();
 
         mp_uint(w, SID_RNS_TRANSPORT);
-        mp_map(w, 13);
+        mp_map(w, 12);
         mp_str(w, "transport_enabled");
         mp_bool(w, true);
         mp_str(w, "transport_identity");
@@ -1313,7 +1332,7 @@ static size_t telemetry_pack(uint8_t *buf, size_t cap, bool compact)
         mp_str(w, "memory_used");
         mp_uint(w, (uint32_t)(heap_total - heap_free));
         mp_str(w, "ifstats");
-        mp_map(w, 6);
+        mp_map(w, 5);
         mp_str(w, "rss");
         mp_uint(w, 0);
         mp_str(w, "rxb");
@@ -1326,7 +1345,7 @@ static size_t telemetry_pack(uint8_t *buf, size_t cap, bool compact)
         mp_uint(w, txs);
         mp_str(w, "interfaces");
         mp_arr(w, 1);
-        mp_map(w, 9);
+        mp_map(w, 10);
         mp_str(w, "name");
         mp_str(w, "UDP [TinyNode]");
         mp_str(w, "short_name");
@@ -1445,22 +1464,28 @@ static void lxmf_send_text(const RNS::Bytes &peer_hash, const std::string &text)
 
 static void lxmf_send_telemetry(const RNS::Bytes &peer_hash)
 {
-    /* Reply with the compact map, in one packet.
+    /* Which map goes back is a runtime choice, because the two differ in how
+     * they travel and that is exactly what has to be measured on the bench.
      *
-     * The full report is ~495 bytes, which cannot travel opportunistically,
-     * so the router sends it over a link -- and link delivery in this stack
-     * currently fails on the far end ("Could not assemble LXMF message").
-     * A reply nobody can read is worse than a smaller one that arrives, so
-     * what goes back is the subset that fits an encrypted packet: TIME with
-     * temperature, humidity and pressure. LOCATION and MAGNETIC_FIELD are the
-     * two that would push it over.
+     * compact: TIME plus temperature, humidity and pressure, 151 packed bytes,
+     *   which fits one encrypted packet and therefore needs no link. This is
+     *   the answer that works today.
      *
-     * The full map is still what `node telemetry` packs, so once link
-     * delivery is fixed the only change here is dropping the compact flag. */
-    const bool have_path = false;
+     * full: adds LOCATION and MAGNETIC_FIELD, which puts the reply past the
+     *   159-byte single-packet threshold, so the router sends it as a DIRECT
+     *   link with a resource transfer. That path is what LXMF-012 is still
+     *   open on: this node has carried a 614-byte reply that way before, while
+     *   another bench could not assemble one. Whether a link resource actually
+     *   lands here is settled by asking for telemetry in `full` mode.
+     *
+     * `node telemetry full` and `node telemetry compact` switch it, so the
+     * bench can A/B the two without a reflash. Default is full, because
+     * position and heading are the readings a remote operator cannot otherwise
+     * see, and a reply that silently omits them is the bigger surprise. */
+    const bool full = s_telemetry_full;
 
     static uint8_t tel[768];
-    size_t n = telemetry_pack(tel, sizeof(tel), true);
+    size_t n = telemetry_pack(tel, sizeof(tel), !full);
     if (n == 0)
     {
         node_log("telemetry: pack overflow");
@@ -1479,8 +1504,8 @@ static void lxmf_send_telemetry(const RNS::Bytes &peer_hash)
     /* Content and title stay empty: a message that carries only telemetry is
      * not shown as a chat message by the client. */
     LXMF::LXMessage reply(dest, s_lxmf->delivery_destination(), RNS::Bytes(), RNS::Bytes(),
-                          have_path ? LXMF::Type::Message::DIRECT
-                                    : LXMF::Type::Message::OPPORTUNISTIC);
+                          full ? LXMF::Type::Message::DIRECT
+                               : LXMF::Type::Message::OPPORTUNISTIC);
 
     /* The field value must itself be msgpack-encoded *bytes*, not the map.
      * microLXMF writes fields with packRawBytes(), so whatever is stored here
@@ -1502,11 +1527,11 @@ static void lxmf_send_telemetry(const RNS::Bytes &peer_hash)
     static const uint8_t field_key[1] = {LXMF_FIELD_TELEMETRY};
     reply.fields_set(RNS::Bytes(field_key, sizeof(field_key)),
                      RNS::Bytes(field_value, fv.len));
-    if (!have_path)
+    if (full)
         RNS::Transport::request_path(peer_hash);
     s_lxmf->handle_outbound(reply);
     node_log("telemetry: queued %u bytes (%s) for %s", (unsigned)n,
-             have_path ? "full/link" : "compact/packet", peer_hash.toHex().c_str());
+             full ? "full/link" : "compact/packet", peer_hash.toHex().c_str());
 }
 
 /* Counts announces that survived validation and were added to the path
@@ -1882,26 +1907,44 @@ static int cmd_node(tdsh_session_t *session, int argc, char **argv)
     }
     if (argc > 1 && strcmp(argv[1], "telemetry") == 0)
     {
-        /* Dry run: pack the map and report its size without sending. The
-         * size is what decides opportunistic versus link delivery, and the
-         * pack is otherwise only exercised by a client request. */
+        /* `node telemetry full` / `node telemetry compact` choose what a
+         * reply carries for the rest of the session; a bare `node telemetry`
+         * is a dry run that packs the current choice and reports its size
+         * without sending. The size is what decides opportunistic versus link
+         * delivery, and the pack is otherwise only exercised by a client. */
+        if (argc > 2)
+        {
+            if (strcmp(argv[2], "full") == 0 || strcmp(argv[2], "compact") == 0)
+            {
+                s_telemetry_full = (strcmp(argv[2], "full") == 0);
+                printf("telemetry replies: %s\n",
+                       s_telemetry_full ? "full (LOCATION + MAGNETIC_FIELD, link)"
+                                        : "compact (environment triad, one packet)");
+                node_log("node: telemetry replies set to %s",
+                         s_telemetry_full ? "full" : "compact");
+                return 0;
+            }
+            printf("usage: node telemetry [full|compact]\n");
+            return 1;
+        }
         static uint8_t probe[768];
-        size_t n = telemetry_pack(probe, sizeof(probe), false);
+        size_t n = telemetry_pack(probe, sizeof(probe), !s_telemetry_full);
         if (n == 0)
         {
             printf("telemetry: pack failed\n");
             node_log("telemetry: pack failed (dry run)");
             return 1;
         }
-        char buf[96];
-        snprintf(buf, sizeof(buf), "telemetry: %u bytes", (unsigned)n);
+        char buf[128];
+        snprintf(buf, sizeof(buf), "telemetry: %u bytes, %s", (unsigned)n,
+                 s_telemetry_full ? "full/link" : "compact/packet");
         printf("%s\n", buf);
         node_log("%s (dry run)", buf);
         return 0;
     }
     if (argc > 1)
     {
-        printf("usage: node [announce|telemetry]\n");
+        printf("usage: node [announce|telemetry [full|compact]]\n");
         return 1;
     }
     /* Printed for the Terminal on the panel, and echoed to node_log so the

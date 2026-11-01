@@ -213,6 +213,18 @@ static struct
     double lat, lon, alt;
     uint32_t unix_time;
     bool have_time;
+
+    /* Motion and quality, both of which the receiver already sends and this
+     * driver used to discard. RMC carries speed over ground in knots and
+     * course over ground in degrees; GGA carries HDOP. Neither is a
+     * substitute for a real accuracy figure, but both are measurements
+     * rather than the zeros that were being reported. */
+    double speed_knots;
+    bool have_speed;
+    double course_deg;
+    bool have_course;
+    double hdop;
+    bool have_hdop;
 } s_gps;
 
 /* ddmm.mmmm -> decimal degrees. */
@@ -263,12 +275,39 @@ static void nmea_sentence(char *s)
             s_gps.lat = nmea_deg(f[2], f[3] && *f[3] ? *f[3] : 'N');
             s_gps.lon = nmea_deg(f[4], f[5] && *f[5] ? *f[5] : 'E');
             s_gps.alt = atof(f[9]);
+            /* Field 8 is HDOP, horizontal dilution of precision. Reported by
+             * the receiver, so it is a measurement; it is dimensionless and
+             * needs a ranging error to become metres (see gps_accuracy_m). */
+            if (f[8] && *f[8])
+            {
+                s_gps.hdop = atof(f[8]);
+                s_gps.have_hdop = (s_gps.hdop > 0.0);
+            }
         }
     }
     if (rmc && n > 9)
     {
         bool active = (f[2] && *f[2] == 'A');
         s_gps.fix = s_gps.fix || active;
+
+        /* Speed over ground in knots (field 7) and course over ground in
+         * degrees true (field 8). Both are empty strings when the receiver
+         * has nothing to say, which is not the same as zero: a stationary
+         * receiver reports no course at all rather than a heading. */
+        if (active && n > 8)
+        {
+            if (f[7] && *f[7])
+            {
+                s_gps.speed_knots = atof(f[7]);
+                s_gps.have_speed = true;
+            }
+            if (f[8] && *f[8])
+            {
+                s_gps.course_deg = atof(f[8]);
+                s_gps.have_course = true;
+            }
+        }
+
         if (active && s_gps.lat == 0.0 && s_gps.lon == 0.0)
         {
             s_gps.lat = nmea_deg(f[3], f[4] && *f[4] ? *f[4] : 'N');
@@ -365,6 +404,37 @@ int sensors_begin(void)
     return n;
 }
 
+/* One knot in metres per second, exact by definition: 1852 m / 3600 s. */
+static const double KNOTS_TO_MPS = 1852.0 / 3600.0;
+
+/* HDOP to metres needs a user-equivalent range error, which is not a property
+ * of this receiver and not something it reports. 5 m is the conventional
+ * single-frequency GPS figure. This is an approximation and is labelled as one
+ * rather than presented as a measured accuracy: the receiver measures HDOP,
+ * and this project chooses the multiplier. */
+static const double GPS_UERE_M = 5.0;
+
+/* Copy the GPS state into a snapshot, converting to the units the LXMF
+ * LOCATION sensor expects. Called from both the one-shot read and the
+ * background poll so the two cannot drift apart. */
+static void fill_gps(struct sensor_snapshot *o)
+{
+    o->have_gps = true;              /* absence shows as no fix and no time */
+    o->gps_fix = s_gps.fix;
+    o->gps_sats = s_gps.sats;
+    o->gps_lat = s_gps.lat;
+    o->gps_lon = s_gps.lon;
+    o->gps_alt_m = s_gps.alt;
+    o->gps_unix = s_gps.have_time ? s_gps.unix_time : 0;
+
+    o->gps_have_speed = s_gps.have_speed;
+    o->gps_speed_mps = s_gps.have_speed ? s_gps.speed_knots * KNOTS_TO_MPS : 0.0;
+    o->gps_have_course = s_gps.have_course;
+    o->gps_course_deg = s_gps.have_course ? s_gps.course_deg : 0.0;
+    o->gps_have_accuracy = s_gps.have_hdop && s_gps.fix;
+    o->gps_accuracy_m = o->gps_have_accuracy ? s_gps.hdop * GPS_UERE_M : 0.0;
+}
+
 void sensors_read(struct sensor_snapshot *out)
 {
     if (!out)
@@ -402,13 +472,7 @@ void sensors_read(struct sensor_snapshot *out)
         out->have_mag = false;
 
     gps_poll();
-    out->have_gps = true;              /* absence shows as no fix and no time */
-    out->gps_fix = s_gps.fix;
-    out->gps_sats = s_gps.sats;
-    out->gps_lat = s_gps.lat;
-    out->gps_lon = s_gps.lon;
-    out->gps_alt_m = s_gps.alt;
-    out->gps_unix = s_gps.have_time ? s_gps.unix_time : 0;
+    fill_gps(out);
 }
 
 const struct sensor_snapshot *sensors_latest(void)
@@ -422,12 +486,7 @@ const struct sensor_snapshot *sensors_latest(void)
 void sensors_poll_gps(void)
 {
     gps_poll();
-    s_snapshot.gps_fix = s_gps.fix;
-    s_snapshot.gps_sats = s_gps.sats;
-    s_snapshot.gps_lat = s_gps.lat;
-    s_snapshot.gps_lon = s_gps.lon;
-    s_snapshot.gps_alt_m = s_gps.alt;
-    s_snapshot.gps_unix = s_gps.have_time ? s_gps.unix_time : 0;
+    fill_gps(&s_snapshot);
 }
 
 void sensors_refresh(void)
