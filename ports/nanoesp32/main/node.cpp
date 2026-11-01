@@ -2078,13 +2078,15 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
     printf("Before you start:\n");
     printf("  * clear 20 cm around the board: no steel, magnets, speakers,\n");
     printf("    power supply or the monitor\n");
-    printf("  * it runs in three phases totalling about 36 s, each naming\n");
-    printf("    the motion: flat, on edge, then upside down. Keep turning\n");
-    printf("    for the whole of each phase -- stopping early leaves that\n");
-    printf("    axis uncorrected and the fit biased\n");
+    printf("  * it asks for one axis at a time and tells you which motion\n");
+    printf("    covers it. Each axis is finished when it has actually seen\n");
+    printf("    the whole field, not when a timer runs out, so just keep\n");
+    printf("    turning slowly until it says the axis is covered\n");
+    printf("  * if an axis never gets there the run stops and changes\n");
+    printf("    nothing, rather than saving a biased offset\n");
     printf("\n");
 
-    if (!shell_read_line("Step 1/3. Press Enter to start sampling, Ctrl+C to cancel: ",
+    if (!shell_read_line("Press Enter to start sampling, Ctrl+C to cancel: ",
                          line, sizeof line))
     {
         printf("cancelled; offsets unchanged\n");
@@ -2097,38 +2099,75 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
         return 1;
     }
 
-    /* Three phases rather than one "tumble for 30 s": the instruction names the
-     * motion that covers the axis it is missing. A first attempt that only spun
-     * the board flat produced offsets biased by about 18 percent, because Z
-     * barely moved and its offset became the midpoint of noise. */
-    struct { const char *title; const char *how; uint32_t ms; } phases[3] = {
-        {"flat, turning on the table",
-         "lay it flat and turn it slowly all the way round, twice",
-         12000},
-        {"on each long edge",
-         "stand it on one edge, turn it round, then on the other edge and turn",
-         12000},
-        {"upside down",
-         "flip it face down and turn it round", 12000},
+    /* One axis at a time, and each axis is done when it has actually seen the
+     * field -- not when a timer runs out.
+     *
+     * That distinction matters. A fixed 30 s tumble tells the user nothing
+     * about whether they covered what was needed; a first attempt spun the
+     * board flat for the whole window, which sweeps X and Y but leaves Z
+     * nearly still, and its offset came out as the midpoint of noise. The
+     * result was 85 percent of the true field with one axis short.
+     *
+     * So each axis has a target. A full turn sweeps the field diameter, so a
+     * calibrated axis should span 2 * 46.6 uT = 6377 counts; 70 percent of
+     * that is enough for a trustworthy midpoint. The axis is marked done only
+     * when its span gets there, and the user keeps turning until it does.
+     *
+     * The motions follow from the geometry: turning the board flat spins the
+     * field in the X-Y plane, so X and Y both sweep; tipping it face down and
+     * back puts Z through its whole range. Y therefore usually completes
+     * during X's turn and is skipped without complaint. */
+    const double ut_per_count = 100.0 / 6842.0;
+    const int32_t axis_target =
+        (int32_t)(2.0 * BENCH_FIELD_UT / ut_per_count * 0.70);
+    static const char *axis_name[3] = {"X", "Y", "Z"};
+    static const char *axis_how[3] = {
+        "Keep the board FLAT on the table and turn it slowly all the way\n"
+        "      round, two or three times. X sweeps a full circle this way.",
+        "Still flat. Y sweeps at the same time as X, so keep turning.",
+        "Now tip it over: face up, then face down, then back again, a few\n"
+        "      times, turning as you go. Z has to see up AND down.",
     };
 
     uint32_t elapsed = 0;
-    uint32_t next_report = 0;
-    for (int ph = 0; ph < 3; ++ph)
+    for (int ax = 0; ax < 3; ++ax)
     {
-        printf("\n  Phase %d of 3 -- %s\n", ph + 1, phases[ph].title);
-        printf("    %s\n\n", phases[ph].how);
+        int32_t span[3];
+        mag_cal_spans(span);
+        if (span[ax] >= axis_target)
+        {
+            printf("\n  Axis %s already covered (%ld counts) -- skipping.\n",
+                   axis_name[ax], (long)span[ax]);
+            continue;
+        }
+
+        printf("\n  --- Axis %s ---\n    %s\n\n", axis_name[ax], axis_how[ax]);
         fflush(stdout);
-        const uint32_t phase_end = elapsed + phases[ph].ms;
-        next_report = elapsed;          /* report at once on entry */
-        while (elapsed < phase_end)
+
+        /* Generous cap so a stuck run still ends, long enough that a careful
+         * turn is never cut short. */
+        const uint32_t axis_end = elapsed + 60000;
+        uint32_t next_report = elapsed;
+        bool done = false;
+        while (elapsed < axis_end)
         {
             vTaskDelay(pdMS_TO_TICKS(250));
             elapsed += 250;
-            if (elapsed >= next_report)
+            if (elapsed >= next_report && (elapsed % 2000) == 0)
             {
-                magcal_progress_line(elapsed);
-                next_report += 3000;
+                mag_cal_spans(span);
+                const double f = (double)span[ax] / (double)axis_target;
+                int bars = (int)(f * 10.0);
+                if (bars > 10) bars = 10;
+                char meter[14];
+                int k = 0;
+                for (int b = 0; b < 10; ++b)
+                    meter[k++] = (b < bars) ? '#' : '.';
+                meter[k] = '\0';
+                printf("    %s [%s] %5ld / %ld counts\n", axis_name[ax],
+                       meter, (long)span[ax], (long)axis_target);
+                fflush(stdout);
+                next_report = elapsed;
             }
             if (tdsh_bridge_break_requested())
             {
@@ -2136,6 +2175,30 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
                 printf("\ncancelled; offsets unchanged\n");
                 return 1;
             }
+            mag_cal_spans(span);
+            if (span[ax] >= axis_target)
+            {
+                done = true;
+                break;
+            }
+        }
+
+        if (done)
+        {
+            printf("  Axis %s covered.\n", axis_name[ax]);
+            fflush(stdout);
+        }
+        else
+        {
+            /* Not enough rotation. Stop here rather than save offsets that
+             * would be a midpoint of a partial range. */
+            mag_cal_abort();
+            printf("\n  Axis %s only reached %ld of %ld counts.\n",
+                   axis_name[ax], (long)span[ax], (long)axis_target);
+            printf("  Offsets NOT changed -- a short axis would be biased.\n");
+            printf("  Run `magcal` again and turn further on axis %s.\n",
+                   axis_name[ax]);
+            return 1;
         }
     }
 
@@ -2143,7 +2206,7 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
     char report[192];
     const bool ok = mag_cal_finish(&found, report, sizeof report);
 
-    printf("\nStep 3/3. Sampling stopped.\n");
+    printf("\nAll three axes covered. Sampling stopped.\n");
     printf("  %s\n", report);
 
     if (!ok)
