@@ -166,6 +166,7 @@ Topic IDs are the `record_id` prefix. An entry reserves a name; it does not clai
 | Why do packets go missing during transmit? | RADIO | RADIO-007 |
 | Can the module run at 5 V, or at 22 dBm? | RADIO | RADIO-008 |
 | Is LoRa transmit actually proven on hardware? | RADIO | RADIO-009 |
+| Which UART and GPIOs does the ESP-IDF port use for the radio? | RADIO | RADIO-010 |
 | What exactly is sent over the air? | FRM | FRM-001, FRM-002, FRM-003 |
 | How many frames is a full packet, and when is a partial dropped? | FRM | FRM-004 |
 | How slow is the link? | FRM | FRM-005 |
@@ -261,6 +262,7 @@ RADIO-006: "The module does not filter by address: every packet in the network a
 RADIO-007: "The module is half duplex and cannot receive while transmitting, so packets from the peer during a transmission are lost; Reticulum's retries make this a throughput question rather than a correctness one"
 RADIO-008: "Electrical: VDD is 2.3-3.6 V and the UART pins are not 5 V tolerant, so the module runs from 3V3 and never VBUS/5V; it peaks at about 140 mA while transmitting at 22 dBm, and 14 dBm is the CE ceiling against the module's 22 dBm maximum"
 RADIO-009: "Transmit and reception are both proven: announces on 2026-10-26, and 16 of 17 frames from a second module on a Pico 2 on 2026-10-27, with the +RCV parser, reassembler and RSSI/SNR path exercised and all error counters at zero"
+RADIO-010: "On the ESP-IDF port the RYLR998 is driven through the ESP-IDF UART driver on UART1 at GPIO 8 (RX) and 9 (TX), because that port's Arduino shim provides no HardwareSerial; GPIO 8/9 are free there, with I2C on 11/12 and the panel on 18/21/38/47/48"
 FRM-001: "One AT+SEND=<address>,<length>,<data> per frame answered with +OK; reception arrives as one line per frame, +RCV=<from>,<length>,<data>,<rssi>,<snr>"
 FRM-002: "<data> is standard base64, not decoration: the AT syntax is comma-delimited and line-terminated, so a raw packet would both corrupt the parser and be cut at the first 0x0D; 180 encoded bytes fill the 240-character field exactly, with no padding and no comma"
 FRM-003: "The binary frame inside the base64 is one header byte NNNN M III -- nonce nibble randomised per frame, M set while more frames follow, rolling message id 0-7 -- followed by up to 179 bytes of Reticulum packet"
@@ -882,7 +884,7 @@ Records are grouped in the order of the topic catalog, and numbered within each 
     - "Sideband 2.2.0 sbapp/sideband/sense.py: RNSTransport.render(), including the d['ifstats']['interfaces'] loop and the seventeen-value dictionary it builds"
     - "Sideband 2.2.0 sbapp/ui/objectdetails.py: the 'Reticulum Transport' branch, using interface_count, link_count, path_count and the traffic fields"
     - "ports/nanoesp32/main/node.cpp: telemetry_pack()'s SID_RNS_TRANSPORT block"
-  verification: "Measured on this board 2026-11-01, in both directions. Before the repair the client logged KeyError 'interfaces' and produced no render; after it, the node's 752-byte reply parsed through Telemeter.from_packed() produced a complete Reticulum Transport render with all seventeen values, including an interface dictionary keyed by 'UDP [TinyNode]'."
+  verification: "Measured on this board 2026-11-01, in both directions. Before the repair the client logged KeyError 'interfaces' and produced no render; after it, the node's 752-byte reply parsed through Telemeter.from_packed() produced a complete Reticulum Transport render with all seventeen values, including an interface dictionary keyed by 'UDP [TinyNode]'. Revised 2026-11-01 (core-log entry 20): the interface list must be enumerated from Transport::get_interfaces() rather than written by hand. It was hand-built while UDP was the only interface, and the moment LoRa registered the map still reported interface_count 1 and named only UDP, so the client showed a transport with one link where there were two. After enumerating, the same render shows both, keyed 'UDPInterface' and 'RYLR998'. microReticulum exposes no path enumeration, so path_table stays empty and no path_count is claimed."
 
 - record_id: MSG-001
   kind: EXTERNAL
@@ -1015,6 +1017,20 @@ Records are grouped in the order of the topic catalog, and numbered within each 
     - "tools/pico_lora_sender.py: the Pico 2 sender, its AT configuration and the frames it builds"
     - "This board: the L command's counters before and after each run (core-log entry 2)"
   verification: "Transmit measured on 2026-10-26; reception measured on 2026-10-27 across three runs of 4, 9 and 4 frames, reading L before and after each. Revised 2026-10-27 (core-log entry 2): reception moved from unexercised to measured, with one intermittent frame loss."
+
+- record_id: RADIO-010
+  kind: DEVICE
+  topic_id: RADIO
+  title: "The ESP-IDF port drives the RYLR998 through UART1 on GPIO 8/9"
+  status: VERIFIED
+  verified_date: 2026-11-01
+  statement: "The RYLR998 driver on the tinydesk ESP-IDF port uses the ESP-IDF UART driver on UART_NUM_1 at 115200 8N1, transmitting on GPIO 9 and receiving on GPIO 8. Those are the same physical pins the standalone Arduino build used as D5 and D6, so the harness does not change; only the API does, because this port builds against ESP-IDF with a shim that supplies delay, random and String but no HardwareSerial. The port is not UART0, which stays free as the ROM console on D0/D1 and is the recovery path if a flash goes wrong. GPIO 8 and 9 are unused by anything else on the board: the I2C sensors are on GPIO 11 and 12, and the ILI9340 panel is on GPIO 18, 21, 38, 47 and 48."
+  consequence: "A LoRa harness built for the standalone node plugs into this one unchanged. Any future addition to this port has to stay clear of GPIO 8/9 or move the radio, and the choice of UART1 rather than UART0 has to be preserved, since losing the ROM console would remove the last way to reach a board whose flash has gone bad. The module is a 3.3 V part: its VDD range is 2.3-3.6 V and it is not 5 V tolerant."
+  sources:
+    - "ports/nanoesp32/main/lora.cpp: UART_PORT, LORA_RX_GPIO and LORA_TX_GPIO, and start() calling uart_driver_install, uart_param_config and uart_set_pin"
+    - "ports/nanoesp32/components/rns/shim/arduino_shim.h: the whole shim, which provides delay, delayMicroseconds, random, Esp and String and no serial class"
+    - "ports/nanoesp32/main/node.cpp: I2C_SDA_GPIO and I2C_SCL_GPIO on 11 and 12; ports/nanoesp32/main/ili9340.h for the panel pins"
+  verification: "Brought up on this board 2026-11-01: the module answered AT on UART1, reported RYLR998_REYAX_V1.2.4, accepted AT+ADDRESS, AT+NETWORKID, AT+PARAMETER and AT+CRFOP, and transmitted 11 packets in 18 frames with no +ERR and nothing dropped. Reception through this port is not yet exercised: there is no second module on the air here."
 
 - record_id: FRM-001
   kind: PROTOCOL

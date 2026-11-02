@@ -633,3 +633,50 @@ The operator has not yet looked at Sideband since this build, so the icon and th
 - User Test: NOT RUN
 
 ---
+
+## 20 COMMIT Unreleased 2026-11-01T20:05:00-07:00
+
+#### Coming From:
+
+Unreleased f561a78
+
+#### Purpose:
+
+Port the RYLR998 LoRa interface from the standalone TinyNode into P4, so the node can carry Reticulum over the radio as well as WiFi, and record the operator's acceptance of the work entry 19 delivered.
+
+#### Outcome:
+
+LoRa is running on this board. The framing layer came across unmodified -- it has no Arduino dependencies at all -- and P1's own host test suite passes against the P4 copy with no changes, covering base64 framing, multi-frame reassembly, abandoned-partial counting and the one-MTU overflow refusal. The AT driver did not port so cleanly: it is written against Arduino HardwareSerial, and this port's Arduino shim provides delay, random, String and Esp but no serial class, so the whole driver was rewritten onto the ESP-IDF UART driver on UART1. The TinyTang protocol was removed rather than ported, since this node speaks only Reticulum and every frame that arrives goes up the stack.
+
+The pins did not collide, which was worth checking rather than assuming. P1 had LoRa on D5/D6, which are GPIO 8 and 9; P4's I2C is on A4/A5, which are GPIO 11 and 12, and the panel is on GPIO 18, 21, 38, 47 and 48. So the harness plugs in unchanged. The board's own board_builtin.conf agrees, describing D5/D6 as the pair the TinyNode harness used for its LoRa module.
+
+Two defects were found by using the thing rather than by reading it. First, the `lora` report showed the values the module held before the driver wrote to it: it said address 0, network 18 and power 22 dBm while the boot log two lines earlier had said those had been changed to 1, 6 and 14. That is precisely the silent mismatch the display exists to expose, and it is inherited from P1 rather than introduced here. Each setting is now read back after writing, and a write the module accepts but does not hold is reported as such instead of being logged as success. Second, the Reticulum Transport telemetry still reported one interface after the radio registered, because the interface list was hand-built for UDP alone. It is now enumerated from Transport::get_interfaces(), and Sideband renders both, keyed UDPInterface and RYLR998.
+
+Bring-up on hardware: the module answered AT on the first boot after wiring, reported RYLR998_REYAX_V1.2.4, and accepted the address, network id, air parameters and power settings -- 0 to 1, 18 to 6, SF9 to SF7, and 22 to 14 dBm. The second boot logged every one of those as unchanged, which shows both that the module keeps them in flash and that the read-before-write path works. The link then carried 11 packets in 18 frames with no +ERR and nothing dropped or left queued, so the module accepted and transmitted every frame the driver gave it.
+
+What that does not prove is reception. There is one module on this bench and nothing else on the air, so the receive path -- the +RCV parser, the reassembler and the RSSI/SNR hand-off to the transport -- has not been exercised on this port, and the interface has received nothing. The standalone node had this proven with a second module on a Pico 2, and this port needs the same before the radio can be called working in both directions. Separately, microReticulum exposes no way to enumerate the transport's live paths, only cumulative counters, so the transport sensor reports an empty path table and claims no path count rather than deriving a number that would be wrong.
+
+Entry 19 is superseded on one point: the operator confirmed the icon, the Information row and the Reticulum Transport row in Sideband and reported them working, so its `User Test: NOT RUN` is answered here. Entry 19 is not amended, since a committed entry is settled history.
+
+The core-syntax audit re-read `.ai/core.md` and `.ai/core-syntax.md`, confirmed that neither was changed and that entries 1 to 19 were not rewritten, and that the reference's six YAML blocks all parse, with the index and the records naming the same 94 ids in the same order under the allowed Status values, and validated this entry as number 20 with exactly six sections, prose in Purpose, Outcome and Next Steps, allowed Status values, and engineering paths in Files Modified.
+
+#### Next Steps:
+
+Reception is the next hardware step and it needs a second RYLR998: the same framing and parameters at both ends, then a packet heard through +RCV and handed to the transport. Until then the radio is proven to transmit and unproven to receive, and the path table on this node cannot fill from the air. The transport sensor still under-reports in two ways that microReticulum's API does not currently allow fixing: it claims no path count and an empty path table, so Sideband shows a transport with no reachable destinations even while it is relaying. Text sent to the node in Sideband is still ignored, which remains the largest gap in the operator's access to it and the cheapest thing left to close. Three older items are still open: LOCATION ships speed, bearing and accuracy derived rather than measured, the heading has never been checked against a surveyed bearing, and P1 retains the copy of `.ai` this one came from.
+
+#### Files Modified:
+
+- ports/nanoesp32/main/CMakeLists.txt
+- ports/nanoesp32/main/lora.cpp
+- ports/nanoesp32/main/lora.h
+- ports/nanoesp32/main/lora_frame.cpp
+- ports/nanoesp32/main/lora_frame.h
+- ports/nanoesp32/main/node.cpp
+
+#### Status:
+
+- Build: PASS
+- Deployment: PASS
+- User Test: NOT RUN
+
+---

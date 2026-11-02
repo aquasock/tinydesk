@@ -18,6 +18,7 @@
  */
 #include "node.h"
 
+#include "lora.h"
 #include "sensors.h"
 
 #include <stdio.h>
@@ -1425,42 +1426,74 @@ static size_t telemetry_pack(uint8_t *buf, size_t cap, bool compact)
         mp_uint(w, rxs);
         mp_str(w, "txs");
         mp_uint(w, txs);
-        /* The interface list belongs INSIDE ifstats. Sideband's
-         * RNSTransport.render() reads d["ifstats"]["interfaces"], so writing
-         * it as a sibling of ifstats -- which is what this did -- raised
-         * KeyError 'interfaces' and lost the whole sensor. */
+        /* Interface list, enumerated from the live table rather than written
+         * by hand. It was a single hardcoded UDP entry before LoRa existed, so
+         * once the radio registered the map still claimed one interface and
+         * Sideband showed a transport with a single link when there were two. */
+        const RNS::Transport::InterfaceTable &ifaces =
+            RNS::Transport::get_interfaces();
         mp_str(w, "interfaces");
-        mp_arr(w, 1);
-        mp_map(w, 8);
-        mp_str(w, "name");
-        mp_str(w, "UDP [TinyNode]");
-        mp_str(w, "short_name");
-        mp_str(w, "UDP");
-        mp_str(w, "status");
-        mp_bool(w, s_udp_ready);
-        mp_str(w, "mode");
-        mp_uint(w, RNS::Type::Interface::MODE_GATEWAY);
-        mp_str(w, "type");
-        mp_str(w, "UDPInterface");
-        mp_str(w, "bitrate");
-        mp_uint(w, 0);
-        mp_str(w, "rxs");
-        mp_uint(w, rxs);
-        mp_str(w, "txs");
-        mp_uint(w, txs);
+        mp_arr(w, (unsigned)ifaces.size());
+        for (const RNS::Interface &ifc : ifaces)
+        {
+            const std::string nm = ifc.name();
+            /* The client keys its interface dictionary by this name, so it
+             * has to be distinct per interface and stable. */
+            char short_name[16];
+            size_t sn = 0;
+            if (!nm.empty() && nm[0] == 'U') sn = 3;              /* "UDP" */
+            else if (nm.rfind("RYLR", 0) == 0) sn = 4;            /* "RYLR" */
+            if (sn == 0)
+            {
+                for (size_t i = 0; i < nm.size() && sn + 1 < sizeof(short_name); ++i)
+                    short_name[sn++] = nm[i];
+            }
+            else
+                std::memcpy(short_name, nm.c_str(), sn);
+            short_name[sn] = '\0';
+
+            /* Sideband maps a handful of type strings to icons and falls back
+             * to a generic one for anything else, so an accurate name it does
+             * not know is better than a familiar name that is a lie. */
+            const char *type = "RYLR998Interface";
+            if (nm.find("UDP") != std::string::npos)
+                type = "UDPInterface";
+
+            mp_map(w, 8);
+            mp_str(w, "name");
+            mp_str(w, nm.c_str());
+            mp_str(w, "short_name");
+            mp_str(w, short_name);
+            mp_str(w, "status");
+            mp_bool(w, ifc.online());
+            mp_str(w, "mode");
+            mp_uint(w, (uint32_t)ifc.mode());
+            mp_str(w, "type");
+            mp_str(w, type);
+            mp_str(w, "bitrate");
+            mp_uint(w, ifc.bitrate());
+            mp_str(w, "rxb");
+            mp_uint(w, (uint32_t)ifc.traffic_counter_rxb());
+            mp_str(w, "txb");
+            mp_uint(w, (uint32_t)ifc.traffic_counter_txb());
+        }
 
         /* These three are read from the top level of the map, not from an
          * interface entry: RNSTransport.render() takes d["path_table"],
          * d["link_count"] and d["interface_count"] directly. Their absence
          * raised KeyError as well, so one misplaced key and three missing
-         * ones each cost the client the whole sensor. path_table stays empty
-         * because this node holds no learned paths of its own to report. */
+         * ones each cost the client the whole sensor.
+         *
+         * path_table stays empty and path_count is not reported: microReticulum
+         * exposes no way to enumerate the transport's live paths, only
+         * cumulative counters, and inventing a number from those would be
+         * worse than showing none. */
         mp_str(w, "path_table");
         mp_arr(w, 0);
         mp_str(w, "link_count");
         mp_uint(w, 0);
         mp_str(w, "interface_count");
-        mp_uint(w, 1);
+        mp_uint(w, (uint32_t)ifaces.size());
     }
 
     return w.ok ? w.len : 0;
@@ -1853,6 +1886,19 @@ static void node_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
+
+    /* LoRa, when the module is fitted.
+     *
+     * Registered after UDP so a single announce reaches both media, and before
+     * the LXMF router so the delivery destination exists by the time the radio
+     * is up. A missing module is not fatal: the node keeps running on WiFi
+     * alone, which is what a board without the harness should do. */
+    lora::set_logger([](const char *line) { node_log("lora: %s", line); });
+    node_log("lora: starting");
+    if (lora::begin())
+        node_log("lora: interface registered");
+    else
+        node_log("lora: not available; continuing on WiFi only");
 
     /* LXMF on top of the Reticulum instance. The router needs the instance
      * and the interface up first: it creates a destination on the delivery
@@ -2814,6 +2860,37 @@ static const tdsh_command_t s_cols_cmd = {
     .flags = 0,
 };
 
+static void shell_log(const char *line) { printf("%s\n", line); }
+
+/* The driver logs through a hook so the same text can land in /node.log at boot
+ * and on the console when asked for. This swaps the hook for the length of one
+ * report rather than duplicating every format string. */
+static int cmd_lora(tdsh_session_t *session, int argc, char **argv)
+{
+    (void)session;
+    if (argc > 1 && strcmp(argv[1], "status") == 0)
+    {
+        char line[160];
+        lora::status_line(line, sizeof line);
+        printf("%s\n", line);
+        return 0;
+    }
+
+    lora::set_logger(shell_log);
+    lora::console_report();
+    lora::set_logger([](const char *line) { node_log("lora: %s", line); });
+    return 0;
+}
+
+static const tdsh_command_t s_lora_cmd = {
+    .name = "lora",
+    .usage = "lora [status]",
+    .help = "Show the RYLR998 link: band, address, network, air parameters, "
+            "counters and the last rssi/snr; 'status' prints one line",
+    .fn = cmd_lora,
+    .flags = 0,
+};
+
 static const tdsh_command_t s_magcal_cmd = {
     .name = "magcal",
     .usage = "magcal [show|gain|check|clear]",
@@ -2845,6 +2922,9 @@ void node_start(void)
         int rc4 = tdsh_register_command(&s_wifi_cmd);
         const tdsh_command_t *found4 = tdsh_command_find("wifi");
         node_log("node: wifi registered rc=%d found=%d", rc4, found4 != nullptr);
+        int rc5 = tdsh_register_command(&s_lora_cmd);
+        const tdsh_command_t *found5 = tdsh_command_find("lora");
+        node_log("node: lora registered rc=%d found=%d", rc5, found5 != nullptr);
     }
     s_state = NODE_WIFI;
     xTaskCreate(node_task, "rns", 32768, NULL, 4, NULL);
