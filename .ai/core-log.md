@@ -559,3 +559,39 @@ The RNS_TRANSPORT packing mismatch is real and unfixed: the client expects the i
 - User Test: NOT RUN
 
 ---
+
+## 18 COMMIT Unreleased 2026-11-01T18:58:00-07:00
+
+#### Coming From:
+
+Unreleased b2d69a4
+
+#### Purpose:
+
+Record the operator's acceptance of the magnetic heading delivered by entry 17, which that entry left as `User Test: NOT RUN` because the agent-side verification was not the operator looking at the client.
+
+#### Outcome:
+
+The operator confirmed the heading and reported it working, so entry 17's `User Test: NOT RUN` is superseded by acceptance recorded here. Entry 17 is not amended: its status line was accurate when it was written and the log treats committed entries as settled history, so the new information belongs in this entry rather than in an edit to that one.
+
+Entry 17 was also committed a step early, and that is worth recording because the mistake will otherwise repeat. `.ai/core-syntax.md` requires an entry to be written once a cycle reaches a terminal point, and one of those points is the build, deployment and user test having completed. Entry 17 was written and pushed after deployment but before the operator had looked at Sideband, which is why its status line could not honestly read PASS. Marking it NOT RUN and saying so was the right call given the commit had to happen then; holding the entry until the operator had tested would have been better. The rule this restates is that the user test is part of the cycle and not a formality after it.
+
+The heading itself is now confirmed end to end by the person who has to read it: the node computes it from the corrected horizontal field, ships it as a CUSTOM telemetry entry, and Sideband renders it as a row labelled Magnetic heading with a compass-rose icon. What was verified by the agent before this acceptance was that Sideband 2.2.0's own parsing code produced that entry from the board's own field bytes; what the operator has now verified is that the same thing happens in the running client.
+
+No engineering files changed in this cycle. The core-syntax audit re-read `.ai/core.md` and `.ai/core-syntax.md`, confirmed that neither was changed and that entries 1 to 17 were not rewritten, and that the reference's six YAML blocks all parse, with the index and the records naming the same 90 ids in the same order under the allowed Status values, and validated this entry as number 18 with exactly six sections, prose in Purpose, Outcome and Next Steps, allowed Status values, and `None.` in Files Modified.
+
+#### Next Steps:
+
+The RNS_TRANSPORT packing mismatch that entry 17 found is still unfixed: Sideband builds the transport row from `ifstats.interfaces` while the node writes `interfaces` as a sibling of `ifstats`, so the client logs a KeyError every time it renders that sensor. Moving the list or writing it in both places is a small change nobody has approved yet. The heading has still never been checked against a surveyed bearing, so its absolute correctness rests on the magnetometer being physically aligned to the GPS module rather than on a measurement, and the readings near 0.0 degrees against a 9.6 degree declination remain unexplained. A second Nano ESP32 would show whether the calibration, the gain correction and the heading logic generalise beyond this board. Three defects from earlier entries remain open: LOCATION ships speed, bearing and accuracy derived rather than measured, the compact telemetry map omits position and magnetic field, and P1 retains the copy of `.ai` this one came from.
+
+#### Files Modified:
+
+None.
+
+#### Status:
+
+- Build: N/A
+- Deployment: N/A
+- User Test: PASS
+
+---
