@@ -595,3 +595,41 @@ None.
 - User Test: PASS
 
 ---
+
+## 19 COMMIT Unreleased 2026-11-01T19:14:00-07:00
+
+#### Coming From:
+
+Unreleased 88c654f
+
+#### Purpose:
+
+Take the three cheapest integrations with Sideband that the previous survey identified: an INFORMATION row identifying the node, an icon and colours for it in the client's conversation list, and the repair of the Reticulum Transport sensor that raised a KeyError and was therefore lost entirely.
+
+#### Outcome:
+
+All three are in the firmware and each was confirmed with real bytes rather than by reading the schema. The node now reports SID_INFORMATION as a single line, `TinyNode Nano, tinydesk 0.2.0, up 1m36s, ip 10.10.0.35`, whose version comes from the app descriptor the build embeds rather than from a literal, so it cannot drift from the image. Outgoing messages carry FIELD_ICON_APPEARANCE as `radio-tower` with near-white on teal, and the Reticulum Transport sensor renders instead of vanishing.
+
+The transport repair turned out to be four faults and not the one that had been noticed. Sideband's RNSTransport.render() reads `d["ifstats"]["interfaces"]`, and the interface list had been written as a sibling of `ifstats`, so the lookup raised KeyError and the client discarded the whole sensor. It also reads `d["path_table"]`, `d["link_count"]` and `d["interface_count"]` from the top level, and none of the three was present, so fixing only the nested list would have traded one KeyError for another. The list moved inside `ifstats`, the three keys were added, and the per-interface `path_table` and `link_count` that had been sitting in an interface entry were removed because render() computes those per interface itself.
+
+The appearance field cost compact telemetry its only distinguishing property, and the bench caught it. Adding it made every reply about 26 bytes longer, which took the compact reply from a one-packet 151-byte message to a 175-byte link transfer, so the mode whose entire purpose is to need no link and no known path stopped doing that. Nothing in the code failed and the reply still arrived; only the measured packed_size showed it. The field is now attached only to replies that already travel over a link, and compact measurably returned to 151 bytes at method 1. The two colours are three raw bytes each rather than hex strings, which is what the client reads with its own three-byte unpack, and the icon name was checked against the MaterialDesignIcons glyph table inside the AppImage rather than assumed to exist.
+
+Verification used the client's own code on the board's own bytes. The 752-byte full reply captured as raw field bytes parsed through Sideband 2.2.0's Telemeter.from_packed() to eleven recognised sensors including `information` and a complete `rns_transport` rendering with seventeen values and no error, where before the repair that sensor was dropped. The same message carried field 0x04 as `['radio-tower', f5f5f5, 00695c]`, which decodes through the client's own htf() to the Kivy floats 0.9608 and 0.4118, 0.3608. Two client settings decide whether a peer's appearance is honoured at all, `telemetry_receive_trusted_only` and `display_style_from_all`, and both default such that an untrusted peer is still shown, so the icon does not require the operator to trust the node first.
+
+The core-syntax audit re-read `.ai/core.md` and `.ai/core-syntax.md`, confirmed that neither was changed and that entries 1 to 18 were not rewritten, and that the reference's six YAML blocks all parse, with the index and the records naming the same 93 ids in the same order under the allowed Status values, and validated this entry as number 19 with exactly six sections, prose in Purpose, Outcome and Next Steps, allowed Status values, and engineering paths in Files Modified.
+
+#### Next Steps:
+
+The operator has not yet looked at Sideband since this build, so the icon and the Information row are verified only as far as the client's parsing and rendering code goes. Text sent to the node still does nothing: the delivery callback returns before reading the content unless FIELD_COMMANDS is present, so the message box in Sideband remains a dead end, and that was the largest gain in the survey behind this cycle. The compact map still omits position, magnetic field and heading, so an operator who leaves the node in compact mode never sees where it is. Appearance is deliberately withheld from compact replies and a client that only ever asks for compact telemetry will never receive an icon. Three older items remain open: LOCATION ships speed, bearing and accuracy derived rather than measured, the heading has never been checked against a surveyed bearing, and P1 retains the copy of `.ai` this one came from.
+
+#### Files Modified:
+
+- ports/nanoesp32/main/node.cpp
+
+#### Status:
+
+- Build: PASS
+- Deployment: PASS
+- User Test: NOT RUN
+
+---

@@ -46,6 +46,7 @@ extern "C" int link_any_key(void);
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_timer.h"
+#include "esp_app_desc.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -725,6 +726,7 @@ static void node_log(const char *fmt, ...)
 
 #define LXMF_FIELD_TELEMETRY 0x02
 #define LXMF_FIELD_COMMANDS  0x09
+#define LXMF_FIELD_ICON_APPEARANCE 0x04
 
 #define LXMF_CMD_TELEMETRY_REQUEST 0x01
 #define LXMF_CMD_PING              0x02
@@ -736,6 +738,7 @@ static void node_log(const char *fmt, ...)
 #define SID_TEMPERATURE    0x07
 #define SID_HUMIDITY       0x08
 #define SID_MAGNETIC_FIELD 0x09
+#define SID_INFORMATION    0x0F
 #define SID_RAM            0x14
 #define SID_NVM            0x15
 #define SID_RNS_TRANSPORT  0x19
@@ -1191,6 +1194,32 @@ static void parse_commands(const RNS::Bytes &field, struct node_commands *out)
     }
 }
 
+/* One line identifying this node, for the client's Information row.
+ *
+ * The client renders SID_INFORMATION as a single copyable string, so this is
+ * the place a remote operator learns what they are talking to without
+ * guessing from telemetry: firmware version, how long it has been up, and the
+ * address to reach it on. Firmware version comes from the app descriptor the
+ * build embeds, not from a literal here, so it cannot drift from the image. */
+static void info_string(char *out, size_t n)
+{
+    char up[24];
+    const uint32_t s = (uint32_t)(esp_timer_get_time() / 1000000);
+    if (s >= 86400)
+        snprintf(up, sizeof up, "%ud%02uh", (unsigned)(s / 86400),
+                 (unsigned)((s % 86400) / 3600));
+    else if (s >= 3600)
+        snprintf(up, sizeof up, "%uh%02um", (unsigned)(s / 3600),
+                 (unsigned)((s % 3600) / 60));
+    else
+        snprintf(up, sizeof up, "%um%02us", (unsigned)(s / 60),
+                 (unsigned)(s % 60));
+
+    const esp_app_desc_t *d = esp_app_get_description();
+    snprintf(out, n, "TinyNode Nano, tinydesk %s, up %s, ip %s",
+             d ? d->version : "?", up, s_ip[0] ? s_ip : "none");
+}
+
 /* Pack the current readings as a FIELD_TELEMETRY map. Returns the length
  * written, or 0 if the buffer was too small. */
 /* compact=true builds a map small enough to travel in one encrypted packet
@@ -1213,6 +1242,8 @@ static size_t telemetry_pack(uint8_t *buf, size_t cap, bool compact)
         fs_total = fs_used = 0;
 
     unsigned entries = compact ? 1 : 3;  /* TIME, and RAM + RNS_TRANSPORT */
+    if (!compact)
+        entries++;                       /* INFORMATION */
     if (!compact && sn->gps_fix)
         entries++;
     if (sn->have_pressure)
@@ -1233,6 +1264,18 @@ static size_t telemetry_pack(uint8_t *buf, size_t cap, bool compact)
      * a number, so it is always written, even at 1970. */
     mp_uint(w, SID_TIME);
     mp_uint(w, now);
+
+    /* One copyable line saying what this node is. Cheap -- well under 80
+     * bytes -- and it answers the question a new operator has before any
+     * telemetry means anything. Full only, to keep the compact map inside one
+     * packet. */
+    if (!compact)
+    {
+        char info[128];
+        info_string(info, sizeof info);
+        mp_uint(w, SID_INFORMATION);
+        mp_str(w, info);
+    }
 
     if (!compact && sn->gps_fix)
     {
@@ -1349,7 +1392,7 @@ static size_t telemetry_pack(uint8_t *buf, size_t cap, bool compact)
         const uint32_t txs = RNS::Transport::packets_sent();
 
         mp_uint(w, SID_RNS_TRANSPORT);
-        mp_map(w, 12);
+        mp_map(w, 14);
         mp_str(w, "transport_enabled");
         mp_bool(w, true);
         mp_str(w, "transport_identity");
@@ -1371,7 +1414,7 @@ static size_t telemetry_pack(uint8_t *buf, size_t cap, bool compact)
         mp_str(w, "memory_used");
         mp_uint(w, (uint32_t)(heap_total - heap_free));
         mp_str(w, "ifstats");
-        mp_map(w, 5);
+        mp_map(w, 6);
         mp_str(w, "rss");
         mp_uint(w, 0);
         mp_str(w, "rxb");
@@ -1382,9 +1425,13 @@ static size_t telemetry_pack(uint8_t *buf, size_t cap, bool compact)
         mp_uint(w, rxs);
         mp_str(w, "txs");
         mp_uint(w, txs);
+        /* The interface list belongs INSIDE ifstats. Sideband's
+         * RNSTransport.render() reads d["ifstats"]["interfaces"], so writing
+         * it as a sibling of ifstats -- which is what this did -- raised
+         * KeyError 'interfaces' and lost the whole sensor. */
         mp_str(w, "interfaces");
         mp_arr(w, 1);
-        mp_map(w, 10);
+        mp_map(w, 8);
         mp_str(w, "name");
         mp_str(w, "UDP [TinyNode]");
         mp_str(w, "short_name");
@@ -1401,10 +1448,19 @@ static size_t telemetry_pack(uint8_t *buf, size_t cap, bool compact)
         mp_uint(w, rxs);
         mp_str(w, "txs");
         mp_uint(w, txs);
+
+        /* These three are read from the top level of the map, not from an
+         * interface entry: RNSTransport.render() takes d["path_table"],
+         * d["link_count"] and d["interface_count"] directly. Their absence
+         * raised KeyError as well, so one misplaced key and three missing
+         * ones each cost the client the whole sensor. path_table stays empty
+         * because this node holds no learned paths of its own to report. */
         mp_str(w, "path_table");
         mp_arr(w, 0);
         mp_str(w, "link_count");
         mp_uint(w, 0);
+        mp_str(w, "interface_count");
+        mp_uint(w, 1);
     }
 
     return w.ok ? w.len : 0;
@@ -1485,6 +1541,34 @@ static RNS::Identity peer_identity(const RNS::Bytes &hash)
     return RNS::Identity(false);
 }
 
+/* Icon and colours the client shows for this node, in its conversation list
+ * and on the map.
+ *
+ * The field is [icon name, fg, bg] where the two colours are three raw bytes
+ * each, not hex strings -- the client sends them to itself as
+ * struct.pack("!BBB") and decodes them with the same three-byte read. An icon
+ * name the font lacks renders blank rather than raising, so the name used here
+ * was checked against the MaterialDesignIcons glyph table shipped inside
+ * Sideband 2.2.0 rather than assumed. */
+static void lxmf_apply_appearance(LXMF::LXMessage &msg)
+{
+    static const char *ICON = "radio-tower";
+    static const uint8_t FG[3] = {0xF5, 0xF5, 0xF5};   /* near-white glyph */
+    static const uint8_t BG[3] = {0x00, 0x69, 0x5C};   /* teal */
+
+    uint8_t buf[48];
+    Mpw w = {buf, sizeof(buf), 0, true};
+    mp_arr(w, 3);
+    mp_str(w, ICON);
+    mp_bin(w, FG, sizeof FG);
+    mp_bin(w, BG, sizeof BG);
+    if (!w.ok)
+        return;
+
+    static const uint8_t key[1] = {LXMF_FIELD_ICON_APPEARANCE};
+    msg.fields_set(RNS::Bytes(key, sizeof key), RNS::Bytes(buf, w.len));
+}
+
 static void lxmf_send_text(const RNS::Bytes &peer_hash, const std::string &text)
 {
     RNS::Identity peer = peer_identity(peer_hash);
@@ -1498,6 +1582,7 @@ static void lxmf_send_text(const RNS::Bytes &peer_hash, const std::string &text)
     LXMF::LXMessage reply(dest, s_lxmf->delivery_destination(),
                           RNS::Bytes((const uint8_t *)text.data(), text.size()),
                           RNS::bytesFromString("re"));
+    lxmf_apply_appearance(reply);
     s_lxmf->handle_outbound(reply);
 }
 
@@ -1566,6 +1651,12 @@ static void lxmf_send_telemetry(const RNS::Bytes &peer_hash)
     static const uint8_t field_key[1] = {LXMF_FIELD_TELEMETRY};
     reply.fields_set(RNS::Bytes(field_key, sizeof(field_key)),
                      RNS::Bytes(field_value, fv.len));
+    /* Not on the compact reply. The appearance field costs about 26 bytes, and
+     * compact exists to fit one encrypted packet so no link and no known path
+     * are needed; measured on this board it took the reply from one packet to a
+     * 175-byte link transfer. The icon can wait for a full request. */
+    if (full)
+        lxmf_apply_appearance(reply);
     if (full)
         RNS::Transport::request_path(peer_hash);
     s_lxmf->handle_outbound(reply);

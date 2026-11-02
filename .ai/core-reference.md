@@ -150,6 +150,9 @@ Topic IDs are the `record_id` prefix. An entry reserves a name; it does not clai
 | How big can a telemetry reply be, and what does 159 bytes mean? | LXMF | LXMF-011 |
 | Does a large telemetry reply actually arrive? | LXMF | LXMF-012 |
 | How is a heading reported, when no sensor id exists for one? | LXMF | LXMF-013 |
+| Where does a node describe itself to the client? | LXMF | LXMF-014 |
+| How does a node set its icon and colours in the client? | LXMF | LXMF-015 |
+| Why does the Reticulum Transport sensor not appear at all? | LXMF | LXMF-016 |
 | Why does Identity::recall() fail for a peer that just announced? | RNS | RNS-007 |
 | Why does the path count read as a huge number? | RNS | RNS-008 |
 | Where can a message carry custom data without colliding? | LXMF | LXMF-007 |
@@ -245,6 +248,9 @@ LXMF-010: "A message field value must itself be msgpack-encoded bytes: microLXMF
 LXMF-011: "159 bytes is the threshold for sending a message as one link-free OPPORTUNISTIC packet, not a size limit: above it LXMF uses DIRECT and a RESOURCE transfer, so any telemetry map arrives, just slower; 114 bytes are committed before sensors, leaving a 45-byte map in which TIME costs 6, LOCATION 41, MAGNETIC_FIELD 29 and the environment trio 10 each"
 LXMF-012: "Link delivery works to Sideband: a 614-byte LOCATION+MAGNETIC_FIELD reply arrived over a DIRECT resource transfer, parsed and was committed to Sideband's database; Sideband's telemetry panel then needed a restart to repaint, which is a client display artefact, not a delivery fault"
 LXMF-013: "Sideband has no sensor id for heading, and the two slots that look like candidates refuse it: MAGNETIC_FIELD unpacks exactly three floats and drops a fourth, and LOCATION's `bearing` is only rendered when speed exceeds 0.1 km/h, so a stationary node never shows it; CUSTOM (0xFF) carries [label, [value, icon]] entries and renders each as its own row regardless of motion"
+LXMF-014: "SID_INFORMATION (0x0F) is a single plain msgpack string that the client shows as one copyable row under the name Information, so it is the place for firmware version, uptime and address in one line"
+LXMF-015: "FIELD_ICON_APPEARANCE (0x04) is [icon name, fg, bg] with the two colours as three raw bytes each rather than hex strings, costs about 26 bytes per message and is honoured from untrusted peers by default, so it must not be attached to the compact telemetry reply whose whole purpose is staying inside one 151-byte packet"
+LXMF-016: "Sideband's RNSTransport.render() reads the interface list at d['ifstats']['interfaces'] and needs d['path_table'], d['link_count'] and d['interface_count'] at the top level, and any one missing raises KeyError that discards the entire sensor"
 MSG-001: "MsgPack 0.4.2 (MIT) is vendored with Packer::packRawBytes (both overloads) and Unpacker::indices made public, because microLXMF's LXMessage.cpp uses them and 0.4.2 keeps them private while upstream CI builds that path only for native targets"
 RADIO-001: "The radio is a REYAX RYLR998, an 868/915 MHz module driven entirely by AT commands on a UART with no SPI path and no RadioLib; the module on this bench reports RYLR998_REYAX_V1.2.4"
 RADIO-002: "Configured values: address 1, network id 6, peer address 0 (broadcast), SF7, bandwidth index 7 (125 kHz), coding rate 1 (4/5), preamble 12, 14 dBm, UART 115200 8N1; the band is left at whatever the module holds (factory 915 MHz) unless -DLORA_BAND_HZ is set"
@@ -835,6 +841,48 @@ Records are grouped in the order of the topic catalog, and numbered within each 
     - "Sideband 2.2.0 sbapp/sideband/sense.py: the Sensor SID constants, MagneticField.pack/unpack/render, Location.unpack/render, Custom.pack/unpack/render, and Telemeter.from_packed()"
     - "Sideband 2.2.0 sbapp/ui/objectdetails.py: the Location branch gated on speed > 0.1, and the Custom branch building the row as f'{label} [b]{value}[/b]'"
   verification: "Read from the Sideband 2.2.0 AppImage on this bench 2026-11-01, and confirmed live: the node's own 660-byte telemetry reply, captured as raw field bytes, was passed to Telemeter.from_packed() from that same installation and produced the entry {'Magnetic heading': ['359.8\u00b0', 'compass-rose']}, which rendered as the row 'Magnetic heading [b]359.8\u00b0[/b]' with the compass-rose icon. The same bytes were also decoded by tools/telemetry_request_test.py, which showed SID 0xff carrying that list under the map."
+
+- record_id: LXMF-014
+  kind: EXTERNAL
+  topic_id: LXMF
+  title: "INFORMATION is one plain string the client shows as a copyable row"
+  status: VERIFIED
+  verified_date: 2026-11-01
+  statement: "Sideband's SID_INFORMATION (0x0F) carries a single msgpack string rather than a structure: Information.pack() returns self.data['contents'] and unpack() wraps whatever arrives as {'contents': str(packed)}. Information.render() emits the row with the icon information-variant under the name Information, and the UI branch in objectdetails.py treats the value as free text, displaying it whole and offering a copy-to-clipboard action on it. There is no length limit in the client and no sub-field to fill in."
+  consequence: "This is the place to say what a node is, in one line, for an operator who has just discovered it: firmware version, uptime, and the address to reach it on all fit and all read well in the row. Because the client copies the string verbatim, it should be a plain sentence rather than a formatted blob. The firmware builds it from the app descriptor the build embeds rather than from a literal, so the reported version cannot drift from the image actually running, which is the failure mode a hardcoded string has. It is in the full telemetry map only, to keep the compact map inside one packet."
+  sources:
+    - "Sideband 2.2.0 sbapp/sideband/sense.py: the Sensor.SID_INFORMATION constant, Information.pack(), unpack() and render()"
+    - "Sideband 2.2.0 sbapp/ui/objectdetails.py: the 'Information' branch, which copies the value to the clipboard on release"
+    - "ports/nanoesp32/main/node.cpp: info_string(), using esp_app_get_description()->version"
+  verification: "Confirmed on this board 2026-11-01: the node's 752-byte telemetry reply, captured as raw field bytes, parsed through Sideband 2.2.0's Telemeter.from_packed() into eleven recognised sensors including 'information', and the map carried SID 0x0f as the string 'TinyNode Nano, tinydesk 0.2.0, up 1m36s, ip 10.10.0.35'."
+
+- record_id: LXMF-015
+  kind: EXTERNAL
+  topic_id: LXMF
+  title: "Icon appearance is a name and two three-byte colours, and it costs a packet"
+  status: VERIFIED
+  verified_date: 2026-11-01
+  statement: "FIELD_ICON_APPEARANCE (0x04) carries a three-element array: an icon name as a string, then the foreground and background colours as three raw bytes each, in that order. The client writes it to itself with struct.pack('!BBB') and reads it back with a matching three-byte unpack that divides by 255, so hex colour strings are not accepted. The icon name indexes the MaterialDesignIcons webfont shipped inside the application; a name the font does not carry renders blank rather than raising an error, so it fails silently. The packed field costs about 26 bytes on every message that carries it, and the client accepts it from an untrusted peer by default, because telemetry_receive_trusted_only and display_style_from_all both default false and true respectively."
+  consequence: "A node can present its own icon and colours in the client's conversation list and on the map without the operator configuring anything, but the cost has to be watched: the compact telemetry reply is a 151-byte one-packet message and adding this field took it to 175 bytes and onto a link, destroying the property that makes compact mode useful. The firmware therefore attaches it only to replies that already travel over a link. Any future field added to outgoing messages has to be measured against packed_size the same way, because the message still arrives when it crosses the threshold -- it simply stops being link-free, and nothing in the code fails."
+  sources:
+    - "Sideband 2.2.0 sbapp/sideband/core.py: the fth() colour packer producing struct.pack('!BBB', ...), and the appearance read path with its matching three-byte unpack"
+    - "Sideband 2.2.0 sbapp/ui/map.py and sbapp/ui/objectdetails.py: appearance[0] used as the icon name, [1] as icon_color and [2] as md_bg_color"
+    - "The MaterialDesignIcons webfont's glyph table inside the Sideband 2.2.0 AppImage, where 'radio-tower' was confirmed present"
+  verification: "Confirmed on this board 2026-11-01: a full telemetry reply arrived carrying field 0x04 as ['radio-tower', f5f5f5, 00695c], and those bytes decode through the client's own three-byte read to the Kivy floats 0.9608 and 0.4118, 0.3608. The packet cost was measured rather than assumed: with the field on every reply the compact message packed to 175 bytes at method 2, and with it withheld from compact the same reply packed to 151 bytes at method 1."
+
+- record_id: LXMF-016
+  kind: EXTERNAL
+  topic_id: LXMF
+  title: "The Reticulum Transport map must nest its interfaces and carry four counts"
+  status: VERIFIED
+  verified_date: 2026-11-01
+  statement: "Sideband's RNSTransport.render() reads the interface list at d['ifstats']['interfaces'] and reads d['path_table'], d['link_count'] and d['interface_count'] from the top level of the map, alongside transport_enabled, transport_identity, transport_uptime, traffic_rxb, traffic_txb, speed_rx, speed_tx, speed_rx_inst, speed_tx_inst and memory_used. It builds its per-interface path and link counts itself from the top-level path_table, so an interface entry needs only its own descriptor fields, of which name is required because render() keys its interface dictionary by it. Any missing key raises KeyError inside a bare except that logs and returns nothing, so the client discards the entire sensor rather than showing the fields it did receive."
+  consequence: "A transport map that is wrong in one key is not partly wrong: the operator sees no Reticulum Transport row at all, and the log line names only the missing key, so repairing one reported KeyError can simply expose the next. All four were missing or misplaced on this node, and fixing only the nested list would have moved the failure from 'interfaces' to 'path_table'. Any node implementing this sensor has to match the whole map shape, not the parts a client happens to complain about."
+  sources:
+    - "Sideband 2.2.0 sbapp/sideband/sense.py: RNSTransport.render(), including the d['ifstats']['interfaces'] loop and the seventeen-value dictionary it builds"
+    - "Sideband 2.2.0 sbapp/ui/objectdetails.py: the 'Reticulum Transport' branch, using interface_count, link_count, path_count and the traffic fields"
+    - "ports/nanoesp32/main/node.cpp: telemetry_pack()'s SID_RNS_TRANSPORT block"
+  verification: "Measured on this board 2026-11-01, in both directions. Before the repair the client logged KeyError 'interfaces' and produced no render; after it, the node's 752-byte reply parsed through Telemeter.from_packed() produced a complete Reticulum Transport render with all seventeen values, including an interface dictionary keyed by 'UDP [TinyNode]'."
 
 - record_id: MSG-001
   kind: EXTERNAL
