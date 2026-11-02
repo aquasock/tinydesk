@@ -131,18 +131,24 @@ without a rebuild. See
 
 | Repository | What it is | Licence |
 | --- | --- | --- |
-| **tinydesk** (this one) | the desktop, apps, ports and tools | MIT |
+| **tinydesk** (this one) | the desktop, apps, ports and tools | GPL-3.0 (see below) |
 | [**tinydesk-shell**](https://github.com/tinydesk-project/tinydesk-shell) | TinyDesk Shell (`tdsh`): the shell, its ESP-IDF services and host port; included here as the submodule `third_party/tdsh` | MIT, with third-party parts under their own licences |
 
 ## Licence
 
-TinyDesk is released under the [MIT licence](LICENSE).
+This repository is released under the [GNU General Public License,
+version 3](LICENSE). It is a fork of TinyDesk, which is MIT; this tree is GPL
+because it links **microLXMF, which is GPL-3.0-only**, and the `rns` and
+`lxm` components compile it into every firmware image. A work that links a
+GPL-3.0-only library has to be distributed under the GPL as a whole, so the
+licence here states what the build already required rather than imposing
+anything new.
 
 The firmware images also contain third-party code under its own licence,
-notably **wolfSSH and wolfSSL (GPLv3)** for the SSH/SFTP server. Firmware
-built with them, including the prebuilt releases, is therefore distributed
-under the terms of the GPLv3 as a whole. The source code in this repository
-stays MIT. See [`third_party/tdsh/THIRD_PARTY_LICENSES.md`](third_party/tdsh/THIRD_PARTY_LICENSES.md)
+notably **wolfSSH and wolfSSL (GPLv3)** for the SSH/SFTP server and the
+Reticulum trees under `third_party/`. See
+[`third_party/VENDORED.md`](third_party/VENDORED.md) and
+[`third_party/tdsh/THIRD_PARTY_LICENSES.md`](third_party/tdsh/THIRD_PARTY_LICENSES.md)
 for the list. The `py` command is [MicroPython](third_party/micropython/README.md)
 (MIT; its SHA-256 code from `lib/crypto-algorithms` is public domain), in
 `third_party/micropython`.

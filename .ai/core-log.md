@@ -824,3 +824,42 @@ P4 is now self-sufficient, which was the precondition for replacing P1, and the 
 - User Test: NOT RUN
 
 ---
+
+## 24 COMMIT Unreleased 2026-11-01T22:20:00-07:00
+
+#### Coming From:
+
+Unreleased 730d18b
+
+#### Purpose:
+
+State the licence the build has always required, and consolidate the three ways the node describes itself behind one view, before this repository replaces the superseded P1 in place.
+
+#### Outcome:
+
+The repository is now GPL-3.0. It is a fork of TinyDesk, which is MIT, and the `rns` and `lxm` components compile microLXMF -- which is GPL-3.0-only -- into every firmware image, so the combined work had to be distributed under the GPL whatever the licence file said. Until this cycle the LICENSE file claimed MIT, which was simply wrong about the artefact it described. The copyright line naming the TinyDesk authors was dropped along with the MIT text rather than carried over, because that attribution was TinyDesk's and this tree is now a different work; nothing in the GPL text requires a replacement line and the history carries the provenance. The README's licensing section was corrected with it, since changing the file alone would have left two documents disagreeing, and it now says why the tree is GPL rather than only that it is.
+
+Two things were also recorded rather than fixed. A stray copy of `board_builtin.conf` was found in the source tree: the build generates that file into its build directory by copying `board.conf` into it, and the copy found here was byte-identical to `board.example.conf`, so it carried nothing and was a mistake rather than a configuration. It was deleted, and the ignore file now covers it so a future run cannot leave one to be committed by accident. Offering to commit it was itself an error worth naming: it is a generated duplicate of a file that is deliberately kept out of git, and there was never a decision to make. Separately, the three renderers now share one view and agree, which was verified on hardware, but the GPS precision they share has not been reconsidered: both report six decimal places, which is about eleven centimetres, well past what this receiver resolves.
+
+Two faults of mine belong in this entry rather than the next one. The rendering consolidation was verified over serial and not by the operator, so its status reads not run; claiming otherwise on the strength of my own reading of the console is the mistake this log has already recorded twice. And while correcting that status line I replaced the first matching block in the file rather than the last, which silently altered entry 18; it was caught by re-reading both entries, reverted from git, and redone against entry 24 alone. The core-syntax audit re-read `.ai/core.md` and `.ai/core-syntax.md`, confirmed that neither was changed and that entries 1 to 23 were not rewritten, and that the reference's six YAML blocks all parse, with the index and the records naming the same 96 ids in the same order under the allowed Status values, and validated this entry as number 24 with exactly six sections, prose in Purpose, Outcome and Next Steps, allowed Status values, and the files listed in Files Modified.
+
+#### Next Steps:
+
+This repository is ready to replace P1 in place, which is the next step and needs the old tree tagged and that tag pushed before anything is rewritten so its 47 commits stay reachable by name. P1's log now carries entries 16 to 23 summarising the port, so the history will read continuously across the replacement rather than starting again. Three things remain open from earlier cycles and none blocks the swap: the GPS precision both renderers now share, the LoRa link loss seen once and never characterised, and the magnetic heading never checked against a surveyed bearing.
+
+#### Files Modified:
+
+- .gitignore
+- LICENSE
+- README.md
+- ports/nanoesp32/main/lora.cpp
+- ports/nanoesp32/main/lora.h
+- ports/nanoesp32/main/node.cpp
+
+#### Status:
+
+- Build: PASS
+- Deployment: PASS
+- User Test: NOT RUN
+
+---

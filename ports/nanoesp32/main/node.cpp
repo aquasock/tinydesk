@@ -2728,6 +2728,112 @@ static int cmd_cols(tdsh_session_t *session, int argc, char **argv)
     return 0;
 }
 
+/* ---- one status view, three renderers ------------------------------------
+ *
+ * The node describes itself three times: the console's `node` command, the
+ * LXMF telemetry map and the Tang's text. Each used to format its own facts,
+ * and they drifted -- the console printed a GPS position to six decimal places
+ * and the Tang to four, and the Tang's radio counters were a placeholder
+ * printing zeros because the real string did not fit its frame budget.
+ *
+ * Everything lands here first, in display units and at one precision, so a
+ * renderer only decides how to present a fact and never recomputes it. The
+ * policy that matters is the precision: six places for a position is about
+ * 11 cm, well past what this receiver resolves, and the Tang's frame budget
+ * cannot afford six anyway.
+ */
+struct node_view
+{
+    const char *state;      /* node_state_text() */
+    uint32_t uptime_s;
+    const char *ip;
+    int rssi_dbm;
+
+    bool have_env;
+    double temperature_c;
+    double humidity_pct;
+    bool have_pressure;
+    double pressure_hpa;
+
+    bool have_mag;
+    double mag_ut;          /* magnitude, not the vector */
+    bool have_heading;
+    double heading_deg;
+
+    bool gps_fix;
+    double lat, lon, alt_m;
+    unsigned sats;
+
+    bool lora_up;
+    uint32_t lora_tx, lora_rx;
+    int lora_rssi, lora_snr;
+    const char *lora_text;  /* filled by node_view_fill */
+};
+
+static char s_lora_text[96];
+
+static void node_view_fill(struct node_view *v)
+{
+    const struct sensor_snapshot *sn = sensors_latest();
+    memset(v, 0, sizeof *v);
+    v->state    = node_state_text();
+    v->uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
+    v->ip       = s_ip[0] ? s_ip : "none";
+    v->rssi_dbm = (int)s_stats.rssi_dbm;
+
+    v->have_env        = sn->have_env;
+    v->temperature_c   = sn->temperature_c;
+    v->humidity_pct    = sn->humidity_pct;
+    v->have_pressure   = sn->have_pressure;
+    v->pressure_hpa    = sn->pressure_hpa;
+
+    v->have_mag = sn->have_mag;
+    if (sn->have_mag)
+        v->mag_ut = sqrt(sn->mag_x_ut * sn->mag_x_ut +
+                         sn->mag_y_ut * sn->mag_y_ut +
+                         sn->mag_z_ut * sn->mag_z_ut);
+    v->have_heading  = sn->have_heading;
+    v->heading_deg   = sn->mag_heading_deg;
+
+    v->gps_fix = sn->gps_fix;
+    v->lat     = sn->gps_lat;
+    v->lon     = sn->gps_lon;
+    v->alt_m   = sn->gps_alt_m;
+    v->sats    = sn->gps_sats;
+
+    v->lora_up = lora::status_line(s_lora_text, sizeof s_lora_text);
+    v->lora_text = s_lora_text;
+    lora::counters(&v->lora_tx, &v->lora_rx, &v->lora_rssi, &v->lora_snr);
+}
+
+const char *trim_copy(const char *s, size_t n, char *out, size_t cap)
+{
+    while (n > 0 && (*s == ' ' || *s == '\t')) { ++s; --n; }
+    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t' || s[n - 1] == '\r'))
+        --n;
+    const size_t k = (n < cap - 1) ? n : cap - 1;
+    for (size_t i = 0; i < k; ++i)
+        out[i] = (char)tolower((unsigned char)s[i]);
+    out[k] = '\0';
+    return out;
+}
+
+/* Append one line, dropping it whole rather than truncating: half a line on a
+ * 320x240 panel reads as data when it is only the end of a buffer. */
+void append_line(char *buf, size_t cap, size_t *used, const char *line)
+{
+    if (!line || !line[0])
+        return;
+    const size_t n = strlen(line);
+    if (*used + n + 2 >= cap)
+        return;
+    memcpy(buf + *used, line, n);
+    *used += n;
+    buf[(*used)++] = '\n';
+    buf[*used] = '\0';
+}
+
+
 static int cmd_node(tdsh_session_t *session, int argc, char **argv)
 {
     (void)session;
@@ -2785,47 +2891,55 @@ static int cmd_node(tdsh_session_t *session, int argc, char **argv)
     /* Printed for the Terminal on the panel, and echoed to node_log so the
      * same lines reach USB -- the panel is 40x15 and reading it back for a
      * bench check is not practical. */
+    struct node_view v;
+    node_view_fill(&v);
+
     char buf[160];
-    snprintf(buf, sizeof(buf), "node:    %s", node_state_text());
+    snprintf(buf, sizeof(buf), "node:    %s", v.state);
     printf("%s\n", buf);
     node_log("%s", buf);
-    snprintf(buf, sizeof(buf), "ip:      %s", s_ip[0] ? s_ip : "(none)");
+    snprintf(buf, sizeof(buf), "ip:      %s", v.ip);
     printf("%s\n", buf);
     node_log("%s", buf);
     snprintf(buf, sizeof(buf), "identity %s", s_identity_hex[0] ? s_identity_hex : "(not yet)");
     printf("%s\n", buf);
     node_log("%s", buf);
-    if (s_stats.rssi_dbm)
+    if (v.rssi_dbm)
     {
-        snprintf(buf, sizeof(buf), "rssi:    %d dBm", (int)s_stats.rssi_dbm);
+        snprintf(buf, sizeof(buf), "rssi:    %d dBm", v.rssi_dbm);
         printf("%s\n", buf);
         node_log("%s", buf);
     }
 
-    const struct sensor_snapshot *sn = sensors_latest();
-    if (sn->have_env)
+    if (v.have_env)
     {
-        snprintf(buf, sizeof(buf), "env:     %.1f C, %.1f %%RH", sn->temperature_c, sn->humidity_pct);
+        snprintf(buf, sizeof(buf), "env:     %.1f C, %.1f %%RH", v.temperature_c, v.humidity_pct);
         printf("%s\n", buf);
         node_log("%s", buf);
     }
-    if (sn->have_pressure)
+    if (v.have_pressure)
     {
-        snprintf(buf, sizeof(buf), "press:   %.1f hPa", sn->pressure_hpa);
+        snprintf(buf, sizeof(buf), "press:   %.1f hPa", v.pressure_hpa);
         printf("%s\n", buf);
         node_log("%s", buf);
     }
-    if (sn->have_mag)
+    if (v.have_mag)
     {
-        snprintf(buf, sizeof(buf), "mag:     %.1f, %.1f, %.1f uT",
-                 sn->mag_x_ut, sn->mag_y_ut, sn->mag_z_ut);
+        snprintf(buf, sizeof(buf), "mag:     %.1f uT%s", v.mag_ut,
+                 v.have_heading ? "" : "");
         printf("%s\n", buf);
         node_log("%s", buf);
+        if (v.have_heading)
+        {
+            snprintf(buf, sizeof(buf), "heading: %.1f deg (magnetic)", v.heading_deg);
+            printf("%s\n", buf);
+            node_log("%s", buf);
+        }
     }
-    if (sn->gps_fix)
+    if (v.gps_fix)
     {
         snprintf(buf, sizeof(buf), "gps:     %.6f, %.6f, %.0f m, %u sat",
-                 sn->gps_lat, sn->gps_lon, sn->gps_alt_m, (unsigned)sn->gps_sats);
+                 v.lat, v.lon, v.alt_m, v.sats);
         printf("%s\n", buf);
         node_log("%s", buf);
     }
@@ -3006,33 +3120,6 @@ void node_announce_now(void)
 
 namespace {
 
-const char *trim_copy(const char *s, size_t n, char *out, size_t cap)
-{
-    while (n > 0 && (*s == ' ' || *s == '\t')) { ++s; --n; }
-    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t' || s[n - 1] == '\r'))
-        --n;
-    const size_t k = (n < cap - 1) ? n : cap - 1;
-    for (size_t i = 0; i < k; ++i)
-        out[i] = (char)tolower((unsigned char)s[i]);
-    out[k] = '\0';
-    return out;
-}
-
-/* Append one line, dropping it whole rather than truncating: half a line on a
- * 320x240 panel reads as data when it is only the end of a buffer. */
-void append_line(char *buf, size_t cap, size_t *used, const char *line)
-{
-    if (!line || !line[0])
-        return;
-    const size_t n = strlen(line);
-    if (*used + n + 2 >= cap)
-        return;
-    memcpy(buf + *used, line, n);
-    *used += n;
-    buf[(*used)++] = '\n';
-    buf[*used] = '\0';
-}
-
 }  // namespace
 
 bool tanglink::node_answer(const char *command, size_t length, char *out, size_t capacity)
@@ -3042,13 +3129,14 @@ bool tanglink::node_answer(const char *command, size_t length, char *out, size_t
 
     char cmd[48];
     trim_copy(command, length, cmd, sizeof cmd);
-    const struct sensor_snapshot *sn = sensors_latest();
-    const uint32_t up = (uint32_t)(esp_timer_get_time() / 1000000);
+
+    struct node_view v;
+    node_view_fill(&v);
     char line[160];
 
     if (strcmp(cmd, "ping") == 0)
     {
-        snprintf(out, capacity, "pong up %lus", (unsigned long)up);
+        snprintf(out, capacity, "pong up %lus", (unsigned long)v.uptime_s);
         return true;
     }
     if (strcmp(cmd, "status") == 0)
@@ -3060,107 +3148,94 @@ bool tanglink::node_answer(const char *command, size_t length, char *out, size_t
          * which costs about 0.6 s of airtime each and then competes with the
          * Tang's own 1.2 s retry -- measured as a reply that arrived in pieces
          * and was abandoned. Short lines, one frame, always. */
-        snprintf(line, sizeof line, "TinyNode %s %luh%lum", node_state_text(),
-                 (unsigned long)(up / 3600), (unsigned long)((up % 3600) / 60));
+        snprintf(line, sizeof line, "TinyNode %s %luh%lum", v.state,
+                 (unsigned long)(v.uptime_s / 3600),
+                 (unsigned long)((v.uptime_s % 3600) / 60));
         append_line(out, capacity, &used, line);
-        snprintf(line, sizeof line, "wifi %s %ddBm",
-                 s_ip[0] ? s_ip : "none", (int)s_stats.rssi_dbm);
+        snprintf(line, sizeof line, "wifi %s %ddBm", v.ip, v.rssi_dbm);
         append_line(out, capacity, &used, line);
-        if (sn->have_env)
+        if (v.have_env)
         {
             snprintf(line, sizeof line, "env %.1fC %.0f%% %.0fhPa",
-                     sn->temperature_c, sn->humidity_pct,
-                     sn->have_pressure ? sn->pressure_hpa : 0.0);
+                     v.temperature_c, v.humidity_pct,
+                     v.have_pressure ? v.pressure_hpa : 0.0);
             append_line(out, capacity, &used, line);
         }
-        if (sn->have_mag)
+        if (v.have_mag)
         {
-            const double b = sqrt(sn->mag_x_ut * sn->mag_x_ut +
-                                  sn->mag_y_ut * sn->mag_y_ut +
-                                  sn->mag_z_ut * sn->mag_z_ut);
-            if (sn->have_heading)
-                snprintf(line, sizeof line, "mag %.0fuT hdg %.0f", b,
-                         sn->mag_heading_deg);
+            if (v.have_heading)
+                snprintf(line, sizeof line, "mag %.0fuT hdg %.0f", v.mag_ut,
+                         v.heading_deg);
             else
-                snprintf(line, sizeof line, "mag %.0fuT", b);
+                snprintf(line, sizeof line, "mag %.0fuT", v.mag_ut);
             append_line(out, capacity, &used, line);
         }
-        if (sn->gps_fix)
+        if (v.gps_fix)
         {
             snprintf(line, sizeof line, "gps %.4f %.4f %.0fm %us",
-                     sn->gps_lat, sn->gps_lon, sn->gps_alt_m, (unsigned)sn->gps_sats);
+                     v.lat, v.lon, v.alt_m, v.sats);
             append_line(out, capacity, &used, line);
         }
         else
             append_line(out, capacity, &used, "gps nofix");
-        snprintf(line, sizeof line, "lora tx%lu rx%lu %ddBm %d",
-                 (unsigned long)0, (unsigned long)0, 0, 0);
-        {
-            char ls[64];
-            if (lora::status_line(ls, sizeof ls))
-            {
-                /* The full status line is too long for one frame; take only
-                 * the counters, which are what a remote operator lacks. */
-                const char *p = strstr(ls, "tx");
-                if (p)
-                    snprintf(line, sizeof line, "lora %.60s", p);
-                else
-                    snprintf(line, sizeof line, "lora up");
-            }
-            else
-                snprintf(line, sizeof line, "lora down");
-        }
+        /* Counters only, not the full status line: that names the address,
+         * network, band and air parameters the Tang has no use for and costs
+         * the ~75 bytes that push this reply into a second frame. */
+        if (v.lora_up)
+            snprintf(line, sizeof line, "lora tx%lu rx%lu %ddBm %d",
+                     (unsigned long)v.lora_tx, (unsigned long)v.lora_rx,
+                     v.lora_rssi, v.lora_snr);
+        else
+            snprintf(line, sizeof line, "lora down");
         append_line(out, capacity, &used, line);
         if (used == 0)
-            snprintf(out, capacity, "TinyNode %s", node_state_text());
+            snprintf(out, capacity, "TinyNode %s", v.state);
         return true;
     }
     if (strcmp(cmd, "env") == 0)
     {
-        if (!sn->have_env)
+        if (!v.have_env)
         {
             snprintf(out, capacity, "env unavailable");
             return true;
         }
         snprintf(out, capacity, "env %.1f C %.1f %%RH %.1f hPa",
-                 sn->temperature_c, sn->humidity_pct,
-                 sn->have_pressure ? sn->pressure_hpa : 0.0);
+                 v.temperature_c, v.humidity_pct,
+                 v.have_pressure ? v.pressure_hpa : 0.0);
         return true;
     }
     if (strcmp(cmd, "gps") == 0)
     {
-        if (!sn->gps_fix)
+        if (!v.gps_fix)
         {
             snprintf(out, capacity, "gps no fix");
             return true;
         }
+        /* Six places here and not in `status`: this is the answer to a direct
+         * question about position, and it may be the only place the operator
+         * can read it. It still costs the same number of frames. */
         snprintf(out, capacity, "gps %.6f %.6f %.0f m %u sat",
-                 sn->gps_lat, sn->gps_lon, sn->gps_alt_m, (unsigned)sn->gps_sats);
+                 v.lat, v.lon, v.alt_m, v.sats);
         return true;
     }
     if (strcmp(cmd, "mag") == 0)
     {
-        if (!sn->have_mag)
+        if (!v.have_mag)
         {
             snprintf(out, capacity, "mag unavailable");
             return true;
         }
-        snprintf(out, capacity, "mag %.1f %.1f %.1f uT%s",
-                 sn->mag_x_ut, sn->mag_y_ut, sn->mag_z_ut,
-                 sn->have_heading ? "" : " (no heading)");
-        if (sn->have_heading)
-        {
-            const size_t used = strlen(out);
-            snprintf(out + used, capacity - used, " heading %.0f deg",
-                     sn->mag_heading_deg);
-        }
+        if (v.have_heading)
+            snprintf(out, capacity, "mag %.1f uT heading %.0f deg", v.mag_ut,
+                     v.heading_deg);
+        else
+            snprintf(out, capacity, "mag %.1f uT", v.mag_ut);
         return true;
     }
     if (strcmp(cmd, "lora") == 0)
     {
-        char st[96];
-        if (lora::status_line(st, sizeof st))
-            snprintf(out, capacity, "%s", st);
+        if (v.lora_up)
+            snprintf(out, capacity, "%.96s", v.lora_text);
         else
             snprintf(out, capacity, "lora not started");
         return true;

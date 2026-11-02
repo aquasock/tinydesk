@@ -53,6 +53,10 @@ std::string short_status();
 // Multi-line detail for the `lora` console command.
 void console_report();
 
+// Just the traffic counters and last signal, for a reply that has to fit one
+// LoRa frame: the full status line is ~75 bytes and would cost a second frame.
+bool counters(uint32_t *tx, uint32_t *rx, int *rssi, int *snr);
+
 // Log every message that reassembles, whatever it turns out to be. Off by
 // default; `lora verbose on` turns it on. This is what separates "the radio
 // heard something and the stack rejected it" from "the radio heard nothing".

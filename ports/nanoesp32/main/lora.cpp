@@ -165,6 +165,11 @@ public:
 	bool up() const { return _online; }
 
 	bool status_line(char* out, size_t n) const;
+	void counters(uint32_t* tx, uint32_t* rx, int* rssi, int* snr) const
+	{
+		*tx = _packets_tx; *rx = _packets_rx;
+		*rssi = _last_rssi; *snr = _last_snr;
+	}
 	std::string short_status() const;
 	void console_report() const;
 	void set_verbose(bool on) { _verbose = on; }
@@ -827,6 +832,15 @@ bool status_line(char* out, size_t n) {
 		return false;
 	}
 	return g_impl->status_line(out, n);
+}
+
+bool counters(uint32_t* tx, uint32_t* rx, int* rssi, int* snr) {
+	if (g_impl == nullptr) {
+		*tx = *rx = 0; *rssi = *snr = 0;
+		return false;
+	}
+	g_impl->counters(tx, rx, rssi, snr);
+	return true;
 }
 
 std::string short_status() {
