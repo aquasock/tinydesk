@@ -115,6 +115,12 @@ bool     mag_cal_residual(int32_t out[3], double *radius_ut, double *scatter_ut)
 /* Largest axis spread among the samples, in uT. Small means the board was
  * never turned and no fit can be trusted. */
 double   mag_cal_rotation_ut(void);
+/* Fit hard AND soft iron from the collected samples: a 3x3 correction that
+ * reshapes the ellipsoid back to a sphere. `target_ut` is the local field
+ * magnitude, since the shape is scale-free. */
+bool     mag_cal_fit_ellipsoid(double target_ut, char *report, size_t n);
+bool     mag_cal_using_matrix(void);
+void     mag_cal_clearmatrix(void);
 void     mag_cal_abort(void);
 void     mag_cal_set_offsets(const struct mag_offsets *o);
 struct mag_offsets mag_cal_offsets(void);

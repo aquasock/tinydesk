@@ -2336,10 +2336,31 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
         printf("  tumble further, especially face down.\n");
     }
 
-    mag_cal_set_offsets(&found);
+    /* Prefer the full model: three offsets cannot reshape an ellipsoid back
+     * into a sphere, and soft iron is what the residuals here show. The
+     * offsets from mag_cal_finish are kept as a fallback and still used when
+     * the fit cannot be solved. */
+    {
+        char erep[128];
+        if (mag_cal_fit_ellipsoid(BENCH_FIELD_UT, erep, sizeof erep))
+        {
+            printf("  %s\n", erep);
+            printf("  (soft-iron matrix, not just offsets -- |B| should now be\n");
+            printf("   steady in every orientation)\n");
+        }
+        else
+        {
+            printf("  %s; using offsets only\n", erep);
+            mag_cal_set_offsets(&found);
+        }
+    }
+
     char rd_after[128];
     magcal_readings(rd_after, sizeof rd_after);
-    printf("\n  new offsets : X %d  Y %d  Z %d\n", found.x, found.y, found.z);
+    if (mag_cal_using_matrix())
+        printf("\n  correction  : soft-iron matrix applied\n");
+    else
+        printf("\n  new offsets : X %d  Y %d  Z %d\n", found.x, found.y, found.z);
     printf("  reading now : %s\n", rd_after);
     if (!shell_read_line("Save these offsets to flash? [Y/n]: ", line, sizeof line))
     {

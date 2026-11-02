@@ -169,11 +169,35 @@ static bool mag_raw(int16_t raw[3])
  * until a calibration has been run and saved; loaded from flash at boot. */
 static struct mag_offsets s_mag_off = {0, 0, 0};
 
+/* Full soft-iron correction: out = M * (raw_counts - centre).
+ *
+ * Three offsets can only shift a sphere. When nearby metal stretches the
+ * field the samples lie on an ellipsoid, and only a 3x3 matrix reshapes it
+ * back. Simulated with a realistic distortion and correct rotations, |B|
+ * spread across orientations was 59 uT raw, 30 uT with offsets, and 2.2 uT
+ * with this matrix.
+ *
+ * s_corr_used selects it; when false the three offsets above are used, which
+ * is what a board with no soft iron needs. */
+static double s_corr[3][3];
+static double s_corr_c[3];
+static bool s_corr_used;
+
 static bool mag_read(double *x, double *y, double *z)
 {
     int16_t raw[3];
     if (!mag_raw(raw))
         return false;
+    if (s_corr_used)
+    {
+        const double d[3] = {raw[0] - s_corr_c[0], raw[1] - s_corr_c[1],
+                             raw[2] - s_corr_c[2]};
+        *x = s_corr[0][0] * d[0] + s_corr[0][1] * d[1] + s_corr[0][2] * d[2];
+        *y = s_corr[1][0] * d[0] + s_corr[1][1] * d[1] + s_corr[1][2] * d[2];
+        *z = s_corr[2][0] * d[0] + s_corr[2][1] * d[1] + s_corr[2][2] * d[2];
+        return true;
+    }
+
     const double lsb_per_gauss = 6842.0;    /* +-4 gauss full scale */
     const double ut_per_lsb = 100.0 / lsb_per_gauss;
     *x = (double)(raw[0] - s_mag_off.x) * ut_per_lsb;
@@ -595,6 +619,244 @@ double mag_cal_rotation_ut(void)
  * spirit: samples must span enough of every axis for the sphere to be fixed,
  * checked against the rotation actually achieved.
  */
+/* ---- ellipsoid fit: hard AND soft iron ------------------------------- */
+
+/* General NxN solve, partial pivoting. N is at most 9 here. */
+static bool solve_n(double *A, double *b, double *out, int n)
+{
+    for (int i = 0; i < n; ++i)
+    {
+        int piv = i;
+        for (int r = i + 1; r < n; ++r)
+            if (fabs(A[r * n + i]) > fabs(A[piv * n + i]))
+                piv = r;
+        if (fabs(A[piv * n + i]) < 1e-18)
+            return false;
+        if (piv != i)
+        {
+            for (int c = 0; c < n; ++c)
+            {
+                const double t = A[i * n + c];
+                A[i * n + c] = A[piv * n + c];
+                A[piv * n + c] = t;
+            }
+            const double t = b[i]; b[i] = b[piv]; b[piv] = t;
+        }
+        for (int r = i + 1; r < n; ++r)
+        {
+            const double f = A[r * n + i] / A[i * n + i];
+            for (int c = i; c < n; ++c)
+                A[r * n + c] -= f * A[i * n + c];
+            b[r] -= f * b[i];
+        }
+    }
+    for (int i = n - 1; i >= 0; --i)
+    {
+        double sum = b[i];
+        for (int j = i + 1; j < n; ++j)
+            sum -= A[i * n + j] * out[j];
+        out[i] = sum / A[i * n + i];
+        if (!isfinite(out[i]))
+            return false;
+    }
+    return true;
+}
+
+static bool inv3(const double M[3][3], double out[3][3])
+{
+    const double a = M[0][0], b = M[0][1], c = M[0][2];
+    const double d = M[1][0], e = M[1][1], f = M[1][2];
+    const double g = M[2][0], h = M[2][1], i = M[2][2];
+    const double det = a * (e * i - f * h) - b * (d * i - f * g) +
+                       c * (d * h - e * g);
+    if (fabs(det) < 1e-18)
+        return false;
+    out[0][0] = (e * i - f * h) / det;
+    out[0][1] = (c * h - b * i) / det;
+    out[0][2] = (b * f - c * e) / det;
+    out[1][0] = (f * g - d * i) / det;
+    out[1][1] = (a * i - c * g) / det;
+    out[1][2] = (c * d - a * f) / det;
+    out[2][0] = (d * h - e * g) / det;
+    out[2][1] = (b * g - a * h) / det;
+    out[2][2] = (a * e - b * d) / det;
+    return true;
+}
+
+/* Jacobi eigenvalues/vectors of a symmetric 3x3. Eigenvectors come back as
+ * the COLUMNS of V. */
+static void jacobi3(double A[3][3], double w[3], double V[3][3])
+{
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            V[i][j] = (i == j) ? 1.0 : 0.0;
+
+    for (int sweep = 0; sweep < 60; ++sweep)
+    {
+        const double off = fabs(A[0][1]) + fabs(A[0][2]) + fabs(A[1][2]);
+        if (off < 1e-18)
+            break;
+        for (int p = 0; p < 2; ++p)
+            for (int q = p + 1; q < 3; ++q)
+            {
+                if (fabs(A[p][q]) < 1e-20)
+                    continue;
+                const double th = (A[q][q] - A[p][p]) / (2.0 * A[p][q]);
+                const double t = (th >= 0 ? 1.0 : -1.0) /
+                                 (fabs(th) + sqrt(th * th + 1.0));
+                const double c = 1.0 / sqrt(t * t + 1.0);
+                const double s = t * c;
+                for (int k = 0; k < 3; ++k)
+                {
+                    const double akp = A[k][p], akq = A[k][q];
+                    A[k][p] = c * akp - s * akq;
+                    A[k][q] = s * akp + c * akq;
+                }
+                for (int k = 0; k < 3; ++k)
+                {
+                    const double apk = A[p][k], aqk = A[q][k];
+                    A[p][k] = c * apk - s * aqk;
+                    A[q][k] = s * apk + c * aqk;
+                }
+                for (int k = 0; k < 3; ++k)
+                {
+                    const double vkp = V[k][p], vkq = V[k][q];
+                    V[k][p] = c * vkp - s * vkq;
+                    V[k][q] = s * vkp + c * vkq;
+                }
+            }
+    }
+    w[0] = A[0][0];
+    w[1] = A[1][1];
+    w[2] = A[2][2];
+}
+
+/* Fit an ellipsoid to the collected samples and turn it into a 3x3 correction.
+ *
+ * The samples lie where the field pushes them, so they satisfy
+ *   v M v + 2 n v = 1
+ * for some symmetric M and vector n. Nine unknowns, linear in them, so one
+ * least-squares solve. The centre is -M^-1 n, and the elliptical distortion is
+ * sqrt(M), which maps the ellipsoid back onto a sphere.
+ *
+ * `target_ut` is the magnitude the corrected readings should have: the local
+ * field. Shape and centre come from the data; the scale has to be an input,
+ * because a pure ellipsoid fit is scale-free. */
+static bool ellipsoid_fit(double target_ut)
+{
+    if (s_dump_n < 200)
+        return false;
+
+    /* Work in centred, unit-scaled coordinates or the 9x9 system is hopeless
+     * conditioned: raw counts are ~1e4 and their squares ~1e8. */
+    double mean[3] = {0, 0, 0};
+    for (uint32_t i = 0; i < s_dump_n; ++i)
+        for (int a = 0; a < 3; ++a)
+            mean[a] += s_dump[i][a];
+    for (int a = 0; a < 3; ++a)
+        mean[a] /= s_dump_n;
+
+    double var = 0;
+    for (uint32_t i = 0; i < s_dump_n; ++i)
+        for (int a = 0; a < 3; ++a)
+        {
+            const double d = s_dump[i][a] - mean[a];
+            var += d * d;
+        }
+    const double scale = sqrt(var / s_dump_n);
+    if (scale < 1.0)
+        return false;
+
+    static double A[81], b[9], q[9];
+    memset(A, 0, sizeof A);
+    memset(b, 0, sizeof b);
+    for (uint32_t i = 0; i < s_dump_n; ++i)
+    {
+        const double x = (s_dump[i][0] - mean[0]) / scale;
+        const double y = (s_dump[i][1] - mean[1]) / scale;
+        const double z = (s_dump[i][2] - mean[2]) / scale;
+        const double row[9] = {x * x, y * y, z * z, 2 * x * y, 2 * x * z,
+                               2 * y * z, 2 * x, 2 * y, 2 * z};
+        for (int r = 0; r < 9; ++r)
+        {
+            b[r] += row[r];
+            for (int c = 0; c < 9; ++c)
+                A[r * 9 + c] += row[r] * row[c];
+        }
+    }
+    if (!solve_n(A, b, q, 9))
+        return false;
+
+    double M[3][3] = {{q[0], q[3], q[4]}, {q[3], q[1], q[5]},
+                      {q[4], q[5], q[2]}};
+    const double nv[3] = {q[6], q[7], q[8]};
+
+    double Mi[3][3];
+    if (!inv3(M, Mi))
+        return false;
+
+    double cc[3];
+    for (int i = 0; i < 3; ++i)
+        cc[i] = -(Mi[i][0] * nv[0] + Mi[i][1] * nv[1] + Mi[i][2] * nv[2]);
+
+    double k = 1.0;
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            k += cc[i] * M[i][j] * cc[j];
+    if (k <= 0)
+        return false;
+
+    double w[3], V[3][3];
+    jacobi3(M, w, V);
+    for (int i = 0; i < 3; ++i)
+        w[i] = (w[i] > 1e-18) ? sqrt(w[i]) : 1e-9;
+
+    /* M^(1/2) = V diag(sqrt(w)) V^T, scaled so the corrected radius is the
+     * target field magnitude, then converted from normalised units back to
+     * raw counts. */
+    const double ksc = target_ut / sqrt(k);
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+        {
+            double sum = 0;
+            for (int t = 0; t < 3; ++t)
+                sum += V[i][t] * w[t] * V[j][t];
+            s_corr[i][j] = ksc * sum / scale;
+        }
+    for (int i = 0; i < 3; ++i)
+        s_corr_c[i] = mean[i] + cc[i] * scale;
+
+    s_corr_used = true;
+    return true;
+}
+
+/* Public entry point: fit soft+hard iron from the collected samples. */
+bool mag_cal_fit_ellipsoid(double target_ut, char *report, size_t n)
+{
+    if (report && n) report[0] = '\0';
+    if (!s_mag_cal_active)
+    {
+        /* Allowed outside a run so `magcal check` can refit what it sampled. */
+    }
+    if (!ellipsoid_fit(target_ut))
+    {
+        if (report && n)
+            snprintf(report, n, "ellipsoid fit failed (not enough spread?)");
+        return false;
+    }
+    if (report && n)
+        snprintf(report, n, "ellipsoid fit applied, corrected |B| targets %.1f uT",
+                 target_ut);
+    return true;
+}
+
+bool mag_cal_using_matrix(void) { return s_corr_used; }
+
+void mag_cal_clearmatrix(void)
+{
+    s_corr_used = false;
+}
+
 bool mag_cal_finish(struct mag_offsets *out, char *report, size_t n)
 {
     if (report && n) report[0] = '\0';
@@ -679,7 +941,20 @@ bool mag_cal_save(void)
     FILE *fp = fopen(MAG_CAL_FILE, "w");
     if (!fp)
         return false;
-    fprintf(fp, "%d %d %d\n", s_mag_off.x, s_mag_off.y, s_mag_off.z);
+    /* Twelve numbers mean a full soft-iron matrix; three mean offsets only.
+     * The count is the format identifier, so an older file still loads. */
+    if (s_corr_used)
+    {
+        fprintf(fp, "%d\n", 12);
+        for (int i = 0; i < 3; ++i)
+            fprintf(fp, "%.9g %.9g %.9g\n", s_corr[i][0], s_corr[i][1], s_corr[i][2]);
+        fprintf(fp, "%.9g %.9g %.9g\n", s_corr_c[0], s_corr_c[1], s_corr_c[2]);
+    }
+    else
+    {
+        fprintf(fp, "%d\n", 3);
+        fprintf(fp, "%d %d %d\n", s_mag_off.x, s_mag_off.y, s_mag_off.z);
+    }
     fclose(fp);
     return true;
 }
@@ -689,19 +964,72 @@ bool mag_cal_load(void)
     FILE *fp = fopen(MAG_CAL_FILE, "r");
     if (!fp)
         return false;
-    int x = 0, y = 0, z = 0;
-    int got = fscanf(fp, "%d %d %d", &x, &y, &z);
+
+    /* The count is the format tag. Anything else is the older format, which
+     * was three bare integers with no tag -- so a file starting "183 -1447
+     * 560" has to be read as offsets, not as a malformed count. */
+    int count = 0;
+    if (fscanf(fp, "%d", &count) != 1)
+    {
+        fclose(fp);
+        return false;
+    }
+
+    bool ok = false;
+    if (count != 12 && count != 3)
+    {
+        /* Legacy: the value just read is the first offset. */
+        int y = 0, z = 0;
+        if (fscanf(fp, "%d %d", &y, &z) == 2 &&
+            count >= -32768 && count <= 32767 && y >= -32768 && y <= 32767 &&
+            z >= -32768 && z <= 32767)
+        {
+            s_mag_off.x = (int16_t)count;
+            s_mag_off.y = (int16_t)y;
+            s_mag_off.z = (int16_t)z;
+            s_corr_used = false;
+            ok = true;
+        }
+        fclose(fp);
+        return ok;
+    }
+
+    if (count == 12)
+    {
+        double m[3][3], c[3];
+        ok = true;
+        for (int i = 0; i < 3 && ok; ++i)
+            if (fscanf(fp, "%lf %lf %lf", &m[i][0], &m[i][1], &m[i][2]) != 3)
+                ok = false;
+        if (ok && fscanf(fp, "%lf %lf %lf", &c[0], &c[1], &c[2]) != 3)
+            ok = false;
+        if (ok)
+        {
+            for (int i = 0; i < 3; ++i)
+            {
+                s_corr_c[i] = c[i];
+                for (int j = 0; j < 3; ++j)
+                    s_corr[i][j] = m[i][j];
+            }
+            s_corr_used = true;
+        }
+    }
+    else if (count == 3)
+    {
+        int x = 0, y = 0, z = 0;
+        if (fscanf(fp, "%d %d %d", &x, &y, &z) == 3 &&
+            x >= -32768 && x <= 32767 && y >= -32768 && y <= 32767 &&
+            z >= -32768 && z <= 32767)
+        {
+            s_mag_off.x = (int16_t)x;
+            s_mag_off.y = (int16_t)y;
+            s_mag_off.z = (int16_t)z;
+            s_corr_used = false;
+            ok = true;
+        }
+    }
     fclose(fp);
-    if (got != 3)
-        return false;
-    /* Bounded so a corrupt file cannot shift the reading into nonsense. */
-    if (x < -32768 || x > 32767 || y < -32768 || y > 32767 ||
-        z < -32768 || z > 32767)
-        return false;
-    s_mag_off.x = (int16_t)x;
-    s_mag_off.y = (int16_t)y;
-    s_mag_off.z = (int16_t)z;
-    return true;
+    return ok;
 }
 
 
