@@ -2256,12 +2256,21 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
             /* Spans are what the min/max estimator uses, so they are what
              * the operator needs to watch: each one stops growing when that
              * axis has been swept end to end. */
+            /* Spans against what a full tumble would give, because "4732"
+             * means nothing to the operator and "74%" does. A full rotation
+             * sweeps the field diameter, 2 * 46.6 uT = 6377 counts, so each
+             * axis needs to reach most of that or its midpoint is biased. */
             int32_t span[3];
             mag_cal_spans(span);
-            printf("    %4lus  %5lu samples  span %5ld %5ld %5ld\n",
+            const double full = 2.0 * BENCH_FIELD_UT * 6842.0 / 100.0;
+            const int p0 = (int)(span[0] / full * 100.0);
+            const int p1 = (int)(span[1] / full * 100.0);
+            const int p2 = (int)(span[2] / full * 100.0);
+            printf("    %4lus %5lu  X %3d%%  Y %3d%%  Z %3d%%   %s\n",
                    (unsigned long)(elapsed / 1000),
-                   (unsigned long)mag_cal_samples(),
-                   (long)span[0], (long)span[1], (long)span[2]);
+                   (unsigned long)mag_cal_samples(), p0, p1, p2,
+                   (p0 >= 95 && p1 >= 95 && p2 >= 95) ? "covered - press Enter"
+                                                     : "keep turning");
             fflush(stdout);
             next_report = elapsed;
         }
@@ -2273,6 +2282,24 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
 
     printf("\nSampling stopped.\n");
     printf("  %s\n", report);
+
+    {
+        int32_t sp[3];
+        mag_cal_spans(sp);
+        const double full = 2.0 * BENCH_FIELD_UT * 6842.0 / 100.0;
+        int lo = (int)(sp[0] / full * 100.0);
+        if ((int)(sp[1] / full * 100.0) < lo) lo = (int)(sp[1] / full * 100.0);
+        if ((int)(sp[2] / full * 100.0) < lo) lo = (int)(sp[2] / full * 100.0);
+        if (lo < 95)
+        {
+            printf("\n  Coverage was only %d%% of a full tumble. min/max takes\n", lo);
+            printf("  the midpoint of each range, so anything short of the\n");
+            printf("  extremes leaves a bias in the offsets -- about %d%% of the\n", 100 - lo);
+            printf("  field radius here, roughly %.0f uT.\n",
+                   (100 - lo) / 100.0 * BENCH_FIELD_UT);
+            printf("  Turn it right over next time: face down as well as up.\n");
+        }
+    }
 
     /* Diagnostics matter most when the fit failed, so they print either way. */
     mag_cal_diagnose();
