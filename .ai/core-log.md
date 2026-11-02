@@ -722,3 +722,49 @@ TinyTang is meant to become the node's primary client, and nothing on it speaks 
 - User Test: NOT RUN
 
 ---
+
+## 22 COMMIT Unreleased 2026-11-01T21:10:00-07:00
+
+#### Coming From:
+
+Unreleased 8ce44e7
+
+#### Purpose:
+
+Restore the TinyTang application protocol to P4 so the node answers the client that already exists, and settle the relationship between the two boards as one simple read-only channel beside a full Reticulum node.
+
+#### Outcome:
+
+The node answers TinyTang. A status request from the Tang returned a CRC-valid reply with the sequence number echoed, carrying six lines of live state: the node's own state and uptime, its address and signal, the environment, the magnetic field with its heading, the GPS fix and the radio's counters. Both directions are now exercised on this port, and the exchange was proven end to end rather than inferred from counters.
+
+The protocol came across from P1 unmodified. tang_proto and tang_link have no platform dependencies, so the only work was in the node: a second branch in the LoRa receive path that hands anything from sender address 2 to the Tang protocol and everything else to Reticulum, and a reimplementation of node_answer against P4's own sensors. P1's version could not be used as it stood because it reads P1's hardware, including WiFi.RSSI, ESP.getFreeHeap and relay states that this port does not have.
+
+One design constraint was found by measurement rather than by reading. P1's status reply was 202 bytes, which is four LoRa frames; at roughly 0.6 s of airtime per frame that is 2.4 s, longer than the Tang's own 1.2 s retry gap, so the reply and the retry compete on the air. The status was rewritten to fit one frame, 148 bytes, and it answers every time. A second constraint is on the receiving side only: the host harness used to stand in for the Tang reads the module's FIFO over JTAG at about 6 ms per register, so a 237-byte reply completes in half a second and outruns it. That is a property of the harness and not of the link, since the Tang reading its own FIFO at processor speed has no such limit.
+
+The operator settled the relationship between the boards, and it is worth recording because it decides what should not be built. TinyTang and TinyNode will speak this simple protocol to each other and nothing else; every other device reaches the node over Reticulum. The Tang is read-only by decision: it may ask for status and may not set anything, and in particular may not touch the WiFi configuration, which is the one command that can lock an operator out of their own node. Relay control was considered and dropped, both because the Tang could then switch the hardware it depends on and because the node's relay pins from P1 -- GPIO 18, 21, 38 and 47 -- are the ILI9340 panel's pins on this port, so that harness would need rewiring rather than porting.
+
+Two faults remain in the code as committed. The status line reporting the radio's counters is a placeholder: the real values exist but the formatting did not fit the frame budget, so zeros were substituted, and it prints as though it were live data. And the node now describes itself three times -- once on the console, once as an LXMF telemetry map and once as Tang text -- with the three already disagreeing on precision, the Tang reporting a GPS position to four decimal places and the console to six. Neither is a defect the operator can see yet, and both are the reason the next cycle consolidates the three renderers behind one status view rather than leaving them to drift further.
+
+The core-syntax audit re-read `.ai/core.md` and `.ai/core-syntax.md`, confirmed that neither was changed and that entries 1 to 21 were not rewritten, and that the reference's six YAML blocks all parse, with the index and the records naming the same 96 ids in the same order under the allowed Status values, and validated this entry as number 22 with exactly six sections, prose in Purpose, Outcome and Next Steps, allowed Status values, and the source paths listed in Files Modified.
+
+#### Next Steps:
+
+The three renderers need consolidating behind one status view, which fixes the placeholder counter line and the precision disagreement together rather than separately; that is the next cycle and it changes no protocol. Nothing on the Tang needs flashing for this relationship to work, and the node is now the only Reticulum participant in it, so the simple channel stays simple precisely because it is read-only and polled. Once the consolidation is in, P1 can be archived: it is the superseded implementation, its microReticulum, microLXMF and MsgPack trees are still vendored under this repository's copy for reference, and its .ai control folder was already duplicated into P4 at entry 16, so the archive is a record rather than a dependency.
+
+#### Files Modified:
+
+- ports/nanoesp32/main/CMakeLists.txt
+- ports/nanoesp32/main/lora.cpp
+- ports/nanoesp32/main/node.cpp
+- ports/nanoesp32/main/tang_link.cpp
+- ports/nanoesp32/main/tang_link.h
+- ports/nanoesp32/main/tang_proto.cpp
+- ports/nanoesp32/main/tang_proto.h
+
+#### Status:
+
+- Build: PASS
+- Deployment: PASS
+- User Test: NOT RUN
+
+---

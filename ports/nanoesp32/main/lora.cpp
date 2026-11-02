@@ -24,6 +24,7 @@
 
 #include "lora.h"
 #include "lora_frame.h"
+#include "tang_link.h"
 
 #include "driver/gpio.h"
 #include "driver/uart.h"
@@ -94,6 +95,11 @@ constexpr uint32_t TX_TIMEOUT_MS      = 6000;  // one frame's airtime, generousl
 constexpr uint16_t MODULE_ADDRESS = 1;
 constexpr uint8_t  NETWORK_ID     = 6;
 constexpr uint16_t PEER_ADDRESS   = 0;      // 0 = every module on the network
+
+/* The TinyTang's module. Frames from this address are its application
+ * messages, answered here rather than handed to Reticulum, which would only
+ * discard a payload it cannot parse. Everything else is a Reticulum packet. */
+constexpr uint16_t TANG_ADDRESS   = 2;
 constexpr uint8_t  SPREADING      = 7;      // SF7
 constexpr uint8_t  BANDWIDTH_IDX  = 7;      // 7 = 125 kHz
 constexpr uint8_t  CODING_RATE    = 1;      // 1 = 4/5
@@ -165,6 +171,8 @@ public:
 
 private:
 	virtual bool send_outgoing(const Bytes& data) override;
+	// A reply to the Tang: same framing, addressed to its module, not a packet.
+	bool send_to_tang(const Bytes& data);
 
 	// AT plumbing (blocking, used only from start()).
 	bool read_line(char* out, size_t cap, uint32_t timeout_ms);
@@ -180,6 +188,8 @@ private:
 	void dispatch(const char* line);
 	void on_receive(const char* line);
 	void pump_tx();
+	// Answer a request from the Tang, and send a reply to its module address.
+	void answer_tang(const uint8_t* data, size_t length);
 	uint8_t next_nonce() { return (uint8_t)(Cryptography::randomnum(256) & 0x0F); }
 
 	const char* module_version() const { return _version[0] ? _version : "?"; }
@@ -598,12 +608,52 @@ void LoRaInterface::on_receive(const char* line) {
 		wrapper.r_stat_rssi((float)rcv.rssi);
 		wrapper.r_stat_snr((float)rcv.snr);
 		++_packets_rx;
-		handle_incoming(Bytes(_rx.data(), _rx.size()));
+		if (rcv.from == TANG_ADDRESS)
+		{
+			/* The Tang's application message: answer it here and never hand it to
+			 * Reticulum, which would discard a payload it cannot parse. */
+			answer_tang(_rx.data(), _rx.size());
+		}
+		else
+			handle_incoming(Bytes(_rx.data(), _rx.size()));
 		_rx.clear();
 	}
 	else if (result == loraframe::Reassembler::OVERFLOW) {
 		logf("RYLR998: message larger than one MTU, dropped");
 	}
+}
+
+/* The Tang speaks the application protocol above the framing; it never speaks
+ * Reticulum. answer() returns the reply bytes, which go back addressed to the
+ * Tang's module rather than broadcast. */
+void LoRaInterface::answer_tang(const uint8_t* data, size_t length) {
+	uint8_t out[TANG_PROTO_MAX_PACKET];
+	const size_t replied = tanglink::answer(data, length, out, sizeof(out));
+	if (replied == 0) {
+		logf("RYLR998: Tang request not answered (%u bytes)", (unsigned)length);
+		return;
+	}
+	if (!send_to_tang(Bytes(out, replied)))
+		logf("RYLR998: could not queue the reply to the Tang");
+	else if (_verbose)
+		logf("Tang reply queued, %u bytes", (unsigned)replied);
+}
+
+// A reply to the Tang: same framing, addressed to its module rather than
+// broadcast, and not handed to Reticulum because it is not a packet.
+bool LoRaInterface::send_to_tang(const Bytes& data) {
+	if (!_online) return false;
+	if (data.size() == 0 || data.size() > loraframe::MAX_MESSAGE) {
+		++_dropped;
+		return false;
+	}
+	if (_queue.size() >= TX_QUEUE_DEPTH) {
+		++_dropped;
+		logf("RYLR998: queue full, dropping %u Tang bytes", (unsigned)data.size());
+		return false;
+	}
+	_queue.push_back(Outgoing{data, TANG_ADDRESS});
+	return true;
 }
 
 void LoRaInterface::pump_tx() {

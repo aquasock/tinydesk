@@ -13,7 +13,7 @@ include("${CMAKE_CURRENT_LIST_DIR}/../../esp_idf/app/app.cmake")
 
 idf_component_register(
     SRCS "main_console.c" "link_nano.c" "ili9340.c" "vt.c" "node.cpp" "sensors.cpp"
-         "lora.cpp" "lora_frame.cpp"
+         "lora.cpp" "lora_frame.cpp" "tang_proto.cpp" "tang_link.cpp"
          "${TD_ESP_APP_DIR}/rs485.c"
     EMBED_TXTFILES "${TD_BOARD_BUILTIN_CONF}"
     INCLUDE_DIRS "." "${TD_ESP_APP_DIR}"

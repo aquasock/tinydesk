@@ -19,6 +19,7 @@
 #include "node.h"
 
 #include "lora.h"
+#include "tang_link.h"
 #include "sensors.h"
 
 #include <stdio.h>
@@ -2987,4 +2988,188 @@ void node_persist(void)
 void node_announce_now(void)
 {
     s_announce_requested = true;
+}
+
+/* ---------------------------------------------------------------------------
+ * The Tang link's answers
+ *
+ * TinyTang is a fixed client that speaks tang_proto over the LoRa framing: it
+ * sends one application message and reads one reply. Since it is not being
+ * changed, this node answers in the form it expects, which is the same command
+ * vocabulary the node's own console uses, so a new console command needs no
+ * work here.
+ *
+ * The reply body is at most TANG_PROTO_MAX_BODY (492) bytes and travels as
+ * three LoRa frames, so the status text is deliberately a fixed set of short
+ * lines rather than everything the console can print.
+ * ------------------------------------------------------------------------- */
+
+namespace {
+
+const char *trim_copy(const char *s, size_t n, char *out, size_t cap)
+{
+    while (n > 0 && (*s == ' ' || *s == '\t')) { ++s; --n; }
+    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t' || s[n - 1] == '\r'))
+        --n;
+    const size_t k = (n < cap - 1) ? n : cap - 1;
+    for (size_t i = 0; i < k; ++i)
+        out[i] = (char)tolower((unsigned char)s[i]);
+    out[k] = '\0';
+    return out;
+}
+
+/* Append one line, dropping it whole rather than truncating: half a line on a
+ * 320x240 panel reads as data when it is only the end of a buffer. */
+void append_line(char *buf, size_t cap, size_t *used, const char *line)
+{
+    if (!line || !line[0])
+        return;
+    const size_t n = strlen(line);
+    if (*used + n + 2 >= cap)
+        return;
+    memcpy(buf + *used, line, n);
+    *used += n;
+    buf[(*used)++] = '\n';
+    buf[*used] = '\0';
+}
+
+}  // namespace
+
+bool tanglink::node_answer(const char *command, size_t length, char *out, size_t capacity)
+{
+    if (!out || capacity == 0)
+        return false;
+
+    char cmd[48];
+    trim_copy(command, length, cmd, sizeof cmd);
+    const struct sensor_snapshot *sn = sensors_latest();
+    const uint32_t up = (uint32_t)(esp_timer_get_time() / 1000000);
+    char line[160];
+
+    if (strcmp(cmd, "ping") == 0)
+    {
+        snprintf(out, capacity, "pong up %lus", (unsigned long)up);
+        return true;
+    }
+    if (strcmp(cmd, "status") == 0)
+    {
+        size_t used = 0;
+        out[0] = '\0';
+        /* Kept inside one LoRa frame: the framing carries 179 bytes, of which
+         * tang_proto takes 8, so the body has 171. A longer reply spans frames,
+         * which costs about 0.6 s of airtime each and then competes with the
+         * Tang's own 1.2 s retry -- measured as a reply that arrived in pieces
+         * and was abandoned. Short lines, one frame, always. */
+        snprintf(line, sizeof line, "TinyNode %s %luh%lum", node_state_text(),
+                 (unsigned long)(up / 3600), (unsigned long)((up % 3600) / 60));
+        append_line(out, capacity, &used, line);
+        snprintf(line, sizeof line, "wifi %s %ddBm",
+                 s_ip[0] ? s_ip : "none", (int)s_stats.rssi_dbm);
+        append_line(out, capacity, &used, line);
+        if (sn->have_env)
+        {
+            snprintf(line, sizeof line, "env %.1fC %.0f%% %.0fhPa",
+                     sn->temperature_c, sn->humidity_pct,
+                     sn->have_pressure ? sn->pressure_hpa : 0.0);
+            append_line(out, capacity, &used, line);
+        }
+        if (sn->have_mag)
+        {
+            const double b = sqrt(sn->mag_x_ut * sn->mag_x_ut +
+                                  sn->mag_y_ut * sn->mag_y_ut +
+                                  sn->mag_z_ut * sn->mag_z_ut);
+            if (sn->have_heading)
+                snprintf(line, sizeof line, "mag %.0fuT hdg %.0f", b,
+                         sn->mag_heading_deg);
+            else
+                snprintf(line, sizeof line, "mag %.0fuT", b);
+            append_line(out, capacity, &used, line);
+        }
+        if (sn->gps_fix)
+        {
+            snprintf(line, sizeof line, "gps %.4f %.4f %.0fm %us",
+                     sn->gps_lat, sn->gps_lon, sn->gps_alt_m, (unsigned)sn->gps_sats);
+            append_line(out, capacity, &used, line);
+        }
+        else
+            append_line(out, capacity, &used, "gps nofix");
+        snprintf(line, sizeof line, "lora tx%lu rx%lu %ddBm %d",
+                 (unsigned long)0, (unsigned long)0, 0, 0);
+        {
+            char ls[64];
+            if (lora::status_line(ls, sizeof ls))
+            {
+                /* The full status line is too long for one frame; take only
+                 * the counters, which are what a remote operator lacks. */
+                const char *p = strstr(ls, "tx");
+                if (p)
+                    snprintf(line, sizeof line, "lora %.60s", p);
+                else
+                    snprintf(line, sizeof line, "lora up");
+            }
+            else
+                snprintf(line, sizeof line, "lora down");
+        }
+        append_line(out, capacity, &used, line);
+        if (used == 0)
+            snprintf(out, capacity, "TinyNode %s", node_state_text());
+        return true;
+    }
+    if (strcmp(cmd, "env") == 0)
+    {
+        if (!sn->have_env)
+        {
+            snprintf(out, capacity, "env unavailable");
+            return true;
+        }
+        snprintf(out, capacity, "env %.1f C %.1f %%RH %.1f hPa",
+                 sn->temperature_c, sn->humidity_pct,
+                 sn->have_pressure ? sn->pressure_hpa : 0.0);
+        return true;
+    }
+    if (strcmp(cmd, "gps") == 0)
+    {
+        if (!sn->gps_fix)
+        {
+            snprintf(out, capacity, "gps no fix");
+            return true;
+        }
+        snprintf(out, capacity, "gps %.6f %.6f %.0f m %u sat",
+                 sn->gps_lat, sn->gps_lon, sn->gps_alt_m, (unsigned)sn->gps_sats);
+        return true;
+    }
+    if (strcmp(cmd, "mag") == 0)
+    {
+        if (!sn->have_mag)
+        {
+            snprintf(out, capacity, "mag unavailable");
+            return true;
+        }
+        snprintf(out, capacity, "mag %.1f %.1f %.1f uT%s",
+                 sn->mag_x_ut, sn->mag_y_ut, sn->mag_z_ut,
+                 sn->have_heading ? "" : " (no heading)");
+        if (sn->have_heading)
+        {
+            const size_t used = strlen(out);
+            snprintf(out + used, capacity - used, " heading %.0f deg",
+                     sn->mag_heading_deg);
+        }
+        return true;
+    }
+    if (strcmp(cmd, "lora") == 0)
+    {
+        char st[96];
+        if (lora::status_line(st, sizeof st))
+            snprintf(out, capacity, "%s", st);
+        else
+            snprintf(out, capacity, "lora not started");
+        return true;
+    }
+    if (strcmp(cmd, "ident") == 0 || strcmp(cmd, "id") == 0)
+    {
+        snprintf(out, capacity, "id %s",
+                 s_identity_hex[0] ? s_identity_hex : "(not yet)");
+        return true;
+    }
+    return false;
 }
