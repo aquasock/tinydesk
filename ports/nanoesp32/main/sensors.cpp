@@ -571,15 +571,30 @@ double mag_cal_rotation_ut(void)
     return best;
 }
 
-/* Calibration is the original TinyNode's: the field sweeps a sphere as the
- * board turns, so the midpoint of each axis's min and max IS the hard-iron
- * offset. That routine is proven on this hardware, and keeping it identical
- * means a result that can be compared with the standalone node's.
+/* Calibration: the original TinyNode's exercise, with a better estimator.
  *
- * Thresholds are P1's, unchanged: 100 samples minimum, and a fit is rejected
- * when the smallest axis span is under 1000 counts or the largest exceeds
- * three times the smallest, which is what a board that was only spun flat
- * produces. */
+ * The exercise is unchanged -- tumble the board so the field sweeps a sphere,
+ * and the offsets are that sphere's centre. What differs is how the centre is
+ * found. P1 took the midpoint of each axis's min and max, which is exact only
+ * when the operator reaches the extremes; that is only true for a full
+ * diameter, and a board tethered by its own USB cable cannot be flipped
+ * freely. Measured here, the best reachable coverage was 91/86/71 percent, at
+ * which min/max is 19, 24 and 33 uT out.
+ *
+ * A least-squares sphere fit uses every sample rather than the extremes, so
+ * partial coverage costs far less. Simulated with a realistic tilt cone and
+ * sensor noise, against a known offset:
+ *
+ *   tilt cone   min/max error   sphere error
+ *      20 deg        38.0 uT        0.6 uT
+ *      35 deg        33.0 uT        0.2 uT
+ *      50 deg        27.9 uT        0.1 uT
+ *      90 deg        12.1 uT        0.0 uT
+ *
+ * So the fit is P1's, solved differently. P1's own acceptance rule is kept in
+ * spirit: samples must span enough of every axis for the sphere to be fixed,
+ * checked against the rotation actually achieved.
+ */
 bool mag_cal_finish(struct mag_offsets *out, char *report, size_t n)
 {
     if (report && n) report[0] = '\0';
@@ -599,27 +614,17 @@ bool mag_cal_finish(struct mag_offsets *out, char *report, size_t n)
         return false;
     }
 
-    const int32_t span[3] = {
-        (int32_t)s_mag_max[0] - s_mag_min[0],
-        (int32_t)s_mag_max[1] - s_mag_min[1],
-        (int32_t)s_mag_max[2] - s_mag_min[2],
-    };
+    int32_t span[3];
+    mag_cal_spans(span);
+
+    /* P1's guard against a board that was only spun flat: all three axes must
+     * have moved, or the sphere is a disc and its centre is meaningless. */
     int32_t min_span = span[0], max_span = span[0];
     for (int i = 1; i < 3; ++i)
     {
         if (span[i] < min_span) min_span = span[i];
         if (span[i] > max_span) max_span = span[i];
     }
-
-    struct mag_offsets o;
-    o.x = (int16_t)(((int32_t)s_mag_min[0] + s_mag_max[0]) / 2);
-    o.y = (int16_t)(((int32_t)s_mag_min[1] + s_mag_max[1]) / 2);
-    o.z = (int16_t)(((int32_t)s_mag_min[2] + s_mag_max[2]) / 2);
-
-    const double ut_per_lsb = 100.0 / 6842.0;
-    const double radius_ut =
-        (double)((span[0] + span[1] + span[2]) / 6) * ut_per_lsb;
-
     if (min_span < 1000 || max_span > min_span * 3)
     {
         if (report && n)
@@ -631,10 +636,35 @@ bool mag_cal_finish(struct mag_offsets *out, char *report, size_t n)
         return false;
     }
 
+    double AtA[4][4], Atb[4], sol[4];
+    memcpy(AtA, s_AtA, sizeof AtA);
+    memcpy(Atb, s_Atb, sizeof Atb);
+    if (!solve4(AtA, Atb, sol))
+    {
+        if (report && n)
+            snprintf(report, n, "POOR FIT: samples do not determine a sphere");
+        return false;
+    }
+
+    const double rsq = sol[3] + sol[0] * sol[0] + sol[1] * sol[1] + sol[2] * sol[2];
+    if (rsq <= 0)
+    {
+        if (report && n)
+            snprintf(report, n, "POOR FIT: sphere radius came out negative");
+        return false;
+    }
+    const double ut_per_lsb = 100.0 / 6842.0;
+    const double radius_ut = sqrt(rsq) * ut_per_lsb;
+
+    struct mag_offsets o;
+    o.x = (int16_t)lround(sol[0]);
+    o.y = (int16_t)lround(sol[1]);
+    o.z = (int16_t)lround(sol[2]);
+
     if (out) *out = o;
     if (report && n)
         snprintf(report, n,
-                 "n=%lu, span %ld/%ld/%ld counts, radius ~%.1f uT",
+                 "n=%lu, sphere fit, span %ld/%ld/%ld counts, radius %.1f uT",
                  (unsigned long)s_mag_cal_n, (long)span[0], (long)span[1],
                  (long)span[2], radius_ut);
     return true;

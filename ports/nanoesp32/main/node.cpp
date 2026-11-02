@@ -2195,9 +2195,8 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
     printf("    power supply or the monitor\n");
     printf("  * TUMBLE it through every orientation, not just a flat spin:\n");
     printf("    flat, both long edges, face down, back up\n");
-    printf("  * the span line shows how far each axis has swept. Each needs\n");
-    printf("    about %.0f counts for a trustworthy midpoint\n",
-           (double)(2.0 * BENCH_FIELD_UT * 6842.0 / 100.0 * 0.9));
+    printf("  * the percentages show how far each axis has swept. 60%% on all\n");
+    printf("    three is enough -- the fit uses every sample, not the extremes\n");
     printf("\n");
 
     if (!shell_read_line("Press Enter to start sampling, Ctrl+C to cancel: ",
@@ -2263,13 +2262,17 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
             int32_t span[3];
             mag_cal_spans(span);
             const double full = 2.0 * BENCH_FIELD_UT * 6842.0 / 100.0;
+            /* A sphere fit uses every sample, so it does not need the
+             * extremes the way a min/max midpoint does. 60 percent on each
+             * axis is ample; beyond that the extra samples hardly change the
+             * fitted centre. */
             const int p0 = (int)(span[0] / full * 100.0);
             const int p1 = (int)(span[1] / full * 100.0);
             const int p2 = (int)(span[2] / full * 100.0);
             printf("    %4lus %5lu  X %3d%%  Y %3d%%  Z %3d%%   %s\n",
                    (unsigned long)(elapsed / 1000),
                    (unsigned long)mag_cal_samples(), p0, p1, p2,
-                   (p0 >= 95 && p1 >= 95 && p2 >= 95) ? "covered - press Enter"
+                   (p0 >= 60 && p1 >= 60 && p2 >= 60) ? "enough - press Enter"
                                                      : "keep turning");
             fflush(stdout);
             next_report = elapsed;
@@ -2290,14 +2293,11 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
         int lo = (int)(sp[0] / full * 100.0);
         if ((int)(sp[1] / full * 100.0) < lo) lo = (int)(sp[1] / full * 100.0);
         if ((int)(sp[2] / full * 100.0) < lo) lo = (int)(sp[2] / full * 100.0);
-        if (lo < 95)
+        if (lo < 60)
         {
-            printf("\n  Coverage was only %d%% of a full tumble. min/max takes\n", lo);
-            printf("  the midpoint of each range, so anything short of the\n");
-            printf("  extremes leaves a bias in the offsets -- about %d%% of the\n", 100 - lo);
-            printf("  field radius here, roughly %.0f uT.\n",
-                   (100 - lo) / 100.0 * BENCH_FIELD_UT);
-            printf("  Turn it right over next time: face down as well as up.\n");
+            printf("\n  Coverage was only %d%% on the weakest axis. The fit\n", lo);
+            printf("  needs the field seen from several directions, so tip the\n");
+            printf("  board further over next time -- face down as well as up.\n");
         }
     }
 
