@@ -768,3 +768,59 @@ The three renderers need consolidating behind one status view, which fixes the p
 - User Test: NOT RUN
 
 ---
+
+## 23 COMMIT Unreleased 2026-11-01T21:55:00-07:00
+
+#### Coming From:
+
+Unreleased f55d754
+
+#### Purpose:
+
+Make P4 build from its own tree, so it no longer reads microReticulum, microLXMF and their Arduino dependencies out of the superseded P1 checkout, and carry across the host tools that were left behind, in preparation for P4 replacing P1 in place.
+
+#### Outcome:
+
+P4 now builds standalone. microReticulum, microLXMF and MsgPack-vendored are copied into third_party beside the trees that were already there, the six Arduino libraries are copied into third_party/arduino, and both components' CMake defaults point at those paths instead of climbing out of the repository into another checkout. A clean build, with the previous build directory deleted, produces a binary of exactly the same size as the one built against P1 -- 0x1e0e50 bytes -- which is the strongest evidence available that the copies are byte-identical to what was being used before. The rebuilt image was flashed and the board came up normal: online, same identity, sensors reading, radio registered.
+
+Proving the change took more care than making it. After repointing the CMake paths the build still contained 166 files naming the old tree, all of them stale objects and logs from earlier builds, so a green build proved nothing about the new paths. Deleting the build directory and rebuilding from empty was the only way to answer the question, and the fresh tree contains no reference to the old checkout at all while naming the vendored trees in 306 files. One fault of mine was found on the way: the first path written was one directory too shallow, so the component looked for microLXMF in ports/ and configure failed loudly rather than building something wrong. The cached CMake variables also had to be cleared, since a cache entry naming a path survives the default changing; idf.py has no option to unset one, and cmake -U was used, which is safe whereas editing CMakeCache.txt as text has corrupted it before.
+
+The host tools moved as well, because they were the only copy: the telemetry requester, the budget measurer, the link-delivery test, the Pico LoRa sender, and the root-level end-to-end, chat, announce and persistence scripts. The four that expect a Reticulum instance beside them now find one, since host-config was copied to sit next to them and its storage and log are ignored as they were before. One of them was run from its new home and answered a live request with a 857-byte reply, so the copies are working rather than merely present.
+
+VENDORED.md came across into third_party and gained a section for the Arduino libraries, because the licence facts it records now describe this repository's own build rather than another one's: microReticulum is Apache-2.0 and MsgPack is MIT, but microLXMF is GPL-3.0-only, so linking it makes the firmware image GPL-3.0. That matters more after the replace than before it, since this repository currently carries no licence of its own.
+
+The core-syntax audit re-read `.ai/core.md` and `.ai/core-syntax.md`, confirmed that neither was changed and that entries 1 to 22 were not rewritten, and that the reference's six YAML blocks all parse, with the index and the records naming the same 96 ids in the same order under the allowed Status values, and validated this entry as number 23 with exactly six sections, prose in Purpose, Outcome and Next Steps, allowed Status values, and the build files listed in Files Modified.
+
+#### Next Steps:
+
+P4 is now self-sufficient, which was the precondition for replacing P1, and the replacement itself is the next step and needs the operator's explicit agreement first because it is not reversible in the ordinary sense. Two consequences have to be accepted with it. The repository currently has no licence and P4 is MIT, so after the swap the tree carries MIT terms it did not carry before. And P4's history descends from TinyDesk rather than from TinyNode, so the resulting log reads as a fork with a port on top rather than as TinyNode's own history, which is honest but worth knowing. P1 must be tagged and that tag pushed before anything is rewritten, so the 47 P1 commits stay reachable by name. The three renderers behind one status view landed in entry 22 and are verified; what remains open there is the GPS precision the two now share. Older items still open: the heading has never been checked against a surveyed bearing, the node cannot report a path count because microReticulum exposes no path enumeration, and loss on the LoRa link was seen once and never characterised.
+
+#### Files Modified:
+
+- .gitignore
+- ports/nanoesp32/components/lxm/CMakeLists.txt
+- ports/nanoesp32/components/rns/CMakeLists.txt
+- third_party/MsgPack-vendored/
+- third_party/VENDORED.md
+- third_party/arduino/
+- third_party/microLXMF/
+- third_party/microReticulum/
+- tools/announce_host.py
+- tools/boot_capture.py
+- tools/chat.py
+- tools/delivery_test.py
+- tools/e2e_test.py
+- tools/host-config/config
+- tools/link_delivery_test.py
+- tools/persistence_check.py
+- tools/pico_lora_sender.py
+- tools/telemetry_budget.py
+- tools/telemetry_request_test.py
+
+#### Status:
+
+- Build: PASS
+- Deployment: PASS
+- User Test: NOT RUN
+
+---

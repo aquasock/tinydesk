@@ -5,21 +5,20 @@
 # the Arduino framework. It was proven to compile and link against ESP-IDF
 # 5.3.1 with no Arduino present before this file existed.
 #
-# The library and its dependencies are NOT vendored here yet. Point these at
-# the trees they live in:
+# microReticulum and its Arduino dependencies are vendored under
+# third_party/, so this builds from this repository alone:
 #
-#   TD_RNS_DIR    the microReticulum checkout
-#   TD_RNS_DEPS   a directory holding its Arduino dependencies, which is what
-#                 PlatformIO resolves into nano-node/.pio/libdeps/<env>/
-#                 (ArduinoJson, microStore, DebugLog, ArxContainer,
-#                 ArxTypeTraits, Crypto)
+#   TD_RNS_DIR    third_party/microReticulum
+#   TD_RNS_DEPS   third_party/arduino, holding ArduinoJson, microStore,
+#                 DebugLog, ArxContainer, ArxTypeTraits and Crypto
 #
-# Vendoring them alongside microReticulum is the next step: a build that
-# depends on another project's .pio directory is not reproducible.
+# They were previously read out of the superseded P1 tree's .pio directory,
+# which made this build depend on a directory that is not part of it.
 
-set(TD_RNS_DIR "${CMAKE_CURRENT_LIST_DIR}/../../../../../../TinyNode/microReticulum"
+set(TD_TP_DIR "${CMAKE_CURRENT_LIST_DIR}/../../../../third_party")
+set(TD_RNS_DIR "${TD_TP_DIR}/microReticulum"
     CACHE PATH "microReticulum checkout")
-set(TD_RNS_DEPS "${CMAKE_CURRENT_LIST_DIR}/../../../../../../TinyNode/nano-node/.pio/libdeps/nano-esp32"
+set(TD_RNS_DEPS "${TD_TP_DIR}/arduino"
     CACHE PATH "microReticulum Arduino dependencies (ArduinoJson, microStore, ...)")
 
 get_filename_component(TD_RNS_DIR "${TD_RNS_DIR}" ABSOLUTE)

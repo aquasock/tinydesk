@@ -1,0 +1,15 @@
+.pio/
+build/
+conformance-bridge/build/
+*.o
+*.a
+*.so
+.DS_Store
+.vscode/
+.idea/
+compile_commands.json
+# Bridge state files dropped during smoke testing
+conformance-bridge/identity
+conformance-bridge/transport_identity
+conformance-bridge/storage/
+conformance-bridge/cache/

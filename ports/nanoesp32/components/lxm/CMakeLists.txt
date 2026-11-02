@@ -5,12 +5,13 @@
 # Point TD_LXMF_DIR at the microLXMF checkout.
 
 # The dependency paths are owned by the rns component, which this one requires.
-set(TD_RNS_DIR "${CMAKE_CURRENT_LIST_DIR}/../../../../../../TinyNode/microReticulum")
+set(TD_TP_DIR "${CMAKE_CURRENT_LIST_DIR}/../../../../third_party")
+set(TD_RNS_DIR "${TD_TP_DIR}/microReticulum")
 get_filename_component(TD_RNS_DIR "${TD_RNS_DIR}" ABSOLUTE)
-set(TD_RNS_DEPS "${CMAKE_CURRENT_LIST_DIR}/../../../../../../TinyNode/nano-node/.pio/libdeps/nano-esp32")
+set(TD_RNS_DEPS "${TD_TP_DIR}/arduino")
 get_filename_component(TD_RNS_DEPS "${TD_RNS_DEPS}" ABSOLUTE)
 
-set(TD_LXMF_DIR "${CMAKE_CURRENT_LIST_DIR}/../../../../../../TinyNode/microLXMF"
+set(TD_LXMF_DIR "${TD_TP_DIR}/microLXMF"
     CACHE PATH "microLXMF checkout")
 get_filename_component(TD_LXMF_DIR "${TD_LXMF_DIR}" ABSOLUTE)
 if(NOT EXISTS "${TD_LXMF_DIR}/src/LXMF/LXMRouter.h")

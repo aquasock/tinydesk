@@ -1,0 +1,61 @@
+{
+	"name": "microReticulum",
+	"version": "0.5.0",
+	"description": "C++ port of the Reticulum Network Stack — a cryptographic mesh networking library that runs on both 32-bit+ microcontrollers (ESP32, nRF52, LoRa boards) and native platforms (Linux, macOS), with PlatformIO and CMake build support.",
+	"keywords": "reticulum, rns, mesh, embedded, mcu, esp32, nrf52, native",
+	"repository":
+	{
+		"type": "git",
+		"url": "https://github.com/attermann/microReticulum.git"
+	},
+	"authors":
+	[
+		{
+			"name": "Chad Attermann",
+			"email": "attermann@gmail.com",
+			"maintainer": true
+		}
+	],
+	"license": "Apache-2.0",
+	"homepage": "https://reticulum.network/",
+	"dependencies": [
+		{
+			"name": "ArduinoJson",
+			"version": "~7.4.2"
+		},
+		{
+			"name": "MsgPack",
+			"version": "~0.4.2"
+		},
+		{
+			"name": "Crypto",
+			"url": "https://github.com/attermann/Crypto.git"
+		},
+		{
+			"name": "microStore",
+			"url": "https://github.com/attermann/microStore.git"
+		}
+	],
+	"frameworks": "*",
+	"platforms": "*",
+	"export": {
+		"include": [
+			"library.json",
+			"platformio.ini",
+			"CMakeLists.txt",
+			"README.md",
+			"LICENSE",
+			"src",
+			"lib"
+		]
+	},
+	"include": [
+		"library.json",
+		"platformio.ini",
+		"CMakeLists.txt",
+		"README.md",
+		"LICENSE",
+		"src",
+		"lib"
+	]
+}

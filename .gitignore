@@ -38,3 +38,7 @@ Thumbs.db
 # the device, not here. Never commit a local copy.
 ports/*/wifi.conf
 wifi.conf
+
+# Bench state, generated on first run
+tools/host-config/storage/
+tools/host-config/rnsd.log
