@@ -852,6 +852,42 @@ bool mag_cal_fit_ellipsoid(double target_ut, char *report, size_t n)
 
 bool mag_cal_using_matrix(void) { return s_corr_used; }
 
+bool mag_cal_matrix(double M[3][3], double centre[3])
+{
+    if (!s_corr_used)
+        return false;
+    for (int i = 0; i < 3; ++i)
+    {
+        centre[i] = s_corr_c[i];
+        for (int j = 0; j < 3; ++j)
+            M[i][j] = s_corr[i][j];
+    }
+    return true;
+}
+
+/* Set the correction's absolute gain against a known field magnitude.
+ *
+ * The ellipsoid fit determines the shape of the correction but not its size:
+ * that comes from how much of the ellipsoid the samples covered. A tumble that
+ * reaches 92/86/74 percent of the three axes leaves the fitted surface small,
+ * every corrected vector lands outside it, and |B| reads high -- measured on
+ * this board as 53.0 uT against a field of 46.6, with the dip already correct
+ * at 58.6 degrees.
+ *
+ * A uniform factor fixes the magnitude and leaves direction alone, so bearing
+ * and dip are untouched. Scaling each axis separately to the sensor's nominal
+ * gain would instead erase the soft-iron asymmetry the fit was run to find. */
+bool mag_cal_rescale(double measured_ut, double target_ut)
+{
+    if (!s_corr_used || measured_ut <= 1.0 || target_ut <= 1.0)
+        return false;
+    const double k = target_ut / measured_ut;
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            s_corr[i][j] *= k;
+    return true;
+}
+
 void mag_cal_clearmatrix(void)
 {
     s_corr_used = false;

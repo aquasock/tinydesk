@@ -52,6 +52,7 @@ extern "C" int link_any_key(void);
 #include "nvs_flash.h"
 
 #include <math.h>
+#include <stdlib.h>
 #include <memory>
 #include <string>
 #include <time.h>
@@ -2138,11 +2139,101 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
 
     if (argc > 1 && strcmp(argv[1], "show") == 0)
     {
-        struct mag_offsets o = mag_cal_offsets();
         char rd[128];
         magcal_readings(rd, sizeof rd);
-        printf("offsets: X %d  Y %d  Z %d\n", o.x, o.y, o.z);
+        double M[3][3], c[3];
+        if (mag_cal_matrix(M, c))
+        {
+            printf("matrix (soft + hard iron):\n");
+            for (int i = 0; i < 3; ++i)
+                printf("  %.9g %.9g %.9g\n", M[i][0], M[i][1], M[i][2]);
+            printf("centre     : %.3f %.3f %.3f counts\n", c[0], c[1], c[2]);
+        }
+        else
+        {
+            struct mag_offsets o = mag_cal_offsets();
+            printf("offsets: X %d  Y %d  Z %d\n", o.x, o.y, o.z);
+        }
         printf("reading: %s\n", rd);
+        return 0;
+    }
+
+    /* Set the correction's gain against a known field.
+     *
+     * The fit fixes the shape of the correction; its size depends on how much
+     * of the ellipsoid was swept, and a partial tumble under-sizes it so every
+     * reading comes out high. Point the board at a field of known strength --
+     * hold it clear of the desk, or pass the local magnitude -- and this scales
+     * the matrix to match, leaving bearing and dip alone. */
+    if (argc > 1 && strcmp(argv[1], "gain") == 0)
+    {
+        if (!mag_cal_using_matrix())
+        {
+            printf("no matrix stored; run `magcal` first\n");
+            return 1;
+        }
+
+        double target = BENCH_FIELD_UT;
+        if (argc > 2)
+            target = atof(argv[2]);
+        if (target < 10.0 || target > 100.0)
+        {
+            printf("target must be 10..100 uT (here it is %.1f)\n",
+                   (double)BENCH_FIELD_UT);
+            return 1;
+        }
+
+        /* Average several seconds of the snapshot. The field is steady and
+         * the sensor is not, so one sample is worth about a percent. */
+        double sum = 0.0;
+        int n = 0;
+        for (int i = 0; i < 8; ++i)
+        {
+            const struct sensor_snapshot *sp = sensors_latest();
+            const double b = sqrt(sp->mag_x_ut * sp->mag_x_ut +
+                                  sp->mag_y_ut * sp->mag_y_ut +
+                                  sp->mag_z_ut * sp->mag_z_ut);
+            if (b > 1.0)
+            {
+                sum += b;
+                ++n;
+            }
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+        if (n < 4 || sum / n < 5.0)
+        {
+            printf("field too weak to measure; hold the board still\n");
+            return 1;
+        }
+
+        const double measured = sum / n;
+        char before[128];
+        magcal_readings(before, sizeof before);
+
+        if (!mag_cal_rescale(measured, target))
+        {
+            printf("no matrix stored\n");
+            return 1;
+        }
+        if (!mag_cal_save())
+        {
+            printf("scaled, but saving failed -- the change is live only\n");
+            return 1;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(2500));    /* let a fresh snapshot land */
+        char after[128];
+        magcal_readings(after, sizeof after);
+
+        printf("\n  measured : %.1f uT\n", measured);
+        printf("  target   : %.1f uT\n", target);
+        printf("  scale    : %.5f\n", target / measured);
+        printf("  before   : %s\n", before);
+        printf("  after    : %s\n", after);
+        if (fabs(measured - target) / target > 0.20)
+            printf("\n  That is %.0f%% out. Check the board is clear of metal\n"
+                   "  before trusting the gain set here.\n",
+                   100.0 * fabs(measured - target) / target);
         return 0;
     }
 
@@ -2160,7 +2251,7 @@ static int cmd_magcal(tdsh_session_t *session, int argc, char **argv)
 
     if (argc > 1)
     {
-        printf("usage: magcal [show|check|clear]\n");
+        printf("usage: magcal [show|gain|check|clear]\n");
         return 1;
     }
 
@@ -2602,9 +2693,10 @@ static const tdsh_command_t s_cols_cmd = {
 
 static const tdsh_command_t s_magcal_cmd = {
     .name = "magcal",
-    .usage = "magcal [show|check|clear]",
+    .usage = "magcal [show|gain|check|clear]",
     .help = "Calibrate the magnetometer: run with no argument to calibrate, "
-            "'check' to verify and correct, 'show' to read, 'clear' to drop",
+            "'check' to verify and correct, 'gain' to set its scale against a "
+            "known field, 'show' to read, 'clear' to drop",
     .fn = cmd_magcal,
     .flags = 0,
 };

@@ -121,6 +121,15 @@ double   mag_cal_rotation_ut(void);
 bool     mag_cal_fit_ellipsoid(double target_ut, char *report, size_t n);
 bool     mag_cal_using_matrix(void);
 void     mag_cal_clearmatrix(void);
+/* Copy the stored correction out, for display. False on the offsets-only path. */
+bool     mag_cal_matrix(double M[3][3], double centre[3]);
+/* Rescale the stored correction so a field measuring `measured_ut` reads
+ * `target_ut`. The fit fixes the shape of the correction but not its absolute
+ * size -- that comes from how much of the ellipsoid the samples covered, and a
+ * partial tumble leaves the surface small so every reading comes out high.
+ * A uniform factor changes magnitude only, leaving bearing and dip untouched;
+ * scaling per axis would destroy the soft-iron information the fit found. */
+bool     mag_cal_rescale(double measured_ut, double target_ut);
 void     mag_cal_abort(void);
 void     mag_cal_set_offsets(const struct mag_offsets *o);
 struct mag_offsets mag_cal_offsets(void);
