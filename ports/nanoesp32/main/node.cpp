@@ -739,6 +739,7 @@ static void node_log(const char *fmt, ...)
 #define SID_RAM            0x14
 #define SID_NVM            0x15
 #define SID_RNS_TRANSPORT  0x19
+#define SID_CUSTOM         0xFF
 
 /* A msgpack writer over a caller-owned buffer. Every put fails soft and
  * latches ok=false, so a caller checks once at the end rather than after
@@ -1220,6 +1221,8 @@ static size_t telemetry_pack(uint8_t *buf, size_t cap, bool compact)
         entries += 2;                    /* temperature and humidity */
     if (!compact && sn->have_mag)
         entries++;
+    if (!compact && sn->have_heading)
+        entries++;                       /* CUSTOM: magnetic heading */
     if (!compact && fs_total > 0)
         entries++;                       /* NVM */
 
@@ -1279,6 +1282,37 @@ static size_t telemetry_pack(uint8_t *buf, size_t cap, bool compact)
         mp_f64(w, sn->mag_x_ut);
         mp_f64(w, sn->mag_y_ut);
         mp_f64(w, sn->mag_z_ut);
+    }
+
+    /* Heading goes in CUSTOM, not in MAGNETIC_FIELD or LOCATION.
+     *
+     * The client's sensor ids have no heading anywhere in them, and the two
+     * slots that look like candidates both refuse it. MAGNETIC_FIELD is exactly
+     * three floats: pack() writes [x, y, z], unpack() reads packed[0..2], and a
+     * fourth element is silently dropped. LOCATION does carry a field called
+     * `bearing` that Location.render() renames to `heading`, but the UI only
+     * prints it when speed exceeds 0.1 km/h -- so a stationary node, which is
+     * the only kind this board will ever be, would never show it, and the slot
+     * means GPS course over ground anyway.
+     *
+     * CUSTOM is a list of [label, [value, icon]] and the client renders each
+     * entry as its own row with that icon, moving or not. So the heading
+     * reaches the operator labelled as what it is.
+     *
+     * Full only: the compact map is already 151 packed bytes against a
+     * 159-byte single-packet limit, so roughly forty more would push it onto a
+     * link and lose the property that makes compact worth having. */
+    if (!compact && sn->have_heading)
+    {
+        char h[16];
+        snprintf(h, sizeof h, "%.1f\xc2\xb0", sn->mag_heading_deg);
+        mp_uint(w, SID_CUSTOM);
+        mp_arr(w, 1);                    /* the list of entries */
+        mp_arr(w, 2);                    /* one entry: [label, [value, icon]] */
+        mp_str(w, "Magnetic heading");
+        mp_arr(w, 2);
+        mp_str(w, h);
+        mp_str(w, "compass-rose");
     }
 
     /* Label 0x00 is the client's own "Storage" bucket. Capacity must be
@@ -1980,17 +2014,15 @@ static void magcal_readings(char *out, size_t n)
     const double y = sp->mag_y_ut;
     const double z = sp->mag_z_ut;
     const double b = sqrt(x * x + y * y + z * z);
+    /* Taken from the snapshot rather than computed here, so this line and the
+     * heading sent as telemetry can never disagree about the same field. */
     char h[24];
-    if (sqrt(x * x + y * y) >= 5.0)      /* else the bearing is noise */
-    {
-        double deg = atan2(y, x) * 180.0 / (double)M_PI;
-        if (deg < 0.0) deg += 360.0;
-        snprintf(h, sizeof h, "%5.1f deg", deg);
-    }
+    if (sp->have_heading)
+        snprintf(h, sizeof h, "%5.1f deg", sp->mag_heading_deg);
     else
         snprintf(h, sizeof h, "   --   ");
     snprintf(out, n,
-             "X %+6.1f  Y %+6.1f  Z %+6.1f uT   |B| %5.1f uT   bearing %s",
+             "X %+6.1f  Y %+6.1f  Z %+6.1f uT   |B| %5.1f uT   magnetic %s",
              x, y, z, b, h);
 }
 

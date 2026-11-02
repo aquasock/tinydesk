@@ -513,3 +513,49 @@ The rescaled matrix has not yet been through a reboot. It is saved in the same t
 - User Test: PASS
 
 ---
+
+## 17 COMMIT Unreleased 2026-11-01T18:52:00-07:00
+
+#### Coming From:
+
+Unreleased bbc15b7
+
+#### Purpose:
+
+Report a magnetic heading from the calibrated magnetometer, now that the calibration makes the bearing a number worth sending, and find the slot in the client's telemetry schema that will actually display it.
+
+#### Outcome:
+
+A magnetic heading now travels to Sideband as a CUSTOM telemetry entry and renders as its own labelled row. The firmware computes it in the sensor snapshot from the corrected horizontal field, so the console and the telemetry cannot disagree about the same measurement, and it is withheld below about 5 uT of horizontal field where the angle is noise rather than direction.
+
+Finding the right slot meant reading the client rather than the schema. Sideband defines twenty-seven sensor ids and none of them is a heading. MAGNETIC_FIELD unpacks exactly three floats, so a fourth is read by nobody. LOCATION does carry an element the client calls `bearing` which Location.render() renames to `heading`, and that looked like the intended home until the interface source showed the row is built only inside a branch taken when speed exceeds 0.1 km/h: a stationary node would never have displayed it, and the element's real meaning is GPS course over ground. CUSTOM carries a list of `[label, [value, icon]]` entries and the UI prints each as its own row with the given icon, testing nothing about motion, so the heading goes there as `Magnetic heading` with a compass-rose icon.
+
+Two mistakes were mine and both were caught before the flash. The first CUSTOM payload was one array level short, which would have handed the client a two-element array where it expects a list of entries; the client iterates the value, so it would have walked a string character by character and produced nonsense rather than an error. That was found by encoding the intended bytes in Python and feeding them to Sideband's own Telemeter.from_packed() from the AppImage installed here, which failed and said why. The second was in that same test, which was missing the msgpack map header and produced an "'int' object is not iterable" that looked like a protocol fault and was entirely my harness. The API takes the map, not the field header, and the pack function writes that header first.
+
+Verification was done with the client's own code on the board's own bytes, not by reasoning about the format. The node's 660-byte reply was captured as raw field bytes, passed to Telemeter.from_packed() from the Sideband 2.2.0 installation on this bench, and produced `{'Magnetic heading': ['359.8 degrees', 'compass-rose']}` rendering as the row `Magnetic heading 359.8 degrees` with the compass-rose icon. The same bytes decoded through tools/telemetry_request_test.py showed SID 0xff carrying that list.
+
+The heading is magnetic, as the operator asked, so declination is not applied and it reads 9.6 degrees anti-clockwise of a true bearing at this bench. It is valid without tilt compensation only because the magnetometer is fixed flat and aligned to the GPS module and that assembly is permanently mounted; the board has no accelerometer, so nothing in the firmware could detect tilt if the assembly were moved. That reasoning is recorded rather than assumed, because it is the whole justification for reporting an uncompensated angle.
+
+The heading is in the full map only. Compact sits at 151 packed bytes against the 159-byte single-packet limit measured in entry 15, and roughly forty more would push it onto a link and destroy the property that makes compact mode worth having.
+
+One unrelated fault surfaced while verifying and was not fixed: the client's render of the RNS_TRANSPORT map raised KeyError 'interfaces', because the client reads `ifstats.interfaces` while the node writes `interfaces` as a sibling of `ifstats`. That is a pre-existing mismatch in the transport packing and not a consequence of this change.
+
+The core-syntax audit re-read `.ai/core.md` and `.ai/core-syntax.md`, confirmed that neither was changed and that entries 1 to 16 were not rewritten, and that the reference's six YAML blocks all parse, with the index and the records naming the same 90 ids in the same order under the allowed Status values, and validated this entry as number 17 with exactly six sections, prose in Purpose, Outcome and Next Steps, allowed Status values, and engineering paths in Files Modified.
+
+#### Next Steps:
+
+The RNS_TRANSPORT packing mismatch is real and unfixed: the client expects the interface list inside `ifstats` and the node writes it beside it, so Sideband logs a KeyError while rendering transport telemetry. Whether to move the list or to write both is a small decision nobody has made. The heading itself still has no reference check against a surveyed bearing, so its absolute correctness rests on the magnetometer's alignment to the GPS module rather than on a measurement, and the readings of about 0.0 degrees against a 9.6 degree declination remain unexplained. A second Nano ESP32 would show whether the heading logic and the calibration behind it generalise beyond this board. Three defects from earlier entries remain open: LOCATION ships speed, bearing and accuracy derived rather than measured, the compact telemetry map still omits position and magnetic field, and P1 retains the copy of `.ai` this one came from.
+
+#### Files Modified:
+
+- ports/nanoesp32/main/node.cpp
+- ports/nanoesp32/main/sensors.cpp
+- ports/nanoesp32/main/sensors.h
+
+#### Status:
+
+- Build: PASS
+- Deployment: PASS
+- User Test: NOT RUN
+
+---

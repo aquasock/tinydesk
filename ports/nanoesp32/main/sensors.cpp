@@ -1426,9 +1426,30 @@ void sensors_refresh(void)
         s_snapshot.mag_x_ut = x;
         s_snapshot.mag_y_ut = y;
         s_snapshot.mag_z_ut = z;
+
+        /* Magnetic heading from the horizontal part of the corrected field.
+         * The threshold is the same one `magcal show` uses: below a few
+         * microtesla of horizontal field the angle is dominated by sensor
+         * noise and the bearing would sweep wildly while the board sits
+         * still. atan2 measures the field's direction, which is the direction
+         * the sensor's X axis points into the field, so the board reading
+         * north depends on how the magnetometer is keyed to the GPS module. */
+        const double horizontal = sqrt(x * x + y * y);
+        if (horizontal >= MAG_HEADING_MIN_UT)
+        {
+            double deg = atan2(y, x) * 180.0 / (double)M_PI;
+            if (deg < 0.0) deg += 360.0;
+            s_snapshot.mag_heading_deg = deg;
+            s_snapshot.have_heading = true;
+        }
+        else
+            s_snapshot.have_heading = false;
     }
     else
+    {
         s_snapshot.have_mag = false;
+        s_snapshot.have_heading = false;
+    }
 
     s_snapshot.have_gps = true;
 }

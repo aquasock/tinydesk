@@ -21,6 +21,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Below this much horizontal field the heading is noise rather than a
+ * direction: a few microtesla is the floor where the angle still holds still
+ * while the board sits still. Shared so the snapshot and `magcal show` cannot
+ * disagree about when a heading is meaningful. */
+#define MAG_HEADING_MIN_UT 5.0
+
 struct sensor_snapshot
 {
     /* Validity per group, so a part that stops answering is reported as
@@ -37,6 +43,18 @@ struct sensor_snapshot
     double pressure_temp_c;
 
     double mag_x_ut, mag_y_ut, mag_z_ut;   /* LIS3MDL, microtesla */
+
+    /* Magnetic heading in degrees, 0..360, from the corrected horizontal
+     * field: the compass bearing to magnetic north, not true north. The
+     * magnetometer is fixed to the GPS module, flat and aligned with it, so
+     * the board is only ever read in one orientation and no tilt
+     * compensation is needed -- which is just as well, since this board has no
+     * accelerometer to sense tilt with. Absent when the horizontal field is
+     * too weak for the angle to mean anything. Magnetic here means magnetic:
+     * no declination is applied, so this reads 9.6 degrees low against a true
+     * bearing at this bench. */
+    double mag_heading_deg;
+    bool have_heading;
 
     /* GPS: a fix and the position it gave. */
     bool gps_fix;

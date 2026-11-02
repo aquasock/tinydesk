@@ -149,6 +149,7 @@ Topic IDs are the `record_id` prefix. An entry reserves a name; it does not clai
 | Why does a client reject my FIELD_TELEMETRY as "not bytes"? | LXMF | LXMF-010 |
 | How big can a telemetry reply be, and what does 159 bytes mean? | LXMF | LXMF-011 |
 | Does a large telemetry reply actually arrive? | LXMF | LXMF-012 |
+| How is a heading reported, when no sensor id exists for one? | LXMF | LXMF-013 |
 | Why does Identity::recall() fail for a peer that just announced? | RNS | RNS-007 |
 | Why does the path count read as a huge number? | RNS | RNS-008 |
 | Where can a message carry custom data without colliding? | LXMF | LXMF-007 |
@@ -180,6 +181,7 @@ Topic IDs are the `record_id` prefix. An entry reserves a name; it does not clai
 | Why does |B| still vary after calibrating? | SEN | SEN-008 |
 | Why does |B| read high when the dip is right? | SEN | SEN-010 |
 | How much does the bench distort the field? | SEN | SEN-011 |
+| Can a heading come from the magnetometer alone? | SEN | SEN-012 |
 | Why does a 6-byte sensor read return one repeated value? | SEN | SEN-009 |
 | Why did a host-side calibration check say the board never moved? | HOST | HOST-008 |
 | How is a client configured to see the node? | HOST | HOST-001, HOST-003 |
@@ -242,6 +244,7 @@ LXMF-009: "FIELD_COMMANDS is a list of single-key dicts using Sideband's command
 LXMF-010: "A message field value must itself be msgpack-encoded bytes: microLXMF re-emits fields with packRawBytes, so a bare map in the field is parsed by the outer msgpack into a dict and the client rejects it with 'packed data must be type bytes'"
 LXMF-011: "159 bytes is the threshold for sending a message as one link-free OPPORTUNISTIC packet, not a size limit: above it LXMF uses DIRECT and a RESOURCE transfer, so any telemetry map arrives, just slower; 114 bytes are committed before sensors, leaving a 45-byte map in which TIME costs 6, LOCATION 41, MAGNETIC_FIELD 29 and the environment trio 10 each"
 LXMF-012: "Link delivery works to Sideband: a 614-byte LOCATION+MAGNETIC_FIELD reply arrived over a DIRECT resource transfer, parsed and was committed to Sideband's database; Sideband's telemetry panel then needed a restart to repaint, which is a client display artefact, not a delivery fault"
+LXMF-013: "Sideband has no sensor id for heading, and the two slots that look like candidates refuse it: MAGNETIC_FIELD unpacks exactly three floats and drops a fourth, and LOCATION's `bearing` is only rendered when speed exceeds 0.1 km/h, so a stationary node never shows it; CUSTOM (0xFF) carries [label, [value, icon]] entries and renders each as its own row regardless of motion"
 MSG-001: "MsgPack 0.4.2 (MIT) is vendored with Packer::packRawBytes (both overloads) and Unpacker::indices made public, because microLXMF's LXMessage.cpp uses them and 0.4.2 keeps them private while upstream CI builds that path only for native targets"
 RADIO-001: "The radio is a REYAX RYLR998, an 868/915 MHz module driven entirely by AT commands on a UART with no SPI path and no RadioLib; the module on this bench reports RYLR998_REYAX_V1.2.4"
 RADIO-002: "Configured values: address 1, network id 6, peer address 0 (broadcast), SF7, bandwidth index 7 (125 kHz), coding rate 1 (4/5), preamble 12, 14 dBm, UART 115200 8N1; the band is left at whatever the module holds (factory 915 MHz) unless -DLORA_BAND_HZ is set"
@@ -277,6 +280,7 @@ SEN-008: "The bench field is 46.6 uT (IGRF-14: 23.8 H, 40.0 Z, dip 59.3 deg); th
 SEN-009: "Multi-byte register reads on the LIS3MDL and BMP581 need the sub-address MSB set, reg | 0x80, or the device repeats one register and a six-byte read yields a degenerate vector rather than an I2C error"
 SEN-010: "An ellipsoid fit determines the shape of a soft-iron correction but not its absolute scale, which follows how much of the ellipsoid the samples covered; a partial tumble leaves the fitted surface small, so every corrected vector lands outside it and |B| reads high while the dip stays correct -- measured here as 53.4 uT against a 46.6 uT field at a dip of 58.6 deg, corrected by a uniform factor of 0.87251 to 46.3-46.8 uT"
 SEN-011: "The bench itself is magnetic: a board whose gain was set in free air reads 44.8 to 45.9 uT and a dip of 61.6 deg once set down on the desk, against 46.3 to 46.8 uT and 60.3 deg in the air above it, so a calibration must be gained in the place it will be used"
+SEN-012: "Magnetic heading is atan2 of the corrected horizontal field, meaningful only while the board is level, so with the magnetometer fixed flat and aligned to the GPS module it is a valid reading and needs no tilt compensation; the board has no accelerometer, so nothing could provide that compensation"
 HOST-001: "host-config/config is an RNS instance with an explicit UDPInterface: listen 0.0.0.0:4242 and forward 255.255.255.255:4242, while the Sideband variant forwards to the node's address 10.10.0.35:4242"
 HOST-002: "e2e_test.py takes the destination hash from k, owns its own RNS instance rather than attaching to a daemon, requests a path, sends a 30-byte packet and waits for the cryptographic proof; the last recorded run passed with rtt 0.676 s"
 HOST-003: "rnsd must be started with setsid or it dies when the launching shell ends; rnpath and rnprobe sometimes hit a shared-instance auth-key mismatch on this box, which owning the instance avoids entirely"
@@ -819,6 +823,19 @@ Records are grouped in the order of the topic catalog, and numbered within each 
     - "core-log entry 13: the full sequence and the restart that repainted the panel"
   verification: "Confirmed end to end on this bench 2026-11-01 with Sideband 2.2.0 as the receiver. The same payload was also fed to Sideband's own Telemeter.from_packed() offline, which parsed it and returned all nine sensors with a current timebase, so encoding and delivery were confirmed independently of the panel. Revised 2026-11-01 (core-log entry 13): this record previously said the question was unestablished and carried another bench's failure; it is now VERIFIED, with the failure attributed to that bench and not to this stack."
 
+- record_id: LXMF-013
+  kind: EXTERNAL
+  topic_id: LXMF
+  title: "Sideband has no heading sensor id; CUSTOM is the only slot that renders one"
+  status: VERIFIED
+  verified_date: 2026-11-01
+  statement: "Sideband 2.2.0's Sensor class defines twenty-seven sensor ids and none of them is a heading, compass or orientation. The two that appear to be candidates both refuse one. MAGNETIC_FIELD (0x09) is exactly three values: pack() writes [x, y, z], unpack() reads packed[0] through packed[2], and render() emits x, y and z, so a fourth element is read by nobody. LOCATION (0x02) does carry an element the client calls `bearing`, and Location.render() renames it to `heading`, but the UI prints it only inside a branch taken when speed exceeds 0.1 km/h: objectdetails.py builds the row as a single string combining speed and heading, so a node reporting zero speed never displays the heading at all, and the element's real meaning is GPS course over ground rather than compass direction. CUSTOM (0xFF) carries a list of [label, [value, custom_icon]] entries; Custom.unpack() rebuilds it as a dict and Custom.render() emits one entry per label, which objectdetails.py prints as `{label} {value}` with the given icon or the sensor's own. Nothing in that path tests speed."
+  consequence: "A heading from a stationary node must travel in CUSTOM, as an entry such as [\"Magnetic heading\", [\"359.8 degrees\", \"compass-rose\"]]. Putting it in LOCATION would appear correct in a schema reading and fail silently in the field, since the failure depends on speed rather than on anything the node can detect. MAGNETIC_FIELD must stay three floats. CUSTOM entries cost roughly forty bytes each, which matters for the compact telemetry map: it sits at 151 packed bytes against a 159-byte single-packet limit, so a heading there would push the reply onto a link and lose the property that makes compact mode worth having."
+  sources:
+    - "Sideband 2.2.0 sbapp/sideband/sense.py: the Sensor SID constants, MagneticField.pack/unpack/render, Location.unpack/render, Custom.pack/unpack/render, and Telemeter.from_packed()"
+    - "Sideband 2.2.0 sbapp/ui/objectdetails.py: the Location branch gated on speed > 0.1, and the Custom branch building the row as f'{label} [b]{value}[/b]'"
+  verification: "Read from the Sideband 2.2.0 AppImage on this bench 2026-11-01, and confirmed live: the node's own 660-byte telemetry reply, captured as raw field bytes, was passed to Telemeter.from_packed() from that same installation and produced the entry {'Magnetic heading': ['359.8\u00b0', 'compass-rose']}, which rendered as the row 'Magnetic heading [b]359.8\u00b0[/b]' with the compass-rose icon. The same bytes were also decoded by tools/telemetry_request_test.py, which showed SID 0xff carrying that list under the map."
+
 - record_id: MSG-001
   kind: EXTERNAL
   topic_id: MSG
@@ -1284,6 +1301,20 @@ Records are grouped in the order of the topic catalog, and numbered within each 
     - "Measurements on this bench 2026-11-01, twelve readings from `magcal show` at 2.5 s intervals, the board held flat at the same orientation in both positions"
     - "The IGRF-14 field for the bench coordinates, recorded in SEN-008"
   verification: "Confirmed on this board 2026-11-01 after the gain correction, by readings taken in the air and then on the desk within the same minute, with no parameter changed between them."
+
+- record_id: SEN-012
+  kind: DEVICE
+  topic_id: SEN
+  title: "A level-fixed magnetometer gives a heading without tilt compensation"
+  status: VERIFIED
+  verified_date: 2026-11-01
+  statement: "The magnetic heading of a two-axis magnetometer measurement is atan2 of the horizontal components of the field, corrected for hard and soft iron. That angle describes the direction the sensor faces only while the sensor is level: if the board tilts, the vertical component of the field projects into the horizontal pair and the apparent heading moves by tens of degrees, with no way to detect it from the magnetic data alone. Tilt compensation requires an accelerometer or an inclinometer to measure the gravity vector. This board carries a LIS3MDL, an SHT45, a BMP581 and a DS3231, and no accelerometer, so nothing on it can sense tilt. The magnetometer, however, is fixed to the GPS module, flat and aligned with it, and the assembly is permanently mounted in one orientation, so the board is only ever read level."
+  consequence: "A magnetic heading is valid on this node because of how it is mounted rather than because of anything the firmware measures, so the firmware reports it without tilt compensation and without any indication of how level the board is. If the assembly is ever moved, re-aimed or mounted at an angle, the heading will be wrong by an amount the node cannot report, and the correct repair is to mount it level again rather than to correct the numbers. The heading is magnetic, not true: no declination is applied, because computing it would need either a fixed constant for one location or a geomagnetic model in firmware, and the operator asked for magnetic. At this bench the geomagnetic declination is 9.6 degrees east, so the heading reads that far anti-clockwise of a true bearing. Below about 5 uT of horizontal field the angle is dominated by sensor noise and is withheld rather than reported."
+  sources:
+    - "ports/nanoesp32/main/sensors.cpp: the snapshot fill computing atan2(y, x) from the corrected field and gating it on MAG_HEADING_MIN_UT"
+    - "The IGRF-14 field and declination for this bench, recorded in SEN-008"
+    - "The fitted accelerometer list for this board: SEN-002, SEN-003, SEN-006 and SEN-001, none of which senses gravity"
+  verification: "Read on this board 2026-11-01: `magcal show` and the telemetry CUSTOM entry both report a heading from the corrected horizontal field, and repeated readings with the board still tracked within about 1.5 degrees of each other. The absence of tilt compensation is a property of the fitted parts rather than a measurement, and was confirmed by there being no accelerometer on the I2C bus."
 
 - record_id: HOST-001
   kind: TOOLCHAIN
