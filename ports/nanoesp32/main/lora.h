@@ -53,4 +53,9 @@ std::string short_status();
 // Multi-line detail for the `lora` console command.
 void console_report();
 
+// Log every message that reassembles, whatever it turns out to be. Off by
+// default; `lora verbose on` turns it on. This is what separates "the radio
+// heard something and the stack rejected it" from "the radio heard nothing".
+void set_verbose(bool on);
+
 }  // namespace lora

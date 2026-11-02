@@ -680,3 +680,45 @@ Reception is the next hardware step and it needs a second RYLR998: the same fram
 - User Test: NOT RUN
 
 ---
+
+## 21 COMMIT Unreleased 2026-11-01T20:40:00-07:00
+
+#### Coming From:
+
+Unreleased 4042c0c
+
+#### Purpose:
+
+Prove the LoRa link works in both directions using the TinyTang's radio as the far end, since the node's own receive path had only ever been verified for transmission, and establish what it takes to reach the Tang's radio when its firmware is not running.
+
+#### Outcome:
+
+The radio carries traffic both ways. The node received three frames sent from the Tang's module, reassembled them, and the payload bytes matched what was sent; the Tang received the node's announce and reported its signal quality. Measured at -44 dBm with SNR 13 going to the node and -45 dBm with SNR 13 going the other way, so the link has margin to spare.
+
+Getting there took a path worth recording, because the obvious one does not exist. In one-wire mode the BL616 runs nothing, so TinyTang's `lora` command and its whole shell are absent -- the desktop core is present but implements only the extended memory protocol, and answers core-ID 0x54 while producing no console text and ignoring keyboard frames. That was established by probing rather than assumed: idle listening returned nothing, a keyboard report produced nothing, and the core's own logic decodes only frame types 0x10 and 0x12. The route that does work is the memory-mapped UART the core implements for the socket: writing 0x170 pushes a byte to the module, 0x174 reads one back, and the whole set is reachable from the host through the extended 0x10 command once the socket word at 0xc0 selects personality 8.
+
+One trap cost a round of confusion. Written without the FPGA's FIFO hold, every command -- including a bare AT -- was answered `+ERR=1`, which reads like a dead or misconfigured module. Setting CTRL_HOLD, pushing the bytes and then releasing it, which is what the Tang's own firmware does, made every command answer correctly on the first try. A command that works on the board and fails from a host is a pacing difference rather than a wiring fault, and that is now recorded so the next person does not start by checking the harness.
+
+The Tang's module turned out to need no reconfiguration at all: address 2, network 6, 915 MHz, SF7 at bandwidth index 7, coding rate 1, preamble 12 and 14 dBm, which is identical to what the node set for itself and differs only in address. Whatever configured it previously left it compatible, so the test needed no changes on that side.
+
+Two honesty notes. First, reception at the node is invisible without help: a frame that reassembles but is not a Reticulum packet is dropped by the transport in silence, which is correct for the stack and useless for bring-up, since it makes "heard and rejected" indistinguishable from "heard nothing". The `lora` command now reports messages reassembled, the sender address and the first eight bytes, and `lora verbose on` logs each one, which is how the byte-level match above was shown. Second, the link is proven to carry traffic but has not been measured for loss: one earlier run of three frames delivered only one of them, while a later run delivered all three, and the difference was not isolated.
+
+The core-syntax audit re-read `.ai/core.md` and `.ai/core-syntax.md`, confirmed that neither was changed and that entries 1 to 20 were not rewritten, and that the reference's six YAML blocks all parse, with the index and the records naming the same 96 ids in the same order under the allowed Status values, and validated this entry as number 21 with exactly six sections, prose in Purpose, Outcome and Next Steps, allowed Status values, and engineering paths in Files Modified.
+
+#### Next Steps:
+
+TinyTang is meant to become the node's primary client, and nothing on it speaks Reticulum yet: the link just proven carries the node's framing, and every frame the node sends is discarded by the Tang, which can only read raw bytes. Making the Tang a client means a Reticulum stack on the BL616, which is a port of its own and has not been attempted. Until then the shared radio is useful for bring-up and for measuring, not for use. Loss on the link should be characterised before anything is built on it, since one run dropped two frames of three and the cause was not found. The node still cannot report its path table because microReticulum exposes no path enumeration, so Sideband shows no reachable destinations even while the node relays. Three older items remain open: LOCATION ships speed, bearing and accuracy derived rather than measured, the heading has never been checked against a surveyed bearing, and P1 retains the copy of `.ai` this one came from.
+
+#### Files Modified:
+
+- ports/nanoesp32/main/lora.cpp
+- ports/nanoesp32/main/lora.h
+- ports/nanoesp32/main/node.cpp
+
+#### Status:
+
+- Build: PASS
+- Deployment: PASS
+- User Test: NOT RUN
+
+---

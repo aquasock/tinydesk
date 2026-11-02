@@ -161,6 +161,7 @@ public:
 	bool status_line(char* out, size_t n) const;
 	std::string short_status() const;
 	void console_report() const;
+	void set_verbose(bool on) { _verbose = on; }
 
 private:
 	virtual bool send_outgoing(const Bytes& data) override;
@@ -225,6 +226,19 @@ private:
 	uint32_t _rx_early    = 0;   // packets heard while still configuring
 	int      _last_rssi   = 0;
 	int      _last_snr    = 0;
+
+	/* What the last complete message looked like, whoever sent it.
+	 *
+	 * A frame that reassembles but is not a Reticulum packet is handed to the
+	 * transport, which discards it without a word -- correct for the stack, but
+	 * it leaves nothing behind to tell "heard it and rejected it" from "heard
+	 * nothing at all". During bring-up that distinction is the whole question,
+	 * so the last message is kept here and can be streamed with `verbose`. */
+	uint32_t _last_rx_len  = 0;
+	uint16_t _last_rx_from = 0;
+	uint8_t  _last_rx_head[8] = {0};
+	uint32_t _rx_complete  = 0;  // messages reassembled, valid packet or not
+	bool     _verbose      = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -558,6 +572,24 @@ void LoRaInterface::on_receive(const char* line) {
 	             loraframe::headerId(header), loraframe::headerMore(header), now_ms());
 
 	if (result == loraframe::Reassembler::COMPLETE) {
+		++_rx_complete;
+		_last_rx_len  = _rx.size();
+		_last_rx_from = rcv.from;
+		for (size_t i = 0; i < sizeof(_last_rx_head) && i < _rx.size(); ++i)
+			_last_rx_head[i] = _rx.data()[i];
+
+		/* A frame that reassembles but is not a Reticulum packet is dropped by
+		 * the transport without a word. That is right for the stack and useless
+		 * for bring-up, where "heard it and rejected it" and "heard nothing"
+		 * look identical from outside. */
+		if (_verbose)
+			logf("rx %u bytes from %u, rssi %d snr %d, first %02x %02x %02x %02x",
+			     (unsigned)_rx.size(), (unsigned)rcv.from, rcv.rssi, rcv.snr,
+			     _rx.size() > 0 ? _rx.data()[0] : 0,
+			     _rx.size() > 1 ? _rx.data()[1] : 0,
+			     _rx.size() > 2 ? _rx.data()[2] : 0,
+			     _rx.size() > 3 ? _rx.data()[3] : 0);
+
 		// Signal quality rides along on the packet the transport builds. Those
 		// fields are private to InterfaceImpl, so they are reached through the
 		// wrapper's setters -- the same wrapping handle_incoming() does itself.
@@ -699,6 +731,14 @@ void LoRaInterface::console_report() const {
 	logf("  queued %u   errors %lu   dropped %lu",
 	     (unsigned)_queue.size(), (unsigned long)_errors, (unsigned long)_dropped);
 	logf("  last rssi %d dBm   snr %d dB", _last_rssi, _last_snr);
+	logf("  messages reassembled %lu   last %lu bytes from %u",
+	     (unsigned long)_rx_complete, (unsigned long)_last_rx_len,
+	     (unsigned)_last_rx_from);
+	if (_last_rx_len)
+		logf("  last head %02x %02x %02x %02x %02x %02x %02x %02x",
+		     _last_rx_head[0], _last_rx_head[1], _last_rx_head[2], _last_rx_head[3],
+		     _last_rx_head[4], _last_rx_head[5], _last_rx_head[6], _last_rx_head[7]);
+	logf("  verbose %s", _verbose ? "on" : "off");
 	logf("  bad lines %lu   overlong %lu   heard-while-configuring %lu",
 	     (unsigned long)_rx_invalid, (unsigned long)_overlong,
 	     (unsigned long)_rx_early);
@@ -750,6 +790,10 @@ void console_report() {
 		return;
 	}
 	g_impl->console_report();
+}
+
+void set_verbose(bool on) {
+	if (g_impl != nullptr) g_impl->set_verbose(on);
 }
 
 }  // namespace lora

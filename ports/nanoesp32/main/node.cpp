@@ -2876,6 +2876,14 @@ static int cmd_lora(tdsh_session_t *session, int argc, char **argv)
         return 0;
     }
 
+    if (argc > 1 && strcmp(argv[1], "verbose") == 0)
+    {
+        const bool on = (argc > 2 && strcmp(argv[2], "on") == 0);
+        lora::set_verbose(on);
+        printf("lora verbose %s\n", on ? "on" : "off");
+        return 0;
+    }
+
     lora::set_logger(shell_log);
     lora::console_report();
     lora::set_logger([](const char *line) { node_log("lora: %s", line); });
@@ -2884,9 +2892,10 @@ static int cmd_lora(tdsh_session_t *session, int argc, char **argv)
 
 static const tdsh_command_t s_lora_cmd = {
     .name = "lora",
-    .usage = "lora [status]",
+    .usage = "lora [status|verbose on|verbose off]",
     .help = "Show the RYLR998 link: band, address, network, air parameters, "
-            "counters and the last rssi/snr; 'status' prints one line",
+            "counters and the last rssi/snr; 'status' prints one line, "
+            "'verbose on' logs every message the radio reassembles",
     .fn = cmd_lora,
     .flags = 0,
 };

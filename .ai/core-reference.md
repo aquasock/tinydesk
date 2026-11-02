@@ -167,6 +167,8 @@ Topic IDs are the `record_id` prefix. An entry reserves a name; it does not clai
 | Can the module run at 5 V, or at 22 dBm? | RADIO | RADIO-008 |
 | Is LoRa transmit actually proven on hardware? | RADIO | RADIO-009 |
 | Which UART and GPIOs does the ESP-IDF port use for the radio? | RADIO | RADIO-010 |
+| What are the Tang's LoRa settings, and do they match the node's? | RADIO | RADIO-011 |
+| How is the Tang's radio reached with no shell loaded? | RADIO | RADIO-012 |
 | What exactly is sent over the air? | FRM | FRM-001, FRM-002, FRM-003 |
 | How many frames is a full packet, and when is a partial dropped? | FRM | FRM-004 |
 | How slow is the link? | FRM | FRM-005 |
@@ -263,6 +265,8 @@ RADIO-007: "The module is half duplex and cannot receive while transmitting, so 
 RADIO-008: "Electrical: VDD is 2.3-3.6 V and the UART pins are not 5 V tolerant, so the module runs from 3V3 and never VBUS/5V; it peaks at about 140 mA while transmitting at 22 dBm, and 14 dBm is the CE ceiling against the module's 22 dBm maximum"
 RADIO-009: "Transmit and reception are both proven: announces on 2026-10-26, and 16 of 17 frames from a second module on a Pico 2 on 2026-10-27, with the +RCV parser, reassembler and RSSI/SNR path exercised and all error counters at zero"
 RADIO-010: "On the ESP-IDF port the RYLR998 is driven through the ESP-IDF UART driver on UART1 at GPIO 8 (RX) and 9 (TX), because that port's Arduino shim provides no HardwareSerial; GPIO 8/9 are free there, with I2C on 11/12 and the panel on 18/21/38/47/48"
+RADIO-011: "The TinyTang's own RYLR998 holds address 2 on network 6 at 915 MHz with SF7, bandwidth index 7, coding rate 1 and preamble 12 at 14 dBm, which is identical to the node's air parameters and the complementary address, so the two modules carry the node's framing between them in both directions -- measured at -45 dBm and -44 dBm with SNR 13"
+RADIO-012: "The Tang's LoRa module can be driven from a host with no shell and no BL616 firmware running: in one-wire mode the desktop core implements the module's UART at FPGA registers 0x170/0x174/0x178/0x17c, reachable through the extended 0x10 memory protocol after the socket word at 0xc0 is set to personality 8, but only if the command is written with CTRL_HOLD set and released afterwards -- writing the bytes without the hold makes the module answer +ERR=1 to every command including a bare AT"
 FRM-001: "One AT+SEND=<address>,<length>,<data> per frame answered with +OK; reception arrives as one line per frame, +RCV=<from>,<length>,<data>,<rssi>,<snr>"
 FRM-002: "<data> is standard base64, not decoration: the AT syntax is comma-delimited and line-terminated, so a raw packet would both corrupt the parser and be cut at the first 0x0D; 180 encoded bytes fill the 240-character field exactly, with no padding and no comma"
 FRM-003: "The binary frame inside the base64 is one header byte NNNN M III -- nonce nibble randomised per frame, M set while more frames follow, rolling message id 0-7 -- followed by up to 179 bytes of Reticulum packet"
@@ -1030,7 +1034,36 @@ Records are grouped in the order of the topic catalog, and numbered within each 
     - "ports/nanoesp32/main/lora.cpp: UART_PORT, LORA_RX_GPIO and LORA_TX_GPIO, and start() calling uart_driver_install, uart_param_config and uart_set_pin"
     - "ports/nanoesp32/components/rns/shim/arduino_shim.h: the whole shim, which provides delay, delayMicroseconds, random, Esp and String and no serial class"
     - "ports/nanoesp32/main/node.cpp: I2C_SDA_GPIO and I2C_SCL_GPIO on 11 and 12; ports/nanoesp32/main/ili9340.h for the panel pins"
-  verification: "Brought up on this board 2026-11-01: the module answered AT on UART1, reported RYLR998_REYAX_V1.2.4, accepted AT+ADDRESS, AT+NETWORKID, AT+PARAMETER and AT+CRFOP, and transmitted 11 packets in 18 frames with no +ERR and nothing dropped. Reception through this port is not yet exercised: there is no second module on the air here."
+  verification: "Brought up on this board 2026-11-01: the module answered AT on UART1, reported RYLR998_REYAX_V1.2.4, accepted AT+ADDRESS, AT+NETWORKID, AT+PARAMETER and AT+CRFOP, and transmitted 11 packets in 18 frames with no +ERR and nothing dropped. Revised 2026-11-01 (core-log entry 21): reception is now exercised. With the TinyTang's module on the air the node received three frames addressed to it, reassembled them, and the payload hex matched what was sent -- see RADIO-011."
+
+- record_id: RADIO-011
+  kind: DEVICE
+  topic_id: RADIO
+  title: "The Tang's module already matches the node's air parameters"
+  status: VERIFIED
+  verified_date: 2026-11-01
+  statement: "The RYLR998 fitted to the TinyTang answers AT+VER? with RYLR998_REYAX_V1.2.4 and holds `+ADDRESS=2`, `+NETWORKID=6`, `+BAND=915000000`, `+PARAMETER=7,7,1,12`, `+CRFOP=14` and `+MODE=0`. The node holds address 1 with the same network id, band, spreading factor, bandwidth index, coding rate, preamble and power. The two therefore agree on every parameter the air depends on and differ only in address, which is what a two-ended link needs. A frame sent from the Tang with AT+SEND=1 was received by the node with sender address 2, and the node's announce was received by the Tang with sender address 1."
+  consequence: "The radio link needs no reconfiguration to be tried: whatever set the Tang's module up previously left it compatible with this node. Because the node speaks only Reticulum, a frame it receives that is not a Reticulum packet is discarded by the transport without an error, so during bring-up the only evidence of reception is the driver's own counters -- `lora` reports frames, reassembled messages, sender address and the first bytes, and `lora verbose on` logs every one. Measurement on this bench gave -45 dBm and -48 dBm for the two directions with SNR 13 to 14, so the link has margin well beyond what the framing needs."
+  sources:
+    - "The Tang's module interrogated over its FPGA registers 2026-11-01: AT+VER?, AT+ADDRESS?, AT+NETWORKID?, AT+BAND?, AT+PARAMETER?, AT+CRFOP?, AT+MODE?"
+    - "ports/nanoesp32/main/lora.cpp: MODULE_ADDRESS, NETWORK_ID, SPREADING, BANDWIDTH_IDX, CODING_RATE, PREAMBLE and RF_POWER_DBM"
+    - "Lora frame exchange measured on this bench 2026-11-01 in both directions"
+  verification: "Measured on this bench 2026-11-01. The node heard the Tang's three frames in one run, reporting rx 3, 'messages reassembled 3', sender address 2, rssi -44 dBm, snr 13 dB, and a head of 52 45 50 32 20 42 42 42, which is the sent payload's own bytes. The Tang heard the node's announce with sender address 1 at -45 dBm, SNR 13 dB. One earlier run of three frames delivered only one of them, so the link is proven to carry traffic but not yet measured for loss."
+
+- record_id: RADIO-012
+  kind: TOOLCHAIN
+  topic_id: RADIO
+  title: "The Tang's radio is reachable over JTAG with no shell, if commands are FIFO-held"
+  status: VERIFIED
+  verified_date: 2026-11-01
+  statement: "In one-wire mode the BL616 runs nothing, so TinyTang's `lora` command and the rest of its shell are absent. The desktop core can still be loaded into the FPGA's SRAM from the host with `openFPGALoader -b tangmega138k <core>.fs`, and that core implements the module's UART at memory-mapped registers: 0x170 writes one byte to the transmit FIFO, 0x174 reads one byte from the receive FIFO and pops it, 0x178 is status, and 0x17c is control with bit 0 NRST-low, bit 1 flush, bit 2 loopback and bit 3 hold. Those registers are reachable from the host through the extended 0x10 command, but the UART is only routed to the socket when the socket word at 0xc0 selects personality 8 for slot 0 -- bits 7:4 of the low half -- and a command only reaches the module intact when it is written with CTRL_HOLD set, the bytes pushed, and the hold then released. Written without the hold, every command, including a bare AT, is answered with `+ERR=1`."
+  consequence: "The Tang's radio can be exercised from a host with no BL616 firmware, no shell and no two-wire cable, which is what made it usable as the far end while the node's own side was being brought up. The hold requirement is the trap: without it the module answers, but every answer is +ERR=1, which reads like a module fault rather than a pacing fault. The same sequence is what the Tang's own firmware does in tang_lora.c, so a command that works there and fails from a host is a pacing difference, not a wiring one."
+  sources:
+    - "fpga/desktop/desktop_regs.sv: the 0x170 write path pushing uart_tx_data, the 0x174 read popping uart_rx_data, and the 0x17c control bits"
+    - "fpga/desktop/desktop_pmod.sv: personality 8 selecting the UART lanes, at bits 7:4 of active_word for slot 0"
+    - "ports/bl616/tang_lora.c: the same CTRL_HOLD sequence, and the register addresses"
+    - "Tang-Phosphor tools/fpga_uart.py: the extended 0x10 read and write frames with CRC-16/CCITT-FALSE"
+  verification: "Run on this bench 2026-11-01 against the Tang in one-wire mode. openFPGALoader loaded desktop.fs and the core answered core-ID 0x54. Pokes to 0x170 written without the hold produced `+ERR=1` for AT, AT+VER? and AT+NETWORKID?; with the hold each was answered correctly, and AT+VER? returned RYLR998_REYAX_V1.2.4."
 
 - record_id: FRM-001
   kind: PROTOCOL
