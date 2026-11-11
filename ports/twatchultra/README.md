@@ -18,6 +18,16 @@ ignored.
 The desktop is **40x26 cells** of 8x16. The glass is bigger than that; see the
 second trap below for why the desktop does not use all of it.
 
+**Apps open maximised** (`TD_OPEN_MAXIMIZED=1`, set in
+`main/project_include.cmake`). On a grid this small a window that asks for a
+desktop-sized size has most of itself below row 26, off the glass — this port's
+Bluetooth window asks for 72x34. Maximised keeps the frame and title bar, so an
+app's own layout is untouched and it is still movable and closable, while giving
+it the whole desk area. Dialogs, tools and windows that ask to keep their own
+size (`TD_WIN_OWN_SIZE`) are unaffected. Switching between open apps is **F6**
+(or Alt+Tab): the taskbar is already full at 40 columns with `[Start]`, the user,
+the network tray and the clock, so it has no room for per-window buttons.
+
 ## Three things that are not like the other ports
 
 **1. The panel is QSPI, and ESP-IDF 5.3's `esp_lcd` has no quad mode.**

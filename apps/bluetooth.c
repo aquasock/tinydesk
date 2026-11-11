@@ -31,9 +31,13 @@ static const td_bt_ops_t *bt(void)
 #define WIN_H     34
 #define TICK_MS   250
 #define COL       11     /* where values start, after the headings */
-#define SLOT_Y(i) (5 + (i)*5)
-#define SCAN_Y    20
-#define LIST_ROWS 8
+/* Each slot is THREE rows: state and device on one line, the last event under
+ * it, and the three buttons under that. It was four rows on a five-row stride,
+ * and on a 40x26 window that pushed the scan section -- the reason anyone opens
+ * this window -- off the bottom of the glass. */
+#define SLOT_Y(i) (4 + (i)*3)
+#define SCAN_Y    14
+#define LIST_ROWS 5
 
 static td_window_t *s_win;
 static td_bt_status_t s_info;
@@ -389,40 +393,44 @@ static void draw_slot(int y, int w, int i)
     char line[128];
     char addr[18];
 
-    if (s->active)
+    /* Row 0: what this slot is doing and which device it is doing it with, on
+     * one line. Three rows per slot instead of four means the pairing state can
+     * no longer have a line to itself, and "idle, not paired" reads as well as
+     * two lines did. */
+    if (s->active && s->name[0])
     {
-        format_addr(addr, sizeof(addr), s->addr);
-        int n = snprintf(line, sizeof(line), "%s, %s%s%s", s->state,
-                         s->name[0] ? s->name : "", s->name[0] ? " " : "", addr);
-        if (s->ready && n > 0 && n < (int)sizeof(line))
-        {
-            snprintf(line + n, sizeof(line) - (size_t)n, " (%s, %lu reports)",
-                     s->boot_protocol ? "boot" : "report", (unsigned long)s->reports);
-        }
+        snprintf(line, sizeof(line), "%s, %s", s->state, s->name);
+    }
+    else if (s->paired && s->paired_name[0])
+    {
+        snprintf(line, sizeof(line), "%s, %s", s->state, s->paired_name);
     }
     else
     {
-        snprintf(line, sizeof(line), "%s", s->state);
+        snprintf(line, sizeof(line), "%s, not paired", s->state);
     }
     row(y, w, s_slot_names[i], line, s->ready ? t->win_fg : t->dim);
 
-    if (s->paired)
-    {
-        format_addr(addr, sizeof(addr), s->paired_addr);
-        snprintf(line, sizeof(line), "paired with %s%s%s, %s",
-                 s->paired_name[0] ? s->paired_name : "", s->paired_name[0] ? " " : "",
-                 addr, s->reconnects ? "reconnects by itself" : "not reconnecting");
-        row(y + 1, w, NULL, line, s->reconnects ? t->win_fg : t->dim);
-    }
-    else
-    {
-        row(y + 1, w, NULL, "not paired", t->dim);
-    }
+    /* Row 1: the last event, at column 1 rather than the value column -- it is
+     * a continuation line, not a value, and the extra ten columns are the
+     * difference between "connected: keyboard and mouse" fitting and being cut
+     * to "connected: keyboard a". With no event to show, the address is more
+     * use than a blank row. */
     if (s->last[0])
     {
         snprintf(line, sizeof(line), "last: %s", s->last);
-        row(y + 2, w, NULL, line, t->dim);
+        td_textn(1, y + 1, line, w - 2, t->dim, t->win_bg, 0);
     }
+    else if (s->paired)
+    {
+        format_addr(addr, sizeof(addr), s->paired_addr);
+        snprintf(line, sizeof(line), "paired %s%s", addr,
+                 s->reconnects ? ", reconnects" : "");
+        td_textn(1, y + 1, line, w - 2, s->reconnects ? t->win_fg : t->dim,
+                 t->win_bg, 0);
+    }
+
+    /* Row 2 is the buttons, placed in launch(). */
 }
 
 static void on_draw(td_window_t *win, int w, int h)
@@ -473,7 +481,7 @@ static void on_draw(td_window_t *win, int w, int h)
 
     if (s_scan_slot >= 0)
     {
-        snprintf(line, sizeof(line), "Pair a %s: put it in pairing mode near the board",
+        snprintf(line, sizeof(line), "Pair a %s: pairing mode",
                  s_slot_lower[s_scan_slot]);
         td_text(1, SCAN_Y - 1, line, t->win_fg, t->win_bg, TD_BOLD);
         if (s_scan_pending)
@@ -483,11 +491,11 @@ static void on_draw(td_window_t *win, int w, int h)
         }
         else if (s_found_count == 0)
         {
-            snprintf(line, sizeof(line), "Nothing found; check pairing mode and scan again");
+            snprintf(line, sizeof(line), "Nothing found; scan again");
         }
         else
         {
-            snprintf(line, sizeof(line), "%d found; choose one and press Pair (or double-click)",
+            snprintf(line, sizeof(line), "%d found; pick one, press Pair",
                      s_found_count);
         }
         td_textn(1, SCAN_Y, line, w - 2, t->win_fg, t->win_bg, 0);
@@ -505,7 +513,9 @@ static void on_draw(td_window_t *win, int w, int h)
             msg = "working...";
         }
     }
-    td_textn(9, h - 1, msg, w - 10, failed ? t->accent : t->win_fg, t->win_bg, 0);
+    /* Column 1, full width: the Close button that used to occupy the start of
+     * this row is gone, so the message has the row to itself. */
+    td_textn(1, h - 1, msg, w - 2, failed ? t->accent : t->win_fg, t->win_bg, 0);
 }
 
 /* ---- the window ---------------------------------------------------------- */
@@ -539,12 +549,6 @@ static void on_tick(td_window_t *win)
 {
     refresh();
     td_win_invalidate(win);
-}
-
-static void on_close_btn(td_widget_t *w, void *user)
-{
-    (void)user;
-    td_win_close(w->win);
 }
 
 static void on_close(td_window_t *win)
@@ -585,21 +589,27 @@ static void launch(void)
 
     for (int i = 0; i < TD_BT_SLOTS; i++)
     {
-        const int y = SLOT_Y(i) + 3;
-        s_pair[i] = td_button(s_win, COL, y, "Pair...", on_pair, (void *)(intptr_t)i);
-        s_toggle[i] = td_button(s_win, COL + 12, y, "Off", on_toggle, (void *)(intptr_t)i);
-        s_forget[i] = td_button(s_win, COL + 20, y, "Forget", on_forget, (void *)(intptr_t)i);
+        const int y = SLOT_Y(i) + 2;
+        /* At column 1, in line with the detail line: the three buttons are
+         * 30 columns (11 + 1 + 7 + 1 + 10) and start at COL they end past
+         * column 40, which cut the closing bracket off "Forget". */
+        s_pair[i] = td_button(s_win, 1, y, "Pair...", on_pair, (void *)(intptr_t)i);
+        s_toggle[i] = td_button(s_win, 13, y, "Off", on_toggle, (void *)(intptr_t)i);
+        s_forget[i] = td_button(s_win, 21, y, "Forget", on_forget, (void *)(intptr_t)i);
     }
     s_list = td_list(s_win, td_rect(0, SCAN_Y + 1, -1, LIST_ROWS), get_item, on_pick, NULL);
     s_scroll = td_scrollbar(s_win, -1, SCAN_Y + 1, LIST_ROWS, s_list);
     s_pick = td_button(s_win, 1, SCAN_Y + LIST_ROWS + 2, "Pair", on_pick, NULL);
     s_rescan = td_button(s_win, 10, SCAN_Y + LIST_ROWS + 2, "Scan again", on_rescan, NULL);
     s_cancel = td_button(s_win, 25, SCAN_Y + LIST_ROWS + 2, "Cancel", on_cancel, NULL);
-    td_widget_t *close = td_button(s_win, 0, -1, "Close", on_close_btn, NULL);
 
     show_scan(false);
     refresh();
-    td_widget_focus(close);
+    /* Nothing to focus but the slots: the window's own [x] closes it, so the
+     * Close button that used to sit on the last row and take it as the initial
+     * focus is gone. Focusing the first slot's Pair button keeps Enter and the
+     * arrow keys working, and gives back the row. */
+    td_widget_focus(s_pair[0]);
 }
 
 static const td_app_t s_app = {"Bluetooth", launch, "B)"};

@@ -257,17 +257,19 @@ static bool on_screen(const char *text, int *row)
 static td_window_t *s_win;
 static td_rect_t s_c;
 
-/* The window's layout: slot buttons on row 5 + 5 * slot + 3, Pair...,
- * Off/On and Forget at columns 11, 23 and 31; the scan's Pair on row 30, which
- * is SCAN_Y + LIST_ROWS + 2 with three slots above it. */
+/* The window's layout: three rows per slot starting at row 4, so the buttons
+ * are two rows into each slot at 4 + 3 * slot + 2, and they start at column 1
+ * rather than the value column -- Pair..., Off/On and Forget at columns 1, 13
+ * and 21. The scan's own Pair sits on row 21, which is SCAN_Y + LIST_ROWS + 2
+ * (14 + 5 + 2) with three slots and the scan header above it. */
 static void press_slot(int slot, int column)
 {
-    click(s_c.x + column + 1, s_c.y + 8 + slot * 5);
+    click(s_c.x + column + 1, s_c.y + 6 + slot * 3);
 }
-#define SCAN_PAIR_ROW 30
-#define PAIR_BTN      11
-#define TOGGLE_BTN    23
-#define FORGET_BTN    31
+#define SCAN_PAIR_ROW 21
+#define PAIR_BTN      1
+#define TOGGLE_BTN    13
+#define FORGET_BTN    21
 
 static void set_slot(int i, bool paired, bool ready, bool reconnects, uint8_t a0)
 {
