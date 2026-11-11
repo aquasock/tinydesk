@@ -28,8 +28,10 @@
 #include "touch.h"
 #include "hal_mux.h"
 #include "tinydesk/td_picture.h"
+#include "tinydesk/td_wm.h"
 #include "driver/usb_serial_jtag.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "tdsh_board.h"
@@ -37,11 +39,14 @@
 #define RX_BUFFER        8192
 #define TX_BUFFER        1024
 #define WRITE_CHUNK      256
-#define WRITE_TIMEOUT_MS 150
+#define MIRROR_BUDGET_MS 15   /* most a frame may spend on the USB mirror */
+#define MIRROR_RESYNC_MS 500  /* how often a stale mirror may ask for a frame */
 #define INJECT_SIZE      512          /* the panel's answers and touch reports */
 
 static const char *TAG = "link_twatch";
 static bool s_mirror = true;
+static uint32_t s_mirror_resync_ms;
+static bool s_mirror_stale;
 static bool s_touch;
 static char s_platform[64] = "ESP32-S3 T-Watch Ultra";
 
@@ -144,20 +149,80 @@ int link_read(uint8_t *buf, int cap)
 
 int link_write(const uint8_t *buf, int len)
 {
+    int done = 0;
+
+    /*
+     * THE PANEL IS AUTHORITATIVE; THE MIRROR IS A CONVENIENCE.
+     *
+     * display_write() always gets the whole buffer -- the panel's td_vterm is
+     * fast and local, and it must never lose a byte of a frame. The USB mirror
+     * is a second view for whoever has a terminal open, and it is allowed to
+     * fall behind; it must never be allowed to stall or truncate the desktop.
+     *
+     * This used to do neither. It waited up to 150 ms per 256-byte chunk and
+     * then returned len regardless, claiming a delivery it had not made:
+     *
+     *   - when nothing was draining the port, every frame stalled the desktop
+     *     by up to 450 ms while the panel already had the picture, which is
+     *     why a Bluetooth mouse was laggy with the watch plugged into a PC that
+     *     had no terminal open, and smooth over a `screen` session;
+     *   - usb_serial_jtag_is_connected() only says a USB HOST is present, so
+     *     the mirror ran whether or not anything was reading.
+     *
+     * Now the mirror gets a fixed 15 ms budget per frame, invisible at 60 Hz.
+     * len is still returned, because returning less would make the renderer
+     * drop bytes that the panel needs as well. When the mirror cannot keep up
+     * it is marked stale and the desktop is asked for one full frame, throttled
+     * so an undrained port cannot turn that into a redraw every frame; the
+     * next complete frame brings the mirror back into step.
+     */
     display_write(buf, len);
 
-    if (s_mirror && usb_serial_jtag_is_connected())
+    if (!s_mirror || !usb_serial_jtag_is_connected())
+        return len;                 /* nothing to mirror; the panel has it */
+
     {
-        int done = 0;
+        int64_t t0 = esp_timer_get_time();
 
         while (done < len)
         {
             int n = len - done > WRITE_CHUNK ? WRITE_CHUNK : len - done;
+            int left_ms = MIRROR_BUDGET_MS - (int)((esp_timer_get_time() - t0) / 1000);
+            int w;
 
-            if (usb_serial_jtag_write_bytes(buf + done, (size_t)n,
-                                            pdMS_TO_TICKS(WRITE_TIMEOUT_MS)) != n)
-                break;
-            done += n;
+            if (left_ms <= 0)
+                break;              /* spent this frame's budget */
+            w = usb_serial_jtag_write_bytes(buf + done, (size_t)n,
+                                            pdMS_TO_TICKS(left_ms));
+            if (w <= 0)
+                break;              /* not draining */
+            done += w;
+        }
+
+        if (done < len)
+        {
+            /* The mirror missed part of a frame, so what it shows now has
+             * holes in it. Do NOT ask for a repaint here: with nothing reading
+             * the port every frame would end like this, and each request is a
+             * full compose plus a full panel repaint -- work and power spent
+             * on a mirror nobody is looking at. Just remember that it is stale.
+             */
+            s_mirror_stale = true;
+        }
+        else if (s_mirror_stale)
+        {
+            /* A frame got all the way through, so something is reading again.
+             * One whole frame fills the holes; without it the mirror would
+             * stay partly blank until some window happened to repaint that
+             * area. Throttled so a reader that keeps up only pays this once. */
+            uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+
+            s_mirror_stale = false;
+            if (now - s_mirror_resync_ms >= MIRROR_RESYNC_MS)
+            {
+                s_mirror_resync_ms = now;
+                td_wm_invalidate();
+            }
         }
     }
     return len;
