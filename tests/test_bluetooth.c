@@ -257,21 +257,17 @@ static bool on_screen(const char *text, int *row)
 static td_window_t *s_win;
 static td_rect_t s_c;
 
-/* The window's layout, which is computed from the client height rather than
- * fixed (apps/bluetooth.c, compute_layout): a full-screen window on this test's
- * 80x45 screen, so the three slots begin at row 2 and each takes four rows --
- * three of text and a row of buttons -- with the buttons on the last of them.
- * They start at column 1, in line with the detail lines under each slot. The
- * scan's own buttons sit two rows above the bottom, and [ Close ] on the last
- * row. */
+/* The window's layout: slot buttons on row 5 + 5 * slot + 3, Pair...,
+ * Off/On and Forget at columns 11, 23 and 31; the scan's Pair on row 30, which
+ * is SCAN_Y + LIST_ROWS + 2 with three slots above it. */
 static void press_slot(int slot, int column)
 {
-    click(s_c.x + column + 1, s_c.y + 5 + slot * 4);
+    click(s_c.x + column + 1, s_c.y + 8 + slot * 5);
 }
-#define SCAN_PAIR_ROW 43
-#define PAIR_BTN      1
-#define TOGGLE_BTN    13
-#define FORGET_BTN    21
+#define SCAN_PAIR_ROW 30
+#define PAIR_BTN      11
+#define TOGGLE_BTN    23
+#define FORGET_BTN    31
 
 static void set_slot(int i, bool paired, bool ready, bool reconnects, uint8_t a0)
 {

@@ -27,72 +27,13 @@ static const td_bt_ops_t *bt(void)
     return td_sysinfo()->bt;
 }
 
+#define WIN_W     72
+#define WIN_H     34
 #define TICK_MS   250
 #define COL       11     /* where values start, after the headings */
-
-/*
- * THE WINDOW FILLS THE SCREEN, AND THE LAYOUT IS COMPUTED FROM IT.
- *
- * It used to be a floating 72x34 window, which is larger than most boards'
- * screens and larger than this one (40x25). The window manager clamps the
- * RECTANGLE to the screen but cannot re-flow its contents, so the device list
- * and the buttons below it were laid out at rows 21..30 -- off the bottom of
- * the glass. On a watch that reads as "the scan found my keyboard but there is
- * nowhere to click it".
- *
- * So: open full screen, and derive every row from the client height instead of
- * hard-coding them. SLOT_ROWS is fixed (three text rows and a row of buttons)
- * because a slot needs that much to say what it is, what it is paired with and
- * what it last did; everything below the slots takes what is left, so the
- * device list is the part that grows on a taller screen.
- */
-#define SLOT_ROWS 4
-
-/* One row per slot block, then the scan section. Comfortably inside 25 rows:
- * 2 + 3*4 = 14, leaving 11 for the list, its buttons and the message line. */
-#define SLOTS_TOP 2
-
-/* The slot buttons start at column 1, in line with the detail lines under
- * each slot -- they were at the value column, which reads as though they
- * belonged to the value rather than to the slot. The group of three is 30
- * columns wide (Pair... 11, Off 7, Forget 10, a column between each), so it
- * ends at column 30 of 40. */
-#define SLOT_BTN_X 1
-
-typedef struct
-{
-    int slot_y[TD_BT_SLOTS];   /* three text rows, then the button row */
-    int scan_hdr;              /* "Pair a keyboard: ..." */
-    int scan_msg;              /* "Listening..." or how many were found */
-    int list_y, list_h;        /* the scan results */
-    int btn_y;                 /* Pair / Scan again / Cancel */
-} layout_t;
-
-static layout_t s_lay;
-
-/* Where everything goes for a client area h rows tall. Called before the
- * widgets are made, so the drawing and the buttons agree even if the window
- * manager hands back a different height than the one asked for. */
-static void compute_layout(int h)
-{
-    int used;
-
-    for (int i = 0; i < TD_BT_SLOTS; i++)
-        s_lay.slot_y[i] = SLOTS_TOP + i * SLOT_ROWS;
-
-    used = SLOTS_TOP + TD_BT_SLOTS * SLOT_ROWS;
-    s_lay.scan_hdr = used;
-    s_lay.scan_msg = used + 1;
-    s_lay.list_y = used + 2;
-
-    /* The bottom two rows are the buttons and the status line. Whatever is
-     * left above them is the list, and it keeps at least one row so the list
-     * widget always has somewhere to draw. */
-    s_lay.btn_y = h - 2;
-    s_lay.list_h = s_lay.btn_y - s_lay.list_y;
-    if (s_lay.list_h < 1)
-        s_lay.list_h = 1;
-}
+#define SLOT_Y(i) (5 + (i)*5)
+#define SCAN_Y    20
+#define LIST_ROWS 8
 
 static td_window_t *s_win;
 static td_bt_status_t s_info;
@@ -431,58 +372,32 @@ static void on_cancel(td_widget_t *w, void *user)
 
 /* ---- drawing ------------------------------------------------------------- */
 
-/* A labelled line, or -- with no heading -- a detail line under one.
- *
- * Detail lines start at column 1, not at COL. Indenting them to the value
- * column spent 11 of a 40-column window's columns on nothing, which is why a
- * paired device's name and address were cut mid-string. */
 static void row(int y, int w, const char *heading, const char *value, uint8_t fg)
 {
     const td_theme_t *t = td_theme();
-    int x = heading != NULL ? COL : 1;
-
     if (heading != NULL)
     {
         td_text(1, y, heading, t->win_fg, t->win_bg, TD_BOLD);
     }
-    td_textn(x, y, value, w - x - 1, fg, t->win_bg, 0);
+    td_textn(COL, y, value, w - COL - 1, fg, t->win_bg, 0);
 }
 
 static void draw_slot(int y, int w, int i)
 {
     const td_theme_t *t = td_theme();
     const td_bt_slot_t *s = &s_info.slot[i];
-    /* A narrow window has about 28 columns for a value and 8 more for a
-     * detail line. Two of these lines are longer than that and the part that
-     * gets cut is the part worth reading, so the address is dropped when there
-     * is no room for it rather than being truncated mid-octet -- the state and
-     * the device's name are what identify it, and a name this long is unique. */
-    bool narrow = w < 50;
     char line[128];
     char addr[18];
 
     if (s->active)
     {
         format_addr(addr, sizeof(addr), s->addr);
-        if (!s->name[0])
+        int n = snprintf(line, sizeof(line), "%s, %s%s%s", s->state,
+                         s->name[0] ? s->name : "", s->name[0] ? " " : "", addr);
+        if (s->ready && n > 0 && n < (int)sizeof(line))
         {
-            snprintf(line, sizeof(line), "%s", s->state);
-        }
-        else if (narrow)
-        {
-            snprintf(line, sizeof(line), "%s, %s", s->state, s->name);
-        }
-        else
-        {
-            int n = snprintf(line, sizeof(line), "%s, %s %s", s->state,
-                             s->name, addr);
-
-            if (s->ready && n > 0 && n < (int)sizeof(line))
-            {
-                snprintf(line + n, sizeof(line) - (size_t)n, " (%s, %lu reports)",
-                         s->boot_protocol ? "boot" : "report",
-                         (unsigned long)s->reports);
-            }
+            snprintf(line + n, sizeof(line) - (size_t)n, " (%s, %lu reports)",
+                     s->boot_protocol ? "boot" : "report", (unsigned long)s->reports);
         }
     }
     else
@@ -494,19 +409,9 @@ static void draw_slot(int y, int w, int i)
     if (s->paired)
     {
         format_addr(addr, sizeof(addr), s->paired_addr);
-        if (narrow)
-        {
-            /* The On/Off button already says whether it reconnects. */
-            snprintf(line, sizeof(line), "paired: %s",
-                     s->paired_name[0] ? s->paired_name : "yes");
-        }
-        else
-        {
-            snprintf(line, sizeof(line), "paired with %s%s%s, %s",
-                     s->paired_name[0] ? s->paired_name : "",
-                     s->paired_name[0] ? " " : "", addr,
-                     s->reconnects ? "reconnects by itself" : "not reconnecting");
-        }
+        snprintf(line, sizeof(line), "paired with %s%s%s, %s",
+                 s->paired_name[0] ? s->paired_name : "", s->paired_name[0] ? " " : "",
+                 addr, s->reconnects ? "reconnects by itself" : "not reconnecting");
         row(y + 1, w, NULL, line, s->reconnects ? t->win_fg : t->dim);
     }
     else
@@ -530,50 +435,47 @@ static void on_draw(td_window_t *win, int w, int h)
     switch (s_info.radio)
     {
     case TD_BT_RADIO_OFF:
-        row(0, w, "Radio", "off; a scan starts it", t->dim);
+        row(1, w, "Radio", "off; a scan starts it", t->dim);
         break;
     case TD_BT_RADIO_STARTING:
-        row(0, w, "Radio", "starting", t->win_fg);
+        row(1, w, "Radio", "starting", t->win_fg);
         break;
     case TD_BT_RADIO_FAILED:
         snprintf(line, sizeof(line), "failed to start (%d)", s_info.enable_error);
-        row(0, w, "Radio", line, t->win_fg);
+        row(1, w, "Radio", line, t->win_fg);
         break;
     case TD_BT_RADIO_UP:
         if (s_info.stack_heap)
         {
-            snprintf(line, sizeof(line), "up, %lu B heap",
+            snprintf(line, sizeof(line), "up, the stack took %lu bytes of heap at start",
                      (unsigned long)s_info.stack_heap);
         }
         else
         {
             snprintf(line, sizeof(line), "up");
         }
-        row(0, w, "Radio", line, t->win_fg);
+        row(1, w, "Radio", line, t->win_fg);
         break;
     }
     if (s_info.pairings != NULL)
     {
-        row(1, w, "Pairings", s_info.pairings, t->win_fg);
+        row(2, w, "Pairings", s_info.pairings, t->win_fg);
     }
     if (s_info.wifi_exclusive)
     {
-        /* One line, not a row of its own: this board cannot run both radios,
-         * and on 25 rows the space is better spent on the device list. */
-        row(1, w, s_info.pairings != NULL ? NULL : "Wi-Fi",
-            "off while Bluetooth runs", t->dim);
+        row(3, w, "Wi-Fi", "off while Bluetooth runs (this board cannot do both)", t->dim);
     }
 
     for (int i = 0; i < TD_BT_SLOTS; i++)
     {
-        draw_slot(s_lay.slot_y[i], w, i);
+        draw_slot(SLOT_Y(i), w, i);
     }
 
     if (s_scan_slot >= 0)
     {
-        snprintf(line, sizeof(line), "Pair a %s: pairing mode",
+        snprintf(line, sizeof(line), "Pair a %s: put it in pairing mode near the board",
                  s_slot_lower[s_scan_slot]);
-        td_textn(1, s_lay.scan_hdr, line, w - 2, t->win_fg, t->win_bg, TD_BOLD);
+        td_text(1, SCAN_Y - 1, line, t->win_fg, t->win_bg, TD_BOLD);
         if (s_scan_pending)
         {
             snprintf(line, sizeof(line), "Listening... %lu s",
@@ -581,19 +483,17 @@ static void on_draw(td_window_t *win, int w, int h)
         }
         else if (s_found_count == 0)
         {
-            snprintf(line, sizeof(line), "Nothing found; scan again");
+            snprintf(line, sizeof(line), "Nothing found; check pairing mode and scan again");
         }
         else
         {
-            snprintf(line, sizeof(line), "%d found; pick one, press Pair",
+            snprintf(line, sizeof(line), "%d found; choose one and press Pair (or double-click)",
                      s_found_count);
         }
-        td_textn(1, s_lay.scan_msg, line, w - 2, t->win_fg, t->win_bg, 0);
+        td_textn(1, SCAN_Y, line, w - 2, t->win_fg, t->win_bg, 0);
     }
 
-    /* The bottom line: a job's progress or outcome, else the window's note.
-     * It starts after the Close button, which is "[ Close ]" -- nine columns
-     * -- so column 10 rather than 9, or the two run together. */
+    /* The bottom line: a job's progress or outcome, else the window's note. */
     const char *msg = s_note;
     bool failed = s_note[0] != '\0';
     if (s_info.busy || (s_note[0] == '\0' && s_info.message[0] != '\0'))
@@ -605,7 +505,7 @@ static void on_draw(td_window_t *win, int w, int h)
             msg = "working...";
         }
     }
-    td_textn(10, h - 1, msg, w - 11, failed ? t->accent : t->win_fg, t->win_bg, 0);
+    td_textn(9, h - 1, msg, w - 10, failed ? t->accent : t->win_fg, t->win_bg, 0);
 }
 
 /* ---- the window ---------------------------------------------------------- */
@@ -670,12 +570,8 @@ static void launch(void)
     }
     td_window_desc_t d = {0};
     d.title = "Bluetooth";
-    d.rect = td_rect(-1, -1, 40, 12);  /* replaced by the screen: see below */
-    /* Full screen, not floating. The window is the only thing on the glass
-     * while it is open and its Close button is on the bottom row, so there is
-     * no frame to move, resize or close it by -- and no title bar stealing a
-     * row from a 25-row screen. */
-    d.flags = TD_WIN_FULLSCREEN;
+    d.rect = td_rect(-1, -1, WIN_W, WIN_H);
+    d.flags = TD_WIN_MOVABLE | TD_WIN_CLOSABLE;
     d.on_draw = on_draw;
     d.on_close = on_close;
     d.on_tick = on_tick;
@@ -687,26 +583,18 @@ static void launch(void)
     }
     note(NULL);
 
-    /* The layout comes from the client area the window manager actually gave
-     * us, not from a constant, so the widgets and the drawing cannot disagree
-     * about where the bottom is. */
-    {
-        td_rect_t c = td_win_client(s_win);
-        compute_layout(c.h);
-    }
-
     for (int i = 0; i < TD_BT_SLOTS; i++)
     {
-        const int y = s_lay.slot_y[i] + SLOT_ROWS - 1;
-        s_pair[i] = td_button(s_win, SLOT_BTN_X, y, "Pair...", on_pair, (void *)(intptr_t)i);
-        s_toggle[i] = td_button(s_win, SLOT_BTN_X + 12, y, "Off", on_toggle, (void *)(intptr_t)i);
-        s_forget[i] = td_button(s_win, SLOT_BTN_X + 20, y, "Forget", on_forget, (void *)(intptr_t)i);
+        const int y = SLOT_Y(i) + 3;
+        s_pair[i] = td_button(s_win, COL, y, "Pair...", on_pair, (void *)(intptr_t)i);
+        s_toggle[i] = td_button(s_win, COL + 12, y, "Off", on_toggle, (void *)(intptr_t)i);
+        s_forget[i] = td_button(s_win, COL + 20, y, "Forget", on_forget, (void *)(intptr_t)i);
     }
-    s_list = td_list(s_win, td_rect(0, s_lay.list_y, -1, s_lay.list_h), get_item, on_pick, NULL);
-    s_scroll = td_scrollbar(s_win, -1, s_lay.list_y, s_lay.list_h, s_list);
-    s_pick = td_button(s_win, 1, s_lay.btn_y, "Pair", on_pick, NULL);
-    s_rescan = td_button(s_win, 10, s_lay.btn_y, "Scan again", on_rescan, NULL);
-    s_cancel = td_button(s_win, 25, s_lay.btn_y, "Cancel", on_cancel, NULL);
+    s_list = td_list(s_win, td_rect(0, SCAN_Y + 1, -1, LIST_ROWS), get_item, on_pick, NULL);
+    s_scroll = td_scrollbar(s_win, -1, SCAN_Y + 1, LIST_ROWS, s_list);
+    s_pick = td_button(s_win, 1, SCAN_Y + LIST_ROWS + 2, "Pair", on_pick, NULL);
+    s_rescan = td_button(s_win, 10, SCAN_Y + LIST_ROWS + 2, "Scan again", on_rescan, NULL);
+    s_cancel = td_button(s_win, 25, SCAN_Y + LIST_ROWS + 2, "Cancel", on_cancel, NULL);
     td_widget_t *close = td_button(s_win, 0, -1, "Close", on_close_btn, NULL);
 
     show_scan(false);
