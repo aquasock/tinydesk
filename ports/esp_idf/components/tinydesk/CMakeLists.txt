@@ -108,6 +108,13 @@ if(DEFINED TD_MAX_COLS AND DEFINED TD_MAX_ROWS)
         set(TD_SCREEN_LIMITS TD_MAX_COLS=${TD_MAX_COLS} TD_MAX_ROWS=${TD_MAX_ROWS}
             TD_VT_SCROLLBACK=12 TD_MAX_WIDGETS=96)
     endif()
+    # FIXED MEANS FIXED IN BOTH DIRECTIONS. The grid is declared because the
+    # panel is soldered, so a terminal reporting a smaller size must not shrink
+    # the desktop either: answering 24 rows for a 26-row panel lost the bottom
+    # two rows and left a black band in the framebuffer. Pinning the minimum to
+    # the declared grid makes src/td.c's clamp degenerate -- every reported size
+    # lands on exactly one value -- which is what "fixed" should mean.
+    list(APPEND TD_SCREEN_LIMITS TD_MIN_COLS=${TD_MAX_COLS} TD_MIN_ROWS=${TD_MAX_ROWS})
     message(STATUS "tinydesk grid fixed by the port: ${TD_MAX_COLS}x${TD_MAX_ROWS}")
 elseif(CONFIG_SPIRAM)
     # Python canvases may cover a whole large screen several times over

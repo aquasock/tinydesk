@@ -53,9 +53,16 @@
 #define TD_DEFAULT_ROWS 25
 #endif
 
-/* Smallest usable desktop. */
+/* Smallest usable desktop. A port with a fixed panel pins these to its grid,
+ * so a terminal that reports a SMALLER size cannot shrink the desktop either --
+ * see the note in ports/esp_idf/components/tinydesk/CMakeLists.txt. Guarded
+ * like every other value in this file so the build system can set them. */
+#ifndef TD_MIN_COLS
 #define TD_MIN_COLS 40
+#endif
+#ifndef TD_MIN_ROWS
 #define TD_MIN_ROWS 12
+#endif
 
 /* Output buffer used by the renderer; written to the HAL in large chunks. */
 #ifndef TD_OUT_BUF_SIZE
