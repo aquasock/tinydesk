@@ -129,10 +129,44 @@ static display_reply_fn s_reply;
 
 #define BAND_ROWS 16
 
-static const uint16_t s_palette[16] = {
-    0x0000, 0xF800, 0x07E0, 0xFFE0, 0x001F, 0xF81F, 0x07FF, 0xFFFF,
-    0x8410, 0xF810, 0x87E0, 0xFF90, 0x841F, 0xF81F, 0x87FF, 0xFFFF,
-};
+/*
+ * The full xterm 256-colour palette, converted to RGB565 once at init.
+ *
+ * td_vterm stores COLOUR INDICES, not colours: 0-15 are the ANSI palette,
+ * 16-231 a 6x6x6 cube, 232-255 a grey ramp. The first version of this file
+ * masked them with 0x0F on the theory that only 16 colours mattered, which
+ * folded every index into the wrong entry -- 75 became 11, 236 became 12, and
+ * the desktop came out in colours nobody chose while the same bytes looked
+ * correct in a PC terminal, because the PC terminal expands the indices
+ * itself.
+ */
+static uint16_t s_palette[256];
+
+static void palette_init(void)
+{
+    static const uint8_t ansi[16][3] = {
+        { 0, 0, 0 },       { 205, 0, 0 },     { 0, 205, 0 },     { 205, 205, 0 },
+        { 0, 0, 238 },     { 205, 0, 205 },   { 0, 205, 205 },   { 229, 229, 229 },
+        { 127, 127, 127 }, { 255, 0, 0 },     { 0, 255, 0 },     { 255, 255, 0 },
+        { 92, 92, 255 },   { 255, 0, 255 },   { 0, 255, 255 },   { 255, 255, 255 },
+    };
+    static const uint8_t lv[6] = { 0, 95, 135, 175, 215, 255 };
+    int i;
+
+    for (i = 0; i < 16; i++) {
+        int r = ansi[i][0] >> 3, g = ansi[i][1] >> 2, b = ansi[i][2] >> 3;
+        s_palette[i] = (uint16_t)((r << 11) | (g << 5) | b);
+    }
+    for (i = 0; i < 216; i++) {
+        int r = lv[i / 36] >> 3, g = lv[(i / 6) % 6] >> 2, b = lv[i % 6] >> 3;
+        s_palette[16 + i] = (uint16_t)((r << 11) | (g << 5) | b);
+    }
+    for (i = 0; i < 24; i++) {
+        int v = 8 + 10 * i;
+        int r = v >> 3, g = v >> 2, b = v >> 3;
+        s_palette[232 + i] = (uint16_t)((r << 11) | (g << 5) | b);
+    }
+}
 
 static inline uint16_t swap16(uint16_t v)
 {
@@ -287,8 +321,8 @@ static bool panel_init(void)
 static void paint_cell(int col, int row, td_vcell_t c, bool cursor)
 {
     const uint8_t *glyph = font8x16_glyph(c.ch);
-    uint16_t fg = s_palette[c.fg & 0x0F];
-    uint16_t bg = s_palette[c.bg & 0x0F];
+    uint16_t fg = s_palette[c.fg];
+    uint16_t bg = s_palette[c.bg];
     int x0 = col * CELL_W;
     int y0 = row * CELL_H;
     int y, bit;
@@ -419,6 +453,7 @@ bool display_init(display_reply_fn reply)
 
     s_lock = xSemaphoreCreateMutex();
     s_reply = reply;
+    palette_init();
     if (!panel_init())
         return false;
 

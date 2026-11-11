@@ -26,6 +26,25 @@
 
 #define DISP_EN_BIT     7       /* P07: the display rail's switch */
 
+/*
+ * TOUCH RESET. Two sources disagree on which expander pin it is:
+ *
+ *   LilyGoLib docs/hardware/lilygo-t-watch-ultra.md  "Expander GPIO10"
+ *                                                    = linear 10 = P12
+ *   Escapement .ai/core-reference.md TCH-005          "P08, port 1 bit 0"
+ *                                                    = linear 8
+ *
+ * Both are plausible readings of the same board and I cannot settle it
+ * without hardware in front of me, so both are driven high and the log says
+ * so. Driving the wrong one costs nothing -- it is an unused expander pin --
+ * and a controller held in reset is one of the two ways touch stays dead
+ * (the other is failing the 0xD1 unlock, which bring_up() already logs).
+ *
+ * This is written to be deleted: once the right pin is known, keep one.
+ */
+#define TOUCH_RST_LINEAR_A  8    /* P08, per the Escapement reference */
+#define TOUCH_RST_LINEAR_B  10   /* per LilyGo's hardware documentation */
+
 /* --- AXP2101 PMU, at 0x34 ------------------------------------------------
  *
  * ALDO2 feeds the display rail, and XL9555 P07 switches it. Both have to be
@@ -189,6 +208,40 @@ void board_dump_expander(void)
     }
     ESP_LOGI(TAG, "XL9555 in=%02x/%02x out=%02x/%02x cfg=%02x/%02x",
              in0, in1, out0, out1, cfg0, cfg1);
+}
+
+/* Configure one linear expander pin as an output and drive it high. */
+static bool xl_pin_high(int linear)
+{
+    int port = linear / 8;
+    int bit = linear % 8;
+    uint8_t cfg_reg = (uint8_t)(XL9555_CONFIG0 + port);
+    uint8_t out_reg = (uint8_t)(XL9555_OUTPUT0 + port);
+    uint8_t cfg, out;
+
+    if (!reg_read(cfg_reg, &cfg) || !reg_read(out_reg, &out))
+        return false;
+
+    if (cfg & (1u << bit))
+        if (!reg_write(cfg_reg, (uint8_t)(cfg & ~(1u << bit))))
+            return false;
+    if (!(out & (1u << bit)))
+        if (!reg_write(out_reg, (uint8_t)(out | (1u << bit))))
+            return false;
+    return true;
+}
+
+/* Release the touch controller's reset line. See TOUCH_RST_LINEAR_* above. */
+bool board_touch_reset_release(void)
+{
+    bool a = xl_pin_high(TOUCH_RST_LINEAR_A);
+    bool b = xl_pin_high(TOUCH_RST_LINEAR_B);
+
+    ESP_LOGI(TAG, "touch reset: linear %d %s, linear %d %s",
+             TOUCH_RST_LINEAR_A, a ? "ok" : "FAILED",
+             TOUCH_RST_LINEAR_B, b ? "ok" : "FAILED");
+    vTaskDelay(pdMS_TO_TICKS(30));
+    return a || b;
 }
 
 bool board_display_power_on(void)

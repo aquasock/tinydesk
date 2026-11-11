@@ -43,6 +43,10 @@ bool board_display_power_on(void);
  */
 bool board_display_rail_on(void);
 
+/* Release the touch controller's reset, which lives on the expander, not on
+ * an SoC GPIO. Must run before touch_init() talks to 0x1A. */
+bool board_touch_reset_release(void);
+
 /* Log the expander's configuration and output registers. */
 void board_dump_expander(void);
 

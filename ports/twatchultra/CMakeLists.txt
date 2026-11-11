@@ -38,6 +38,17 @@ endif()
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(tinydesk)
 
+# No terminal-size polling, project-wide (not just in main): td.c lives in the
+# `tinydesk` component, so a definition set on the port's own component would
+# never reach it. The desktop asks the terminal for its size once a second
+# because a serial terminal can never report a resize -- but this panel's
+# geometry is fixed at build time, so there is nothing to discover, and the
+# question is not free: the query jumps the cursor to the bottom-right corner
+# to measure it, and the cells that touches repaint. On a 40x25 grid that
+# showed up as a full-screen flash once a second on the panel and on the USB
+# mirror.
+add_compile_definitions(TD_SIZE_POLL_MS=0)
+
 # Fresh build date and time in every firmware image.
 include("${TD_ROOT}/ports/common/app_desc_stamp.cmake")
 

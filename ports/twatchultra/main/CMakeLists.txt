@@ -17,3 +17,12 @@ target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Wextra -Werror)
 # Its own update feed: this image draws to a QSPI AMOLED, and the esp32s3
 # image would replace it with one that talks to a UART.
 target_compile_definitions(${COMPONENT_LIB} PRIVATE TD_UPDATE_BOARD="twatchultra")
+
+# No terminal-size polling. The desktop asks the terminal for its size once a
+# second because a serial terminal can never report a resize -- but this
+# panel's geometry is fixed at build time, so there is nothing to discover and
+# the question is not free: the query moves the cursor to the bottom-right
+# corner to measure it, and every cell that touches repaints. On a 40x25 grid
+# that showed up as a full-screen flash once a second, on both the panel and
+# the USB mirror.
+target_compile_definitions(${COMPONENT_LIB} PRIVATE TD_SIZE_POLL_MS=0)

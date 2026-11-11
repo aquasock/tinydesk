@@ -121,6 +121,9 @@ bool link_init(void)
     td_picture_set_rgb_sink(NULL, NULL);
     td_picture_set_runs_sink(NULL, NULL);
 
+    /* The controller is held in reset by an expander pin until something
+     * drives it, so release it before the driver tries to talk. */
+    board_touch_reset_release();
     s_touch = touch_init(inject);
     snprintf(s_platform, sizeof(s_platform),
              "ESP32-S3 T-Watch Ultra (%dx%d cells%s)",
