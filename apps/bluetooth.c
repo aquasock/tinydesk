@@ -52,9 +52,12 @@ static const td_bt_ops_t *bt(void)
  * 2 + 3*4 = 14, leaving 11 for the list, its buttons and the message line. */
 #define SLOTS_TOP 2
 
-/* The slot buttons start one column left of the value column so the group of
- * three ends on the last column of a 40-wide window instead of one past it. */
-#define SLOT_BTN_X (COL - 1)
+/* The slot buttons start at column 1, in line with the detail lines under
+ * each slot -- they were at the value column, which reads as though they
+ * belonged to the value rather than to the slot. The group of three is 30
+ * columns wide (Pair... 11, Off 7, Forget 10, a column between each), so it
+ * ends at column 30 of 40. */
+#define SLOT_BTN_X 1
 
 typedef struct
 {
@@ -695,11 +698,6 @@ static void launch(void)
     for (int i = 0; i < TD_BT_SLOTS; i++)
     {
         const int y = s_lay.slot_y[i] + SLOT_ROWS - 1;
-        /* A button is its caption plus 4 columns of border, so the three of
-         * them with one column between need 30 -- and starting at COL they
-         * ended at column 40 of a 40-column window, which cut the closing
-         * bracket off "[ Forget ]". Starting one column left ends the group at
-         * column 39, the last one there is. */
         s_pair[i] = td_button(s_win, SLOT_BTN_X, y, "Pair...", on_pair, (void *)(intptr_t)i);
         s_toggle[i] = td_button(s_win, SLOT_BTN_X + 12, y, "Off", on_toggle, (void *)(intptr_t)i);
         s_forget[i] = td_button(s_win, SLOT_BTN_X + 20, y, "Forget", on_forget, (void *)(intptr_t)i);
