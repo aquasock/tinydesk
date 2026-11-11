@@ -83,6 +83,11 @@ port's own sources under `-Werror`.
 **Not yet flashed to a board.** The parts most likely to need adjustment on
 first contact, in order:
 
+0. **Panel power -- found, and it was the first real bug.** The AMOLED's rail
+   is switched by XL9555 **P07** and nothing else, and on a cold boot that
+   expander has every pin configured as an input, so the panel is unpowered
+   until something drives it. `main/power.c` now does that before
+   `display_init()` touches the bus.
 1. **The QSPI framing in `display.c`.** No other ESP-IDF port here drives a
    panel by hand, so the command/address/lane structure is derived rather than
    copied from working code. `co5300_cmd()` sends the opcode with an 8-bit
