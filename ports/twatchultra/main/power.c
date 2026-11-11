@@ -26,6 +26,24 @@
 
 #define DISP_EN_BIT     7       /* P07: the display rail's switch */
 
+/* --- AXP2101 PMU, at 0x34 ------------------------------------------------
+ *
+ * ALDO2 feeds the display rail, and XL9555 P07 switches it. Both have to be
+ * on: P07 alone switches a rail that is not generating, and ALDO2 alone is
+ * disconnected by the switch. Registers and bit layout are from the mainline
+ * AXP2101 driver this project carries in patches/kernel/axp2101 -- the
+ * voltage field is bits 4:0 at 100 mV per step above 500 mV, and the enables
+ * for ALDO1..4 are bits 0..3 of 0x90.
+ */
+#define PMU_ADDR            0x34
+#define PMU_ALDO2_VOLT      0x93
+#define PMU_LDO_EN          0x90
+#define PMU_ALDO2_EN_BIT    1
+/* 3.3 V: (3300 - 500) / 100 = 28 */
+#define PMU_ALDO2_3300MV    28
+
+static i2c_master_dev_handle_t s_pmu;
+
 static i2c_master_bus_handle_t s_bus;
 static bool s_bus_tried;
 static i2c_master_dev_handle_t s_xl;
@@ -73,6 +91,72 @@ static i2c_master_dev_handle_t xl9555(void)
     return s_xl;
 }
 
+static i2c_master_dev_handle_t pmu(void)
+{
+    if (s_pmu)
+        return s_pmu;
+
+    i2c_device_config_t dev = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = PMU_ADDR,
+        .scl_speed_hz = BOARD_HZ,
+    };
+
+    if (!board_i2c() || i2c_master_bus_add_device(board_i2c(), &dev, &s_pmu) != ESP_OK)
+    {
+        ESP_LOGE(TAG, "PMU 0x%02X did not answer", PMU_ADDR);
+        s_pmu = NULL;
+    }
+    return s_pmu;
+}
+
+static bool pmu_r(uint8_t reg, uint8_t *v)
+{
+    i2c_master_dev_handle_t d = pmu();
+    return d && i2c_master_transmit_receive(d, &reg, 1, v, 1, 100) == ESP_OK;
+}
+
+static bool pmu_w(uint8_t reg, uint8_t v)
+{
+    i2c_master_dev_handle_t d = pmu();
+    uint8_t b[2] = { reg, v };
+    return d && i2c_master_transmit(d, b, sizeof(b), 100) == ESP_OK;
+}
+
+/* Raise ALDO2 to 3.3 V and enable it. Returns false only if the PMU does not
+ * answer; a rail that is already up is a success. */
+bool board_display_rail_on(void)
+{
+    uint8_t v, en;
+
+    if (!pmu_r(PMU_ALDO2_VOLT, &v) || !pmu_r(PMU_LDO_EN, &en))
+    {
+        ESP_LOGE(TAG, "PMU did not answer");
+        return false;
+    }
+
+    if ((v & 0x1F) != PMU_ALDO2_3300MV)
+    {
+        if (!pmu_w(PMU_ALDO2_VOLT, (uint8_t)((v & 0xE0) | PMU_ALDO2_3300MV)))
+        {
+            ESP_LOGE(TAG, "could not set ALDO2 voltage");
+            return false;
+        }
+    }
+    if (!(en & (1u << PMU_ALDO2_EN_BIT)))
+    {
+        if (!pmu_w(PMU_LDO_EN, (uint8_t)(en | (1u << PMU_ALDO2_EN_BIT))))
+        {
+            ESP_LOGE(TAG, "could not enable ALDO2");
+            return false;
+        }
+    }
+
+    ESP_LOGI(TAG, "PMU aldo2_v=%02x ldo_en=%02x", v, en);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    return true;
+}
+
 static bool reg_read(uint8_t reg, uint8_t *v)
 {
     i2c_master_dev_handle_t d = xl9555();
@@ -110,6 +194,10 @@ void board_dump_expander(void)
 bool board_display_power_on(void)
 {
     uint8_t cfg, out;
+
+    /* Rail first, then the switch. */
+    if (!board_display_rail_on())
+        ESP_LOGW(TAG, "PMU rail did not come up; continuing anyway");
 
     if (!reg_read(XL9555_CONFIG0, &cfg) || !reg_read(XL9555_OUTPUT0, &out))
     {

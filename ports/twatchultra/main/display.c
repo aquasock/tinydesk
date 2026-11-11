@@ -49,7 +49,7 @@
 #define LCD_D3    45
 #define LCD_CS    41
 #define LCD_RST   37
-#define LCD_SPI_HZ (40 * 1000 * 1000)
+#define LCD_SPI_HZ (80 * 1000 * 1000)   /* LilyGo runs this panel at 80 MHz */
 
 /* The panel's own coordinate space. The glass is 410x502; DISPLAY_W/H in
  * display.h is the 320x400 rectangle inside it that the desktop uses. The
@@ -60,23 +60,75 @@
 #define CELL_W    8
 #define CELL_H    16
 
-/* A CO5300 command on the QSPI bus: one command byte, then parameters. The
- * controller treats a CS edge as end-of-burst, so a command and its payload
- * must travel in one transaction. */
+/* ---- low level ---------------------------------------------------------
+ *
+ * TRANSCRIBED FROM LILYGO'S OWN FIRMWARE, which is the thing that actually
+ * works on this panel. Two earlier attempts in this file were wrong, and both
+ * failures were silent -- no error, no busy bit, a black screen:
+ *
+ *   attempt 1  command and address on four lanes. Wrong.
+ *   attempt 2  command and address on ONE lane, on the theory that only the
+ *              pixel payload is quad. Also wrong.
+ *
+ * LilyGo's LilyGoDispQSPI::writeCommand() is the authority:
+ *
+ *     t.flags = (SPI_TRANS_MULTILINE_CMD | SPI_TRANS_MULTILINE_ADDR);
+ *     t.cmd   = 0x02;
+ *     t.addr  = reg << 8;
+ *
+ * with the DEVICE configured command_bits = 8, address_bits = 24,
+ * spics_io_num = -1 (chip select driven by hand) and SPI_DEVICE_HALFDUPLEX.
+ * So a register write is: multiline command byte 0x02, the register number in
+ * bits 15:8 of a 24-bit address, then the payload.
+ *
+ * Pixels are a different shape again (pushColorsDMA): SPI_TRANS_MODE_QIO with
+ * cmd 0x32 and addr 0x002C00 to open the stream, then continuations with
+ * VARIABLE_CMD|VARIABLE_ADDR and zero-length command/address so CS can be
+ * held across the whole transfer. There is no separate 0x2C command -- the
+ * 0x002C00 address IS the memory-write marker.
+ *
+ * Chip select is driven by hand because the controller treats a CS edge as
+ * end-of-burst and discards whatever follows.
+ */
+
+#define CMD_WRITE   0x02
+#define CMD_PIXELS  0x32
+#define ADDR_RAMWR  0x002C00
+/*
+ * WHERE THE 320x400 RECTANGLE SITS ON THE GLASS.
+ *
+ * The panel is 410x502 with 45-degree chamfered corners, so the largest
+ * rectangle guaranteed to render in full is inset 45 px on every side. Our
+ * framebuffer is 320x400 and lives at (45,45) inside the panel.
+ *
+ * On top of that the controller's own RAM starts 22 columns to the left of the
+ * visible glass, so a column written to the panel needs PANEL_COL_OFFSET added
+ * to its x. Both offsets are required: without them the picture appears
+ * shifted up and to the left, which is exactly what the first working flash of
+ * this port showed.
+ *
+ * These are the Escapement project's measured constants, from
+ * patches/kernel/display/final/co5300.c where the Linux driver uses the same
+ * geometry.
+ */
+#define PANEL_SAFE_INSET 45
+#define FB_X             45      /* (410 - 320) / 2 */
+#define FB_Y             45      /* (502 - 412) / 2, and 400 tall from there */
+#define PANEL_COL_OFFSET 22      /* the controller's RAM starts 22 columns left */
+#define PIX_CHUNK   16384        /* pixels per SPI transaction, as LilyGo */
+
 static spi_device_handle_t s_spi;
-static SemaphoreHandle_t s_lock;      /* the bus, between painter and init */
-static td_vterm_t *s_vt;              /* in PSRAM */
-static td_vcell_t *s_shown;           /* what the panel is displaying */
+static SemaphoreHandle_t s_lock;
+static td_vterm_t *s_vt;
+static td_vcell_t *s_shown;
+static uint16_t *s_fb;
+static uint16_t *s_tx;
 static int s_cols, s_rows;
 static TaskHandle_t s_paint_task;
 static display_reply_fn s_reply;
 
-/* One line of pixels, in panel byte order, composed a row at a time. */
-static uint16_t s_line[DISPLAY_W];
+#define BAND_ROWS 16
 
-/* Palette: td_vterm gives a 256-colour index. Above 15 the desktop only uses
- * indices it knows are approximated, so a 16-colour table is enough and the
- * upper half is folded down by the terminal itself. */
 static const uint16_t s_palette[16] = {
     0x0000, 0xF800, 0x07E0, 0xFFE0, 0x001F, 0xF81F, 0x07FF, 0xFFFF,
     0x8410, 0xF810, 0x87E0, 0xFF90, 0x841F, 0xF81F, 0x87FF, 0xFFFF,
@@ -87,46 +139,94 @@ static inline uint16_t swap16(uint16_t v)
     return (uint16_t)((v >> 8) | (v << 8));
 }
 
-/* ---- low level --------------------------------------------------------- */
-
-/* Send one command plus its parameters in a single transaction. */
-static void co5300_cmd(uint8_t op, const uint8_t *data, int len)
+/* A register write, exactly as LilyGoDispQSPI::writeCommand(). */
+static void reg_write(uint8_t reg, const uint8_t *data, size_t len)
 {
-    spi_transaction_ext_t t = { 0 };
+    spi_transaction_t t = { 0 };
+
+    t.flags = SPI_TRANS_MULTILINE_CMD | SPI_TRANS_MULTILINE_ADDR;
+    t.cmd = CMD_WRITE;
+    t.addr = (uint64_t)reg << 8;
+    t.tx_buffer = len ? data : NULL;
+    t.length = 8 * len;
 
     spi_device_acquire_bus(s_spi, portMAX_DELAY);
-    /* Everything on all four lanes: the CO5300's QSPI framing has no
-     * single-lane phase, and a burst that switches lane count mid-transfer
-     * costs a second CS edge, which the controller reads as end-of-command. */
-    t.base.flags = SPI_TRANS_MODE_QIO | SPI_TRANS_VARIABLE_CMD |
-                   SPI_TRANS_VARIABLE_ADDR;
-    t.base.cmd = op;
-    t.base.addr = 0;                  /* the CO5300 takes no address phase */
-    t.command_bits = 8;
-    t.address_bits = 0;
-    t.base.length = 8 * (size_t)len;
-    t.base.tx_buffer = len ? data : NULL;
-    spi_device_polling_transmit(s_spi, (spi_transaction_t *)&t);
+    gpio_set_level(LCD_CS, 0);
+    esp_err_t err = spi_device_polling_transmit(s_spi, &t);
+    gpio_set_level(LCD_CS, 1);
+    spi_device_release_bus(s_spi);
+
+    if (err != ESP_OK)
+        ESP_LOGE(TAG, "reg 0x%02X failed: %s", reg, esp_err_to_name(err));
+}
+
+static void set_window(int x, int y, int w, int h)
+{
+    uint8_t cas[4] = { (uint8_t)((x >> 8) & 0xFF), (uint8_t)(x & 0xFF),
+                       (uint8_t)(((x + w - 1) >> 8) & 0xFF), (uint8_t)((x + w - 1) & 0xFF) };
+    uint8_t ras[4] = { (uint8_t)((y >> 8) & 0xFF), (uint8_t)(y & 0xFF),
+                       (uint8_t)(((y + h - 1) >> 8) & 0xFF), (uint8_t)((y + h - 1) & 0xFF) };
+
+    reg_write(0x2A, cas, 4);
+    reg_write(0x2B, ras, 4);
+}
+
+/* Push w*h byte-swapped pixels from s_tx, CS held across the whole stream. */
+static void push_pixels(int x, int y, int w, int h)
+{
+    size_t npix = (size_t)w * h;
+    uint16_t *p = s_tx;
+    size_t remaining = npix;
+    bool first = true;
+    esp_err_t err = ESP_OK;
+
+    set_window(x + FB_X + PANEL_COL_OFFSET, y + FB_Y, w, h);
+
+    spi_device_acquire_bus(s_spi, portMAX_DELAY);
+    gpio_set_level(LCD_CS, 0);
+
+    while (remaining)
+    {
+        size_t chunk = remaining > PIX_CHUNK ? PIX_CHUNK : remaining;
+        spi_transaction_ext_t t = { 0 };
+
+        if (first)
+        {
+            t.base.flags = SPI_TRANS_MODE_QIO;
+            t.base.cmd = CMD_PIXELS;
+            t.base.addr = ADDR_RAMWR;
+            first = false;
+        }
+        else
+        {
+            /* Continuation: no command, no address, CS still low. */
+            t.base.flags = SPI_TRANS_MODE_QIO | SPI_TRANS_VARIABLE_CMD |
+                           SPI_TRANS_VARIABLE_ADDR | SPI_TRANS_VARIABLE_DUMMY;
+            t.command_bits = 0;
+            t.address_bits = 0;
+            t.dummy_bits = 0;
+        }
+        t.base.tx_buffer = p;
+        t.base.length = chunk * 16;
+
+        err = spi_device_polling_transmit(s_spi, (spi_transaction_t *)&t);
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "pixel stream failed: %s", esp_err_to_name(err));
+            break;
+        }
+        p += chunk;
+        remaining -= chunk;
+    }
+
+    gpio_set_level(LCD_CS, 1);
     spi_device_release_bus(s_spi);
 }
 
-static void co5300_window(int x, int y, int w, int h)
-{
-    uint8_t cas[4] = { (uint8_t)(x >> 8), (uint8_t)x,
-                       (uint8_t)((x + w - 1) >> 8), (uint8_t)(x + w - 1) };
-    uint8_t ras[4] = { (uint8_t)(y >> 8), (uint8_t)y,
-                       (uint8_t)((y + h - 1) >> 8), (uint8_t)(y + h - 1) };
-
-    co5300_cmd(0x2A, cas, 4);
-    co5300_cmd(0x2B, ras, 4);
-    co5300_cmd(0x2C, NULL, 0);        /* memory write follows */
-}
-
-/* The eleven entries that bring this panel up. */
 static const struct {
     uint8_t op;
     uint8_t data[4];
-    uint8_t len;                      /* low 5 bits: parameters, 0x80: settle */
+    uint8_t len;
 } s_init[] = {
     { 0xFE, { 0x00 }, 0x01 },
     { 0xC4, { 0x80 }, 0x01 },
@@ -143,25 +243,42 @@ static const struct {
 
 static bool panel_init(void)
 {
-    gpio_config_t io = {
+    uint8_t bright = 0xFF;
+    size_t i;
+
+    /* CS is driven by hand, so it must be a plain output. */
+    gpio_config_t cs = {
+        .pin_bit_mask = 1ULL << LCD_CS,
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    gpio_config_t rst = {
         .pin_bit_mask = 1ULL << LCD_RST,
         .mode = GPIO_MODE_OUTPUT,
     };
-    size_t i;
-    uint8_t bright = 0xFF;
 
-    gpio_config(&io);
-    gpio_set_level(LCD_RST, 0);
-    vTaskDelay(pdMS_TO_TICKS(20));
+    gpio_config(&cs);
+    gpio_set_level(LCD_CS, 1);
+
+    /*
+     * The reset pulse, timed as LilyGo's own init times it: HIGH 200 ms,
+     * LOW 300 ms, HIGH 200 ms. An earlier version here used 20/120 ms, which
+     * is far too short for the controller's power-on reset to complete -- it
+     * holds the panel in reset and every later command is discarded.
+     */
+    gpio_config(&rst);
     gpio_set_level(LCD_RST, 1);
-    vTaskDelay(pdMS_TO_TICKS(120));
+    vTaskDelay(pdMS_TO_TICKS(200));
+    gpio_set_level(LCD_RST, 0);
+    vTaskDelay(pdMS_TO_TICKS(300));
+    gpio_set_level(LCD_RST, 1);
+    vTaskDelay(pdMS_TO_TICKS(200));
 
     for (i = 0; i < sizeof(s_init) / sizeof(s_init[0]); i++) {
-        co5300_cmd(s_init[i].op, s_init[i].data, s_init[i].len & 0x1F);
+        reg_write(s_init[i].op, s_init[i].data, s_init[i].len & 0x1F);
         if (s_init[i].len & 0x80)
             vTaskDelay(pdMS_TO_TICKS(120));
     }
-    co5300_cmd(0x51, &bright, 1);
+    reg_write(0x51, &bright, 1);
     return true;
 }
 
@@ -173,6 +290,7 @@ static void paint_cell(int col, int row, td_vcell_t c, bool cursor)
     uint16_t fg = s_palette[c.fg & 0x0F];
     uint16_t bg = s_palette[c.bg & 0x0F];
     int x0 = col * CELL_W;
+    int y0 = row * CELL_H;
     int y, bit;
 
     if (cursor)
@@ -181,32 +299,33 @@ static void paint_cell(int col, int row, td_vcell_t c, bool cursor)
         fg = bg;
         bg = t;
     }
-    if (fg == bg)
-    {
-        /* Nothing to compose: one fill instead of 16 glyph rows. */
-        for (y = 0; y < CELL_H; y++)
-            for (bit = 0; bit < CELL_W; bit++)
-                s_line[x0 + bit] = swap16(bg);
-        return;
-    }
 
     for (y = 0; y < CELL_H; y++)
     {
-        uint8_t bits = glyph ? glyph[y] : 0;
+        uint8_t bits = (fg == bg || !glyph) ? 0 : glyph[y];
+        uint16_t *dst = s_fb + (size_t)(y0 + y) * DISPLAY_W + x0;
 
         for (bit = 0; bit < CELL_W; bit++)
-            s_line[x0 + bit] = swap16((bits & (0x80 >> bit)) ? fg : bg);
+            dst[bit] = (bits & (0x80 >> bit)) ? fg : bg;
+    }
+}
 
-        co5300_window(x0, row * CELL_H + y, CELL_W, 1);
-        spi_device_acquire_bus(s_spi, portMAX_DELAY);
-        {
-            spi_transaction_ext_t t = { 0 };
-            t.base.flags = SPI_TRANS_MODE_QIO;
-            t.base.length = 8 * CELL_W * 2;
-            t.base.tx_buffer = s_line + x0;
-            spi_device_polling_transmit(s_spi, (spi_transaction_t *)&t);
-        }
-        spi_device_release_bus(s_spi);
+static void flush_rows(int y0, int y1)
+{
+    int y, x;
+
+    if (y1 > DISPLAY_H)
+        y1 = DISPLAY_H;
+
+    for (y = y0; y < y1; y += BAND_ROWS)
+    {
+        int rows = (y1 - y) > BAND_ROWS ? BAND_ROWS : (y1 - y);
+        const uint16_t *src = s_fb + (size_t)y * DISPLAY_W;
+        size_t n = (size_t)rows * DISPLAY_W;
+
+        for (x = 0; x < (int)n; x++)
+            s_tx[x] = swap16(src[x]);
+        push_pixels(0, y, DISPLAY_W, rows);
     }
 }
 
@@ -216,6 +335,8 @@ static void paint_task(void *arg)
 
     for (;;)
     {
+        int lo = DISPLAY_H, hi = 0;
+
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
         xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -234,8 +355,14 @@ static void paint_task(void *arg)
                     continue;
                 paint_cell(c, r, want, cur);
                 *have = want;
+                if (r * CELL_H < lo)
+                    lo = r * CELL_H;
+                if ((r + 1) * CELL_H > hi)
+                    hi = (r + 1) * CELL_H;
             }
         }
+        if (hi > lo)
+            flush_rows(lo, hi);
         s_vt->dirty = false;
         xSemaphoreGive(s_lock);
     }
@@ -261,13 +388,22 @@ bool display_init(display_reply_fn reply)
         .sclk_io_num = LCD_SCK,
         .quadwp_io_num = LCD_D2,
         .quadhd_io_num = LCD_D3,
-        .max_transfer_sz = 8 * DISPLAY_W * 2,
+        .max_transfer_sz = 0x40000 + 8,
+        /* GPIO_PINS routes the quad lines through the GPIO matrix rather
+         * than IO_MUX, which is what LilyGo's init asks for. */
+        .flags = SPICOMMON_BUSFLAG_MASTER | SPICOMMON_BUSFLAG_GPIO_PINS,
     };
+    /* As LilyGo: command_bits and address_bits are fixed on the DEVICE, chip
+     * select is -1 because it is driven by hand, and the device is
+     * half-duplex so the command/address phases are output-only. */
     spi_device_interface_config_t dev = {
-        .clock_speed_hz = LCD_SPI_HZ,
+        .command_bits = 8,
+        .address_bits = 24,
         .mode = 0,
-        .spics_io_num = LCD_CS,
-        .queue_size = 1,
+        .clock_speed_hz = LCD_SPI_HZ,
+        .spics_io_num = -1,
+        .flags = SPI_DEVICE_HALFDUPLEX,
+        .queue_size = 8,
     };
 
     if (spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_CH_AUTO) != ESP_OK)
@@ -291,11 +427,33 @@ bool display_init(display_reply_fn reply)
     s_shown = heap_caps_calloc(TD_VT_MAX_ROWS * TD_VT_MAX_COLS,
                                sizeof(*s_shown),
                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_vt || !s_shown)
+    s_fb = heap_caps_malloc((size_t)DISPLAY_W * DISPLAY_H * 2,
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_tx = heap_caps_malloc((size_t)DISPLAY_W * BAND_ROWS * 2,
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_vt || !s_shown || !s_fb || !s_tx)
     {
         ESP_LOGE(TAG, "no PSRAM for the terminal");
         return false;
     }
+
+    /*
+     * A test pattern before anything else. This is the only way to tell a
+     * dark panel apart from a panel that is lit but showing a desktop which
+     * never painted: three bands of solid colour that survive until the
+     * first real paint. If these do not appear, the problem is power or the
+     * QSPI framing, and the desktop is irrelevant.
+     */
+    for (int y = 0; y < DISPLAY_H; y++)
+    {
+        uint16_t c = (y < DISPLAY_H / 3) ? 0xF800        /* red   */
+                   : (y < 2 * DISPLAY_H / 3) ? 0x07E0    /* green */
+                   : 0x001F;                             /* blue  */
+        for (int x = 0; x < DISPLAY_W; x++)
+            s_fb[(size_t)y * DISPLAY_W + x] = c;
+    }
+    flush_rows(0, DISPLAY_H);
+    ESP_LOGI(TAG, "test pattern written: %dx%d", DISPLAY_W, DISPLAY_H);
 
     s_cols = DISPLAY_MAX_COLS;
     s_rows = DISPLAY_MAX_ROWS;

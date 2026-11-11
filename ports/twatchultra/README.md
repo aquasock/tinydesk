@@ -76,28 +76,43 @@ all present on the board and none of them are needed to show a desktop.
 
 ## Status
 
-**Builds clean** with ESP-IDF v5.3.1 on 2026-11-11: `tinydesk.bin` is
-2,327,472 bytes, 26% free in the 3 MB app slot, with no warnings from the
-port's own sources under `-Werror`.
+**Works on hardware, 2026-11-11.** The desktop renders on the AMOLED: the
+sign-in screen with its header, account list and buttons, and the touch panel
+drives the mouse. Getting there took four attempts and every one of them
+failed silently, so the failure modes are written down here.
 
-**Not yet flashed to a board.** The parts most likely to need adjustment on
-first contact, in order:
+### What was wrong, in the order it was found
 
-0. **Panel power -- found, and it was the first real bug.** The AMOLED's rail
-   is switched by XL9555 **P07** and nothing else, and on a cold boot that
-   expander has every pin configured as an input, so the panel is unpowered
-   until something drives it. `main/power.c` now does that before
-   `display_init()` touches the bus.
-1. **The QSPI framing in `display.c`.** No other ESP-IDF port here drives a
-   panel by hand, so the command/address/lane structure is derived rather than
-   copied from working code. `co5300_cmd()` sends the opcode with an 8-bit
-   command phase and no address phase, all on four lanes. If the panel stays
-   dark, that framing is the first thing to question -- and the second is
-   whether the CO5300 wants a 24-bit address carrying the parameter count, as
-   some QSPI controllers do.
-2. **`lcd.spi_mhz`.** 40 MHz is what the board's Linux driver settled on, but
-   the panel's own maximum is worth confirming before trusting it.
-3. **The touch unlock.** The handshake follows the hardware's measured
-   behaviour, so a failure here should be visible as a log line rather than a
-   dead panel: `bring_up()` logs the checkcode it read and the value that
-   failed the unlock.
+1. **No panel power.** The AMOLED's rail is switched by XL9555 **P07** and
+   nothing else; on a cold boot the expander has every pin an input. The panel
+   was unpowered while a perfectly correct init sequence went into it.
+   `main/power.c` raises ALDO2 on the AXP2101 and then closes P07.
+
+2. **The QSPI framing.** Command and address go out with
+   `SPI_TRANS_MULTILINE_CMD | SPI_TRANS_MULTILINE_ADDR` on a device configured
+   `command_bits = 8, address_bits = 24, spics_io_num = -1,
+   SPI_DEVICE_HALFDUPLEX`. Two earlier attempts -- everything on four lanes,
+   then command and address on one lane -- were both wrong and both silent.
+   Read `LilyGoDispQSPI` in LilyGoLib before guessing at this protocol.
+
+3. **The reset pulse.** 200 ms HIGH, 300 ms LOW, 200 ms HIGH. A shorter pulse
+   leaves the controller held in reset and every later command is discarded.
+
+4. **The framebuffer origin.** The 320x400 rectangle sits at (45,45) on the
+   glass, and the controller's RAM starts a further 22 columns left, so a
+   column is written at `x + 45 + 22` and a row at `y + 45`. Without both the
+   picture is shifted up and to the left.
+
+### Everything here came from LilyGo or from the Escapement project
+
+The CO5300 framing and init table are transcribed from LilyGo's own firmware
+(LilyGoLib, `src/display/LilyGoDispInterface.cpp`). The panel geometry, the
+expander register map and the CST9217 handshake come from the Escapement
+project's measured reference (`.ai/core-reference.md`, records BRD-003,
+BRD-004, LCD-003 and TCH-001..010). None of it is from a datasheet.
+
+### Known gaps
+
+No picture/Sixel support, no sound, no haptics, no PMU battery reporting. The
+desktop polls the terminal size once a second by design (`TD_SIZE_POLL_MS`),
+which looks alarming on a serial capture and is not a fault.

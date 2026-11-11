@@ -35,6 +35,14 @@ i2c_master_bus_handle_t board_i2c(void);
  */
 bool board_display_power_on(void);
 
+/*
+ * Raise the AXP2101's ALDO2 and enable it. This is the rail the display runs
+ * from; P07 above only switches it. Order matters: the rail has to be
+ * generating before the switch closes, or the panel sees an unpowered line
+ * and stays dark with no signal that anything is wrong.
+ */
+bool board_display_rail_on(void);
+
 /* Log the expander's configuration and output registers. */
 void board_dump_expander(void);
 
