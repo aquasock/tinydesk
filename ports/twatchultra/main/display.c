@@ -95,11 +95,13 @@
 #define CMD_PIXELS  0x32
 #define ADDR_RAMWR  0x002C00
 /*
- * WHERE THE 320x400 RECTANGLE SITS ON THE GLASS.
+ * WHERE THE FRAMEBUFFER SITS ON THE GLASS.
  *
  * The panel is 410x502 with 45-degree chamfered corners, so the largest
- * rectangle guaranteed to render in full is inset 45 px on every side. Our
- * framebuffer is 320x400 and lives at (45,45) inside the panel.
+ * rectangle guaranteed to render in full is inset 45 px on every side, which
+ * is 320x400. DISPLAY_ORIGIN_X/Y in display.h hold where it actually starts;
+ * they are both 45, and this build is one row TALLER than 400 because it is
+ * trying an extra row at the bottom (see the note there).
  *
  * On top of that the controller's own RAM starts 22 columns to the left of the
  * visible glass, so a column written to the panel needs PANEL_COL_OFFSET added

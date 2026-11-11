@@ -15,7 +15,7 @@ idf.py -p /dev/ttyACM0 flash
 No baud argument is needed or used: the link is USB, and line speed is
 ignored.
 
-The desktop is **40x25 cells** of 8x16. The glass is bigger than that; see the
+The desktop is **40x26 cells** of 8x16. The glass is bigger than that; see the
 second trap below for why the desktop does not use all of it.
 
 ## Three things that are not like the other ports
@@ -34,9 +34,16 @@ than from a datasheet.
 **2. The desktop does not use the whole glass.** The panel is 410x502 with
 45-degree chamfers, so the corners are not addressable as a rectangle. The
 largest unclipped rectangle inside the visible area is **320x400**, which is
-what `DISPLAY_W`/`DISPLAY_H` are set to and what the panel window is
-programmed to. Setting a bigger window draws into the chamfers and produces a
-band of nonsense along two edges.
+what `DISPLAY_W`/`DISPLAY_H` were originally set to and what the panel window
+is programmed to. Setting a bigger window draws into the chamfers and produces
+a band of nonsense along two edges.
+
+This build runs one row **taller** than that, 320x416 for 40x26. The measured
+rectangle is inset 45 px on every side, so its bottom edge is at row 457 and
+the extra row reaches 461 — four pixels past it. They are visible on the glass:
+the chamfers cut the corners rather than the middle of the edges, so the lower
+test row survives. Treat the width as the hard limit and the height as having a
+few pixels of slack; `DISPLAY_H` back to 400 returns to the measured rectangle.
 
 **3. PSRAM is QUAD, and getting this wrong looks like a dead board.** The
 trap is the mirror image of the CrowPanel's: this S3 has *quad* PSRAM, and
@@ -170,7 +177,7 @@ No picture/Sixel support, no sound, no haptics, no PMU battery reporting.
 
 **Bluetooth is enabled for input.** The watch's input is a Bluetooth LE keyboard
 and mouse (`bt.enable = 1`, `CONFIG_BT_ENABLED=y` with NimBLE as a central):
-320x400 of glass is too small to type on, so there is no on-screen keyboard in
+320 pixels across of glass is too small to type on, so there is no on-screen keyboard in
 the intended flow. Until this was turned on the image was built without
 Bluetooth at all, `bt_hid_start()` returned the empty stub, and the Mouse,
 Keyboard and Bluetooth apps were absent from the start menu — that absence is

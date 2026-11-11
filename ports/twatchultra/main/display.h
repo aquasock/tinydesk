@@ -7,14 +7,17 @@
  * port that is not modelled on ports/crowpanel7.
  *
  * The desktop's output goes into a td_vterm, and a task paints its cells onto
- * the panel: 8x16 pixels, 40x25 of them in the 320x400 area the glass offers.
+ * the panel: 8x16 pixels, 40 across and 26 down in the area the glass offers.
  *
  * WHY 320x400 AND NOT 410x502. The glass is 410x502 with 45-degree chamfers,
  * so the corners are not addressable as a rectangle. 320x400 is the largest
  * rectangle that fits inside the visible area, and it is what the Escapement
  * project measured and used for its own Linux framebuffer. The panel window
- * below is set to the same 320x400 sub-rectangle rather than to the full glass
- * so the offsets match what the driver writes.
+ * below is set to the same sub-rectangle rather than to the full glass so the
+ * offsets match what the driver writes.
+ *
+ * This build adds one row below that rectangle, for 40x26: see the note on
+ * DISPLAY_H below. DISPLAY_W is still 320.
  */
 #ifndef TWATCH_DISPLAY_H
 #define TWATCH_DISPLAY_H
@@ -24,19 +27,29 @@
 #include <stddef.h>
 
 #define DISPLAY_W         320
-#define DISPLAY_H         400
+#define DISPLAY_H         416
 #define DISPLAY_MAX_COLS  (DISPLAY_W / 8)    /* 40 */
-#define DISPLAY_MAX_ROWS  (DISPLAY_H / 16)   /* 25 */
+#define DISPLAY_MAX_ROWS  (DISPLAY_H / 16)   /* 26 */
 #define DISPLAY_MAX_CELLS (DISPLAY_MAX_COLS * DISPLAY_MAX_ROWS)
 
-/* Where the 320x400 framebuffer sits on the 410x502 glass. The panel is
+/* Where the framebuffer sits on the 410x502 glass. The panel is
  * addressed in glass coordinates, so anything that converts between the two
  * needs these: the display driver adds them when it writes a pixel, and the
  * touch driver subtracts them to turn a reported touch into a cell. Without
  * the subtraction every touch is 45 px off and scaled as though the desktop
- * were the whole glass. */
+ * were the whole glass.
+ *
+ * EXPERIMENT: 40 x 26, one row (16 px) taller than the 400 px that was
+ * measured as the largest unclipped rectangle, added at the BOTTOM -- the top
+ * stays at 45 and the framebuffer now runs to 461 instead of 445.
+ *
+ * The safe rectangle is 45 inset on every side, so its bottom edge is at
+ * 502 - 45 = 457, and the new row's last 4 px are past it. That is the point
+ * of the experiment: they may be inside the visible glass anyway, since the
+ * chamfers cut the corners rather than the middle of the edges. Set
+ * DISPLAY_H back to 400 to undo. */
 #define DISPLAY_ORIGIN_X  45        /* (410 - 320) / 2 */
-#define DISPLAY_ORIGIN_Y  45        /* (502 - 412) / 2, 400 tall from there */
+#define DISPLAY_ORIGIN_Y  45        /* top edge, unchanged */
 
 /* The glass itself. The touch controller reports the panel's own resolution,
  * not the framebuffer's -- 410x502, measured (TCH-006) -- so this is what its
