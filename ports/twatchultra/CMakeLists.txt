@@ -19,11 +19,29 @@ set(TDSH_SDK_ROOT "${TD_ROOT}/third_party/tdsh")
 
 set(IDF_TARGET "esp32s3" CACHE STRING "tinydesk target")
 
-# Screen limits, in cells. The panel is 320x400 after its own bezel is taken
-# off; at the 8x16 font that is 40x25 cells, and the desktop follows whatever
-# the link reports, so these are an upper bound rather than a target.
-set(TD_MAX_COLS     40 CACHE STRING "screen cells across (panel grid)")
-set(TD_MAX_ROWS     30 CACHE STRING "screen cells down (panel grid)")
+# THE GRID, IN CELLS. This board's screen is a soldered panel, not a terminal
+# whose size is discovered at run time, so the grid is fixed here and the
+# desktop is clamped to it.
+#
+# The framebuffer is 320x416 (main/display.h, DISPLAY_W x DISPLAY_H) at the
+# 8x16 font, which is 40 columns by 26 rows. Keep these three in step: this is
+# what the window manager believes, and DISPLAY_W/H are what the panel
+# actually shows. They disagreed before -- 30 rows here, 26 rendered -- and the
+# failure is invisible until an app puts something on the rows that do not
+# exist.
+#
+# Setting these makes the `tinydesk` component use them instead of its own
+# PSRAM-sized defaults, so a host terminal attached over USB cannot resize the
+# desktop to its own window: both views show the same 40x26.
+#
+# PLAIN set(), NOT CACHE. A cached value survives in the build directory, so
+# changing the number here while a build directory already exists changes
+# nothing -- idf.py keeps reporting the old grid and the old cache entry has to
+# be deleted by hand. This is a property of the soldered panel, not a choice the
+# builder makes, so it should not be cached: -DTD_MAX_ROWS= on the command line
+# is deliberately ignored, because a grid larger than the glass would only clip.
+set(TD_MAX_COLS     40)
+set(TD_MAX_ROWS     26)
 set(TD_VT_SCROLLBACK 50 CACHE STRING "terminal scrollback lines")
 
 list(APPEND EXTRA_COMPONENT_DIRS

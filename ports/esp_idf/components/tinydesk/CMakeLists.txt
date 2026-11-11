@@ -86,7 +86,30 @@ idf_component_register(
 # ESP32; all apps open need about 115): 96 without PSRAM (14 KB of internal
 # RAM), the default 128 with it. A window that still does not fit, or gets
 # no timer, is closed with a message instead of opening with missing parts.
-if(CONFIG_SPIRAM)
+#
+# A PORT WITH A FIXED PANEL OVERRIDES THE GRID. These limits are an upper
+# bound for a terminal whose size is not known until it answers (a PuTTY
+# window), which is why they are generous. A board whose screen is a soldered
+# LCD has no such question: its grid is known at build time, and letting a
+# host terminal answer a larger size makes the desktop lay itself out for
+# columns the glass does not have -- windows are measured to fit the host's
+# window and then clipped, and text is cut mid-word. Setting TD_MAX_COLS and
+# TD_MAX_ROWS in the port's own CMakeLists now sets the grid, because
+# td_config.h documents exactly that ("Override any value from the build
+# system, for example -DTD_MAX_COLS=100") and the window manager already
+# clamps every reported size into these. Only one port sets them today
+# (twatchultra, 40x26), so every other board is unaffected.
+if(DEFINED TD_MAX_COLS AND DEFINED TD_MAX_ROWS)
+    if(CONFIG_SPIRAM)
+        set(TD_SCREEN_LIMITS TD_MAX_COLS=${TD_MAX_COLS} TD_MAX_ROWS=${TD_MAX_ROWS}
+            TD_VT_SCROLLBACK=200 TD_PYUI_MAX_CELLS=32000
+            TD_PYUI_MAX_PIXELS=2097152 TD_PICTURE_MAX=128)
+    else()
+        set(TD_SCREEN_LIMITS TD_MAX_COLS=${TD_MAX_COLS} TD_MAX_ROWS=${TD_MAX_ROWS}
+            TD_VT_SCROLLBACK=12 TD_MAX_WIDGETS=96)
+    endif()
+    message(STATUS "tinydesk grid fixed by the port: ${TD_MAX_COLS}x${TD_MAX_ROWS}")
+elseif(CONFIG_SPIRAM)
     # Python canvases may cover a whole large screen several times over
     # (pages: 100x30 is 3000 cells, 6 bytes each); they are allocated in
     # PSRAM while a script runs, 192 KB at most. Their pixel layers and the

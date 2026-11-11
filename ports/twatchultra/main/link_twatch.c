@@ -9,11 +9,15 @@
  * host terminal shows the same picture. Input is the USB port (the keyboard,
  * and the host terminal's mouse) and the touch panel (touch.c).
  *
- * The desktop's size is the panel's: its answers to the size query are the
- * only ones the desktop gets, and the host terminal's are dropped. That
- * matters here more than on a bigger board -- a 40x25 grid is small, and
- * letting a PuTTY window decide the geometry would make the desktop depend on
- * which terminal happened to be attached.
+ * The desktop's size is the panel's, but not by filtering the host: the host
+ * terminal's answer is allowed through and then clamped, because the grid is
+ * declared at build time (TD_MAX_COLS/TD_MAX_ROWS in the port's CMakeLists,
+ * 40x26) and src/td.c clamps whatever any terminal reports into it. So a
+ * `screen` session that answers 74x34 shows the same 40x26 desktop as the
+ * glass -- the mirror is a second view of one screen, not a second screen.
+ * Filtering the host's answer here was tried and removed: it is the wrong
+ * layer, it hides the size the terminal really has, and the clamp upstream
+ * already does the job.
  *
  * Board configuration keys (see board.example.conf):
  *   lcd.mirror    1 (default): also send the picture to the USB port
@@ -137,142 +141,13 @@ bool link_init(void)
     return true;
 }
 
-/*
- * THE PANEL'S SIZE IS THE DESKTOP'S SIZE, AND THE HOST MUST NOT CHANGE IT.
- *
- * The desktop asks the terminal for its size (ESC[6n) and believes the answer.
- * Two answers arrive here: the panel's, from display.c's own td_vterm through
- * the inject queue, and -- whenever a terminal is attached over USB -- the
- * host terminal's, in whatever window the user happens to have open. A `screen`
- * default answers 74x34, so the whole window manager was laid out for 74
- * columns on a 40-column panel: windows measured to fit 74, the panel clipped
- * them, and text was cut mid-word with no indication. That is the same fault
- * the Bluetooth window and the message box showed, and it looked like two
- * layout bugs rather than one.
- *
- * The file's own comment already said the host's answer is dropped; now it
- * actually is. Only the cursor-position report ESC[<rows>;<cols>R is removed,
- * from the USB side alone -- the panel's answer comes the other way, so it is
- * untouched. Everything else the host sends (keys, mouse, paste) goes through
- * unchanged.
- */
-static int s_dsr_state;
-static int s_dsr_digits;
-static int s_dsr_value[2];
-
-static bool drop_host_dsr(uint8_t b, uint8_t *out, int *n, int cap)
-{
-    switch (s_dsr_state)
-    {
-    case 0:                                  /* not in a sequence */
-        if (b == 0x1b) { s_dsr_state = 1; return true; }
-        if (*n < cap) out[(*n)++] = b;
-        return true;
-
-    case 1:                                  /* after ESC */
-        if (b == '[') { s_dsr_state = 2; s_dsr_digits = 0; return true; }
-        if (*n + 2 <= cap)
-        {
-            out[(*n)++] = 0x1b;
-            out[(*n)++] = b;
-        }
-        s_dsr_state = 0;
-        return true;
-
-    case 2:                                  /* after ESC[ */
-        if (b >= '0' && b <= '9')
-        {
-            s_dsr_value[0] = b - '0';
-            s_dsr_value[1] = 0;
-            s_dsr_digits = 1;
-            s_dsr_state = 3;
-            return true;
-        }
-        if (*n + 3 <= cap) { out[(*n)++] = 0x1b; out[(*n)++] = '['; out[(*n)++] = b; }
-        s_dsr_state = 0;
-        return true;
-
-    case 3:                                  /* first number */
-        if (b >= '0' && b <= '9' && s_dsr_digits < 4)
-        {
-            s_dsr_value[0] = s_dsr_value[0] * 10 + (b - '0');
-            s_dsr_digits++;
-            return true;
-        }
-        if (b == ';')
-        {
-            s_dsr_digits = 0;
-            s_dsr_state = 4;
-            return true;
-        }
-        goto flush;                          /* ESC[<n><other>: not a report */
-
-    case 4:                                  /* after the semicolon */
-        if (b >= '0' && b <= '9' && s_dsr_digits < 4)
-        {
-            s_dsr_value[1] = s_dsr_value[1] * 10 + (b - '0');
-            s_dsr_digits++;
-            s_dsr_state = 5;
-            return true;
-        }
-        goto flush;
-
-    case 5:                                  /* second number */
-        if (b >= '0' && b <= '9' && s_dsr_digits < 4)
-        {
-            s_dsr_value[1] = s_dsr_value[1] * 10 + (b - '0');
-            s_dsr_digits++;
-            return true;
-        }
-        if (b == 'R')
-        {
-            s_dsr_state = 0;                 /* a cursor-position report: gone */
-            return false;
-        }
-        goto flush;
-
-    default:
-        s_dsr_state = 0;
-        if (*n < cap) out[(*n)++] = b;
-        return true;
-    }
-
-flush:
-    /* Not a report after all, so put back what was held, as literal text. */
-    {
-        char tmp[16];
-        int len = snprintf(tmp, sizeof(tmp), "\x1b[%d;%d",
-                           s_dsr_value[0], s_dsr_value[1]);
-
-        for (int i = 0; i < len && *n < cap; i++)
-            out[(*n)++] = (uint8_t)tmp[i];
-        if (*n < cap)
-            out[(*n)++] = b;
-        s_dsr_state = 0;
-        return true;
-    }
-}
-
 int link_read(uint8_t *buf, int cap)
 {
     int n = take_injected(buf, cap);
 
     if (n > 0)
-        return n;                    /* the panel's own answers, unfiltered */
-
+        return n;                    /* the panel's own answers come first */
     n = usb_serial_jtag_read_bytes(buf, (uint32_t)cap, 0);
-    if (n > 0)
-    {
-        uint8_t raw[128];
-        int keep = 0;
-
-        if (n > (int)sizeof(raw))
-            n = (int)sizeof(raw);
-        memcpy(raw, buf, (size_t)n);
-        for (int i = 0; i < n; i++)
-            (void)drop_host_dsr(raw[i], buf, &keep, cap);
-        n = keep;
-    }
     return n > 0 ? n : 0;
 }
 
