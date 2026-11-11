@@ -501,7 +501,8 @@ static void on_identify(td_widget_t *w, void *user)
     int n = td_wm_monitors(m, 2, NULL);
     for (int i = 0; i < n; i++)
     {
-        td_window_desc_t d = {.title = i ? "Display 2" : "Display 1", .rect = td_rect(0, 0, 14, 5), .on_draw = ident_draw};
+        td_window_desc_t d = {.title = i ? "Display 2" : "Display 1", .rect = td_rect(0, 0, 14, 5),
+                              .flags = TD_WIN_OWN_SIZE, .on_draw = ident_draw};
         s_ident[i] = td_win_create(&d);
         if (s_ident[i])
             td_win_move(s_ident[i], m[i].x + 2, m[i].y + 1);

@@ -106,6 +106,20 @@
 #define TD_SIZE_QUERY_TIMEOUT_MS 300
 #endif
 
+/* Windows open maximised (filling the desk area, frames and title bars kept).
+ *
+ * For a small fixed panel this is the difference between usable and not: an app
+ * asks for the size that suits a desktop, and on 40x26 anything below row 26 is
+ * off the glass. Dialogs (TD_WIN_MODAL), tools (TD_WIN_NO_FOCUS) and windows
+ * that ask to keep their own size (TD_WIN_OWN_SIZE) are left alone -- a message
+ * box two-thirds of the way down a screen is still a message box, not a page.
+ *
+ * Off by default so a board with room can keep the overlapping-windows feel.
+ * A port turns it on by defining it; see the port's project_include.cmake. */
+#ifndef TD_OPEN_MAXIMIZED
+#define TD_OPEN_MAXIMIZED 0
+#endif
+
 /* The terminal size is re-queried this often so window resizes are noticed
  * (0 disables periodic queries). */
 #ifndef TD_SIZE_POLL_MS

@@ -26,6 +26,10 @@
 #define TD_WIN_NO_FOCUS    0x0800u  /* a tool (the on-screen keyboard): stays above
                                     * the others, also dialogs, and gets clicks,
                                     * but never the focus or the keys */
+#define TD_WIN_OWN_SIZE    0x1000u  /* opens at the size the caller asked for even
+                                    * when TD_OPEN_MAXIMIZED is on: for a popover
+                                    * such as the display identifier, whose whole
+                                    * meaning is its small size */
 
 #define TD_WIN_DEFAULT (TD_WIN_MOVABLE | TD_WIN_RESIZABLE | TD_WIN_CLOSABLE)
 

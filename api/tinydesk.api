@@ -240,6 +240,7 @@ td_config.h: #define TD_PASTE_TIMEOUT_MS 2000
 td_config.h: #define TD_OSC52_MAX 8192
 td_config.h: #define TD_SEQ_TIMEOUT_MS 500
 td_config.h: #define TD_SIZE_QUERY_TIMEOUT_MS 300
+td_config.h: #define TD_OPEN_MAXIMIZED 0
 td_config.h: #define TD_SIZE_POLL_MS 1000
 td_config.h: #define TD_LINK_RETRY_MS 500
 td_config.h: #define TD_LINK_LOST_MS 3000
@@ -593,6 +594,7 @@ td_wm.h: #define TD_WIN_HIDDEN 0x0100u
 td_wm.h: #define TD_WIN_MAXIMIZED 0x0200u
 td_wm.h: #define TD_WIN_FULLSCREEN 0x0400u
 td_wm.h: #define TD_WIN_NO_FOCUS 0x0800u
+td_wm.h: #define TD_WIN_OWN_SIZE 0x1000u
 td_wm.h: #define TD_WIN_DEFAULT (TD_WIN_MOVABLE | TD_WIN_RESIZABLE | TD_WIN_CLOSABLE)
 td_wm.h: #define TD_START_USER_MAX 16
 td_wm.h: #define TD_MAX_ICON_PLACES 96

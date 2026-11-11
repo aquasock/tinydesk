@@ -605,6 +605,19 @@ td_window_t *td_win_create(const td_window_desc_t *desc)
      * frame to move, resize, minimise or close it by. */
     if (s_kiosk && !(w->flags & (TD_WIN_MODAL | TD_WIN_NO_FOCUS)))
         w->flags |= TD_WIN_FULLSCREEN;   /* not a tool such as the On-screen keyboard */
+
+    /* TD_OPEN_MAXIMIZED: open at the desk size rather than the size asked for.
+     * Set before clamp_rect so restore_rect (assigned just above) stays the
+     * caller's rect and un-maximising puts the window back where it wanted to
+     * be. Maximised rather than full screen on purpose: the frame and title bar
+     * stay, so an app's own layout code is untouched and the window is still
+     * movable, resizable and closable. */
+#if TD_OPEN_MAXIMIZED
+    if (!(w->flags & (TD_WIN_MODAL | TD_WIN_NO_FOCUS | TD_WIN_FULLSCREEN |
+                      TD_WIN_OWN_SIZE | TD_WIN_MAXIMIZED)))
+        w->flags |= TD_WIN_MAXIMIZED;
+#endif
+
     clamp_rect(w);
 
     if (w->on_tick && desc->tick_ms > 0)

@@ -36,3 +36,10 @@ idf_build_set_property(COMPILE_DEFINITIONS "TD_SIZE_POLL_MS=0" APPEND)
 # for a round trip that is measured in microseconds and controls nothing.
 # TD_ACK_TIMEOUT_MS=0 is the documented way to turn it off (td_config.h).
 idf_build_set_property(COMPILE_DEFINITIONS "TD_ACK_TIMEOUT_MS=0" APPEND)
+
+# Apps open maximised (frames and title bars kept; dialogs and tools are not
+# affected -- src/wm.c, td_win_create). On a 40x26 panel an app that asks for a
+# desktop-sized window has most of its content below row 26, which is off the
+# glass: the Bluetooth window's own WIN_H is 34. Maximised, an app gets the
+# whole desk area and its layout code needs no change at all.
+idf_build_set_property(COMPILE_DEFINITIONS "TD_OPEN_MAXIMIZED=1" APPEND)
