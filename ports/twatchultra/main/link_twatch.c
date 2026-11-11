@@ -24,6 +24,7 @@
 #include <string.h>
 
 #include "display.h"
+#include "power.h"
 #include "touch.h"
 #include "hal_mux.h"
 #include "tinydesk/td_picture.h"
@@ -97,6 +98,16 @@ bool link_init(void)
     }
 
     s_mirror = tdsh_board_int("lcd.mirror", 1) != 0;
+
+    /*
+     * Power the panel BEFORE touching its bus. The AMOLED's rail is switched
+     * by XL9555 P07, and on a cold boot the expander has every pin an input,
+     * so the panel is unpowered until this runs. Doing it after display_init()
+     * would send a full CO5300 init sequence into a dark, unpowered panel and
+     * then draw a screen nobody can see.
+     */
+    if (!board_display_power_on())
+        ESP_LOGW(TAG, "panel power did not come on; the screen will be dark");
 
     if (!display_init(inject))
     {

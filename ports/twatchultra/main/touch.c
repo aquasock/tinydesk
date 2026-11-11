@@ -50,6 +50,7 @@
 #include "freertos/task.h"
 
 #include "display.h"
+#include "power.h"
 #include "tinydesk/td_vterm.h"
 
 #define TAG "twatch-touch"
@@ -224,23 +225,18 @@ static void poll_task(void *arg)
 
 bool touch_init(touch_input_fn input)
 {
-    i2c_master_bus_config_t bus = {
-        .i2c_port = I2C_NUM_0,
-        .sda_io_num = TOUCH_SDA,
-        .scl_io_num = TOUCH_SCL,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
     i2c_device_config_t dev = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = TOUCH_ADDR,
         .scl_speed_hz = TOUCH_HZ,
     };
 
-    if (i2c_new_master_bus(&bus, &s_bus) != ESP_OK)
+    /* The bus belongs to power.c: every peripheral on this board shares it,
+     * and installing two masters on one port is not possible. */
+    s_bus = board_i2c();
+    if (!s_bus)
     {
-        ESP_LOGE(TAG, "I2C bus did not start");
+        ESP_LOGE(TAG, "no I2C bus");
         return false;
     }
     if (i2c_master_bus_add_device(s_bus, &dev, &s_dev) != ESP_OK)
