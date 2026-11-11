@@ -127,6 +127,11 @@ static td_vterm_t *s_vt;
 static td_vcell_t *s_shown;
 static uint16_t *s_fb;
 static int s_cols, s_rows;
+/* Where the cursor was last drawn. paint_cell inverts a cell when the cursor is
+ * on it, but the cell's own colours are unchanged, so the comparison below
+ * cannot see the cursor leaving: the cell would stay inverted on the glass for
+ * ever. One cursor exists at a time, so remembering where it was is enough. */
+static int s_cur_col = -1, s_cur_row = -1;
 static TaskHandle_t s_paint_task;
 static display_reply_fn s_reply;
 
@@ -415,6 +420,74 @@ static void flush_rect(int x0, int y0, int x1, int y1)
     }
 }
 
+
+/* Fill the entire panel with one colour, in strips narrow enough for s_tx.
+ *
+ * The framebuffer is 320x416 inside a 410x502 glass, inset 45 columns and 45
+ * rows to clear the chamfers, so a margin of the panel is never written by the
+ * paint loop. The controller's RAM is not cleared at reset, so whatever the
+ * previous firmware left there survives -- and that firmware was a Linux
+ * framebuffer with a different geometry. Whether anything visible was left in
+ * those margins is unproven: this wipe was added while chasing leftover pixels
+ * inside the window and did NOT fix them, so the margins may well have been
+ * clean all along. It stays because one pass over the panel at start-up costs
+ * nothing and makes the panel's state independent of whatever ran before.
+ */
+static void panel_fill(uint16_t colour)
+{
+    const int strip = (int)(sizeof(s_tx) / sizeof(s_tx[0])) / 16;   /* columns */
+
+    for (int x = 0; x < PANEL_W; x += strip)
+    {
+        int w = PANEL_W - x > strip ? strip : PANEL_W - x;
+
+        for (int r = 0; r < 16; r++)
+            for (int i = 0; i < w; i++)
+                s_tx[r * w + i] = colour;
+
+        for (int y = 0; y < PANEL_H; y += 16)
+        {
+            int h = PANEL_H - y > 16 ? 16 : PANEL_H - y;
+            size_t remaining = (size_t)w * h;
+            uint16_t *pp = s_tx;
+            bool first = true;
+
+            set_window(x + PANEL_COL_OFFSET, y, w, h);
+            spi_device_acquire_bus(s_spi, portMAX_DELAY);
+            gpio_set_level(LCD_CS, 0);
+
+            while (remaining)
+            {
+                size_t chunk = remaining > PIX_CHUNK ? PIX_CHUNK : remaining;
+                spi_transaction_ext_t t = { 0 };
+
+                if (first)
+                {
+                    t.base.flags = SPI_TRANS_MODE_QIO;
+                    t.base.cmd = CMD_PIXELS;
+                    t.base.addr = ADDR_RAMWR;
+                    first = false;
+                }
+                else
+                {
+                    t.base.flags = SPI_TRANS_MODE_QIO | SPI_TRANS_VARIABLE_CMD |
+                                   SPI_TRANS_VARIABLE_ADDR | SPI_TRANS_VARIABLE_DUMMY;
+                    t.command_bits = 0;
+                    t.address_bits = 0;
+                    t.dummy_bits = 0;
+                }
+                t.base.tx_buffer = pp;
+                t.base.length = chunk * 16;
+                (void)spi_device_polling_transmit(s_spi, (spi_transaction_t *)&t);
+                pp += chunk;
+                remaining -= chunk;
+            }
+            gpio_set_level(LCD_CS, 1);
+            spi_device_release_bus(s_spi);
+        }
+    }
+}
+
 static void paint_task(void *arg)
 {
     (void)arg;
@@ -440,6 +513,11 @@ static void paint_task(void *arg)
          * the framebuffer for a change that touches one column. */
         int run_lo = -1, run_hi = -1;   /* pixel rows of the open run */
         int run_x0 = 0, run_x1 = 0;     /* pixel columns of the open run */
+        /* Where the cursor was drawn last frame; the cell it leaves has to be
+         * painted back, and this is what makes that happen exactly once. */
+        int old_cur_col = s_cur_col, old_cur_row = s_cur_row;
+
+        s_cur_col = s_cur_row = -1;
 
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
@@ -457,10 +535,16 @@ static void paint_task(void *arg)
 
                 want = s_vt->cells[r * TD_VT_MAX_COLS + c];
                 if (want.ch == have->ch && want.fg == have->fg &&
-                    want.bg == have->bg && !cur)
-                    continue;
+                    want.bg == have->bg && !cur &&
+                    !(old_cur_col == c && old_cur_row == r))
+                    continue;               /* and nothing to un-invert */
                 paint_cell(c, r, want, cur);
                 *have = want;
+                if (cur)
+                {
+                    s_cur_col = c;
+                    s_cur_row = r;
+                }
                 if (c * CELL_W < row_x0)
                     row_x0 = c * CELL_W;
                 if ((c + 1) * CELL_W > row_x1)
@@ -588,6 +672,10 @@ bool display_init(display_reply_fn reply)
     }
     flush_rect(0, 0, DISPLAY_W, DISPLAY_H);
     ESP_LOGI(TAG, "test pattern written: %dx%d", DISPLAY_W, DISPLAY_H);
+
+    /* Then wipe the margins this port never writes, which still hold whatever
+     * the previous firmware left in the controller's RAM. */
+    panel_fill(0);
 
     s_cols = DISPLAY_MAX_COLS;
     s_rows = DISPLAY_MAX_ROWS;
