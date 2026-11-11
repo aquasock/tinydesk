@@ -120,7 +120,7 @@ TinyDesk whole:
 | Display (CO5300 QSPI) | **Works.** Verified on the glass: the sign-in screen renders, correctly positioned. |
 | Touch (CST9217) | **Bring-up verified on hardware.** `CST9220 410x502`, then `CST9217 up at 0x1A`: the checkcode, chip type, resolution and firmware reads all pass and the poll task runs. A synthetic SGR click over the link opens the start menu, so the pointer path into the desktop works. **What is not yet verified is a finger on the glass.** |
 | Keyboard (USB Serial/JTAG) | Works; it is the link, and the desktop is driven through it. |
-| Bluetooth (NimBLE, `bt.enable = 1`) | **Enabled.** The Mouse, Keyboard and Bluetooth apps appear in the start menu, which only happens when the radio starts. **Pairing not yet tried.** |
+| Bluetooth (NimBLE, `bt.enable = 1`) | **Works, verified on the glass.** A combo keyboard-and-mouse paired from a scan into the Combo slot and drives the desktop; the pairing survives in NVS across reboots. The Mouse and Keyboard slots (one device each) are the same code path but have not been tried. |
 | `/fs` (littlefs, 9.9 MB) | Should work: `partitions.csv` defines it and the littlefs component is linked. Unverified. |
 | WiFi | ESP-IDF native on this SoC, so no port code. Unverified; needs credentials via `wificonnect`. |
 | OTA | `TD_UPDATE_BOARD="twatchultra"` so this image will not be replaced by a UART desktop's. No update feed exists for this board yet. |

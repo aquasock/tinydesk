@@ -52,6 +52,10 @@ static const td_bt_ops_t *bt(void)
  * 2 + 3*4 = 14, leaving 11 for the list, its buttons and the message line. */
 #define SLOTS_TOP 2
 
+/* The slot buttons start one column left of the value column so the group of
+ * three ends on the last column of a 40-wide window instead of one past it. */
+#define SLOT_BTN_X (COL - 1)
+
 typedef struct
 {
     int slot_y[TD_BT_SLOTS];   /* three text rows, then the button row */
@@ -424,24 +428,32 @@ static void on_cancel(td_widget_t *w, void *user)
 
 /* ---- drawing ------------------------------------------------------------- */
 
+/* A labelled line, or -- with no heading -- a detail line under one.
+ *
+ * Detail lines start at column 1, not at COL. Indenting them to the value
+ * column spent 11 of a 40-column window's columns on nothing, which is why a
+ * paired device's name and address were cut mid-string. */
 static void row(int y, int w, const char *heading, const char *value, uint8_t fg)
 {
     const td_theme_t *t = td_theme();
+    int x = heading != NULL ? COL : 1;
+
     if (heading != NULL)
     {
         td_text(1, y, heading, t->win_fg, t->win_bg, TD_BOLD);
     }
-    td_textn(COL, y, value, w - COL - 1, fg, t->win_bg, 0);
+    td_textn(x, y, value, w - x - 1, fg, t->win_bg, 0);
 }
 
 static void draw_slot(int y, int w, int i)
 {
     const td_theme_t *t = td_theme();
     const td_bt_slot_t *s = &s_info.slot[i];
-    /* A narrow window has about 28 columns for a value; two of these lines are
-     * longer than that, and the part that gets cut is the part worth reading.
-     * So the trailing detail is dropped when there is no room for it rather
-     * than being truncated mid-address. */
+    /* A narrow window has about 28 columns for a value and 8 more for a
+     * detail line. Two of these lines are longer than that and the part that
+     * gets cut is the part worth reading, so the address is dropped when there
+     * is no room for it rather than being truncated mid-octet -- the state and
+     * the device's name are what identify it, and a name this long is unique. */
     bool narrow = w < 50;
     char line[128];
     char addr[18];
@@ -449,12 +461,25 @@ static void draw_slot(int y, int w, int i)
     if (s->active)
     {
         format_addr(addr, sizeof(addr), s->addr);
-        int n = snprintf(line, sizeof(line), "%s, %s%s%s", s->state,
-                         s->name[0] ? s->name : "", s->name[0] ? " " : "", addr);
-        if (s->ready && !narrow && n > 0 && n < (int)sizeof(line))
+        if (!s->name[0])
         {
-            snprintf(line + n, sizeof(line) - (size_t)n, " (%s, %lu reports)",
-                     s->boot_protocol ? "boot" : "report", (unsigned long)s->reports);
+            snprintf(line, sizeof(line), "%s", s->state);
+        }
+        else if (narrow)
+        {
+            snprintf(line, sizeof(line), "%s, %s", s->state, s->name);
+        }
+        else
+        {
+            int n = snprintf(line, sizeof(line), "%s, %s %s", s->state,
+                             s->name, addr);
+
+            if (s->ready && n > 0 && n < (int)sizeof(line))
+            {
+                snprintf(line + n, sizeof(line) - (size_t)n, " (%s, %lu reports)",
+                         s->boot_protocol ? "boot" : "report",
+                         (unsigned long)s->reports);
+            }
         }
     }
     else
@@ -469,9 +494,8 @@ static void draw_slot(int y, int w, int i)
         if (narrow)
         {
             /* The On/Off button already says whether it reconnects. */
-            snprintf(line, sizeof(line), "paired: %s%s%s",
-                     s->paired_name[0] ? s->paired_name : "",
-                     s->paired_name[0] ? " " : "", addr);
+            snprintf(line, sizeof(line), "paired: %s",
+                     s->paired_name[0] ? s->paired_name : "yes");
         }
         else
         {
@@ -671,9 +695,14 @@ static void launch(void)
     for (int i = 0; i < TD_BT_SLOTS; i++)
     {
         const int y = s_lay.slot_y[i] + SLOT_ROWS - 1;
-        s_pair[i] = td_button(s_win, COL, y, "Pair...", on_pair, (void *)(intptr_t)i);
-        s_toggle[i] = td_button(s_win, COL + 12, y, "Off", on_toggle, (void *)(intptr_t)i);
-        s_forget[i] = td_button(s_win, COL + 20, y, "Forget", on_forget, (void *)(intptr_t)i);
+        /* A button is its caption plus 4 columns of border, so the three of
+         * them with one column between need 30 -- and starting at COL they
+         * ended at column 40 of a 40-column window, which cut the closing
+         * bracket off "[ Forget ]". Starting one column left ends the group at
+         * column 39, the last one there is. */
+        s_pair[i] = td_button(s_win, SLOT_BTN_X, y, "Pair...", on_pair, (void *)(intptr_t)i);
+        s_toggle[i] = td_button(s_win, SLOT_BTN_X + 12, y, "Off", on_toggle, (void *)(intptr_t)i);
+        s_forget[i] = td_button(s_win, SLOT_BTN_X + 20, y, "Forget", on_forget, (void *)(intptr_t)i);
     }
     s_list = td_list(s_win, td_rect(0, s_lay.list_y, -1, s_lay.list_h), get_item, on_pick, NULL);
     s_scroll = td_scrollbar(s_win, -1, s_lay.list_y, s_lay.list_h, s_list);
