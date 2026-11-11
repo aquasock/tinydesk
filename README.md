@@ -138,6 +138,7 @@ cd tinydesk
 | Classic ESP32, 4 MB flash, no PSRAM | `cd ports/esp32-4mb && idf.py build && idf.py -p PORT -b 921600 flash` |
 | Elecrow CrowPanel 7.0, ESP-IDF 5.3.1 | `cd ports/crowpanel7 && idf.py build && idf.py -p PORT -b 921600 flash` |
 | Arduino Nano ESP32, ESP-IDF 5.3.1 | `cd ports/nanoesp32 && idf.py build && idf.py -p PORT flash` (read `ports/nanoesp32/README.md` first) |
+| LilyGo T-Watch Ultra (AMOLED + touch), ESP-IDF 5.3.1 | `cd ports/twatchultra && idf.py set-target esp32s3 && idf.py build && idf.py -p PORT flash` |
 
 Step-by-step instructions, terminal settings and troubleshooting are in the
 [getting started guide](docs/GETTING_STARTED.md).

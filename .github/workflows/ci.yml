@@ -118,7 +118,7 @@ jobs:
           idf.py set-target esp32c6
           idf.py build
           idf.py size
-      - name: Build the classic ESP32, ESP32-S3, CrowPanel and Nano ESP32 firmware
+      - name: Build the classic ESP32, ESP32-S3, CrowPanel, Nano ESP32 and T-Watch Ultra firmware
         shell: bash
         run: |
           . $IDF_PATH/export.sh
@@ -127,6 +127,7 @@ jobs:
           (cd ports/esp32s3 && idf.py set-target esp32s3 && idf.py build && idf.py size)
           (cd ports/crowpanel7 && idf.py set-target esp32s3 && idf.py build && idf.py size)
           (cd ports/nanoesp32 && idf.py set-target esp32s3 && idf.py build && idf.py size)
+          (cd ports/twatchultra && idf.py set-target esp32s3 && idf.py build && idf.py size)
       - name: Build the TinyDesk Shell firmware (ESP32-C6, ESP32, ESP32-S3)
         shell: bash
         run: |
