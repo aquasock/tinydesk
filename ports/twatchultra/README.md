@@ -111,6 +111,24 @@ expander register map and the CST9217 handshake come from the Escapement
 project's measured reference (`.ai/core-reference.md`, records BRD-003,
 BRD-004, LCD-003 and TCH-001..010). None of it is from a datasheet.
 
+### Subsystem status
+
+A port is the board, not the apps, so this is what the BOARD needs to make
+TinyDesk whole:
+
+| System | Status |
+| --- | --- |
+| Display (CO5300 QSPI) | **Works.** Verified on the glass: the sign-in screen renders, correctly positioned. |
+| Touch (CST9217) | Written against the hardware's measured protocol. **Not verified on the glass yet.** |
+| Keyboard (USB Serial/JTAG) | Works; it is the link, and the desktop is driven through it. |
+| `/fs` (littlefs, 9.9 MB) | Should work: `partitions.csv` defines it and the littlefs component is linked. Unverified. |
+| WiFi | ESP-IDF native on this SoC, so no port code. Unverified; needs credentials via `wificonnect`. |
+| OTA | `TD_UPDATE_BOARD="twatchultra"` so this image will not be replaced by a UART desktop's. No update feed exists for this board yet. |
+| SD card | Hardware **unproven on this board** (see `board.example.conf`). Opt-in and commented out. |
+| Battery / PMU | No TinyDesk UI consumes it. The AXP2101 is used only to raise ALDO2. |
+| RTC | TinyDesk has no RTC hook -- it takes time from SNTP. The PCF85063A is unused. |
+| Haptics | No TinyDesk integration. The DRV2605 is unused. |
+
 ### Known gaps
 
 No picture/Sixel support, no sound, no haptics, no PMU battery reporting. The
