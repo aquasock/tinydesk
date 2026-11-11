@@ -8,22 +8,31 @@
  * hardware by the Escapement project and is in its reference library as
  * TCH-001 to TCH-010; the short version:
  *
- *   * The part is at I2C 0x1A. Register 0x0000 reads 0xCA, the family
- *     checkcode, which is how it is told apart from the DRV2605 haptic driver
- *     at 0x5A that the vendor header wrongly also calls a CST92xx.
+ *   * The part is at I2C 0x1A and its bring-up is four attribute reads taken
+ *     in command mode, exactly as LilyGo's SensorLib does it: reset, write
+ *     0xD1 = 0x01, then read 0xD1FC (checkcode, 0xCACA____), 0xD1F8
+ *     (resolution), 0xD204 (chip type) and 0xD208 (firmware). Then 0xD1 =
+ *     0x09 into normal mode, where a read of 0x0002 returns 0x00 0x09.
  *
- *   * A reset part is in COMMAND mode and reports nothing. It must be put in
- *     normal mode: write 0xD1 = 0x01, then 0xD1 = 0x1E twice, read back
- *     0x0002 and require byte 1 to be 0x1E, then write 0xD1 = 0x09.
+ *     There is NO 0xD1 = 0x1E unlock step. This file previously had one --
+ *     write 0xD1 = 0x01, then 0xD1 = 0x1E twice, and require 0x1E in byte 1
+ *     of 0x0002 -- and that sequence is retracted: the 0x1E writes live in
+ *     SensorLib's setMode(), whose only caller is sleep(), and a working part
+ *     reads back 0x00 0x09, not 0x1E. Requiring 0x1E made this driver refuse
+ *     a healthy controller, which is why touch never worked. See TCH-007 and
+ *     the 2026-11-10 revision note under TCH-002.
  *
  *   * The report block at 0xD000 is 15 bytes and the whole block must be read
- *     even though only the first seven are decoded. A short read leaves the
- *     controller's acknowledge mid-block, and the symptom is a touch that
- *     works once and then freezes until the next full read -- TCH-003.
+ *     even though only the first seven are decoded. **Every read must be
+ *     acknowledged with a separate write of 0xD000 = 0xAB**: without it the
+ *     controller's buffer never advances, the same block comes back for ever
+ *     and a release is never seen (TCH-003, TCH-008).
  *
- *   * Byte 0 is 0x06 for a down event; 0xAB means "no new report". The
- *     controller emits NO release event, so a release has to be inferred from
- *     the finger count going to zero (TCH-008).
+ *   * A block is a press only if byte 6 is 0xAB, byte 5's low seven bits give
+ *     a finger count of 1 or 2, and bits 3:0 of byte 0 are 0x06. Event 0x00
+ *     with a non-zero count is not a touch -- accepting it invents a phantom
+ *     press at a stale position (TCH-008). The controller emits no release
+ *     event, so a release is inferred from a gap in reports.
  *
  *   * Coordinates: x = (b1 << 4) | (b3 >> 4), y = (b2 << 4) | (b3 & 0x0F),
  *     already in panel coordinates -- no swap, no scale (TCH-006).
@@ -63,7 +72,24 @@
 #define REPORT_ADDR     0xD000
 #define REPORT_LEN      15
 #define EVENT_DOWN      0x06
-#define NO_REPORT       0xAB
+#define ACK_BYTE        0xAB
+#define MAX_FINGERS     2
+
+/* Command mode entry, the attribute registers it unlocks, and normal mode.
+ * The attribute registers are only readable in command mode (TCH-007). */
+#define REG_CMD         0xD1
+#define CMD_MODE        0x01
+#define NORMAL_MODE     0x09
+#define REG_CHECKCODE   0xD1FC
+#define REG_RESOLUTION  0xD1F8
+#define REG_CHIPTYPE    0xD204
+#define REG_FWVERSION   0xD208
+#define REG_PROBE_MODE  0x0002
+
+#define CHECKCODE_MASK  0xFFFF0000u
+#define CHECKCODE_ID    0xCACA0000u
+#define CHIP_9217       0x9217
+#define CHIP_9220       0x9220
 
 #define POLL_MS         15
 /* A pressed finger that stops reporting is treated as released after this,
@@ -76,6 +102,26 @@ static touch_input_fn s_input;
 static bool s_down;
 static int s_last_x = -1, s_last_y = -1;
 static int s_idle_ms;
+
+/* Diagnostics. Touch is the one subsystem that so far failed with no evidence
+ * at all: bring_up() succeeding and then no report ever arriving looks exactly
+ * the same from the desktop's side as a panel that never came out of reset.
+ * So the first blocks the controller returns are logged verbatim, then only
+ * the transitions, then a periodic count -- the Log Viewer is a 64-line ring
+ * and a 15 ms poll would bury everything else in it. */
+static uint32_t s_reads;
+static uint32_t s_reports;
+static int s_logged_blocks;
+static int s_logged_events;
+
+static void log_block(const char *what, const uint8_t *b)
+{
+    ESP_LOGI(TAG, "%s: %02x %02x %02x %02x %02x %02x %02x %02x "
+                  "%02x %02x %02x %02x %02x %02x %02x",
+             what,
+             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+             b[8], b[9], b[10], b[11], b[12], b[13], b[14]);
+}
 
 /* IDF 5.3 dropped the legacy driver/i2c.h: only the new master API exists. */
 static esp_err_t wr(uint16_t reg, uint8_t v)
@@ -90,32 +136,91 @@ static esp_err_t rd(uint16_t reg, uint8_t *buf, size_t n)
     return i2c_master_transmit_receive(s_dev, a, sizeof(a), buf, n, 100);
 }
 
-/* The unlock handshake. Returns false if the part is not there or will not
- * come out of command mode. */
+/* The bring-up LilyGo's SensorLib performs, in the same order and with the
+ * same checks (TCH-007). Returns false if the part is not there, is the wrong
+ * part, or has no firmware -- all of which accept writes and then never report,
+ * so continuing hopefully would only turn into a phantom-input bug later. */
 static bool bring_up(void)
 {
-    uint8_t id = 0, v = 0;
+    uint8_t b[8] = { 0 };
+    uint32_t checkcode, fw;
+    uint16_t chiptype, max_x, max_y;
 
-    if (rd(0x0000, &id, 1) != ESP_OK || id != 0xCA)
+    /* Command mode: the 0xD1xx attribute registers are unreadable outside it. */
+    if (wr(REG_CMD, CMD_MODE) != ESP_OK)
     {
-        ESP_LOGW(TAG, "no 0xCA checkcode at 0x%02X (read 0x%02X)",
-                 TOUCH_ADDR, id);
+        ESP_LOGW(TAG, "no answer at 0x%02X (command mode write failed)",
+                 TOUCH_ADDR);
+        return false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    if (rd(REG_CHECKCODE, b, 4) != ESP_OK)
+    {
+        ESP_LOGW(TAG, "0x%04X did not read", REG_CHECKCODE);
+        return false;
+    }
+    checkcode = (uint32_t)b[3] << 24 | (uint32_t)b[2] << 16 |
+                (uint32_t)b[1] << 8 | b[0];
+    if ((checkcode & CHECKCODE_MASK) != CHECKCODE_ID)
+    {
+        ESP_LOGW(TAG, "bad checkcode 0x%08lx at 0x%04X (want 0xcaca____)",
+                 (unsigned long)checkcode, REG_CHECKCODE);
         return false;
     }
 
-    wr(0xD1, 0x01);
-    vTaskDelay(pdMS_TO_TICKS(10));
-    wr(0xD1, 0x1E);
-    wr(0xD1, 0x1E);
-    vTaskDelay(pdMS_TO_TICKS(10));
-    rd(0x0002, &v, 1);
-    if (v != 0x1E)
+    if (rd(REG_RESOLUTION, b, 4) == ESP_OK)
     {
-        ESP_LOGW(TAG, "unlock did not take (0x0002 = 0x%02X)", v);
+        max_x = (uint16_t)(b[1] << 8 | b[0]);
+        max_y = (uint16_t)(b[3] << 8 | b[2]);
+    }
+    else
+    {
+        max_x = max_y = 0;
+    }
+
+    if (rd(REG_CHIPTYPE, b, 4) != ESP_OK)
+    {
+        ESP_LOGW(TAG, "0x%04X did not read", REG_CHIPTYPE);
         return false;
     }
-    wr(0xD1, 0x09);
+    chiptype = (uint16_t)(b[3] << 8 | b[2]);
+    if (chiptype != CHIP_9217 && chiptype != CHIP_9220)
+    {
+        ESP_LOGW(TAG, "unexpected chip type 0x%04X", chiptype);
+        return false;
+    }
+
+    if (rd(REG_FWVERSION, b, 8) != ESP_OK)
+    {
+        ESP_LOGW(TAG, "0x%04X did not read", REG_FWVERSION);
+        return false;
+    }
+    fw = (uint32_t)b[3] << 24 | (uint32_t)b[2] << 16 |
+         (uint32_t)b[1] << 8 | b[0];
+    if (fw == 0xa5a5a5a5u)
+    {
+        ESP_LOGW(TAG, "no firmware in the controller");
+        return false;
+    }
+
+    /* Normal mode. A part left in command mode answers a report read with 15
+     * bytes of 0xFF, so this is a state change worth confirming rather than
+     * assuming. The readback is a check, not an unlock: 0x00 0x09 on a working
+     * part, never 0x1E. */
+    wr(REG_CMD, NORMAL_MODE);
     vTaskDelay(pdMS_TO_TICKS(10));
+    if (rd(REG_PROBE_MODE, b, 2) == ESP_OK && b[1] != NORMAL_MODE)
+        ESP_LOGW(TAG, "mode readback 0x%02x, expected 0x%02x",
+                 b[1], NORMAL_MODE);
+
+    ESP_LOGI(TAG, "CST%04x at 0x%02X, %ux%u, fw 0x%08lx",
+             chiptype, TOUCH_ADDR, max_x, max_y, (unsigned long)fw);
+
+    if (max_x != DISPLAY_W || max_y != DISPLAY_H)
+        ESP_LOGW(TAG, "controller reports %ux%u, panel window is %dx%d",
+                 max_x, max_y, DISPLAY_W, DISPLAY_H);
+
     return true;
 }
 
@@ -158,6 +263,8 @@ static void poll_task(void *arg)
 
     for (;;)
     {
+        bool press;
+
         vTaskDelay(pdMS_TO_TICKS(POLL_MS));
 
         /*
@@ -167,13 +274,54 @@ static void poll_task(void *arg)
          */
         if (rd(REPORT_ADDR, b, REPORT_LEN) != ESP_OK)
             continue;
-        if (b[0] == NO_REPORT)
+
+        /*
+         * Acknowledge the block with a separate write. The controller's buffer
+         * does not advance until it has this, so without it every read returns
+         * the same block for ever and a release is never seen (TCH-008). It is
+         * sent whether or not the block turns out to be a press, because the
+         * buffer has to be advanced either way -- the same reason the read is
+         * the full 15 bytes.
+         */
+        wr(REPORT_ADDR, ACK_BYTE);
+
+        s_reads++;
+        if (s_logged_blocks < 3)
         {
-            /*
-             * No new report. If a finger was down it may simply have lifted:
-             * this controller sends no release event, so a held press that
-             * stops reporting is a release.
-             */
+            log_block("first blocks", b);
+            s_logged_blocks++;
+        }
+        else if (s_reads % 300 == 0)
+        {
+            ESP_LOGI(TAG, "%lu reads, %lu reports, down=%d",
+                     (unsigned long)s_reads, (unsigned long)s_reports,
+                     s_down ? 1 : 0);
+        }
+
+        /* A block carries a press only if byte 6 has the validity marker, the
+         * finger count in byte 5's low seven bits is 1 or 2, and the event
+         * nibble of byte 0 is 0x06. A non-zero count with event 0x00 is not a
+         * touch: taking it for one invents a phantom press at a stale
+         * position (TCH-008). Byte 0 is 0xAB on an acknowledged read and 0x00
+         * when the part handed nothing over. */
+        press = false;
+        if (b[0] != ACK_BYTE && b[0] != 0x00)
+        {
+            int fingers = b[5] & 0x7F;
+
+            press = b[6] == ACK_BYTE && fingers > 0 &&
+                    fingers <= MAX_FINGERS && (b[0] & 0x0F) == EVENT_DOWN;
+            if (press && s_logged_events < 5)
+            {
+                log_block("press", b);
+                s_logged_events++;
+            }
+        }
+
+        if (!press)
+        {
+            /* This part has no release event: a lifted finger simply stops
+             * being reported, so a held press that goes quiet is a release. */
             if (s_down && ++s_idle_ms >= (RELEASE_MS / POLL_MS))
             {
                 int col, row;
@@ -187,16 +335,12 @@ static void poll_task(void *arg)
         }
 
         s_idle_ms = 0;
+        s_reports++;
 
-        if (b[0] == EVENT_DOWN)
         {
-            int fingers = b[5] & 0x7F;
             int x = (b[1] << 4) | (b[3] >> 4);
             int y = (b[2] << 4) | (b[3] & 0x0F);
             int col, row;
-
-            if (fingers == 0)
-                continue;
 
             to_cell(x, y, &col, &row);
             s_last_x = x;
@@ -247,7 +391,10 @@ bool touch_init(touch_input_fn input)
 
     s_input = input;
     if (!bring_up())
+    {
+        ESP_LOGW(TAG, "touch not started: the controller did not come up");
         return false;
+    }
 
     if (xTaskCreatePinnedToCore(poll_task, "tdtouch", 3072, NULL, 3,
                                 NULL, 0) != pdPASS)

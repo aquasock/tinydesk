@@ -119,7 +119,7 @@ TinyDesk whole:
 | System | Status |
 | --- | --- |
 | Display (CO5300 QSPI) | **Works.** Verified on the glass: the sign-in screen renders, correctly positioned. |
-| Touch (CST9217) | Written against the hardware's measured protocol. **Not verified on the glass yet.** |
+| Touch (CST9217) | Bring-up rewritten to LilyGo's own `getAttribute()` sequence and the report/acknowledge protocol measured on this board. **Not verified on the glass yet.** |
 | Keyboard (USB Serial/JTAG) | Works; it is the link, and the desktop is driven through it. |
 | `/fs` (littlefs, 9.9 MB) | Should work: `partitions.csv` defines it and the littlefs component is linked. Unverified. |
 | WiFi | ESP-IDF native on this SoC, so no port code. Unverified; needs credentials via `wificonnect`. |
@@ -131,6 +131,24 @@ TinyDesk whole:
 
 ### Known gaps
 
-No picture/Sixel support, no sound, no haptics, no PMU battery reporting. The
-desktop polls the terminal size once a second by design (`TD_SIZE_POLL_MS`),
-which looks alarming on a serial capture and is not a fault.
+No picture/Sixel support, no sound, no haptics, no PMU battery reporting.
+
+**The desktop's terminal-size poll is turned off for this port**
+(`TD_SIZE_POLL_MS=0`). It exists upstream because a serial terminal cannot
+report a resize; this panel's grid is fixed at build time, so there is nothing
+to discover. It was not free here: the query parks the cursor in the
+bottom-right corner to measure the terminal, and the cells it touched marked
+rows at the top and the bottom of the screen changed, so the frame's dirty
+region reached from row 0 to row 24 and repainted the whole panel once a
+second. Turning it off needs a definition in the `tinydesk` component, which is
+not this port's to edit, so it is set from `main/project_include.cmake` — the
+one point ESP-IDF evaluates before components are registered. Setting it at
+project scope in the top-level `CMakeLists.txt` does not work and the port
+carried that mistake for a while: the definition reached 19 translation units
+and not `src/td.c`, the one that reads it.
+
+`TD_ACK_TIMEOUT_MS=0` is set the same way. Frame pacing exists so a slow remote
+terminal never has two frames queued; here the terminal is this board's own
+`td_vterm`, which answers `ESC[5n` and whose reply is fed back as desktop
+input, so pacing was answered every time and never switched itself off — one
+query, one flush and one reply per frame, controlling nothing.

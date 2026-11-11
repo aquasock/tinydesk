@@ -210,8 +210,10 @@ void board_dump_expander(void)
              in0, in1, out0, out1, cfg0, cfg1);
 }
 
-/* Configure one linear expander pin as an output and drive it high. */
-static bool xl_pin_high(int linear)
+/* Configure one linear expander pin as an output and drive it to `level`.
+ * The configuration bit must be cleared first: a set bit means INPUT, and an
+ * output register written while the pin is still an input changes nothing. */
+static bool xl_pin_set(int linear, bool level)
 {
     int port = linear / 8;
     int bit = linear % 8;
@@ -225,23 +227,46 @@ static bool xl_pin_high(int linear)
     if (cfg & (1u << bit))
         if (!reg_write(cfg_reg, (uint8_t)(cfg & ~(1u << bit))))
             return false;
-    if (!(out & (1u << bit)))
-        if (!reg_write(out_reg, (uint8_t)(out | (1u << bit))))
-            return false;
+
+    uint8_t want = level ? (uint8_t)(out | (1u << bit))
+                         : (uint8_t)(out & ~(1u << bit));
+
+    if (want != out && !reg_write(out_reg, want))
+        return false;
     return true;
 }
 
-/* Release the touch controller's reset line. See TOUCH_RST_LINEAR_* above. */
+static bool xl_pin_high(int linear)
+{
+    return xl_pin_set(linear, true);
+}
+
+/* Pulse the touch controller's reset line, then release it.
+ *
+ * A level is not a pulse. The measured driver asserts the line (active low)
+ * for 20 ms and then releases it for 60 ms before the first I2C transfer, and
+ * on a cold boot the expander has every pin configured as an input, so the
+ * line's state before this runs is the board's pull-up and not something this
+ * code chose. Pulsing makes the starting state irrelevant.
+ *
+ * Two expander pins are driven because two sources disagree on which one the
+ * panel's reset is -- see TOUCH_RST_LINEAR_A/B. Driving the wrong one costs
+ * nothing: it is an unused pin. */
 bool board_touch_reset_release(void)
 {
-    bool a = xl_pin_high(TOUCH_RST_LINEAR_A);
-    bool b = xl_pin_high(TOUCH_RST_LINEAR_B);
+    bool a_ok = xl_pin_set(TOUCH_RST_LINEAR_A, false);
+    bool b_ok = xl_pin_set(TOUCH_RST_LINEAR_B, false);
+
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    a_ok = xl_pin_high(TOUCH_RST_LINEAR_A) && a_ok;
+    b_ok = xl_pin_high(TOUCH_RST_LINEAR_B) && b_ok;
 
     ESP_LOGI(TAG, "touch reset: linear %d %s, linear %d %s",
-             TOUCH_RST_LINEAR_A, a ? "ok" : "FAILED",
-             TOUCH_RST_LINEAR_B, b ? "ok" : "FAILED");
-    vTaskDelay(pdMS_TO_TICKS(30));
-    return a || b;
+             TOUCH_RST_LINEAR_A, a_ok ? "ok" : "FAILED",
+             TOUCH_RST_LINEAR_B, b_ok ? "ok" : "FAILED");
+    vTaskDelay(pdMS_TO_TICKS(60));
+    return a_ok || b_ok;
 }
 
 bool board_display_power_on(void)

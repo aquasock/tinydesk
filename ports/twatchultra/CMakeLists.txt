@@ -38,16 +38,15 @@ endif()
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(tinydesk)
 
-# No terminal-size polling, project-wide (not just in main): td.c lives in the
-# `tinydesk` component, so a definition set on the port's own component would
-# never reach it. The desktop asks the terminal for its size once a second
-# because a serial terminal can never report a resize -- but this panel's
-# geometry is fixed at build time, so there is nothing to discover, and the
-# question is not free: the query jumps the cursor to the bottom-right corner
-# to measure it, and the cells that touches repaint. On a 40x25 grid that
-# showed up as a full-screen flash once a second on the panel and on the USB
-# mirror.
-add_compile_definitions(TD_SIZE_POLL_MS=0)
+# No terminal-size polling (TD_SIZE_POLL_MS=0, see main/project_include.cmake).
+#
+# It is NOT set here. td.c lives in the shared `tinydesk` component, and
+# `add_compile_definitions` at this point in the file comes after ESP-IDF has
+# registered the components, so the definition only reaches the components
+# added afterwards -- this port's `main`, and not `tinydesk`. That was the
+# first attempt and it did not work; the define reached 19 translation units
+# and not the one that reads it. main/project_include.cmake is the place the
+# build system guarantees is evaluated first.
 
 # Fresh build date and time in every firmware image.
 include("${TD_ROOT}/ports/common/app_desc_stamp.cmake")

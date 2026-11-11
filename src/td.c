@@ -685,7 +685,14 @@ static void watch(term_t *t, uint32_t now)
                 t->redraw_pending = true;
         }
     }
-    else if (TD_SIZE_POLL_MS > 0 && now - t->last_size_query_ms >= TD_SIZE_POLL_MS && !td_input_pasting(&t->input))
+#if TD_SIZE_POLL_MS > 0
+    /* Compile-time switch, like TD_ACK_TIMEOUT_MS above: a port whose panel has
+     * a fixed grid can set TD_SIZE_POLL_MS to 0 to turn the poll off, and with
+     * the test written as a run-time `else if (TD_SIZE_POLL_MS > 0 && ...)` that
+     * configuration does not compile at all -- the second comparison becomes
+     * `unsigned >= 0`, which -Werror=type-limits rejects. Left out entirely this
+     * way, the disabled build carries no dead branch either. */
+    else if (now - t->last_size_query_ms >= TD_SIZE_POLL_MS && !td_input_pasting(&t->input))
     {
          /* Terminals do not report resizes over a serial line; ask. Not
          * during a paste: the reply would arrive in the middle of it (the
@@ -695,6 +702,7 @@ static void watch(term_t *t, uint32_t now)
         td_render_flush(&t->renderer);
         t->last_size_query_ms = now;
     }
+#endif
 }
 
   /* Whether terminal t takes a frame now, after its pending resync / repaint

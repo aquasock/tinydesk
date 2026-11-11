@@ -369,13 +369,26 @@ static void paint_task(void *arg)
 
     for (;;)
     {
-        int lo = DISPLAY_H, hi = 0;
+        /* The rows that changed, flushed as contiguous runs.
+         *
+         * The previous version kept one span from the topmost changed row to
+         * the bottommost and pushed that. It repaints far more than it needs
+         * to when two changes are far apart -- one cell at the top of the
+         * screen and one at the bottom made the span the whole panel, which is
+         * what the once-a-second terminal-size query did: it parks the cursor
+         * in the bottom-right corner to measure the terminal, so the cursor
+         * cell near the top and the cell it touched at the bottom stretched
+         * the span over all 400 rows. A run per contiguous block of rows means
+         * a screen that changed in two places costs two bands, not a frame. */
+        int run_lo = -1, run_hi = -1;
 
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
         xSemaphoreTake(s_lock, portMAX_DELAY);
         for (int r = 0; r < s_rows; r++)
         {
+            bool row_changed = false;
+
             for (int c = 0; c < s_cols; c++)
             {
                 td_vcell_t want;
@@ -389,14 +402,23 @@ static void paint_task(void *arg)
                     continue;
                 paint_cell(c, r, want, cur);
                 *have = want;
-                if (r * CELL_H < lo)
-                    lo = r * CELL_H;
-                if ((r + 1) * CELL_H > hi)
-                    hi = (r + 1) * CELL_H;
+                row_changed = true;
+            }
+
+            if (row_changed)
+            {
+                if (run_lo < 0)
+                    run_lo = r * CELL_H;
+                run_hi = (r + 1) * CELL_H;
+            }
+            else if (run_lo >= 0)
+            {
+                flush_rows(run_lo, run_hi);
+                run_lo = -1;
             }
         }
-        if (hi > lo)
-            flush_rows(lo, hi);
+        if (run_lo >= 0)
+            flush_rows(run_lo, run_hi);
         s_vt->dirty = false;
         xSemaphoreGive(s_lock);
     }
