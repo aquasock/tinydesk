@@ -1223,7 +1223,10 @@ td_window_t *td_passwordbox(const char *title, const char *prompt,
 /* ----------------------------------------------------------- msgbox */
 
 #define MSGBOX_MAX   4
-#define MSGBOX_LINES 8
+/* After wrapping: the longest message in the tree is a paragraph of about four
+ * sentences, which is nine lines at 36 columns. Eight was enough when callers
+ * broke their own lines. */
+#define MSGBOX_LINES 12
 
 typedef struct
 {
@@ -1273,30 +1276,123 @@ td_window_t *td_msgbox(const char *title, const char *text, const char *buttons,
     if (!mb)
         return NULL;
 
-    /* Split the text into lines and measure. */
+    /*
+     * Split the text into lines and measure.
+     *
+     * WRAPPING. Callers give their text pre-broken into lines that suit a wide
+     * window -- several are over 60 columns -- and this used to take them at
+     * face value: the window was measured to fit the longest line and the
+     * window manager then clamped it to the screen, so on a 40-column board the
+     * text was simply cut off mid-word and nothing said so. (It read as
+     * "Forget the combo K06 BLE Keyboard? I".)
+     *
+     * So the text is re-wrapped to what the screen can show, and the window is
+     * measured from the result. A single newline in the caller's text is a soft
+     * break -- it was chosen for a wider window, not for meaning -- and becomes
+     * a space. A blank line is kept, because that is a real paragraph break.
+     *
+     * The source line is NOT copied into the per-line buffer before wrapping:
+     * that buffer is TD_TEXT_MAX and the longest sentence here is over 60
+     * columns, so doing that dropped the end of every long line and the wrap
+     * then faithfully wrapped what was left.
+     */
     char lines[MSGBOX_LINES][TD_TEXT_MAX];
     int nlines = 0, width = td_utf8_len(title ? title : "") + 10;
-    const char *p = text ? text : "";
-    while (nlines < MSGBOX_LINES)
+    int scr_cols = 80, scr_rows = 25;
+
+    td_wm_screen_size(&scr_cols, &scr_rows);
+    /* A window loses two columns to its frame, the labels sit one in from
+     * that, and one more keeps the text off the right border. */
+    int wrap = scr_cols - 4;
+
+    if (wrap < 8)
+        wrap = 8;
+
     {
-        const char *nl = strchr(p, '\n');
-        size_t len = nl ? (size_t)(nl - p) : strlen(p);
-        if (len >= TD_TEXT_MAX)
-            len = TD_TEXT_MAX - 1;
-        memcpy(lines[nlines], p, len);
-        lines[nlines][len] = '\0';
-        int cols = td_utf8_len(lines[nlines]);
-        if (cols + 4 > width)
-            width = cols + 4;
-        nlines++;
-        if (!nl)
-            break;
-        p = nl + 1;
+        /* One paragraph at a time, with its newlines already folded to
+         * spaces. */
+        char para[512];
+        const char *p = text ? text : "";
+
+        while (nlines < MSGBOX_LINES)
+        {
+            int plen = 0;
+            bool blank;
+
+            /* Collect up to a blank line or the end. */
+            while (*p && !(*p == '\n' && p[1] == '\n'))
+            {
+                if (plen < (int)sizeof(para) - 1)
+                    para[plen++] = (*p == '\n') ? ' ' : *p;
+                p++;
+            }
+            para[plen] = '\0';
+            blank = plen == 0;
+
+            /* Skip the blank line's newlines. */
+            if (*p == '\n')
+                p += (p[1] == '\n') ? 2 : 1;
+
+            if (blank)
+            {
+                if (*p == '\0' && nlines > 0)
+                    break;                  /* trailing blank line */
+                lines[nlines++][0] = '\0';
+                continue;
+            }
+
+            /* Wrap the paragraph at spaces; hard-break a word longer than the
+             * whole width. Bytes are copied whole, so a UTF-8 sequence is
+             * never split. */
+            char *q = para;
+            while (*q && nlines < MSGBOX_LINES)
+            {
+                int seen = 0, cut = 0, last_space = -1;
+
+                while (q[cut])
+                {
+                    if (q[cut] == ' ')
+                        last_space = cut;
+                    if ((q[cut] & 0xC0) != 0x80)   /* start of a character */
+                    {
+                        if (seen == wrap)
+                            break;
+                        seen++;
+                    }
+                    cut++;
+                }
+                int at = (q[cut] && last_space > 0) ? last_space : cut;
+                int n = at < TD_TEXT_MAX - 1 ? at : TD_TEXT_MAX - 1;
+
+                memcpy(lines[nlines], q, (size_t)n);
+                lines[nlines][n] = '\0';
+                {
+                    int cols = td_utf8_len(lines[nlines]);
+                    if (cols + 4 > width)
+                        width = cols + 4;
+                }
+                nlines++;
+                q += at;
+                while (*q == ' ')
+                    q++;
+            }
+
+            if (*p == '\0')
+                break;
+        }
     }
+
+    if (nlines == 0)
+    {
+        lines[0][0] = '\0';
+        nlines = 1;
+    }
+    if (width > scr_cols)
+        width = scr_cols;
 
     char names[4][TD_TEXT_MAX];
     int nbuttons = 0, buttons_w = 0;
-    p = buttons && *buttons ? buttons : "OK";
+    const char *p = buttons && *buttons ? buttons : "OK";
     while (nbuttons < 4)
     {
         const char *bar = strchr(p, '|');
@@ -1314,13 +1410,20 @@ td_window_t *td_msgbox(const char *title, const char *text, const char *buttons,
     if (buttons_w + 2 > width)
         width = buttons_w + 2;
 
+    /* The buttons are two rows below the last line; keep all of it on screen,
+     * because a modal whose buttons are off the bottom cannot be answered. */
+    int height = nlines + 5;
+    if (height > scr_rows)
+        height = scr_rows;
+
     td_window_desc_t d = {
         .title = title,
-        .rect = td_rect(-1, -1, width + 2, nlines + 5),
+        .rect = td_rect(-1, -1, width + 2, height),
         .flags = TD_WIN_MOVABLE | TD_WIN_CLOSABLE | TD_WIN_MODAL,
         .on_close = msgbox_close,
         .user = mb,
     };
+    fprintf(stderr, "DBG msgbox cols=%d rows=%d width=%d nlines=%d height=%d\n", scr_cols, scr_rows, width, nlines, height);
     td_window_t *win = td_win_create(&d);
     if (!win)
         return NULL;
