@@ -57,7 +57,6 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-
 #include "display.h"
 #include "power.h"
 #include "tinydesk/td_vterm.h"
@@ -91,7 +90,7 @@
 #define CHIP_9217       0x9217
 #define CHIP_9220       0x9220
 
-#define POLL_MS         15
+#define POLL_MS         20
 /* A pressed finger that stops reporting is treated as released after this,
  * because the controller never sends a release event of its own. */
 #define RELEASE_MS      250
@@ -106,27 +105,43 @@ static int s_idle_ms;
 /* Diagnostics. Touch is the one subsystem that so far failed with no evidence
  * at all: bring_up() succeeding and then no report ever arriving looks exactly
  * the same from the desktop's side as a panel that never came out of reset.
- * So the first blocks the controller returns are logged verbatim, then only
- * the transitions, then a periodic count -- the Log Viewer is a 64-line ring
- * and a 15 ms poll would bury everything else in it. */
+ * So the first blocks the controller returns are logged, then only a count --
+ * the Log Viewer is a 64-line ring and a 15 ms poll would bury everything else
+ * in it.
+ *
+ * COMPACT ON PURPOSE. The Log Viewer window is 40 columns and silently
+ * truncates anything longer, and that is how the checkcode fault stayed
+ * invisible across several builds. Six bytes, no spaces: the event/count bytes
+ * (0, 5, 6) and the three coordinate bytes are everything needed to tell a
+ * press from a phantom. */
 static uint32_t s_reads;
 static uint32_t s_reports;
 static int s_logged_blocks;
-static int s_logged_events;
 
 static void log_block(const char *what, const uint8_t *b)
 {
-    ESP_LOGI(TAG, "%s: %02x %02x %02x %02x %02x %02x %02x %02x "
-                  "%02x %02x %02x %02x %02x %02x %02x",
-             what,
-             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-             b[8], b[9], b[10], b[11], b[12], b[13], b[14]);
+    ESP_LOGI(TAG, "%s %02x%02x%02x%02x%02x%02x",
+             what, b[0], b[1], b[2], b[3], b[5], b[6]);
 }
 
-/* IDF 5.3 dropped the legacy driver/i2c.h: only the new master API exists. */
+/* IDF 5.3 dropped the legacy driver/i2c.h: only the new master API exists.
+ *
+ * TWO WRITE SHAPES, and they are not interchangeable. A command-mode entry is
+ * a two-byte write -- the register pair alone, 0xD1 0x01 -- exactly as the
+ * measured driver's cst92xx_write_cmd() does it. A register write that carries
+ * a value is three bytes: high, low, value. Sending the two-byte command as
+ * three (0x00 0xD1 0x01) addresses register 0x00D1 instead, which this part
+ * accepts and ignores, so command mode is never entered and the 0xD1FC read
+ * afterwards returns normal-mode content rather than the checkcode. */
 static esp_err_t wr(uint16_t reg, uint8_t v)
 {
     uint8_t b[3] = { (uint8_t)(reg >> 8), (uint8_t)reg, v };
+    return i2c_master_transmit(s_dev, b, sizeof(b), 100);
+}
+
+static esp_err_t cmd(uint8_t hi, uint8_t lo)
+{
+    uint8_t b[2] = { hi, lo };
     return i2c_master_transmit(s_dev, b, sizeof(b), 100);
 }
 
@@ -146,26 +161,28 @@ static bool bring_up(void)
     uint32_t checkcode, fw;
     uint16_t chiptype, max_x, max_y;
 
-    /* Command mode: the 0xD1xx attribute registers are unreadable outside it. */
-    if (wr(REG_CMD, CMD_MODE) != ESP_OK)
+    /* Command mode: the 0xD1xx attribute registers are unreadable outside it.
+     * Two bytes, not three -- see the note above cmd(). */
+    if (cmd(REG_CMD, CMD_MODE) != ESP_OK)
     {
-        ESP_LOGW(TAG, "no answer at 0x%02X (command mode write failed)",
-                 TOUCH_ADDR);
+        ESP_LOGW(TAG, "no answer at 0x%02X", TOUCH_ADDR);
         return false;
     }
     vTaskDelay(pdMS_TO_TICKS(10));
 
     if (rd(REG_CHECKCODE, b, 4) != ESP_OK)
     {
-        ESP_LOGW(TAG, "0x%04X did not read", REG_CHECKCODE);
+        ESP_LOGW(TAG, "0xD1FC did not read");
         return false;
     }
     checkcode = (uint32_t)b[3] << 24 | (uint32_t)b[2] << 16 |
                 (uint32_t)b[1] << 8 | b[0];
     if ((checkcode & CHECKCODE_MASK) != CHECKCODE_ID)
     {
-        ESP_LOGW(TAG, "bad checkcode 0x%08lx at 0x%04X (want 0xcaca____)",
-                 (unsigned long)checkcode, REG_CHECKCODE);
+        /* Compact: the Log Viewer is 40 columns and truncates anything wider,
+         * which is exactly how this fault stayed invisible. */
+        ESP_LOGW(TAG, "bad cc %02x%02x%02x%02x",
+                 b[3], b[2], b[1], b[0]);
         return false;
     }
 
@@ -181,19 +198,19 @@ static bool bring_up(void)
 
     if (rd(REG_CHIPTYPE, b, 4) != ESP_OK)
     {
-        ESP_LOGW(TAG, "0x%04X did not read", REG_CHIPTYPE);
+        ESP_LOGW(TAG, "0xD204 did not read");
         return false;
     }
     chiptype = (uint16_t)(b[3] << 8 | b[2]);
     if (chiptype != CHIP_9217 && chiptype != CHIP_9220)
     {
-        ESP_LOGW(TAG, "unexpected chip type 0x%04X", chiptype);
+        ESP_LOGW(TAG, "chip type %04x", chiptype);
         return false;
     }
 
     if (rd(REG_FWVERSION, b, 8) != ESP_OK)
     {
-        ESP_LOGW(TAG, "0x%04X did not read", REG_FWVERSION);
+        ESP_LOGW(TAG, "0xD208 did not read");
         return false;
     }
     fw = (uint32_t)b[3] << 24 | (uint32_t)b[2] << 16 |
@@ -208,18 +225,20 @@ static bool bring_up(void)
      * bytes of 0xFF, so this is a state change worth confirming rather than
      * assuming. The readback is a check, not an unlock: 0x00 0x09 on a working
      * part, never 0x1E. */
-    wr(REG_CMD, NORMAL_MODE);
+    cmd(REG_CMD, NORMAL_MODE);
     vTaskDelay(pdMS_TO_TICKS(10));
     if (rd(REG_PROBE_MODE, b, 2) == ESP_OK && b[1] != NORMAL_MODE)
-        ESP_LOGW(TAG, "mode readback 0x%02x, expected 0x%02x",
-                 b[1], NORMAL_MODE);
+        ESP_LOGW(TAG, "mode %02x want %02x", b[1], NORMAL_MODE);
 
-    ESP_LOGI(TAG, "CST%04x at 0x%02X, %ux%u, fw 0x%08lx",
-             chiptype, TOUCH_ADDR, max_x, max_y, (unsigned long)fw);
+    ESP_LOGI(TAG, "CST%04x %ux%u fw%08lx",
+             chiptype, max_x, max_y, (unsigned long)fw);
 
-    if (max_x != DISPLAY_W || max_y != DISPLAY_H)
-        ESP_LOGW(TAG, "controller reports %ux%u, panel window is %dx%d",
-                 max_x, max_y, DISPLAY_W, DISPLAY_H);
+    /* The controller reports the glass, 410x502, not the 320x400 rectangle the
+     * desktop draws into -- that is the expected answer (TCH-006), so this only
+     * speaks up if the part reports something else entirely, which would mean
+     * the attribute read or the part is not what this driver assumes. */
+    if (max_x != DISPLAY_PANEL_W || max_y != DISPLAY_PANEL_H)
+        ESP_LOGW(TAG, "res %ux%u want 410x502", max_x, max_y);
 
     return true;
 }
@@ -236,15 +255,29 @@ static void emit(bool press, int col, int row)
         s_input(buf, n);
 }
 
-/* Panel pixels to a terminal cell. The desktop's grid is the link's, not the
- * panel's, so the scale comes from the cell counts display_init reported. */
+/* Panel pixels to a terminal cell.
+ *
+ * The controller reports in glass coordinates over the whole 410x502 panel,
+ * but the desktop only occupies the 320x400 rectangle at (45,45). So the
+ * origin comes off first, and only then is the position divided by the cell
+ * size. Without that subtraction every touch lands 45 px down and right of
+ * where the finger is and the right-hand fifth of the screen is unreachable --
+ * the mapping was scaling the whole glass onto the desktop's grid.
+ *
+ * A touch below the framebuffer -- the three bars on the glass under the
+ * display -- clamps to the bottom row, which is the taskbar. That is where
+ * those bars belong: they are the Start button, the middle of the bar and the
+ * clock, and at 40 columns their centres come out at columns 0, 14 and 31 of
+ * the taskbar without any special case. */
 static void to_cell(int x, int y, int *col, int *row)
 {
     int cw = DISPLAY_W / display_cols();
     int ch = DISPLAY_H / display_rows();
+    int fx = x - DISPLAY_ORIGIN_X;
+    int fy = y - DISPLAY_ORIGIN_Y;
 
-    *col = x / cw;
-    *row = y / ch;
+    *col = fx / cw;
+    *row = fy / ch;
     if (*col < 0)
         *col = 0;
     if (*row < 0)
@@ -288,12 +321,12 @@ static void poll_task(void *arg)
         s_reads++;
         if (s_logged_blocks < 3)
         {
-            log_block("first blocks", b);
+            log_block("blk", b);
             s_logged_blocks++;
         }
         else if (s_reads % 300 == 0)
         {
-            ESP_LOGI(TAG, "%lu reads, %lu reports, down=%d",
+            ESP_LOGI(TAG, "%lu rd %lu rep d%d",
                      (unsigned long)s_reads, (unsigned long)s_reports,
                      s_down ? 1 : 0);
         }
@@ -311,11 +344,8 @@ static void poll_task(void *arg)
 
             press = b[6] == ACK_BYTE && fingers > 0 &&
                     fingers <= MAX_FINGERS && (b[0] & 0x0F) == EVENT_DOWN;
-            if (press && s_logged_events < 5)
-            {
-                log_block("press", b);
-                s_logged_events++;
-            }
+            if (press)
+                log_block("prs", b);
         }
 
         if (!press)
@@ -390,9 +420,19 @@ bool touch_init(touch_input_fn input)
     }
 
     s_input = input;
+
+    /* The controller NACKs every read taken while it has nothing to hand over,
+     * which at rest is most of them (TCH-003), and ESP-IDF's i2c.master logs
+     * each one at ERROR. That is normal idle behaviour for this part, not a
+     * fault, and left alone it fills the Log Viewer with three ERROR lines per
+     * poll -- several hundred a second at a 20 ms period -- burying the driver's
+     * own diagnostics and anything else the board wants to say. Failures of the
+     * reads that matter are reported by this driver instead. */
+    esp_log_level_set("i2c.master", ESP_LOG_NONE);
+
     if (!bring_up())
     {
-        ESP_LOGW(TAG, "touch not started: the controller did not come up");
+        ESP_LOGW(TAG, "not started");
         return false;
     }
 

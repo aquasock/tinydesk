@@ -29,6 +29,21 @@
 #define DISPLAY_MAX_ROWS  (DISPLAY_H / 16)   /* 25 */
 #define DISPLAY_MAX_CELLS (DISPLAY_MAX_COLS * DISPLAY_MAX_ROWS)
 
+/* Where the 320x400 framebuffer sits on the 410x502 glass. The panel is
+ * addressed in glass coordinates, so anything that converts between the two
+ * needs these: the display driver adds them when it writes a pixel, and the
+ * touch driver subtracts them to turn a reported touch into a cell. Without
+ * the subtraction every touch is 45 px off and scaled as though the desktop
+ * were the whole glass. */
+#define DISPLAY_ORIGIN_X  45        /* (410 - 320) / 2 */
+#define DISPLAY_ORIGIN_Y  45        /* (502 - 412) / 2, 400 tall from there */
+
+/* The glass itself. The touch controller reports the panel's own resolution,
+ * not the framebuffer's -- 410x502, measured (TCH-006) -- so this is what its
+ * attribute register is checked against. */
+#define DISPLAY_PANEL_W   410
+#define DISPLAY_PANEL_H   502
+
 /* The cells the panel shows (after display_init()). */
 int display_cols(void);
 int display_rows(void);

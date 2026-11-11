@@ -71,3 +71,29 @@ CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
 # FreeRTOS kernel code (non-ISR functions) in flash, which frees IRAM for the
 # QSPI panel driver and the rest of the firmware.
 CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y
+
+# --- Bluetooth LE keyboards and mice --------------------------------------
+# bt_hid.c (bt.enable = 1, set in board.example.conf) is the watch's input:
+# the panel is 320x400 of glass, which is too small to type on, so there is no
+# on-screen keyboard here and a Bluetooth keyboard and mouse do the work.
+# NimBLE as a central only -- it connects to devices, it never advertises --
+# with the same limits as ports/nanoesp32.
+#
+# The radio needs the memory the settings below put in PSRAM; a build without
+# CONFIG_BT_ENABLED still compiles (bt_hid.c has an empty stub) and simply
+# reports no Bluetooth, which is how this port shipped until now -- the
+# keyboard and mouse could not have worked.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
+# CONFIG_BT_NIMBLE_ROLE_PERIPHERAL is not set
+# CONFIG_BT_NIMBLE_ROLE_BROADCASTER is not set
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=3
+CONFIG_BT_NIMBLE_MAX_BONDS=6
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
+CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING=y
+# Its memory from PSRAM, which this board has 8 MB of.
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
+# Coexistence with Wi-Fi, which is how the desktop reaches telnet and OTA.
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y

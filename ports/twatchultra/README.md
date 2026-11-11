@@ -104,7 +104,6 @@ failed silently, so the failure modes are written down here.
    picture is shifted up and to the left.
 
 ### Everything here came from LilyGo or from the Escapement project
-
 The CO5300 framing and init table are transcribed from LilyGo's own firmware
 (LilyGoLib, `src/display/LilyGoDispInterface.cpp`). The panel geometry, the
 expander register map and the CST9217 handshake come from the Escapement
@@ -119,8 +118,9 @@ TinyDesk whole:
 | System | Status |
 | --- | --- |
 | Display (CO5300 QSPI) | **Works.** Verified on the glass: the sign-in screen renders, correctly positioned. |
-| Touch (CST9217) | Bring-up rewritten to LilyGo's own `getAttribute()` sequence and the report/acknowledge protocol measured on this board. **Not verified on the glass yet.** |
+| Touch (CST9217) | **Bring-up verified on hardware.** `CST9220 410x502`, then `CST9217 up at 0x1A`: the checkcode, chip type, resolution and firmware reads all pass and the poll task runs. A synthetic SGR click over the link opens the start menu, so the pointer path into the desktop works. **What is not yet verified is a finger on the glass.** |
 | Keyboard (USB Serial/JTAG) | Works; it is the link, and the desktop is driven through it. |
+| Bluetooth (NimBLE, `bt.enable = 1`) | **Enabled.** The Mouse, Keyboard and Bluetooth apps appear in the start menu, which only happens when the radio starts. **Pairing not yet tried.** |
 | `/fs` (littlefs, 9.9 MB) | Should work: `partitions.csv` defines it and the littlefs component is linked. Unverified. |
 | WiFi | ESP-IDF native on this SoC, so no port code. Unverified; needs credentials via `wificonnect`. |
 | OTA | `TD_UPDATE_BOARD="twatchultra"` so this image will not be replaced by a UART desktop's. No update feed exists for this board yet. |
@@ -132,6 +132,30 @@ TinyDesk whole:
 ### Known gaps
 
 No picture/Sixel support, no sound, no haptics, no PMU battery reporting.
+
+**Bluetooth is enabled for input.** The watch's input is a Bluetooth LE keyboard
+and mouse (`bt.enable = 1`, `CONFIG_BT_ENABLED=y` with NimBLE as a central):
+320x400 of glass is too small to type on, so there is no on-screen keyboard in
+the intended flow. Until this was turned on the image was built without
+Bluetooth at all, `bt_hid_start()` returned the empty stub, and the Mouse,
+Keyboard and Bluetooth apps were absent from the start menu — that absence is
+the quickest way to check the build.
+
+**Touch has two write shapes, and they are not interchangeable.** A command-mode
+entry is a two-byte write (`0xD1 0x01`); a register write carrying a value is
+three (`hi lo value`). Sending the two-byte command as three addresses register
+`0x00D1` instead, which the part accepts and ignores, so command mode is never
+entered and the `0xD1FC` checkcode read returns normal-mode content. That was
+the fault that kept touch from ever initialising.
+
+**The Log Viewer is 40 columns and truncates.** A diagnostic line longer than
+that is silently cut, which hid the checkcode fault across several builds. The
+touch driver's messages are deliberately short for that reason.
+
+**The touch controller NACKs at idle, by design.** Every read taken while it has
+nothing to hand over fails, and ESP-IDF's `i2c.master` logs each one at ERROR —
+three lines per poll, several hundred a second. That is normal for this part
+(TCH-003), not a fault, so the driver sets that tag's log level to none.
 
 **The desktop's terminal-size poll is turned off for this port**
 (`TD_SIZE_POLL_MS=0`). It exists upstream because a serial terminal cannot

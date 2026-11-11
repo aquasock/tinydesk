@@ -111,9 +111,11 @@
  * patches/kernel/display/final/co5300.c where the Linux driver uses the same
  * geometry.
  */
-#define PANEL_SAFE_INSET 45
-#define FB_X             45      /* (410 - 320) / 2 */
-#define FB_Y             45      /* (502 - 412) / 2, and 400 tall from there */
+#define PANEL_SAFE_INSET DISPLAY_ORIGIN_X
+/* Shared with touch.c through display.h, which is the only place that has to
+ * agree about where the framebuffer sits on the glass. */
+#define FB_X             DISPLAY_ORIGIN_X
+#define FB_Y             DISPLAY_ORIGIN_Y
 #define PANEL_COL_OFFSET 22      /* the controller's RAM starts 22 columns left */
 #define PIX_CHUNK   16384        /* pixels per SPI transaction, as LilyGo */
 

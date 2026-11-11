@@ -262,9 +262,10 @@ bool board_touch_reset_release(void)
     a_ok = xl_pin_high(TOUCH_RST_LINEAR_A) && a_ok;
     b_ok = xl_pin_high(TOUCH_RST_LINEAR_B) && b_ok;
 
-    ESP_LOGI(TAG, "touch reset: linear %d %s, linear %d %s",
-             TOUCH_RST_LINEAR_A, a_ok ? "ok" : "FAILED",
-             TOUCH_RST_LINEAR_B, b_ok ? "ok" : "FAILED");
+    /* Compact so the line fits the Log Viewer's 40 columns. */
+    ESP_LOGI(TAG, "rst %d=%d %d=%d",
+             TOUCH_RST_LINEAR_A, a_ok ? 1 : 0,
+             TOUCH_RST_LINEAR_B, b_ok ? 1 : 0);
     vTaskDelay(pdMS_TO_TICKS(60));
     return a_ok || b_ok;
 }
