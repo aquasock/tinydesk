@@ -335,14 +335,23 @@ static void on_ap(td_widget_t *w, void *user)
     static const char *const modes[3] = {"Off", "On", "On while there is no network"};
     for (int i = 0; i < 3; i++)
         s_ap_mode[i] = td_checkbox(s_ap_win, 1, i, modes[i], i == c.mode, on_ap_mode, (void *)(intptr_t)i);
-    td_label(s_ap_win, 1, 4, 0, "Name:");
-    s_ap_ssid = td_textbox(s_ap_win, 11, 4, 34, 32, NULL, NULL);
-    td_widget_set_text(s_ap_ssid, c.ssid);
-    td_label(s_ap_win, 1, 5, 0, "Password:");
-    s_ap_pass = td_textbox(s_ap_win, 11, 5, 34, 63, NULL, NULL);
+    /* The fields were a fixed 34 columns at x 11, which is right for a 56-wide
+     * dialog and six columns too wide for a 38-column client -- and this
+     * dialog is on a 40-column panel, where the window manager maximises it. */
+    {
+        int fw = td_win_client(s_ap_win).w - 11 - 2;
+
+        if (fw < 8)
+            fw = 8;
+        td_label(s_ap_win, 1, 4, 0, "Name:");
+        s_ap_ssid = td_textbox(s_ap_win, 11, 4, fw, 32, NULL, NULL);
+        td_widget_set_text(s_ap_ssid, c.ssid);
+        td_label(s_ap_win, 1, 5, 0, "Password:");
+        s_ap_pass = td_textbox(s_ap_win, 11, 5, fw, 63, NULL, NULL);
+    }
     td_textbox_set_buffer(s_ap_pass, s_ap_pass_buf, sizeof(s_ap_pass_buf));
     td_widget_set_text(s_ap_pass, c.password);
-    td_label(s_ap_win, 1, 7, 0, "Clients get 192.168.4.x; the board is 192.168.4.1.");
+    td_label(s_ap_win, 1, 7, 0, "Clients get 192.168.4.x, board .1");
     s_ap_msg = td_label(s_ap_win, 1, 8, 0, "");
     td_button(s_ap_win, 1, -1, "Save", on_ap_save, NULL);
     td_button(s_ap_win, 10, -1, "Cancel", on_ap_cancel, NULL);
@@ -383,37 +392,135 @@ static void launch(void)
     if (!s_win)
         return;
 
-    s_wifi = td_label(s_win, 1, 0, 0, "");
-    s_addr = td_label(s_win, 1, 1, 0, "");
-    s_eth = td_label(s_win, 1, 2, 0, "");
-    if (net()->telnet_enable)
+    /* TWO LAYOUTS, chosen from the width the window actually got.
+     *
+     * The wide one puts buttons at columns 30, 47 and 52 and assumes a 68
+     * column window. On a 40-column panel (38 usable columns inside the frame)
+     * everything past column 38 is off the glass, and the four bottom buttons
+     * alone need 43 columns with their full captions. A narrow window gets a
+     * stacked layout: one item per row, values that shorten, buttons at the
+     * right of their own row, and a short form of the bottom four.
+     *
+     * Same problem as the Bluetooth window, same answer: find out how much room
+     * there is and lay out for it, rather than asking for a size and hoping.
+     */
     {
-        s_telnet = td_checkbox(s_win, 1, 3, "Telnet desktop (port 23)", false, on_telnet, NULL);
-        if (td_sysinfo()->displays)
-            s_telnet_mode = td_button(s_win, 30, 3, "Displays...", on_telnet_mode, NULL);
-        s_peer = td_label(s_win, 47, 3, 0, "");
-    }
-    if (net()->server_status)
-    {
-        for (int i = 0; i < 2; i++)
+        int cw = td_win_client(s_win).w;
+        bool narrow = cw < 60;
+        int row;
+        /* A button is its caption plus four columns; keep values clear of it. */
+        int btn_x = cw - 10;            /* room for "Start", 9 wide */
+
+        s_wifi = td_label(s_win, 1, 0, 0, "");
+        s_addr = td_label(s_win, 1, 1, 0, "");
+        s_eth = td_label(s_win, 1, 2, 0, "");
+
+        if (net()->telnet_enable)
         {
-            s_srv_label[i] = td_label(s_win, 1, 4 + i, 50, "");
-            s_srv_button[i] = td_button(s_win, 52, 4 + i, "Start", on_server, (void *)(intptr_t)i);
+            s_telnet = td_checkbox(s_win, 1, 3,
+                                   narrow ? "Telnet desktop"
+                                          : "Telnet desktop (port 23)",
+                                   false, on_telnet, NULL);
+            if (td_sysinfo()->displays)
+            {
+                if (narrow)
+                {
+                    /* "Displays..." is 15 columns and cannot share the row with
+                     * the checkbox, so the shorter caption; the checkbox is 20
+                     * wide and this starts after it. */
+                    s_telnet_mode = td_button(s_win, 22, 3, "Display", on_telnet_mode, NULL);
+                }
+                else
+                {
+                    s_telnet_mode = td_button(s_win, 30, 3, "Displays...", on_telnet_mode, NULL);
+                }
+            }
+            if (narrow)
+            {
+                s_peer = td_label(s_win, 1, 4, 0, "");
+                row = 5;
+            }
+            else
+            {
+                s_peer = td_label(s_win, 47, 3, 0, "");
+                row = 4;
+            }
+        }
+        else
+        {
+            row = 4;
+        }
+
+        if (net()->server_status)
+        {
+            for (int i = 0; i < 2; i++)
+            {
+                /* Narrow: the label gets the room to the left of its button
+                 * rather than a fixed 50 columns, which does not exist. */
+                s_srv_label[i] = td_label(s_win, 1, row + i, narrow ? btn_x - 2 : 50, "");
+                s_srv_button[i] = td_button(s_win, narrow ? btn_x : 52, row + i,
+                                            "Start", on_server, (void *)(intptr_t)i);
+            }
+            row += 2;
+        }
+
+        if (net()->ap_get && net()->ap_set)
+        {
+            if (narrow)
+            {
+                /* Its own row for the button: 17 columns of "[ Access point... ]"
+                 * leaves nothing worth reading beside it on a 38-column row. */
+                s_ap = td_label(s_win, 1, row, 0, "");
+                td_button(s_win, 1, row + 1, "Access point...", on_ap, NULL);
+                row += 2;
+            }
+            else
+            {
+                s_ap = td_label(s_win, 1, row, 50, "");
+                td_button(s_win, 52, row, "Access point...", on_ap, NULL);
+                row++;
+            }
+        }
+
+        td_label(s_win, 1, row, 0, narrow ? "Wi-Fi networks"
+                                          : "Wi-Fi networks (double-click to connect)");
+
+        {
+            /* The height is RELATIVE (-2 rows below the client's bottom), not
+             * computed here: a negative height is resolved against the client
+             * at draw time, so the list follows the window when it is resized.
+             * Computing it from `ch` looked equivalent and was not -- the
+             * widgets kept the height they were given at launch, and the first
+             * resize pushed the list past the bottom of the client. The window
+             * manager's own tests caught it, which is the argument for them. */
+            int list_y = row + 1;
+
+            s_list = td_list(s_win, td_rect(0, list_y, -1, -2), get_item, on_activate, NULL);
+            td_scrollbar(s_win, -1, list_y, -2, s_list);
+        }
+
+        if (narrow)
+        {
+            /* Four captions do not fit one 38-column row; the short forms do
+             * (Scan 8, Join 8, Leave 9, Forget 10, one column between). The
+             * message takes the row above them instead of sharing it. */
+            /* A button is its caption plus 4 columns, so back to back with no
+             * gap: Scan 0..7, Join 8..15, Leave 16..24, Forget 25..34. */
+            s_msg = td_label(s_win, 1, -2, 0, "");
+            td_button(s_win, 0, -1, "Scan", on_scan, NULL);
+            td_button(s_win, 8, -1, "Join", on_connect, NULL);
+            td_button(s_win, 16, -1, "Leave", on_disconnect, NULL);
+            td_button(s_win, 25, -1, "Forget", on_forget, NULL);
+        }
+        else
+        {
+            s_msg = td_label(s_win, 1, -2, 0, "");
+            td_button(s_win, 0, -1, "Scan", on_scan, NULL);
+            td_button(s_win, 9, -1, "Connect", on_connect, NULL);
+            td_button(s_win, 21, -1, "Disconnect", on_disconnect, NULL);
+            td_button(s_win, 36, -1, "Forget", on_forget, NULL);
         }
     }
-    if (net()->ap_get && net()->ap_set)
-    {
-        s_ap = td_label(s_win, 1, 6, 50, "");
-        td_button(s_win, 52, 6, "Access point...", on_ap, NULL);
-    }
-    td_label(s_win, 1, 7, 0, "Wi-Fi networks (double-click to connect)");
-    s_list = td_list(s_win, td_rect(0, 8, -1, -2), get_item, on_activate, NULL);
-    td_scrollbar(s_win, -1, 8, -2, s_list);
-    s_msg = td_label(s_win, 1, -2, 0, "");
-    td_button(s_win, 0, -1, "Scan", on_scan, NULL);
-    td_button(s_win, 9, -1, "Connect", on_connect, NULL);
-    td_button(s_win, 21, -1, "Disconnect", on_disconnect, NULL);
-    td_button(s_win, 36, -1, "Forget", on_forget, NULL);
     td_widget_focus(s_list);
     update_status();
     start_scan();

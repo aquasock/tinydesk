@@ -1423,7 +1423,6 @@ td_window_t *td_msgbox(const char *title, const char *text, const char *buttons,
         .on_close = msgbox_close,
         .user = mb,
     };
-    fprintf(stderr, "DBG msgbox cols=%d rows=%d width=%d nlines=%d height=%d\n", scr_cols, scr_rows, width, nlines, height);
     td_window_t *win = td_win_create(&d);
     if (!win)
         return NULL;
