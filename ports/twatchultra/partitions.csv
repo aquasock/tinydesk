@@ -1,0 +1,15 @@
+# tinydesk on the LilyGo T-Watch Ultra (16 MB flash): two 3 MB OTA slots and
+# a 9.9 MB /fs, the same shape as ports/nanoesp32.
+#
+# NOTE: this table replaces the watch's stock layout. Read the flash out first
+# if it holds anything that cannot be regenerated -- on this board it does,
+# because the Escapement project keeps a Linux kernel, a rootfs and a home
+# partition in it. `esptool read_flash 0 0x1000000 backup.bin` beforehand.
+#
+# Name,     Type, SubType,  Offset,   Size,
+nvs,        data, nvs,      0x9000,   0x6000,
+phy_init,   data, phy,      0xF000,   0x1000,
+ota_0,      app,  ota_0,    0x10000,  0x300000,
+ota_1,      app,  ota_1,    0x310000, 0x300000,
+otadata,    data, ota,      0x610000, 0x2000,
+storage,    data, littlefs, 0x620000, 0x9E0000,
