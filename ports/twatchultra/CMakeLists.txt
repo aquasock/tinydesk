@@ -28,8 +28,7 @@ set(TD_VT_SCROLLBACK 50 CACHE STRING "terminal scrollback lines")
 
 list(APPEND EXTRA_COMPONENT_DIRS
     "${TDSH_SDK_ROOT}/ports/esp_idf/components"
-    "${TD_ROOT}/ports/esp_idf/components"
-    "${CMAKE_CURRENT_LIST_DIR}/components")
+    "${TD_ROOT}/ports/esp_idf/components")
 
 if(DEFINED ENV{TD_VERSION})
     set(PROJECT_VER "$ENV{TD_VERSION}")

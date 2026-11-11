@@ -76,8 +76,23 @@ all present on the board and none of them are needed to show a desktop.
 
 ## Status
 
-The port builds against the shared application and the two board drivers are
-written from the hardware's measured behaviour, but it has **not been flashed
-to a board yet**. The panel init sequence, the QSPI framing and the touch
-unlock handshake are the pieces most likely to need adjustment on first
-contact.
+**Builds clean** with ESP-IDF v5.3.1 on 2026-11-11: `tinydesk.bin` is
+2,327,472 bytes, 26% free in the 3 MB app slot, with no warnings from the
+port's own sources under `-Werror`.
+
+**Not yet flashed to a board.** The parts most likely to need adjustment on
+first contact, in order:
+
+1. **The QSPI framing in `display.c`.** No other ESP-IDF port here drives a
+   panel by hand, so the command/address/lane structure is derived rather than
+   copied from working code. `co5300_cmd()` sends the opcode with an 8-bit
+   command phase and no address phase, all on four lanes. If the panel stays
+   dark, that framing is the first thing to question -- and the second is
+   whether the CO5300 wants a 24-bit address carrying the parameter count, as
+   some QSPI controllers do.
+2. **`lcd.spi_mhz`.** 40 MHz is what the board's Linux driver settled on, but
+   the panel's own maximum is worth confirming before trusting it.
+3. **The touch unlock.** The handshake follows the hardware's measured
+   behaviour, so a failure here should be visible as a log line rather than a
+   dead panel: `bring_up()` logs the checkcode it read and the value that
+   failed the unlock.

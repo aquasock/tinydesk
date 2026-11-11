@@ -95,21 +95,18 @@ static void co5300_cmd(uint8_t op, const uint8_t *data, int len)
     spi_transaction_ext_t t = { 0 };
 
     spi_device_acquire_bus(s_spi, portMAX_DELAY);
-    t.base.flags = SPI_TRANS_MODE_QIO;
+    /* Everything on all four lanes: the CO5300's QSPI framing has no
+     * single-lane phase, and a burst that switches lane count mid-transfer
+     * costs a second CS edge, which the controller reads as end-of-command. */
+    t.base.flags = SPI_TRANS_MODE_QIO | SPI_TRANS_VARIABLE_CMD |
+                   SPI_TRANS_VARIABLE_ADDR;
     t.base.cmd = op;
-    t.base.length = 8 * len;
-    t.base.tx_buffer = data;
-    /* Command and address in QIO, data in QIO, so the whole burst stays on
-     * all four lanes. One command byte, one dummy "address" byte, then the
-     * payload -- which is the framing the CO5300 expects and what the Linux
-     * driver's spi-mem op encodes. */
-    t.address_bits = 8;
-    t.address = 0x00;
+    t.base.addr = 0;                  /* the CO5300 takes no address phase */
     t.command_bits = 8;
-    if (len)
-        spi_device_polling_transmit(s_spi, (spi_transaction_t *)&t);
-    else
-        spi_device_polling_transmit(s_spi, (spi_transaction_t *)&t);
+    t.address_bits = 0;
+    t.base.length = 8 * (size_t)len;
+    t.base.tx_buffer = len ? data : NULL;
+    spi_device_polling_transmit(s_spi, (spi_transaction_t *)&t);
     spi_device_release_bus(s_spi);
 }
 

@@ -44,7 +44,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "driver/i2c.h"
+#include "driver/i2c_master.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -54,7 +54,6 @@
 
 #define TAG "twatch-touch"
 
-#define TOUCH_I2C_PORT  I2C_NUM_0
 #define TOUCH_SDA       3
 #define TOUCH_SCL       2
 #define TOUCH_HZ        400000
@@ -70,23 +69,24 @@
  * because the controller never sends a release event of its own. */
 #define RELEASE_MS      250
 
+static i2c_master_bus_handle_t s_bus;
+static i2c_master_dev_handle_t s_dev;
 static touch_input_fn s_input;
 static bool s_down;
 static int s_last_x = -1, s_last_y = -1;
 static int s_idle_ms;
 
+/* IDF 5.3 dropped the legacy driver/i2c.h: only the new master API exists. */
 static esp_err_t wr(uint16_t reg, uint8_t v)
 {
     uint8_t b[3] = { (uint8_t)(reg >> 8), (uint8_t)reg, v };
-    return i2c_master_write_to_device(TOUCH_I2C_PORT, TOUCH_ADDR, b, 3,
-                                      100 / portTICK_PERIOD_MS);
+    return i2c_master_transmit(s_dev, b, sizeof(b), 100);
 }
 
 static esp_err_t rd(uint16_t reg, uint8_t *buf, size_t n)
 {
     uint8_t a[2] = { (uint8_t)(reg >> 8), (uint8_t)reg };
-    return i2c_master_write_read_device(TOUCH_I2C_PORT, TOUCH_ADDR, a, 2,
-                                        buf, n, 100 / portTICK_PERIOD_MS);
+    return i2c_master_transmit_receive(s_dev, a, sizeof(a), buf, n, 100);
 }
 
 /* The unlock handshake. Returns false if the part is not there or will not
@@ -224,19 +224,30 @@ static void poll_task(void *arg)
 
 bool touch_init(touch_input_fn input)
 {
-    i2c_config_t cfg = {
-        .mode = I2C_MODE_MASTER,
+    i2c_master_bus_config_t bus = {
+        .i2c_port = I2C_NUM_0,
         .sda_io_num = TOUCH_SDA,
         .scl_io_num = TOUCH_SCL,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = TOUCH_HZ,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    i2c_device_config_t dev = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = TOUCH_ADDR,
+        .scl_speed_hz = TOUCH_HZ,
     };
 
-    if (i2c_param_config(TOUCH_I2C_PORT, &cfg) != ESP_OK)
+    if (i2c_new_master_bus(&bus, &s_bus) != ESP_OK)
+    {
+        ESP_LOGE(TAG, "I2C bus did not start");
         return false;
-    if (i2c_driver_install(TOUCH_I2C_PORT, I2C_MODE_MASTER, 0, 0, 0) != ESP_OK)
+    }
+    if (i2c_master_bus_add_device(s_bus, &dev, &s_dev) != ESP_OK)
+    {
+        ESP_LOGE(TAG, "touch device did not register");
         return false;
+    }
 
     s_input = input;
     if (!bring_up())
