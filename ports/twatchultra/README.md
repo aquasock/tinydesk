@@ -129,6 +129,41 @@ TinyDesk whole:
 | RTC | TinyDesk has no RTC hook -- it takes time from SNTP. The PCF85063A is unused. |
 | Haptics | No TinyDesk integration. The DRV2605 is unused. |
 
+### What a partial update costs, and why it matters here
+
+The panel is write-only and has no scanout, so every frame the desktop draws
+has to be pushed over the bus. `main/display.c` keeps a full 320x400
+framebuffer, compares the terminal's cells against what is on the glass, and
+pushes only what changed -- as a **rectangle**, not a band.
+
+Getting that wrong is expensive and does not look like a rendering bug. The
+first version flushed contiguous runs of *rows* at full width. That is fine
+until something changes one column from top to bottom, which this desktop does
+on every pointer move: hovering repaints the whole icon column. 23 changed
+rows is a contiguous run, so the run was pushed as 320 pixels wide for a
+column that is 8 pixels wide -- **122,880 pixels, 96% of the framebuffer, per
+mouse move**. Measured on the board: 641 us average per flush in steady state,
+and a full-width run of that height cost about 16 ms, which is what "the touch
+lags" feels like.
+
+Tracking the column extent of each run turns that same move into 3,072 pixels,
+a 40x reduction, and the band height is now sized to the rectangle so the whole
+column goes out as one transaction rather than 24.
+
+Two related things are worth knowing before changing this file:
+
+- **The DMA source buffer is static and internal on purpose.** It started as a
+  PSRAM allocation, which makes every transfer read through the cache, and
+  moving it to a `MALLOC_CAP_INTERNAL|MALLOC_CAP_DMA` allocation made the port
+  boot to a dark screen: with the Bluetooth controller already holding its
+  share, that request can fail, and with `CONFIG_ESP_CONSOLE_NONE` the failure
+  has nowhere to be reported before the desktop link is up. It is a 10 KB
+  static array now, which cannot fail.
+
+- **Diagnostics are short deliberately.** The Log Viewer is 40 columns and
+truncates silently. A whole fault stayed invisible for several builds because
+the line reporting it was too long to read.
+
 ### Known gaps
 
 No picture/Sixel support, no sound, no haptics, no PMU battery reporting.

@@ -124,12 +124,27 @@ static SemaphoreHandle_t s_lock;
 static td_vterm_t *s_vt;
 static td_vcell_t *s_shown;
 static uint16_t *s_fb;
-static uint16_t *s_tx;
 static int s_cols, s_rows;
 static TaskHandle_t s_paint_task;
 static display_reply_fn s_reply;
 
 #define BAND_ROWS 16
+
+/*
+ * The SPI DMA source: one full-width band, byte-swapped and pushed.
+ *
+ * STATIC, in internal DRAM, and deliberately not allocated. It has to be
+ * internal -- DMA out of PSRAM goes through the cache and is markedly slower,
+ * and this buffer is read by the peripheral on every flush -- but asking the
+ * heap for MALLOC_CAP_INTERNAL|MALLOC_CAP_DMA after the Bluetooth controller
+ * has taken its share is a request that can simply fail, and it did: the port
+ * booted to a dark screen with no output, because with CONFIG_ESP_CONSOLE_NONE
+ * the failure has nowhere to be reported until the desktop link is up. A
+ * static array in this component is internal DRAM by construction (only
+ * libtinydesk, libtdsh and libmicropython are mapped to PSRAM by extram.lf),
+ * so it costs nothing to allocate and cannot fail. 10 KB of .bss.
+ */
+static uint16_t s_tx[DISPLAY_W * BAND_ROWS];
 
 /*
  * The full xterm 256-colour palette, converted to RGB565 once at init.
@@ -346,22 +361,55 @@ static void paint_cell(int col, int row, td_vcell_t c, bool cursor)
     }
 }
 
-static void flush_rows(int y0, int y1)
+/* Push one rectangle of the framebuffer to the panel.
+ *
+ * x0/x1 are pixel columns (x1 exclusive), y0/y1 pixel rows, all in framebuffer
+ * space. Pushing only the columns that changed is what makes a partial update
+ * cheap: a change confined to one 8-pixel icon column used to be pushed as a
+ * full 320-pixel band, forty times the bytes for nothing. A single mouse move
+ * repaints the whole icon column on this desktop, so that waste was 96% of the
+ * framebuffer per move -- which is the lag. */
+static void flush_rect(int x0, int y0, int x1, int y1)
 {
-    int y, x;
+    int w, y, band;
 
+    if (x0 < 0)
+        x0 = 0;
+    if (x1 > DISPLAY_W)
+        x1 = DISPLAY_W;
     if (y1 > DISPLAY_H)
         y1 = DISPLAY_H;
+    if (x0 >= x1)
+        return;
 
-    for (y = y0; y < y1; y += BAND_ROWS)
+    w = x1 - x0;
+
+    /* How many rows one transaction can carry: as many as fit in s_tx, which
+     * is a fixed size. A full-width band is 16 rows; an 8-pixel column is 640,
+     * so a single changed column goes out as ONE transaction instead of 24.
+     * That matters because each transaction re-programs the window registers
+     * (two QSPI writes) and takes the bus, so at narrow widths the per-call
+     * overhead dominated the pixel data. */
+    band = (int)(sizeof(s_tx) / sizeof(s_tx[0])) / w;
+    if (band < 1)
+        band = 1;
+
+    for (y = y0; y < y1; y += band)
     {
-        int rows = (y1 - y) > BAND_ROWS ? BAND_ROWS : (y1 - y);
-        const uint16_t *src = s_fb + (size_t)y * DISPLAY_W;
-        size_t n = (size_t)rows * DISPLAY_W;
+        int rows = (y1 - y) > band ? band : (y1 - y);
+        uint16_t *dst = s_tx;
+        int r;
 
-        for (x = 0; x < (int)n; x++)
-            s_tx[x] = swap16(src[x]);
-        push_pixels(0, y, DISPLAY_W, rows);
+        /* Only the columns in this rectangle are copied out, so the transfer
+         * is w wide rather than DISPLAY_W. */
+        for (r = 0; r < rows; r++)
+        {
+            const uint16_t *src = s_fb + (size_t)(y + r) * DISPLAY_W + x0;
+
+            for (int i = 0; i < w; i++)
+                *dst++ = swap16(src[i]);
+        }
+        push_pixels(x0, y, w, rows);
     }
 }
 
@@ -381,15 +429,22 @@ static void paint_task(void *arg)
          * in the bottom-right corner to measure the terminal, so the cursor
          * cell near the top and the cell it touched at the bottom stretched
          * the span over all 400 rows. A run per contiguous block of rows means
-         * a screen that changed in two places costs two bands, not a frame. */
-        int run_lo = -1, run_hi = -1;
+         * a screen that changed in two places costs two bands, not a frame.
+         *
+         * The column extent of each run is tracked too. Rows alone are not
+         * enough: this desktop repaints a whole column of icons on a single
+         * pointer move, which is one contiguous run of 23 rows but only 8
+         * pixels wide -- pushed as a full-width band that is 96 per cent of
+         * the framebuffer for a change that touches one column. */
+        int run_lo = -1, run_hi = -1;   /* pixel rows of the open run */
+        int run_x0 = 0, run_x1 = 0;     /* pixel columns of the open run */
 
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
         xSemaphoreTake(s_lock, portMAX_DELAY);
         for (int r = 0; r < s_rows; r++)
         {
-            bool row_changed = false;
+            int row_x0 = DISPLAY_W, row_x1 = 0;
 
             for (int c = 0; c < s_cols; c++)
             {
@@ -404,23 +459,41 @@ static void paint_task(void *arg)
                     continue;
                 paint_cell(c, r, want, cur);
                 *have = want;
-                row_changed = true;
+                if (c * CELL_W < row_x0)
+                    row_x0 = c * CELL_W;
+                if ((c + 1) * CELL_W > row_x1)
+                    row_x1 = (c + 1) * CELL_W;
             }
 
-            if (row_changed)
+            if (row_x1 > row_x0)
             {
-                if (run_lo < 0)
+                if (run_lo >= 0 && r * CELL_H == run_hi)
+                {
+                    /* Its first row follows the open run: extend. */
+                    if (row_x0 < run_x0)
+                        run_x0 = row_x0;
+                    if (row_x1 > run_x1)
+                        run_x1 = row_x1;
+                    run_hi = (r + 1) * CELL_H;
+                }
+                else
+                {
+                    if (run_lo >= 0)
+                        flush_rect(run_x0, run_lo, run_x1, run_hi);
                     run_lo = r * CELL_H;
-                run_hi = (r + 1) * CELL_H;
+                    run_hi = (r + 1) * CELL_H;
+                    run_x0 = row_x0;
+                    run_x1 = row_x1;
+                }
             }
             else if (run_lo >= 0)
             {
-                flush_rows(run_lo, run_hi);
+                flush_rect(run_x0, run_lo, run_x1, run_hi);
                 run_lo = -1;
             }
         }
         if (run_lo >= 0)
-            flush_rows(run_lo, run_hi);
+            flush_rect(run_x0, run_lo, run_x1, run_hi);
         s_vt->dirty = false;
         xSemaphoreGive(s_lock);
     }
@@ -488,11 +561,11 @@ bool display_init(display_reply_fn reply)
                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s_fb = heap_caps_malloc((size_t)DISPLAY_W * DISPLAY_H * 2,
                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    s_tx = heap_caps_malloc((size_t)DISPLAY_W * BAND_ROWS * 2,
-                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_vt || !s_shown || !s_fb || !s_tx)
+    if (!s_vt || !s_shown || !s_fb)
     {
-        ESP_LOGE(TAG, "no PSRAM for the terminal");
+        ESP_LOGE(TAG, "no PSRAM for the terminal (%u B vt, %u B fb)",
+                 (unsigned)sizeof(*s_vt),
+                 (unsigned)(DISPLAY_W * DISPLAY_H * 2));
         return false;
     }
 
@@ -511,7 +584,7 @@ bool display_init(display_reply_fn reply)
         for (int x = 0; x < DISPLAY_W; x++)
             s_fb[(size_t)y * DISPLAY_W + x] = c;
     }
-    flush_rows(0, DISPLAY_H);
+    flush_rect(0, 0, DISPLAY_W, DISPLAY_H);
     ESP_LOGI(TAG, "test pattern written: %dx%d", DISPLAY_W, DISPLAY_H);
 
     s_cols = DISPLAY_MAX_COLS;
