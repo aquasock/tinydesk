@@ -673,30 +673,62 @@ void td_datetime_open(void)
     if (!s_win)
         return;
 
-    s_zone_info = td_label(s_win, 1, 4, 64, "");
-    td_label(s_win, 1, 6, 0, "Time zone");
-    s_zone_btn = td_button(s_win, 12, 6, "", on_zone, NULL);
-
-    s_auto = NULL;
-    if (si->time_auto_get)
+    /*
+     * BUTTONS AT COLUMN 40 ON A 38-COLUMN CLIENT.
+     *
+     * "Sync now" and "Change..." both sit at column 40, and "12-hour" starts at
+     * 30 and is 11 wide, reaching 41. On a 40-column panel both buttons were off
+     * the glass -- so the clock could be configured but not actually set -- and
+     * the 12-hour option was half visible.
+     *
+     * A narrow window puts each of those on the row of the thing it acts on,
+     * at column 1, and shortens the caption that cannot fit.
+     */
     {
-        s_auto = td_checkbox(s_win, 1, 8, "Set time automatically", false, on_auto, NULL);
-        s_sync_btn = td_button(s_win, 40, 8, "Sync now", on_sync, NULL);
-    }
-    else
-    {
-        td_label(s_win, 1, 8, 0, "The time comes from the host computer.");
-    }
-    td_label(s_win, 1, 9, 0, "Set the date and time manually");
-    s_manual_btn = td_button(s_win, 40, 9, "Change...", on_manual, NULL);
+        int cw = td_win_client(s_win).w;
+        bool narrow = cw < 60;
 
-    s_show = td_checkbox(s_win, 1, 11, "Show time and date in the taskbar", true, on_show, NULL);
-    td_label(s_win, 1, 12, 0, "Time format");
-    s_h24 = td_checkbox(s_win, 16, 12, "24-hour", true, on_hours, (void *)(intptr_t)0);
-    s_h12 = td_checkbox(s_win, 30, 12, "12-hour", false, on_hours, (void *)(intptr_t)1);
-    td_label(s_win, 1, 13, 0, "Date format");
-    s_fmt_btn = td_button(s_win, 16, 13, "DD-MM-YYYY", on_format, NULL);
-    td_label(s_win, 1, 15, 0, td_session_has_right(TD_RIGHT_TIME) ? "Clock settings apply to the whole device." : "The time permission is required to set the clock; the rest is yours.");
+        s_zone_info = td_label(s_win, 1, 4, narrow ? cw - 2 : 64, "");
+        td_label(s_win, 1, 6, 0, "Time zone");
+        s_zone_btn = td_button(s_win, 12, 6, "", on_zone, NULL);
+
+        s_auto = NULL;
+        if (si->time_auto_get)
+        {
+            s_auto = td_checkbox(s_win, 1, 8, narrow ? "Set time automatically"
+                                                     : "Set time automatically",
+                                 false, on_auto, NULL);
+            s_sync_btn = td_button(s_win, narrow ? 1 : 40, narrow ? 9 : 8,
+                                   "Sync now", on_sync, NULL);
+        }
+        else
+        {
+            td_label(s_win, 1, 8, 0, narrow ? "The time comes from the host."
+                                            : "The time comes from the host computer.");
+        }
+        td_label(s_win, 1, narrow ? 10 : 9, 0,
+                 narrow ? "Set date and time" : "Set the date and time manually");
+        s_manual_btn = td_button(s_win, narrow ? 1 : 40, narrow ? 11 : 9,
+                                 "Change...", on_manual, NULL);
+
+        s_show = td_checkbox(s_win, 1, narrow ? 12 : 11,
+                             narrow ? "Show time in taskbar"
+                                    : "Show time and date in the taskbar",
+                             true, on_show, NULL);
+        td_label(s_win, 1, narrow ? 13 : 12, 0, "Time format");
+        s_h24 = td_checkbox(s_win, 16, narrow ? 13 : 12, "24-hour", true, on_hours,
+                            (void *)(intptr_t)0);
+        s_h12 = td_checkbox(s_win, narrow ? 1 : 30, narrow ? 14 : 12, "12-hour",
+                            false, on_hours, (void *)(intptr_t)1);
+        td_label(s_win, 1, narrow ? 15 : 13, 0, "Date format");
+        s_fmt_btn = td_button(s_win, 16, narrow ? 15 : 13, "DD-MM-YYYY", on_format, NULL);
+        td_label(s_win, 1, narrow ? 16 : 15, 0,
+                 td_session_has_right(TD_RIGHT_TIME)
+                     ? (narrow ? "Applies to the whole device."
+                               : "Clock settings apply to the whole device.")
+                     : (narrow ? "Needs the time permission."
+                               : "The time permission is required to set the clock; the rest is yours."));
+    }
 
     s_msg = td_label(s_win, 1, -2, 64, "");
     td_button(s_win, 1, -1, "Close", on_close_btn, NULL);

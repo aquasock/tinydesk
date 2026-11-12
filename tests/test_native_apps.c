@@ -226,19 +226,21 @@ static void check_controls(td_window_t *w, const char *app, bool audit)
                 CHECK(fits);
         }
 }
-/* Apps whose narrow layout is not done yet.
+/* Apps exempt from the 40x26 pass because their narrow layout is not done.
  *
- * The 40x26 pass exists because that is the T-Watch Ultra's grid, and it found
- * real faults the 80 and 100 column passes could not: Files put its Delete
- * button off a 38-column client, so the file manager could not delete a file,
- * and MQTT and Modbus resolved their lists to zero rows at their own minimum
- * size. Those are fixed.
+ * This list is EMPTY, and that is the point: every app now lays itself out for
+ * a 40-column client, and the pass below checks each one at this board's grid
+ * as a plain regression test.
  *
- * Every name here is a KNOWN DEFECT, not an exemption: each one still clips a
- * control on a narrow screen. Deleting a name from this list is how a fix is
- * proved, and the list should end up empty. */
+ * It was not empty for most of its life. It started with five names -- Settings,
+ * Recycle Bin, Remote Desktop, Software Update and Date & time -- each of which
+ * really did clip a control, and each was removed as it was fixed. Keeping it as
+ * a named list rather than an inline skip meant the remaining work was visible
+ * in the source and a fix could be recorded by deleting a line.
+ *
+ * If an app is ever added to this list again, it is a statement that the app is
+ * BROKEN on a narrow screen, not that it is acceptable. */
 static const char *const s_narrow_todo[] = {
-    "Date & time",
 };
 
 static bool narrow_todo(const char *name)
