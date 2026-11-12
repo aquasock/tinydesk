@@ -288,9 +288,20 @@ static void on_draw(td_window_t *win, int w, int h)
     (void)win;
     (void)h;
     const td_theme_t *t = td_theme();
-    td_text(0, 0, "Broker", t->win_fg, t->win_bg, 0);
-    td_text(0, 2, "Topic", t->win_fg, t->win_bg, 0);
-    td_text(0, 3, "Message", t->win_fg, t->win_bg, 0);
+    /*
+     * The labels are positioned for the wide form: "Broker" at row 0 where the
+     * field is, then Topic and Message under it. A narrow window has six rows of
+     * controls instead of four, and its own inline labels, so nothing is drawn
+     * over them -- except the status and subscription lines, which move below.
+     */
+    const bool narrow = w < 60;
+
+    if (!narrow)
+    {
+        td_text(0, 0, "Broker", t->win_fg, t->win_bg, 0);
+        td_text(0, 2, "Topic", t->win_fg, t->win_bg, 0);
+        td_text(0, 3, "Message", t->win_fg, t->win_bg, 0);
+    }
 
     td_mqtt_status_t st;
     td_mqtt_status(&st);
@@ -300,7 +311,8 @@ static void on_draw(td_window_t *win, int w, int h)
         snprintf(line, sizeof(line), "%s  (%u in, %u out)", st.text, (unsigned)st.rx, (unsigned)st.tx);
     else
         snprintf(line, sizeof(line), "%s", st.text);
-    td_textn(0, 1, line, 58, fg, t->win_bg, st.state == TD_MQTT_CONNECTED ? TD_BOLD : 0);
+    td_textn(0, narrow ? 7 : 1, line, narrow ? w : 58, fg, t->win_bg,
+             st.state == TD_MQTT_CONNECTED ? TD_BOLD : 0);
 
     /* Subscriptions, then the last action's outcome. */
     char subs[160] = "Subscribed: ";
@@ -314,11 +326,13 @@ static void on_draw(td_window_t *win, int w, int h)
     }
     if (!n)
         snprintf(subs, sizeof(subs), "Subscribed: nothing yet");
-    td_textn(0, 4, subs, w, t->win_fg, t->win_bg, 0);
+    td_textn(0, narrow ? 8 : 4, subs, w, t->win_fg, t->win_bg, 0);
     if (U->note[0])
-        td_textn(0, 5, U->note, w, t->accent, t->win_bg, 0);
+        td_textn(0, narrow ? 9 : 5, U->note, w, t->accent, t->win_bg, 0);
     else
-        td_textn(0, 5, "Time     Dir Topic  Message", w, t->dim, t->win_bg, 0);
+        td_textn(0, narrow ? 9 : 5,
+                 narrow ? "Time  Dir Topic" : "Time     Dir Topic  Message",
+                 w, t->dim, t->win_bg, 0);
 }
 
 static void on_close(td_window_t *win)
@@ -373,18 +387,79 @@ static void launch(void)
         return;
     }
 
-    s_broker = td_textbox(s_win, 8, 0, 34, TD_TEXT_MAX - 1, on_connect, NULL);
-    s_connect = td_button(s_win, 44, 0, "Connect", on_connect, NULL);
-    td_button(s_win, 59, 0, "Login...", on_login, NULL);
-    td_button(s_win, 59, 1, "Config...", on_config, NULL);
-    s_topic = td_textbox(s_win, 8, 2, 34, TD_TEXT_MAX - 1, on_topic_enter, NULL);
-    td_button(s_win, 44, 2, "Subscribe", on_subscribe, NULL);
-    td_button(s_win, 58, 2, "Unsubscribe", on_unsubscribe, NULL);
-    s_payload = td_textbox(s_win, 8, 3, 34, TD_TEXT_MAX - 1, on_payload_enter, NULL);
-    td_button(s_win, 44, 3, "Publish", on_publish, NULL);
-    s_retain = td_checkbox(s_win, 56, 3, "Retain", false, NULL, NULL);
-    s_list = td_list(s_win, td_rect(0, LIST_Y, -1, 0), get_item, NULL, NULL);
-    td_scrollbar(s_win, -1, LIST_Y, 0, s_list);
+    /*
+     * SEVEN CONTROLS WERE OFF THE GLASS.
+     *
+     * Upstream puts a 34-column text field at x 8 and its buttons to the right
+     * of it: Connect at 44, Login at 59, Config at 59, Subscribe at 44,
+     * Unsubscribe at 58, Publish at 44 and Retain at 56. On a 40-column panel
+     * the client is 38 wide, so every one of those buttons was invisible and
+     * unreachable -- the window still looked healthy because the read-only
+     * topic list renders correctly underneath.
+     *
+     * A narrow window puts each field on its own row with its button beside it,
+     * which is the only arrangement that fits: a 34-column field leaves three
+     * columns, and a button is its caption plus four.
+     */
+    {
+        int cw = td_win_client(s_win).w;
+        bool narrow = cw < 60;
+
+        if (narrow)
+        {
+            int fw = cw - 2;                /* a field's width inside the frame */
+            int row = 0;
+
+            /* Broker and Connect share a row: the field gives up enough to fit
+             * "Connect", 11 columns including its border. */
+            s_broker = td_textbox(s_win, 0, row, fw - 13, TD_TEXT_MAX - 1, on_connect, NULL);
+            s_connect = td_button(s_win, fw - 11, row, "Connect", on_connect, NULL);
+            row++;
+
+            /* Login and Config are settings, not part of the publish flow, so
+             * they share one row at the bottom of the form. */
+            s_topic = td_textbox(s_win, 0, row, fw, TD_TEXT_MAX - 1, on_topic_enter, NULL);
+            row++;
+
+            /* "Subscribe" and "Unsubscribe" are 13 and 15; with the topic field
+             * they cannot share, so the field has its own row and the two
+             * buttons share the next. */
+            td_button(s_win, 0, row, "Subscribe", on_subscribe, NULL);
+            td_button(s_win, 14, row, "Unsubscribe", on_unsubscribe, NULL);
+            row++;
+
+            s_payload = td_textbox(s_win, 0, row, fw - 11, TD_TEXT_MAX - 1, on_payload_enter, NULL);
+            td_button(s_win, fw - 9, row, "Publish", on_publish, NULL);
+            row++;
+
+            s_retain = td_checkbox(s_win, 0, row, "Retain", false, NULL, NULL);
+            td_button(s_win, fw - 10, row, "Login...", on_login, NULL);
+            row++;
+
+            td_button(s_win, 0, row, "Config...", on_config, NULL);
+            row++;
+
+            /* row is 7 after the six form rows; the heading is drawn at 9, so
+             * the list starts at 10 and must not cover it. */
+            s_list = td_list(s_win, td_rect(0, 10, -1, 0), get_item, NULL, NULL);
+            td_scrollbar(s_win, -1, 10, 0, s_list);
+        }
+        else
+        {
+            s_broker = td_textbox(s_win, 8, 0, 34, TD_TEXT_MAX - 1, on_connect, NULL);
+            s_connect = td_button(s_win, 44, 0, "Connect", on_connect, NULL);
+            td_button(s_win, 59, 0, "Login...", on_login, NULL);
+            td_button(s_win, 59, 1, "Config...", on_config, NULL);
+            s_topic = td_textbox(s_win, 8, 2, 34, TD_TEXT_MAX - 1, on_topic_enter, NULL);
+            td_button(s_win, 44, 2, "Subscribe", on_subscribe, NULL);
+            td_button(s_win, 58, 2, "Unsubscribe", on_unsubscribe, NULL);
+            s_payload = td_textbox(s_win, 8, 3, 34, TD_TEXT_MAX - 1, on_payload_enter, NULL);
+            td_button(s_win, 44, 3, "Publish", on_publish, NULL);
+            s_retain = td_checkbox(s_win, 56, 3, "Retain", false, NULL, NULL);
+            s_list = td_list(s_win, td_rect(0, LIST_Y, -1, 0), get_item, NULL, NULL);
+            td_scrollbar(s_win, -1, LIST_Y, 0, s_list);
+        }
+    }
 
     td_mqtt_status_t st;
     td_mqtt_status(&st);
