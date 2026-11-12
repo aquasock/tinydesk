@@ -49,15 +49,20 @@
 #define FB_CY0   DISPLAY_ORIGIN_Y
 #define FB_CY1   (FB_CY0 + DISPLAY_H - 1)
 
-/* The left column: x 22..66, y 45..460, five buttons stacked. */
+/* The two columns either side of the framebuffer. They are the same height and
+ * carry the same number of buttons, so one set of vertical bounds and one slot
+ * formula serve both; only the x bounds differ, and which way each faces. */
+#define COL_Y0   FB_CY0
+#define COL_Y1   FB_CY1
+#define COL_N    5
+
+/* The left column: x 22..66. The desktop is to its right, so the corners that
+ * face it -- and the corners cut at each separator -- are on the right edge. */
 #define LEFT_X0   PANEL_COL_OFFSET
 #define LEFT_X1   (FB_CX0 - 1)
-#define LEFT_Y0   FB_CY0
-#define LEFT_Y1   FB_CY1
-#define LEFT_N    5
 
-/* The right column, the mirror of the left one: x 387..431. One control, a
- * scroll column, so it has no slot arithmetic. */
+/* The right column: x 387..431, mirrored. The desktop is to its left, so its
+ * arcs are on the left edge. */
 #define RIGHT_X0   (FB_CX1 + 1)
 #define RIGHT_X1   (PANEL_COL_OFFSET + DISPLAY_PANEL_W - 1)
 
@@ -84,11 +89,11 @@
  * spare pixels to the later slots, so the boundaries are a formula. Keeping
  * them a formula means the painter and the hit test cannot disagree. */
 
-/* First row of left button i. 416 rows over five buttons is 83 each with a row
- * left over, which the last one takes. */
-static inline int left_slot_y(int i)
+/* First row of button i in either column. 416 rows over five buttons is 83
+ * each with a row left over, which the last one takes. */
+static inline int col_slot_y(int i)
 {
-    return LEFT_Y0 + (i * (LEFT_Y1 - LEFT_Y0 + 1)) / LEFT_N;
+    return COL_Y0 + (i * (COL_Y1 - COL_Y0 + 1)) / COL_N;
 }
 
 /* First column of bottom bar i, on the same principle. */
@@ -97,19 +102,19 @@ static inline int btn_slot_x(int i)
     return BTN_X0 + (i * (BTN_X1 - BTN_X0 + 1)) / BTN_N;
 }
 
-/* Which button a row of the left column belongs to.
+/* Which button a row belongs to, in either column.
  *
- * The exact inverse of left_slot_y(), not an approximation of it: with H rows
+ * The exact inverse of col_slot_y(), not an approximation of it: with H rows
  * over N buttons the boundaries are at floor(i*H/N), and the inverse of that is
  * floor(((y - Y0 + 1)*N - 1)/H). Dividing by H directly, the obvious thing, is
  * off by one against every boundary that does not divide evenly -- which put a
  * press on the wrong side of the gap at two of the four separators. A gap row
  * therefore counts as the button below it. */
-static inline int left_slot_at(int y)
+static inline int col_slot_at(int y)
 {
-    int n = LEFT_N;
-    int h = LEFT_Y1 - LEFT_Y0 + 1;
-    int i = ((y - LEFT_Y0 + 1) * n - 1) / h;
+    int n = COL_N;
+    int h = COL_Y1 - COL_Y0 + 1;
+    int i = ((y - COL_Y0 + 1) * n - 1) / h;
 
     return i < 0 ? 0 : i >= n ? n - 1 : i;
 }
@@ -130,7 +135,7 @@ typedef enum
     EDGE_NONE = 0,   /* the framebuffer, the top margin, or a black corner */
     EDGE_LEFT,
     EDGE_BOTTOM,
-    EDGE_RIGHT,
+    EDGE_RIGHT,      /* the mirror of EDGE_LEFT: five buttons, arrows */
     EDGE_TOP,        /* classified so the status bar has a region to claim,
                       * but inert: it is not a touch target */
 } edge_region_t;
@@ -158,17 +163,18 @@ static inline void edges_hit(int panel_x, int panel_y, edge_hit_t *hit)
     hit->region = EDGE_NONE;
     hit->index = -1;
 
-    if (y >= LEFT_Y0 && y <= LEFT_Y1)
+    if (y >= COL_Y0 && y <= COL_Y1)
     {
         if (x >= LEFT_X0 && x <= LEFT_X1)
         {
             hit->region = EDGE_LEFT;
-            hit->index = left_slot_at(y);
+            hit->index = col_slot_at(y);
             return;
         }
         if (x >= RIGHT_X0 && x <= RIGHT_X1)
         {
             hit->region = EDGE_RIGHT;
+            hit->index = col_slot_at(y);
             return;
         }
         return;      /* including the framebuffer, which is not an edge */

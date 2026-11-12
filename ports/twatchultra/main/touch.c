@@ -46,10 +46,10 @@
  * px, so aiming a finger at the desktop's own controls is not practical, and
  * making them big enough would cost the screen. So while the desktop is
  * showing, the controller's reports are read as presses on the margins around
- * the framebuffer -- the left column, the bottom strip, the right scroll
- * column -- and a touch on the framebuffer itself does nothing. Those margins
- * are painted by display.c and their geometry lives in edges.h, shared with
- * the painter so that a button and its hit test cannot disagree.
+ * the framebuffer -- a column of five down each side and a strip of three along
+ * the bottom -- and a touch on the framebuffer itself does nothing. Those
+ * margins are painted by display.c and their geometry lives in edges.h, shared
+ * with the painter so that a button and its hit test cannot disagree.
  *
  * When an application owns the whole screen instead -- kiosk mode, or a
  * full-screen window -- the panel goes back to being a mouse for that
@@ -340,12 +340,32 @@ static void to_cell(int x, int y, int *col, int *row)
  * there is no single byte for it and the parser already understands that shape.
  * A lone Esc is the one key here that waits: 0x1b is the start of every escape
  * sequence, so the parser resolves it on TD_ESC_TIMEOUT_MS, which is 50 ms. */
-static const char *const s_fkey[LEFT_N] = {
+static const char *const s_fkey[COL_N] = {
     "\x1b[21~",             /* F10     Start menu */
     "\x1b",                 /* Esc     cancel */
     "\x1b[17~",             /* F6      window switcher */
     "\x1b[27;9;100~",       /* Super+D show desktop */
     "\x1b[23~",             /* F11     full screen */
+};
+
+/* The right column, top to bottom: nothing, Left, Right, Up, Down.
+ *
+ * Arrows, because the other half of the desktop's actions are movement and the
+ * margins now form a complete set with no pointer anywhere: the left column is
+ * what windows do, this one is where the cursor goes. They reach whatever has
+ * the focus -- the icon grid when nothing is open, a list or a form inside a
+ * window -- and they are the key a keyboard would send, so nothing here is a
+ * private convention.
+ *
+ * The first button is deliberately empty and is what the operator asked for:
+ * a reserved slot. It is painted like the others, so it looks live and does
+ * nothing, which is worth knowing before someone presses it and wonders. */
+static const char *const s_rkey[COL_N] = {
+    NULL,                   /* reserved */
+    "\x1b[D",               /* Left */
+    "\x1b[C",               /* Right */
+    "\x1b[A",               /* Up */
+    "\x1b[B",               /* Down */
 };
 
 /* Left to right: Tab, Enter, Back.
@@ -366,27 +386,12 @@ static void send_str(const char *s)
         s_input(s, (int)strlen(s));
 }
 
-/* The right column scrolls: the wheel, at the middle of the desktop.
- *
- * The position matters because the window manager routes a wheel event to the
- * window under it, and there is no pointer on the glass anymore to take the
- * position from. The middle of the desktop is under whichever window is
- * focused, which is the one the operator is looking at. */
-static void send_wheel(int y)
-{
-    char buf[32];
-    int button = y < (LEFT_Y0 + LEFT_Y1) / 2 ? 64 : 65;   /* up / down */
-    int n = snprintf(buf, sizeof(buf), "\x1b[<%d;%d;%dM",
-                     button, display_cols() / 2 + 1, display_rows() / 2 + 1);
-
-    if (n > 0 && s_input)
-        s_input(buf, n);
-}
-
 /* What a press at the start of a touch does. Anything not in a margin does
  * nothing: on the desktop the framebuffer is not a touch surface. */
 static void edge_press(const edge_hit_t *hit, int y)
 {
+    (void)y;
+
     /* One short line per edge press, and short on purpose: the Log Viewer is 40
      * columns and truncates silently. This is what distinguishes the three ways
      * a margin button can fail -- no line means the press was not on an edge at
@@ -397,15 +402,16 @@ static void edge_press(const edge_hit_t *hit, int y)
     switch (hit->region)
     {
     case EDGE_LEFT:
-        if (hit->index >= 0 && hit->index < LEFT_N)
+        if (hit->index >= 0 && hit->index < COL_N)
             send_str(s_fkey[hit->index]);
+        break;
+    case EDGE_RIGHT:
+        if (hit->index >= 0 && hit->index < COL_N)
+            send_str(s_rkey[hit->index]);
         break;
     case EDGE_BOTTOM:
         if (hit->index >= 0 && hit->index < BTN_N)
             send_str(s_bkey[hit->index]);
-        break;
-    case EDGE_RIGHT:
-        send_wheel(y);
         break;
     default:
         break;

@@ -674,52 +674,59 @@ static void paint_buttons(void)
 }
 
 /*
- * THE BUTTONS DOWN THE LEFT EDGE.
+ * THE BUTTONS DOWN EACH EDGE.
  *
  * The same treatment as the strip below the framebuffer, turned through a right
- * angle: green slots stacked down the margin the framebuffer does not reach,
- * with a 10 px radius on the corners that face a neighbour.
+ * angle: green slots stacked down the margins the framebuffer does not reach,
+ * with a 10 px radius on the corners that face a neighbour. Both margins get
+ * it, mirrored, so the column on each side of the desktop is the same object
+ * seen from a different side.
  *
- * Which corners those are follows the strip rather than being chosen again. The
- * strip sits on the bottom glass edge, so its bottom edge is square and the
- * corners at its separators are cut on the top edge, facing the desktop. This
- * column sits on the left glass edge, so its corners at the separators are cut
- * on the right edge, facing the desktop.
+ * Which corners are which follows the strip rather than being chosen again. The
+ * strip sits on the bottom glass edge, so its corners at the separators are cut
+ * on the top edge, facing the desktop. A column sits on a side glass edge, so
+ * its corners at the separators are cut on the edge that faces the desktop --
+ * the right edge of the left column, the left edge of the right one.
  *
  * The two end buttons are round on all four corners. That is what stops them
  * running into the glass: with the corner cut, the green recedes from both the
- * desktop edge and the glass edge at the top of the first and the bottom of the
- * last, so the column ends in a finished cap rather than a square one. The
- * three in between keep square left corners, because they are a continuous run
- * down the glass and there is nothing there to turn.
+ * desk-facing edge and the glass edge at the top of the first and the bottom of
+ * the last, so the column ends in a finished cap rather than a square one. The
+ * three in between keep square glass-side corners, because they are a
+ * continuous run down the glass and there is nothing there to turn.
  *
  * Geometry: the visible glass is controller 22..431, the framebuffer occupies
- * 67..386, so the left margin is controller 22..66 -- 45 columns -- running the
- * framebuffer's own height, rows 45..460. The buttons therefore finish exactly
- * at the framebuffer's top and bottom edges, one at each, which is where the
- * desktop starts and stops beside them. The strip below starts at 461, so the
- * two do not overlap. The margin above the framebuffer is left alone: the
- * operator intends it for status icons. Those bounds are edges.h's, along with
- * the slot arithmetic, because the touch driver needs the same numbers: a
- * button the painter and the hit test disagree about is a button that does
- * something other than what it looks like.
+ * 67..386, so each margin is 45 columns running the framebuffer's own height,
+ * rows 45..460. The buttons therefore finish exactly at the framebuffer's top
+ * and bottom edges, one at each, which is where the desktop starts and stops
+ * beside them. The strip below starts at 461, so a column and the strip do not
+ * overlap. The margin above the framebuffer is left alone: the operator intends
+ * it for status icons. Those bounds are edges.h's, along with the slot
+ * arithmetic, because the touch driver needs the same numbers: a button the
+ * painter and the hit test disagree about is a button that does something other
+ * than what it looks like.
  */
-
-static void paint_left_buttons(void)
+ 
+/* One column, at controller x0..x1. desk_right says which side the desktop is
+ * on, which is the only thing that differs between the two. */
+static void paint_column(int x0, int x1, bool desk_right)
 {
     static const uint16_t COL_GREEN = 0x07E0;
     /* One sacrificial row and column: exactly one pixel is lost at the top-left
      * of a window (docs/panel-geometry.md, "The first row and column are
-     * swallowed"). Both fall outside the visible area -- column 21 is off the
-     * glass and row 44 is the black margin -- so paying them costs nothing and
-     * puts the green exactly where it is meant to be. */
-    const int wx = LEFT_X0 - 1;
-    const int wy = LEFT_Y0 - 1;
-    const int width = LEFT_X1 - wx + 1;             /* 46 */
-    const int height = LEFT_Y1 - wy + 1;            /* 417 */
+     * swallowed"). The row is 44, black margin, and the column is one to the
+     * left of the green -- 21 on the left column, which is off the glass, and
+     * 386 on the right, which is the framebuffer's last column and is repainted
+     * by the desktop's first frame a moment later. The bottom strip already
+     * pays its column the same way at 66, and the operator has seen no artefact
+     * at that edge, so the sacrifice is known to work rather than assumed. */
+    const int wx = x0 - 1;
+    const int wy = COL_Y0 - 1;
+    const int width = x1 - wx + 1;                  /* 46 */
+    const int height = COL_Y1 - wy + 1;             /* 417 */
     const int band = (int)(sizeof(s_tx) / sizeof(s_tx[0])) / width;
-    const int arc_rx = LEFT_X1 - BTN_RADIUS;         /* desktop-facing edge */
-    const int arc_lx = LEFT_X0 + BTN_RADIUS;         /* glass edge, ends only */
+    const int arc_desk = desk_right ? x1 - BTN_RADIUS : x0 + BTN_RADIUS;
+    const int arc_glass = desk_right ? x0 + BTN_RADIUS : x1 - BTN_RADIUS;
     int y = wy;
     bool first = true;
 
@@ -744,27 +751,27 @@ static void paint_left_buttons(void)
                 int x = wx + i;
                 uint16_t c = 0x0000;
 
-                if (x >= LEFT_X0 && x <= LEFT_X1)
+                if (x >= x0 && x <= x1)
                 {
                     /* Which button's rows this is, if any: a separator row
                      * belongs to no button, which is what leaves the gap.
                      * Green starts two rows into every slot but the first, and
                      * ends one row before the next slot begins. */
-                    for (int s = 0; s < LEFT_N; s++)
+                    for (int s = 0; s < COL_N; s++)
                     {
-                        int g0 = s == 0 ? LEFT_Y0 : left_slot_y(s) + BTN_SEP;
-                        int g1 = left_slot_y(s + 1) - 1;
+                        int g0 = s == 0 ? COL_Y0 : col_slot_y(s) + BTN_SEP;
+                        int g1 = col_slot_y(s + 1) - 1;
 
                         if (yy < g0 || yy > g1)
                             continue;
 
                         c = COL_GREEN;
-                        if (corner_notch(x, yy, arc_rx, g0 + BTN_RADIUS, true, true) ||
-                            corner_notch(x, yy, arc_rx, g1 - BTN_RADIUS, true, false) ||
+                        if (corner_notch(x, yy, arc_desk, g0 + BTN_RADIUS, desk_right, true) ||
+                            corner_notch(x, yy, arc_desk, g1 - BTN_RADIUS, desk_right, false) ||
                             (s == 0 &&
-                             corner_notch(x, yy, arc_lx, g0 + BTN_RADIUS, false, true)) ||
-                            (s == LEFT_N - 1 &&
-                             corner_notch(x, yy, arc_lx, g1 - BTN_RADIUS, false, false)))
+                             corner_notch(x, yy, arc_glass, g0 + BTN_RADIUS, !desk_right, true)) ||
+                            (s == COL_N - 1 &&
+                             corner_notch(x, yy, arc_glass, g1 - BTN_RADIUS, !desk_right, false)))
                             c = 0x0000;
                         break;
                     }
@@ -975,8 +982,9 @@ bool display_init(display_reply_fn reply)
     /* The three button bars below the framebuffer, images only for now. */
     paint_buttons();
 
-    /* Seven more down the left margin, same treatment. */
-    paint_left_buttons();
+    /* Five down each margin, same treatment, mirrored. */
+    paint_column(LEFT_X0, LEFT_X1, true);
+    paint_column(RIGHT_X0, RIGHT_X1, false);
 
     s_cols = DISPLAY_MAX_COLS;
     s_rows = DISPLAY_MAX_ROWS;
