@@ -69,7 +69,6 @@
 #include "display.h"
 #include "edges.h"
 #include "haptic.h"
-#include "sound.h"
 #include "tinydesk/td_wm.h"
 #include "power.h"
 #include "tinydesk/td_vterm.h"
@@ -431,13 +430,6 @@ static void edge_press(const edge_hit_t *hit, int y)
      * slot or on inert glass does nothing, and buzzing for it would say
      * something happened when nothing did. */
     haptic_tap();
-
-    /* TEMPORARY PROBE, and marked as such: a beep on a margin press. It exists
-     * only to test the amplifier without going through the shell -- the BEL
-     * route was tried and produced no log line at all, so either the byte never
-     * arrived or the hook was never called, and this separates the amplifier
-     * from both. Delete it once the answer is known. */
-    sound_beep();
 }
 
 /* Emit a release if a press has stopped reporting.

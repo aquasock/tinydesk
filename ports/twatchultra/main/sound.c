@@ -221,3 +221,12 @@ void sound_bell(void *user)
     (void)user;
     sound_beep();
 }
+
+/* The port's BEL hook, called through td_sysinfo_t by whichever app's terminal
+ * emulator saw the 0x07. This is the path that actually works: the Terminal app
+ * owns its own td_vterm_t, so a callback installed on the renderer's copy never
+ * fires for terminal output. */
+void board_bell(void)
+{
+    sound_beep();
+}

@@ -352,6 +352,17 @@ static int board_batteries(td_battery_t *out, int max)
     return board_battery_read(out, max);
 }
 
+  /* What a BEL means on this board. The weak default does nothing, so a board
+ * with no speaker ignores BEL the way every terminal does. */
+__attribute__((weak)) void board_bell(void)
+{
+}
+
+static void bell_hook(void)
+{
+    board_bell();
+}
+
 __attribute__((weak)) void board_time_set_post(int64_t utc)
 {
     (void)utc;
@@ -608,6 +619,7 @@ static void fill_sysinfo(void)
     s_info.drives = sd_drives;
     s_info.drive_eject = sd_eject;
     s_info.batteries = board_batteries;
+    s_info.bell = bell_hook;
     s_info.extra = "Shell:     TinyDesk Shell " TDSH_VERSION;
     td_set_sysinfo(&s_info);
 }

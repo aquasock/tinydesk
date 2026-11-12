@@ -174,6 +174,15 @@ static void test_bell(void)
     CHECK_EQ(s_bells, 1);
     CHECK(row_is(0, "XYZ"));
 
+    /* A RE-INIT KEEPS THE CALLBACK. td_terminal_reset() re-initialises the
+     * terminal on every session change, so a callback that did not survive
+     * init would work until the first session switch and then silently stop --
+     * which is precisely how the beep broke on the watch. */
+    s_bells = 0;
+    td_vterm_init(&s_vt, 20, 4);
+    put("\a");
+    CHECK_EQ(s_bells, 1);
+
     /* A terminal with no callback ignores BEL and does not crash. */
     td_vterm_init(&s_vt, 20, 4);
     put("\a\a");

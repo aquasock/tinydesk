@@ -36,4 +36,9 @@ void sound_beep(void);
  * Trivial, but it keeps the vterm's signature out of sound.c. */
 void sound_bell(void *user);
 
+/* The port's BEL hook: overrides the weak board_bell() in the shared ESP-IDF
+ * app, which the desktop calls through td_sysinfo_t when any app's terminal
+ * emulator receives a BEL. */
+void board_bell(void);
+
 #endif

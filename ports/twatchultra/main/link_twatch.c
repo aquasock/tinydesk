@@ -156,6 +156,10 @@ bool link_init(void)
      * here is logged and not fatal -- the same shape as the haptics below. */
     if (sound_init())
     {
+        /* Also keep the renderer's copy wired: it mirrors the desktop's
+         * output, so a BEL that reaches the mirror rather than an app still
+         * rings. The path that matters is board_bell(), which the Terminal's
+         * own emulator calls through td_sysinfo_t. */
         display_set_bell(sound_bell, NULL);
         ESP_LOGI(TAG, "sound on");
     }

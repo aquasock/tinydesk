@@ -72,9 +72,21 @@ void td_vterm_init(td_vterm_t *vt, int cols, int rows)
 {
     td_vterm_reply_fn reply = vt->reply;
     void *reply_user = vt->reply_user;
+    void (*bell)(void *) = vt->bell;
+    void *bell_user = vt->bell_user;
+
     memset(vt, 0, sizeof(*vt));
     vt->reply = reply;
     vt->reply_user = reply_user;
+    /* THE BELL SURVIVES A RE-INIT, like the reply callback does. These are
+     * configuration, not content: a caller installs them once and may re-init
+     * the terminal afterwards -- td_terminal_reset() does exactly that on every
+     * session change -- and losing them there is silent. On the T-Watch Ultra
+     * it cost a whole cycle: the hook was installed, a host test proved the
+     * emulator calls it, and the beep never happened because a re-init had
+     * wiped the pointer before any BEL arrived. */
+    vt->bell = bell;
+    vt->bell_user = bell_user;
     vt->cols = clamp(cols, 1, TD_VT_MAX_COLS);
     vt->rows = clamp(rows, 1, TD_VT_MAX_ROWS);
     reset_state(vt);

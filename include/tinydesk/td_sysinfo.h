@@ -631,6 +631,13 @@ typedef struct
      * registers the port already has cached rather than a bus round trip per
      * field. A board with no fuel gauge leaves it NULL and the app says so. */
     int (*batteries)(td_battery_t *out, int max);
+
+        /* Optional: what a BEL means on this board -- a beep, a flash, nothing.
+     * Called when a terminal application receives a BEL in ordinary text, from
+     * any app that writes through a td_vterm: Terminal, Editor's output pane.
+     * NULL on a board with no way to make a noise, and the BEL is then simply
+     * ignored, which is what every terminal does when it has no bell. */
+    void (*bell)(void);
 } td_sysinfo_t;
 
     /* Install / read the port's sysinfo (never NULL; unset members are NULL). */

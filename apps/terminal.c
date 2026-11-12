@@ -178,12 +178,30 @@ static int encode_key(const td_event_t *ev, char *out)
     return 0;
 }
 
+/* A BEL from the terminal's emulator: hand it to whatever the port provides. */
+static void vt_bell(void *user)
+{
+    (void)user;
+    if (td_sysinfo()->bell)
+        td_sysinfo()->bell();
+}
+
 static void ensure_vt(int cols, int rows)
 {
     if (!s_vt_ready)
     {
         s_vt.reply = vt_reply;
         td_vterm_init(&s_vt, cols, rows);
+        /* THE TERMINAL HAS ITS OWN vterm, separate from the one the renderer
+         * mirrors, so a port that installed a bell callback on the renderer's
+         * copy never saw a BEL from here. That is exactly what happened on the
+         * T-Watch Ultra: the hook was wired, verified by a host test, and never
+         * called, because this struct is a different object.
+         *
+         * The port's hook lives on td_sysinfo_t instead, so the desktop decides
+         * what a BEL means without any app knowing what hardware is behind it. */
+        if (td_sysinfo()->bell)
+            s_vt.bell = vt_bell;
         s_vt_ready = true;
     }
     if (!s_started && s_backend && s_backend->start)
