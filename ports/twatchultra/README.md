@@ -143,7 +143,7 @@ TinyDesk whole:
 | OTA | `TD_UPDATE_BOARD="twatchultra"` so this image will not be replaced by a UART desktop's. No update feed exists for this board yet. |
 | SD card | Hardware **unproven on this board** (see `board.example.conf`). Opt-in and commented out. |
 | Battery / PMU | No TinyDesk UI consumes it. The AXP2101 is used only to raise ALDO2. |
-| RTC | TinyDesk has no RTC hook -- it takes time from SNTP. The PCF85063A is unused. |
+| RTC (PCF85063A) | **Works.** `main/rtc.c` reads the chip at boot and seeds the system clock, so the desktop has a time with no network; it writes back when the time is set by Date & time or SNTP. Verified on the glass: the taskbar showed the correct UTC with Wi-Fi offline. Reading uses mainline's register map and refuses a stopped oscillator. |
 | Haptics | No TinyDesk integration. The DRV2605 is unused. |
 
 ### What a partial update costs, and why it matters here

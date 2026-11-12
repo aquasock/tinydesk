@@ -314,10 +314,23 @@ static bool time_now(int64_t *utc)
     return true;
 }
 
+/* A board with a battery-backed RTC writes the new time to it here, so a
+ * correction survives a power cycle. Weak, like board_maintenance_start: the
+ * shared code calls it and a port that has an RTC overrides it. Called after
+ * the system clock has been set, whether by Date & time or by SNTP. */
+__attribute__((weak)) void board_time_set_post(int64_t utc)
+{
+    (void)utc;
+}
+
 static bool time_set(int64_t utc)
 {
     struct timeval tv = {.tv_sec = (time_t)utc, .tv_usec = 0};
-    return settimeofday(&tv, NULL) == 0;
+    bool ok = settimeofday(&tv, NULL) == 0;
+
+    if (ok)
+        board_time_set_post(utc);
+    return ok;
 }
 
 static bool time_auto_get(void)

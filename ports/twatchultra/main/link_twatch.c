@@ -29,6 +29,7 @@
 
 #include "display.h"
 #include "power.h"
+#include "rtc.h"
 #include "touch.h"
 #include "hal_mux.h"
 #include "tinydesk/td_picture.h"
@@ -105,6 +106,19 @@ bool link_init(void)
                  esp_err_to_name(err));
         return false;
     }
+
+    /*
+     * SEED THE CLOCK FROM THE RTC BEFORE ANYTHING ELSE NEEDS IT.
+     *
+     * The desktop shows "--:--" and "no clock" until something sets the system
+     * clock, and upstream's only source is SNTP, which needs the network. This
+     * board has a battery-backed PCF85063A holding the time whether or not
+     * Wi-Fi associates, so it is read here, before display_init and before
+     * TinyDesk starts. SNTP still overrides it when it arrives, through
+     * board_time_set_post().
+     */
+    if (!rtc_seed_system_clock())
+        ESP_LOGW(TAG, "no time from the RTC; the clock will wait for the network");
 
     s_mirror = tdsh_board_int("lcd.mirror", 1) != 0;
 
