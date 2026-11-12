@@ -31,6 +31,7 @@
 #include "driver/spi_master.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "tdsh.h"
@@ -70,6 +71,10 @@
 static spi_device_handle_t s_nfc;
 static int s_cs = -1;
 static int s_int = -1;
+static int s_host = -1;
+static int s_sck = -1;
+static int s_mosi = -1;
+static int s_miso = -1;
 
 /* What the probe run from link_init() found.
  *
@@ -129,6 +134,10 @@ static bool nfc_bus(void)
     int miso = tdsh_board_int("sd.miso", 33);
     s_cs = tdsh_board_int("nfc.cs", NFC_CS_DEFAULT);
     s_int = tdsh_board_int("nfc.int", NFC_INT_DEFAULT);
+    s_host = host;
+    s_sck = sclk;
+    s_mosi = mosi;
+    s_miso = miso;
 
     if (host < 0 || sclk < 0 || mosi < 0 || miso < 0 || s_cs < 0)
     {
@@ -152,12 +161,28 @@ static bool nfc_bus(void)
         return false;
     }
 
+    /* CHIP SELECT IS DRIVEN BY HAND, NOT BY THE SPI PERIPHERAL.
+     *
+     * This is not a style choice. A pin handed to the SPI driver as its CS is
+     * routed to a peripheral output signal through the GPIO matrix, and
+     * gpio_set_level() has no effect on such a pin. ST's stack pulls CS low
+     * itself around the command byte and its data (digitalWrite(cs, LOW) ...
+     * digitalWrite(cs, HIGH)), so the pin has to stay a plain GPIO -- and the
+     * failure if it does not is that the chip never answers, which is
+     * indistinguishable from a dead part or a wrong mode. */
     spi_device_interface_config_t dev = {
         .mode = 1,                 /* CPOL 0, CPHA 1 -- the part's only mode */
         .clock_speed_hz = NFC_HZ,
-        .spics_io_num = s_cs,
+        .spics_io_num = -1,
         .queue_size = 1,
     };
+
+    gpio_config_t cs_out = {
+        .pin_bit_mask = (1ULL << s_cs),
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    gpio_config(&cs_out);
+    gpio_set_level((gpio_num_t)s_cs, 1);
 
     err = spi_bus_add_device((spi_host_device_t)host, &dev, &s_nfc);
     if (err != ESP_OK)
@@ -221,7 +246,9 @@ static bool xfer(const uint8_t *tx, uint8_t *rx, size_t n)
         }
     }
 
+    gpio_set_level((gpio_num_t)s_cs, 0);
     esp_err_t err = spi_device_transmit(s_nfc, &t);
+    gpio_set_level((gpio_num_t)s_cs, 1);
 
     if (err == ESP_OK && rx)
     {
@@ -390,9 +417,197 @@ bool nfc_probe(void)
 
 /* --- the shell command --------------------------------------------------- */
 
+/* One card, in two short lines. Forty columns is the desktop terminal's whole
+ * width, so the UID goes on its own line rather than trailing a description
+ * that would push it off the edge. */
+/* The message as hex, eight bytes to a line, so it fits the forty columns
+ * without wrapping. A length above the buffer's size is called out rather than
+ * silently truncated -- a tag that holds more than is shown is a different
+ * fact from a tag that holds exactly what is shown. */
+static void print_ndef_hex(const nfc_card_t *c)
+{
+    char line[40];
+
+    for (int i = 0; i < c->ndef_raw_len; i++)
+    {
+        int o = (i % 8) * 2;
+        if (o == 0)
+            line[0] = '\0';
+        line[o] = "0123456789abcdef"[(c->ndef_raw[i] >> 4) & 0xF];
+        line[o + 1] = "0123456789abcdef"[c->ndef_raw[i] & 0xF];
+        line[o + 2] = '\0';
+
+        if (i % 8 == 7 || i == c->ndef_raw_len - 1)
+            printf("  %s\n", line);
+    }
+
+    if (c->ndef_len > c->ndef_raw_len && c->ndef_raw_len > 0)
+        printf("  ...of %d bytes\n", c->ndef_len);
+}
+
+/*
+ * A single well-known URI or Text record, decoded; nothing else.
+ *
+ * This is not an NDEF parser and does not pretend to be one. A tag written by
+ * a phone is nearly always one of these two record types, and reading one in
+ * the shell is what makes a tag's presence checkable rather than merely
+ * detectable. Anything else prints as hex and stops, which is honest.
+ */
+static void print_ndef_text(const nfc_card_t *c)
+{
+    static const char *const URI_PREFIX[] = {
+        "", "http://www.", "https://www.", "http://", "https://", "tel:",
+        "mailto:", "ftp://anonymous:anonymous@", "ftp://ftp.", "ftps://",
+        "sftp://", "smb://", "nfs://", "ftp://", "dav://", "news:",
+        "telnet://", "imap:", "rtsp://", "urn:", "pop:", "sip:", "sips:",
+        "tftp:", "btspp://", "btl2cap://", "btgoep://", "tcpobex://",
+        "irdaobex://", "file://", "urn:epc:id:", "urn:epc:tag:",
+        "urn:epc:pat:", "urn:epc:raw:", "urn:epc:", "urn:nfc:",
+    };
+
+    int n = c->ndef_raw_len;
+    if (n < 3)
+        return;
+
+    const uint8_t *b = c->ndef_raw;
+    if ((b[0] & 0x10) == 0)      /* not a short record: length is 4 bytes */
+        return;
+    if ((b[0] & 0x07) != 0x01)   /* not TNF well-known */
+        return;
+
+    int type_len = b[1];
+    int pay_len = b[2];
+    int type_at = 3;
+    int pay_at = type_at + type_len;
+    if (type_len != 1 || pay_at >= n || pay_at + pay_len > n || pay_len < 1)
+        return;
+
+    char out[48];
+    int o = 0;
+
+    if (b[type_at] == 'U')
+    {
+        unsigned pfx = b[pay_at];
+        const char *p = pfx < sizeof(URI_PREFIX) / sizeof(URI_PREFIX[0])
+                            ? URI_PREFIX[pfx]
+                            : "";
+        o = snprintf(out, sizeof(out), "%s", p);
+        for (int i = pay_at + 1; i < pay_at + pay_len && o < (int)sizeof(out) - 1; i++)
+            out[o++] = (b[i] >= 0x20 && b[i] < 0x7F) ? (char)b[i] : '?';
+        out[o] = '\0';
+    }
+    else if (b[type_at] == 'T')
+    {
+        /* Text: status byte, then a language code, then the text itself. The
+         * status byte's low six bits are the language length. */
+        unsigned status = b[pay_at];
+        int lang = (int)(status & 0x3F);
+        int at = pay_at + 1 + lang;
+        for (int i = at; i < pay_at + pay_len && o < (int)sizeof(out) - 1; i++)
+            out[o++] = (b[i] >= 0x20 && b[i] < 0x7F) ? (char)b[i] : '?';
+        out[o] = '\0';
+    }
+    else
+    {
+        return;
+    }
+
+    if (o > 0)
+        printf("  %c %s\n", b[type_at], out);
+}
+
+static void print_card(const nfc_card_t *c)
+{
+    if (c->uid_len > 0)
+        printf("card %s uid %s\n", c->tech, c->uid);
+    else
+        printf("card %s (no uid)\n", c->tech);
+
+    printf("  ");
+    if (c->sak >= 0)
+        printf("sak %02x ", c->sak);
+    if (c->tag[0])
+        printf("%s ", c->tag);
+    if (c->ndef < 0)
+        printf("ndef n/a");
+    else if (c->ndef)
+        printf("ndef %d bytes", c->ndef_len);
+    else
+        printf("ndef none");
+    printf("\n");
+
+    if (c->ndef_raw_len > 0)
+    {
+        print_ndef_text(c);
+        print_ndef_hex(c);
+    }
+}
+
+/*
+ * `nfc scan [seconds]` -- the field on, for a while, printing whatever answers.
+ *
+ * The loop is here rather than in a task because the reader's supply is the
+ * battery: a background poller would keep the antenna cycling for ever and show
+ * up in the milliamps, and nothing above this needs a tag to be live. Two
+ * milliseconds per pass is well inside the reader's framing, and the worker
+ * returns immediately when there is nothing to do.
+ */
+static int cmd_nfc_scan(int argc, char **argv)
+{
+    int secs = argc >= 3 ? atoi(argv[2]) : 20;
+    if (secs <= 0)
+        secs = 20;
+
+    if (!board_nfc_rail_on())
+    {
+        printf("nfc rail FAILED\n");
+        return 1;
+    }
+
+    if (!nfc_bus())
+        return 1;
+
+    if (!nfc_scan_start(s_host, s_sck, s_miso, s_mosi, s_cs, s_int))
+    {
+        printf("scanner did not start\n");
+        return 1;
+    }
+
+    printf("scanning %d s -- tap a tag\n", secs);
+
+    int64_t end = esp_timer_get_time() + (int64_t)secs * 1000000;
+    int seen = 0;
+
+    while (esp_timer_get_time() < end)
+    {
+        nfc_card_t c;
+        int r = nfc_scan_step(&c);
+
+        if (r > 0)
+        {
+            print_card(&c);
+            seen++;
+        }
+        else if (r < 0)
+        {
+            printf("scanner stopped\n");
+            break;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+
+    nfc_scan_stop();
+    printf("%d card%s\n", seen, seen == 1 ? "" : "s");
+    return seen > 0 ? 0 : 1;
+}
+
 static int cmd_nfc(tdsh_session_t *session, int argc, char **argv)
 {
     (void)session;
+
+    if (argc >= 2 && strcmp(argv[1], "scan") == 0)
+        return cmd_nfc_scan(argc, argv);
 
     if (argc >= 2 && strcmp(argv[1], "reg") == 0)
     {
@@ -419,7 +634,7 @@ static int cmd_nfc(tdsh_session_t *session, int argc, char **argv)
 
     if (argc >= 2)
     {
-        printf("usage: nfc | nfc reg <hex>\n");
+        printf("usage: nfc | nfc scan [s] | nfc reg <hex>\n");
         return 2;
     }
 
@@ -447,8 +662,8 @@ static int cmd_nfc(tdsh_session_t *session, int argc, char **argv)
 
 static const tdsh_command_t s_nfc_cmd = {
     "nfc",
-    "nfc | nfc reg <hex>",
-    "Probe the ST25R3916 NFC reader, or read a register",
+    "nfc | nfc scan [s] | nfc reg <hex>",
+    "Probe the ST25R3916 reader, scan for tags, or read a register",
     cmd_nfc,
     TDSH_CMD_INTERACTIVE,
 };
