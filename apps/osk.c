@@ -363,9 +363,21 @@ bool td_osk_shown(void)
     return td_win_is_open(s_win);
 }
 
+#if !TD_HIDE_OSK_APP
 static const td_app_t s_app = {"On-screen keyboard", launch, "KB"};
+#endif
 
 void td_osk_register(void)
 {
+    /* TD_HIDE_OSK_APP: no Start-menu entry, but the keyboard itself still
+     * exists. Sign in and the kiosk way out open it through td_osk_show(), and
+     * that is untouched -- only the icon is gone.
+     *
+     * A board whose screen is too small for a working on-screen keyboard can
+     * set this rather than carry an app nobody can use. A 40-column panel is
+     * that case: the keys do not fit at a size a finger can hit, and the board
+     * has a Bluetooth keyboard instead. */
+#if !TD_HIDE_OSK_APP
     td_app_register(&s_app);
+#endif
 }

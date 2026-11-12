@@ -241,6 +241,7 @@ td_config.h: #define TD_OSC52_MAX 8192
 td_config.h: #define TD_SEQ_TIMEOUT_MS 500
 td_config.h: #define TD_SIZE_QUERY_TIMEOUT_MS 300
 td_config.h: #define TD_OPEN_MAXIMIZED 0
+td_config.h: #define TD_HIDE_OSK_APP 0
 td_config.h: #define TD_SIZE_POLL_MS 1000
 td_config.h: #define TD_LINK_RETRY_MS 500
 td_config.h: #define TD_LINK_LOST_MS 3000

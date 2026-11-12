@@ -43,3 +43,9 @@ idf_build_set_property(COMPILE_DEFINITIONS "TD_ACK_TIMEOUT_MS=0" APPEND)
 # glass: the Bluetooth window's own WIN_H is 34. Maximised, an app gets the
 # whole desk area and its layout code needs no change at all.
 idf_build_set_property(COMPILE_DEFINITIONS "TD_OPEN_MAXIMIZED=1" APPEND)
+
+# No On-screen keyboard in the Start menu. A 40-column panel cannot hold the
+# keys at a size a finger can hit, so the app is not usable here, and this board
+# has a Bluetooth keyboard. The keyboard itself is still built and still opens
+# from Sign in and the kiosk way out -- this removes the icon, not the feature.
+idf_build_set_property(COMPILE_DEFINITIONS "TD_HIDE_OSK_APP=1" APPEND)

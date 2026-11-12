@@ -120,6 +120,16 @@
 #define TD_OPEN_MAXIMIZED 0
 #endif
 
+/* Register the On-screen keyboard as a Start-menu app.
+ *
+ * On by default, because a board with no keyboard of its own needs it. A board
+ * whose panel is too small to type on sets this to 1: the app icon disappears,
+ * while the keyboard itself still works -- Sign in and the kiosk way out open it
+ * directly and are unaffected. */
+#ifndef TD_HIDE_OSK_APP
+#define TD_HIDE_OSK_APP 0
+#endif
+
 /* The terminal size is re-queried this often so window resizes are noticed
  * (0 disables periodic queries). */
 #ifndef TD_SIZE_POLL_MS
