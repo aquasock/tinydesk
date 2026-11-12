@@ -61,14 +61,14 @@ static bool start(bool check_only)
     const char *src = text;
     if (!text[0] || !strcmp(text, "https://"))
     {
-        note("Type a URL (http:// or https://) or a .bin file, or check for official updates.");
+        note("Type a URL or a .bin file.");
         return false;
     }
     if (!is_url(text))
     {
         if (!td_session_real_path(text, real, sizeof(real)))
         {
-            note("That file is outside your home folder.");
+            note("That file is outside your home.");
             return false;
         }
         src = real;
@@ -361,24 +361,30 @@ static void on_draw(td_window_t *win, int w, int h)
             snprintf(line, sizeof(line), "Official    TinyDesk %s%s%s%s%s  %s", r.version, r.date[0] ? ", " : "", r.date,
                      size[0] ? ", " : "", size, r.newer ? "(newer)" : !strcmp(r.version, i.version) ? "(installed)"
                                                                                                     : "");
-            td_textn(1, 9, line, w - 1, r.newer ? t->accent : t->win_fg, t->win_bg, r.newer ? TD_BOLD : 0);
+            td_textn(narrow_info ? 0 : 1, narrow_info ? h - 6 : 9,
+                     line, w - (narrow_info ? 0 : 1),
+                     r.newer ? t->accent : t->win_fg, t->win_bg, r.newer ? TD_BOLD : 0);
             if (r.notes[0])
             {
                 snprintf(line, sizeof(line), "Notes       %s", r.notes);
-                td_textn(1, 10, line, w - 1, t->dim, t->win_bg, 0);
+                td_textn(narrow_info ? 0 : 1, narrow_info ? h - 6 : 10,
+                         line, w - (narrow_info ? 0 : 1), t->dim, t->win_bg, 0);
             }
         }
         else if (r.error[0] && strcmp(r.error, st.message) != 0)
         {   /* a background check failed */
-            snprintf(line, sizeof(line), "Official    %s", r.error);
-            td_textn(1, 9, line, w - 1, t->dim, t->win_bg, 0);
+            snprintf(line, sizeof(line), narrow_info ? "Official: %s" : "Official    %s",
+                     r.error);
+            td_textn(narrow_info ? 0 : 1, narrow_info ? h - 6 : 9,
+                     line, w - (narrow_info ? 0 : 1), t->dim, t->win_bg, 0);
         }
     }
 
     if (st.new_version[0])
     {
         snprintf(line, sizeof(line), "Image       TinyDesk %s  (built %s)", st.new_version, st.new_built);
-        td_textn(1, 11, line, w - 1, t->win_fg, t->win_bg, 0);
+        td_textn(narrow_info ? 0 : 1, narrow_info ? h - 5 : 11,
+                 line, w - (narrow_info ? 0 : 1), t->win_fg, t->win_bg, 0);
     }
     if (st.state == TD_OTA_INSTALLING || st.state == TD_OTA_DONE || (st.state == TD_OTA_FAILED && st.done))
     {
@@ -395,13 +401,17 @@ static void on_draw(td_window_t *win, int w, int h)
         {
             snprintf(line, sizeof(line), "%3d%%   %s of %s", st.state == TD_OTA_DONE ? 100 : st.percent, done, total);
         }
-        td_textn(1, 13, line, w - 1, t->win_fg, t->win_bg, 0);
+        td_textn(1, narrow_info ? h - 4 : 13, line, w - 1, t->win_fg, t->win_bg, 0);
     }
     const char *msg = s_note[0] ? s_note : st.message;
     uint8_t fg = st.state == TD_OTA_FAILED && !s_note[0] ? t->accent : t->win_fg;
-    td_textn(1, 14, msg, w - 1, fg, t->win_bg, st.state == TD_OTA_DONE ? TD_BOLD : 0);
+    td_textn(narrow_info ? 0 : 1, narrow_info ? h - 2 : 14, msg,
+             w - (narrow_info ? 0 : 1), fg, t->win_bg,
+             st.state == TD_OTA_DONE ? TD_BOLD : 0);
     if (!td_session_is_root())
-        td_textn(1, 15, "Only root can install updates or roll back.", w - 1, t->dim, t->win_bg, 0);
+        td_textn(narrow_info ? 0 : 1, narrow_info ? h - 1 : 15,
+                 "Only root can install updates or roll back.",
+                 w - (narrow_info ? 0 : 1), t->dim, t->win_bg, 0);
 }
 
 static void on_close(td_window_t *win)
@@ -454,7 +464,7 @@ static void launch(void)
         int url_w = narrow ? cw - 2 : 62;
         int url_x = narrow ? 0 : 13;
         int btn_y = narrow ? 7 : 6;
-        int prog_y = narrow ? 13 : 12;
+        int prog_y = narrow ? td_win_client(s_win).h - 5 : 12;
 
         s_source = td_textbox(s_win, url_x, narrow ? 5 : 4, url_w,
                               TD_TEXT_MAX - 1, on_enter, NULL);
