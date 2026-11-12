@@ -24,7 +24,9 @@
 
 #define TICK_MS  20
 #define OUT_MAX  4096
-#define BAR_ROWS 1
+/* Rows the connection bar takes: one on a wide window, two when narrow because
+ * the Host/Port row and the Connect row cannot share one. Set in launch(). */
+static int s_bar_rows = 1;
 
 enum
 {
@@ -219,7 +221,7 @@ static void connect_to(void)
         set_state("Not enough memory.");
         return;
     }
-    td_vterm_init(s_vt, c.w, c.h - BAR_ROWS > 2 ? c.h - BAR_ROWS : 2);
+    td_vterm_init(s_vt, c.w, c.h - s_bar_rows > 2 ? c.h - s_bar_rows : 2);
     s_vt->reply = vt_reply;
     s_vt->reply_user = NULL;
     td_addr_t addr;
@@ -289,7 +291,7 @@ static void on_tick(td_window_t *win)
 
 static void send_mouse(const td_event_t *ev)
 {
-    int x = ev->x + 1, y = ev->y - BAR_ROWS + 1;
+    int x = ev->x + 1, y = ev->y - s_bar_rows + 1;
     if (y < 1 || !s_vt || x > s_vt->cols || y > s_vt->rows)
         return;
     /* Only what the remote asked for: at its login prompt nothing, so the
@@ -329,7 +331,7 @@ static bool on_event(td_window_t *win, const td_event_t *ev)
         return false;   /* the address fields and the button work as usual */
     if (ev->type == TD_EV_MOUSE)
     {
-        if (ev->y < BAR_ROWS)
+        if (ev->y < s_bar_rows)
             return false;   /* Disconnect stays clickable */
         send_mouse(ev);
         return true;
@@ -363,8 +365,8 @@ static void on_draw(td_window_t *win, int w, int h)
 {
     (void)win;
     const td_theme_t *t = td_theme();
-    td_fill(td_rect(0, 0, w, BAR_ROWS), ' ', t->win_fg, t->win_bg);
-    td_fill(td_rect(0, BAR_ROWS, w, h - BAR_ROWS), ' ', 250, 0);
+    td_fill(td_rect(0, 0, w, s_bar_rows), ' ', t->win_fg, t->win_bg);
+    td_fill(td_rect(0, s_bar_rows, w, h - s_bar_rows), ' ', 250, 0);
     if (!s_vt || s_status != S_CONNECTED)
     {
         static const char *const help[] = {
@@ -374,14 +376,14 @@ static void on_draw(td_window_t *win, int w, int h)
             "sign in as root in this window. Telnet is not encrypted: use it",
             "on a network you trust.",
         };
-        for (int i = 0; i < 5 && BAR_ROWS + 1 + i < h; i++)
-            td_text(1, BAR_ROWS + 1 + i, help[i], 250, 0, 0);
+        for (int i = 0; i < 5 && s_bar_rows + 1 + i < h; i++)
+            td_text(1, s_bar_rows + 1 + i, help[i], 250, 0, 0);
         return;
     }
-    int rows = h - BAR_ROWS;
+    int rows = h - s_bar_rows;
     if (w > 1 && rows > 1 && (w != s_vt->cols || rows != s_vt->rows))
         td_vterm_resize(s_vt, w, rows);   /* the remote follows within a second */
-    td_vterm_draw(s_vt, 0, BAR_ROWS, 0, false);
+    td_vterm_draw(s_vt, 0, s_bar_rows, 0, false);
 }
 
 static void on_close(td_window_t *win)
@@ -414,14 +416,52 @@ static void launch(void)
     s_win = td_win_create(&d);
     if (!s_win)
         return;
-    td_label(s_win, 0, 0, 5, "Host");
-    s_host = td_textbox(s_win, 5, 0, 18, (int)sizeof(s_host_text) - 1, on_go, NULL);
-    td_textbox_set_buffer(s_host, s_host_text, (int)sizeof(s_host_text));
-    td_label(s_win, 24, 0, 5, "Port");
-    s_port = td_textbox(s_win, 29, 0, 6, (int)sizeof(s_port_text) - 1, on_go, NULL);
-    td_textbox_set_buffer(s_port, s_port_text, (int)sizeof(s_port_text));
-    s_go = td_button(s_win, 36, 0, "Connect", on_go, NULL);
-    s_state = td_label(s_win, 52, 0, 0, "");
+    s_bar_rows = td_win_client(s_win).w < 60 ? 2 : 1;
+    /*
+     * ONE ROW, AND ON A 38-COLUMN CLIENT IT DOES NOT FIT.
+     *
+     * Upstream: "Host" at 0, the field at 5..22, "Port" at 24, its field at
+     * 29..34, "Connect" at 36..46 and the state from 52. On a 40-column panel
+     * Connect was cut to its first two columns and the state label did not
+     * exist, so the window could take a host and a port and had no visible way
+     * to connect.
+     *
+     * Narrow: Host and Port share the first row with their fields, and Connect
+     * and the state go on the second, where there is room for both.
+     */
+    {
+        int cw = td_win_client(s_win).w;
+
+        if (cw < 60)
+        {
+            int host_w = cw - 5 - 14;       /* leaves "Port" and its field */
+
+            if (host_w < 6)
+                host_w = 6;
+            td_label(s_win, 0, 0, 5, "Host");
+            s_host = td_textbox(s_win, 5, 0, host_w, (int)sizeof(s_host_text) - 1, on_go, NULL);
+            td_textbox_set_buffer(s_host, s_host_text, (int)sizeof(s_host_text));
+
+            td_label(s_win, host_w + 6, 0, 5, "Port");
+            s_port = td_textbox(s_win, host_w + 11, 0, 5,
+                                (int)sizeof(s_port_text) - 1, on_go, NULL);
+            td_textbox_set_buffer(s_port, s_port_text, (int)sizeof(s_port_text));
+
+            s_go = td_button(s_win, 0, 1, "Connect", on_go, NULL);
+            s_state = td_label(s_win, 11, 1, cw - 11, "");
+        }
+        else
+        {
+            td_label(s_win, 0, 0, 5, "Host");
+            s_host = td_textbox(s_win, 5, 0, 18, (int)sizeof(s_host_text) - 1, on_go, NULL);
+            td_textbox_set_buffer(s_host, s_host_text, (int)sizeof(s_host_text));
+            td_label(s_win, 24, 0, 5, "Port");
+            s_port = td_textbox(s_win, 29, 0, 6, (int)sizeof(s_port_text) - 1, on_go, NULL);
+            td_textbox_set_buffer(s_port, s_port_text, (int)sizeof(s_port_text));
+            s_go = td_button(s_win, 36, 0, "Connect", on_go, NULL);
+            s_state = td_label(s_win, 52, 0, 0, "");
+        }
+    }
     td_widget_focus(s_host);
 }
 
