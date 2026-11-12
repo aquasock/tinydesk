@@ -37,6 +37,7 @@
 #include "driver/gpio.h"
 
 #include "font8x16.h"
+#include "edges.h"
 #include "tinydesk/td_vterm.h"
 
 #define TAG "twatch-display"
@@ -115,10 +116,11 @@
  */
 #define PANEL_SAFE_INSET DISPLAY_ORIGIN_X
 /* Shared with touch.c through display.h, which is the only place that has to
- * agree about where the framebuffer sits on the glass. */
+ * agree about where the framebuffer sits on the glass. PANEL_COL_OFFSET moved
+ * there for the same reason: the margins and the touch driver are both written
+ * in controller coordinates. */
 #define FB_X             DISPLAY_ORIGIN_X
 #define FB_Y             DISPLAY_ORIGIN_Y
-#define PANEL_COL_OFFSET 22      /* the controller's RAM starts 22 columns left */
 #define PIX_CHUNK   16384        /* pixels per SPI transaction, as LilyGo */
 
 static spi_device_handle_t s_spi;
@@ -540,21 +542,6 @@ static void panel_fill(uint16_t colour)
  * palette: RGB565(0,63,0). It is the brightest thing on the glass and is meant
  * to be.
  */
-#define BTN_X0   (FB_X + PANEL_COL_OFFSET)                    /* 67: fb left */
-#define BTN_X1   (FB_X + PANEL_COL_OFFSET + DISPLAY_W - 1)    /* 386: fb right */
-#define BTN_Y0   (FB_Y + DISPLAY_H)      /* 461: first row below the framebuffer */
-#define BTN_Y1   (PANEL_H - 1)           /* 501: last row of the glass */
-#define BTN_SEP  2
-#define BTN_RADIUS 10
-#define BTN_N    3
-
-/* First column of bar i. The bars are not all the same width: 320 columns do
- * not divide by BTN_N, so the remainder is spread one column at a time rather
- * than left as a fat last bar. */
-static int btn_slot_x(int i)
-{
-    return BTN_X0 + (i * (BTN_X1 - BTN_X0 + 1)) / BTN_N;
-}
 
 /* Is (x, y) cut away by a rounded corner of radius BTN_RADIUS?
  *
@@ -712,21 +699,11 @@ static void paint_buttons(void)
  * at the framebuffer's top and bottom edges, one at each, which is where the
  * desktop starts and stops beside them. The strip below starts at 461, so the
  * two do not overlap. The margin above the framebuffer is left alone: the
- * operator intends it for status icons.
+ * operator intends it for status icons. Those bounds are edges.h's, along with
+ * the slot arithmetic, because the touch driver needs the same numbers: a
+ * button the painter and the hit test disagree about is a button that does
+ * something other than what it looks like.
  */
-#define LEFT_X0   PANEL_COL_OFFSET                  /* 22: visible glass edge */
-#define LEFT_X1   (FB_X + PANEL_COL_OFFSET - 1)     /* 66: last column before fb */
-#define LEFT_Y0   FB_Y                              /* 45: framebuffer top row */
-#define LEFT_Y1   (FB_Y + DISPLAY_H - 1)            /* 460: framebuffer bottom */
-#define LEFT_N    5
-
-/* First row of slot i. Slots are not all the same height: 416 rows do not
- * divide by LEFT_N, so the remainder is spread one row at a time rather than
- * left as a fat last button. */
-static int left_slot_y(int i)
-{
-    return LEFT_Y0 + (i * (LEFT_Y1 - LEFT_Y0 + 1)) / LEFT_N;
-}
 
 static void paint_left_buttons(void)
 {

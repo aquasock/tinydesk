@@ -261,10 +261,23 @@ void td_wm_set_input_gate(bool locked, td_window_t *w)
 }
 static bool (*s_kiosk_hook)(const td_event_t *ev);
 
-static bool taskbar_visible(void)
+  /* Whether an application has the whole screen: the top window is full screen,
+ * or the desktop is in kiosk mode. This is the opposite of "the desktop's own
+ * furniture is showing", which is why taskbar_visible() is written in terms of
+ * it rather than repeating the test. A port with a touch panel needs to ask
+ * the same question for a different reason: outside kiosk and full screen the
+ * margins of the glass carry this port's own buttons, and inside them the
+ * application owns every pixel, touch included. */
+bool td_wm_app_owns_screen(void)
 {
     td_window_t *top = top_window(false);
-    return !s_kiosk && !(top && (top->flags & TD_WIN_FULLSCREEN));
+
+    return s_kiosk || (top && (top->flags & TD_WIN_FULLSCREEN));
+}
+
+static bool taskbar_visible(void)
+{
+    return !td_wm_app_owns_screen();
 }
 
 static int taskbar_h(void)

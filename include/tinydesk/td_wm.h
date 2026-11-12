@@ -231,6 +231,13 @@ void td_wm_close_all(void);
 void td_wm_set_kiosk(bool on, bool (*hook)(const td_event_t *ev));
 bool td_wm_kiosk(void);
 
+  /* Whether an application has the whole screen right now: the top window is
+ * full screen, or kiosk mode is on. False when the desktop's own furniture --
+ * taskbar, icons, margins -- is showing. A port whose glass carries controls
+ * outside the framebuffer uses this to decide whether a touch belongs to those
+ * controls or to the application. */
+bool td_wm_app_owns_screen(void);
+
   /* The taskbar clock (optional). text() fills in the clock (return false to
  * hide it); click() gets TD_BUTTON_LEFT or TD_BUTTON_RIGHT and the cell. */
 typedef struct

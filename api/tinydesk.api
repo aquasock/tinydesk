@@ -641,6 +641,7 @@ td_wm.h: void td_wm_set_start_provider(const td_start_provider_t *provider);
 td_wm.h: void td_wm_close_all(void);
 td_wm.h: void td_wm_set_kiosk(bool on, bool (*hook)(const td_event_t *ev));
 td_wm.h: bool td_wm_kiosk(void);
+td_wm.h: bool td_wm_app_owns_screen(void);
 td_wm.h: typedef struct { bool (*text)(char *buf, int cap); void (*click)(int button, int x, int y); bool (*parts)(char *time, int tcap, char *date, int dcap); } td_clock_provider_t;
 td_wm.h: void td_wm_set_clock(const td_clock_provider_t *clock);
 td_wm.h: void td_wm_set_user_label(const char *label);

@@ -42,10 +42,19 @@
  * coordinates are mapped onto the terminal's cell grid here rather than
  * anywhere else.
  *
- * THE INPUT MODEL IS A POINTER, NOT A TAP. The desktop expects a mouse, so a
- * finger down is button 1 held and a finger up is button 1 released, with the
- * cursor following the finger. A tap is therefore press-and-release at the
- * same cell, which is what the window manager reads as a click.
+ * THE PANEL IS NOT A POINTER ON THE DESKTOP. A cell of the 40x26 grid is 8x16
+ * px, so aiming a finger at the desktop's own controls is not practical, and
+ * making them big enough would cost the screen. So while the desktop is
+ * showing, the controller's reports are read as presses on the margins around
+ * the framebuffer -- the left column, the bottom strip, the right scroll
+ * column -- and a touch on the framebuffer itself does nothing. Those margins
+ * are painted by display.c and their geometry lives in edges.h, shared with
+ * the painter so that a button and its hit test cannot disagree.
+ *
+ * When an application owns the whole screen instead -- kiosk mode, or a
+ * full-screen window -- the panel goes back to being a mouse for that
+ * application: absolute position mapped onto the cell grid as SGR reports, with
+ * drag as button-held motion. A game wants raw touch and gets it.
  */
 
 #include "touch.h"
@@ -58,6 +67,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "display.h"
+#include "edges.h"
+#include "tinydesk/td_wm.h"
 #include "power.h"
 #include "tinydesk/td_vterm.h"
 
@@ -95,20 +106,11 @@
  * because the controller never sends a release event of its own. */
 #define RELEASE_MS      250
 
-/* First panel row that is below the framebuffer, and so not the desktop.
- *
- * display.c paints the three bars from glass row 461 (FB_Y + DISPLAY_H), but
- * the part reads a few pixels high near the bottom of the glass: TCH-004
- * measured 2 and 3 px on a bar painted from 445. So the guard sits three rows
- * above the paint rather than on it, which costs the taskbar its bottom three
- * rows -- descender space, almost always blank -- and buys the property that a
- * press anywhere on a bar is never read as a press on the taskbar. */
-#define STRIP_Y0        (DISPLAY_ORIGIN_Y + DISPLAY_H - 3)	/* 458 */
-
 static i2c_master_bus_handle_t s_bus;
 static i2c_master_dev_handle_t s_dev;
 static touch_input_fn s_input;
-static bool s_down;
+static bool s_down;              /* pointer button down: only in pass-through */
+static bool s_pressed;           /* the controller is reporting a press */
 static int s_last_x = -1, s_last_y = -1;
 static int s_idle_ms;
 
@@ -268,18 +270,17 @@ static void emit(bool press, int col, int row)
 /* Panel pixels to a terminal cell.
  *
  * The controller reports in glass coordinates over the whole 410x502 panel,
- * but the desktop only occupies the 320x400 rectangle at (45,45). So the
+ * but the desktop only occupies the 320x416 rectangle at (45,45). So the
  * origin comes off first, and only then is the position divided by the cell
  * size. Without that subtraction every touch lands 45 px down and right of
  * where the finger is and the right-hand fifth of the screen is unreachable --
  * the mapping was scaling the whole glass onto the desktop's grid.
  *
- * The clamp to the last row and column is a safety net and nothing more. A
- * touch below the framebuffer used to rely on it, which was wrong: the three
- * bars on the glass under the display are not taskbar cells, and mapping them
- * as if they were put panel x 22..100 on the Start button and panel x 221..431
- * on the clock's Date and time shortcut. They are filtered out before this is
- * called, at STRIP_Y0. */
+ * This is the pass-through path and it runs only when an application owns the
+ * screen. On the desktop itself a touch on the framebuffer does nothing at
+ * all, which is why the clamp below is a safety net rather than a routing
+ * rule: it used to route the margins onto the taskbar, and that put the left
+ * margin on the Start button and the right margin on Date and time. */
 static void to_cell(int x, int y, int *col, int *row)
 {
     int cw = DISPLAY_W / display_cols();
@@ -299,21 +300,103 @@ static void to_cell(int x, int y, int *col, int *row)
         *row = display_rows() - 1;
 }
 
+/* ---- the glass margins, which are the only touch targets on the desktop ----
+ *
+ * The framebuffer is 320x416 on a 410x502 glass, and a finger on that grid is
+ * not usable: a cell is 8x16 px, so aiming at a button means landing inside a
+ * 16-pixel-tall target, and the desktop's own controls are one or two cells.
+ * So the touch panel stops being a pointer while the desktop is showing. What
+ * it does instead is the three margins, which are large, painted, and in the
+ * same place every time.
+ *
+ * An application that owns the whole screen gets the panel back, as a pointer,
+ * with no margins and no dead zones: kiosk mode and full screen are exactly the
+ * cases where an application wants raw touch, and on those the glass is its,
+ * not ours. td_wm_app_owns_screen() is the question, and it is the same one the
+ * window manager asks before drawing a taskbar. */
+
+/* A key, as the terminal would send it: the desktop's input parser turns these
+ * back into key events, so an edge press is indistinguishable from the same key
+ * on a Bluetooth keyboard. CSI 11~ to 15~ are F1 to F5. */
+static const char *const s_fkey[LEFT_N] = {
+    "\x1b[11~", "\x1b[12~", "\x1b[13~", "\x1b[14~", "\x1b[15~",
+};
+
+/* Left to right: Tab, Enter, Esc. */
+static const char *const s_bkey[BTN_N] = {
+    "\t", "\r", "\x1b",
+};
+
+static void send_str(const char *s)
+{
+    if (s && s_input)
+        s_input(s, (int)strlen(s));
+}
+
+/* The right column scrolls: the wheel, at the middle of the desktop.
+ *
+ * The position matters because the window manager routes a wheel event to the
+ * window under it, and there is no pointer on the glass anymore to take the
+ * position from. The middle of the desktop is under whichever window is
+ * focused, which is the one the operator is looking at. */
+static void send_wheel(int y)
+{
+    char buf[32];
+    int button = y < (LEFT_Y0 + LEFT_Y1) / 2 ? 64 : 65;   /* up / down */
+    int n = snprintf(buf, sizeof(buf), "\x1b[<%d;%d;%dM",
+                     button, display_cols() / 2 + 1, display_rows() / 2 + 1);
+
+    if (n > 0 && s_input)
+        s_input(buf, n);
+}
+
+/* What a press at the start of a touch does. Anything not in a margin does
+ * nothing: on the desktop the framebuffer is not a touch surface. */
+static void edge_press(const edge_hit_t *hit, int y)
+{
+    switch (hit->region)
+    {
+    case EDGE_LEFT:
+        if (hit->index >= 0 && hit->index < LEFT_N)
+            send_str(s_fkey[hit->index]);
+        break;
+    case EDGE_BOTTOM:
+        if (hit->index >= 0 && hit->index < BTN_N)
+            send_str(s_bkey[hit->index]);
+        break;
+    case EDGE_RIGHT:
+        send_wheel(y);
+        break;
+    default:
+        break;
+    }
+}
+
 /* Emit a release if a press has stopped reporting.
  *
  * This part has no release event: a lifted finger simply stops being reported,
  * so a held press that goes quiet is a release. Called both when a block is
- * not a press and when a press arrives outside the desktop, so that the count
- * keeps running in either case. */
+ * not a press and when a press arrives where nothing is listening, so that the
+ * count keeps running in every case -- and so that a finger which slides off
+ * the glass does not leave the pointer latched down. */
 static void release_if_idle(void)
 {
-    int col, row;
-
-    if (!s_down || ++s_idle_ms < (RELEASE_MS / POLL_MS))
+    if (!s_pressed)
+    {
+        s_idle_ms = 0;
         return;
-    to_cell(s_last_x, s_last_y, &col, &row);
-    emit(false, col, row);
-    s_down = false;
+    }
+    if (++s_idle_ms < (RELEASE_MS / POLL_MS))
+        return;
+    if (s_down)
+    {
+        int col, row;
+
+        to_cell(s_last_x, s_last_y, &col, &row);
+        emit(false, col, row);
+        s_down = false;
+    }
+    s_pressed = false;
     s_idle_ms = 0;
 }
 
@@ -386,47 +469,57 @@ static void poll_task(void *arg)
         {
             int x = (b[1] << 4) | (b[3] >> 4);
             int y = (b[2] << 4) | (b[3] & 0x0F);
-            int col, row;
+            edge_hit_t hit;
+            bool app = td_wm_app_owns_screen();
 
-            /* Counted before the strip is filtered: this is the count of
-             * presses the controller reported, and the strip is one of the
-             * things worth knowing about when its buttons are wired up. */
             s_reports++;
-
-            /* The strip below the framebuffer is the board's three capacitive
-             * buttons, and they have no duties yet, so a press there is a dead
-             * zone. It still runs the release path: a finger that slides down
-             * off the framebuffer has left the desktop, and the drag it was
-             * carrying should end at its last on-screen cell rather than stay
-             * latched for ever. */
-            if (y >= STRIP_Y0)
-            {
-                release_if_idle();
-                continue;
-            }
-
             s_idle_ms = 0;
 
-            to_cell(x, y, &col, &row);
-            s_last_x = x;
-            s_last_y = y;
+            edges_hit(x, y, &hit);
 
-            /* A move while down is a drag: the desktop gets motion with the
-             * button held, which is what a window manager expects for a
-             * title bar or a scroll bar. */
-            if (!s_down)
+            /* The action fires once per touch, on the first report, not once
+             * per report: the controller re-reports the same finger about
+             * every 66 ms while it is held, which would be a hundred presses a
+             * second on a held Tab. */
+            if (!s_pressed)
             {
-                s_down = true;
-                emit(true, col, row);
+                s_pressed = true;
+                if (!app)
+                    edge_press(&hit, y);
             }
-            else
-            {
-                char buf[32];
-                int n = snprintf(buf, sizeof(buf), "\x1b[<32;%d;%dM",
-                                 col + 1, row + 1);
 
-                if (n > 0 && s_input)
-                    s_input(buf, n);
+            /* An application that owns the screen gets the panel as a pointer,
+             * margins included -- on those the glass is its, and a game that
+             * draws its own controls near the edge needs the whole surface.
+             * On the desktop nothing here runs: the framebuffer is not a touch
+             * surface, and the margins were already handled above. */
+            if (!app)
+                continue;
+
+            {
+                int col, row;
+
+                to_cell(x, y, &col, &row);
+                s_last_x = x;
+                s_last_y = y;
+
+                /* A move while down is a drag: the desktop gets motion with
+                 * the button held, which is what a window manager expects for
+                 * a title bar or a scroll bar. */
+                if (!s_down)
+                {
+                    s_down = true;
+                    emit(true, col, row);
+                }
+                else
+                {
+                    char buf[32];
+                    int n = snprintf(buf, sizeof(buf), "\x1b[<32;%d;%dM",
+                                     col + 1, row + 1);
+
+                    if (n > 0 && s_input)
+                        s_input(buf, n);
+                }
             }
         }
     }

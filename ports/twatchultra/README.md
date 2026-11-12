@@ -135,7 +135,7 @@ TinyDesk whole:
 | System | Status |
 | --- | --- |
 | Display (CO5300 QSPI) | **Works.** Verified on the glass: the sign-in screen renders, correctly positioned. |
-| Touch (CST9217) | **Bring-up verified on hardware.** `CST9220 410x502`, then `CST9217 up at 0x1A`: the checkcode, chip type, resolution and firmware reads all pass and the poll task runs. A synthetic SGR click over the link opens the start menu, so the pointer path into the desktop works. **What is not yet verified is a finger on the glass.** |
+| Touch (CST9217) | **Bring-up verified on hardware.** `CST9220 410x502`, then `CST9217 up at 0x1A`: the checkcode, chip type, resolution and firmware reads all pass and the poll task runs. On the desktop the panel is **not** a pointer: a press on one of the three margins is a button, and a press on the framebuffer does nothing. An application that owns the whole screen -- kiosk mode or a full-screen window -- gets the panel back as an absolute pointer, `td_wm_app_owns_screen()` being the test. |
 | Keyboard (USB Serial/JTAG) | Works; it is the link, and the desktop is driven through it. |
 | Bluetooth (NimBLE, `bt.enable = 1`) | **Works, verified on the glass.** A combo keyboard-and-mouse paired from a scan into the Combo slot and drives the desktop; the pairing survives in NVS across reboots. The Mouse and Keyboard slots (one device each) are the same code path but have not been tried. |
 | `/fs` (littlefs, 9.9 MB) | Should work: `partitions.csv` defines it and the littlefs component is linked. Unverified. |
@@ -143,7 +143,7 @@ TinyDesk whole:
 | OTA | `TD_UPDATE_BOARD="twatchultra"` so this image will not be replaced by a UART desktop's. No update feed exists for this board yet. |
 | SD card | Hardware **unproven on this board** (see `board.example.conf`). Opt-in and commented out. |
 | Battery / PMU | No TinyDesk UI consumes it. The AXP2101 is used only to raise ALDO2. |
-| Buttons (three bars below the framebuffer) | **Painted, images only.** `main/display.c` draws a green strip below the desktop and a column of five green buttons down its left margin, both capped with rounded corners and both ending at the framebuffer's edges rather than the glass. Nothing reads them yet: a press on either is a dead zone in the touch driver. |
+| Buttons (the three margins) | **Painted and live.** `main/edges.h` holds the geometry, `main/display.c` paints it and `main/touch.c` hit-tests it, so a button and its target cannot drift apart. **Left column**, five buttons, `F1` to `F5` top to bottom. **Bottom strip**, three: `Tab`, `Enter`, `Esc` left to right. **Right column**, the wheel -- upper half up, lower half down. Green, 10 px radius where a button faces a neighbour, and the column's and strip's end buttons are capped on all four corners so they stop at the framebuffer's edges rather than running into the glass. |
 | RTC (PCF85063A) | **Works.** `main/rtc.c` reads the chip at boot and seeds the system clock, so the desktop has a time with no network; it writes back when the time is set by Date & time or SNTP. Verified on the glass: the taskbar showed the correct UTC with Wi-Fi offline. Reading uses mainline's register map and refuses a stopped oscillator. |
 | Haptics | No TinyDesk integration. The DRV2605 is unused. |
 

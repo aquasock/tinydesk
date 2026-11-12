@@ -57,6 +57,13 @@
 #define DISPLAY_PANEL_W   410
 #define DISPLAY_PANEL_H   502
 
+/* The controller's RAM starts 22 columns to the LEFT of the visible glass, so a
+ * column written to the panel needs this added (LCD-004: the first column of a
+ * window is swallowed). Everything outside the framebuffer -- the button bars
+ * and the margins -- works in these controller coordinates, which is also what
+ * the touch controller reports. */
+#define PANEL_COL_OFFSET  22
+
 /* The cells the panel shows (after display_init()). */
 int display_cols(void);
 int display_rows(void);
