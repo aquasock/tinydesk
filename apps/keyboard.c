@@ -28,8 +28,9 @@ static const struct
 
 #define LAYOUT_Y 3
 #define ROW_Y(i) (5 + 2 * (i))
-#define BAR_X    23
-#define BAR_W    20
+/* The bar's geometry is computed from the client width, so the click handler
+ * reads these rather than compiling in a position the panel may not have. */
+static int s_bar_x = 23, s_bar_w = 20;
 
 static td_window_t *s_win;
 static td_widget_t *s_status, *s_layout, *s_bar[SETTINGS], *s_value[SETTINGS], *s_note;
@@ -137,10 +138,10 @@ static bool on_event(td_window_t *win, const td_event_t *ev)
         return false;
     for (int i = 0; i < SETTINGS; i++)
     {
-        if (ev->y != ROW_Y(i) || ev->x < BAR_X || ev->x >= BAR_X + BAR_W)
+        if (ev->y != ROW_Y(i) || ev->x < s_bar_x || ev->x >= s_bar_x + s_bar_w)
             continue;
         int span = s_rows[i].max - s_rows[i].min, step = s_rows[i].step;
-        int v = s_rows[i].min + (ev->x - BAR_X) * span / (BAR_W - 1);
+        int v = s_rows[i].min + (ev->x - s_bar_x) * span / (s_bar_w - 1);
         change(i, (v + step / 2) / step * step);
         return true;
     }
@@ -180,25 +181,67 @@ static void launch(void)
     if (!s_win)
         return;
     td_sysinfo()->keyboard->get(&s_set);
+    td_widget_t *try_box;
 
-    s_status = td_label(s_win, 2, 1, 0, "");
-    td_label(s_win, 2, LAYOUT_Y, 14, "Layout");
-    td_button(s_win, 17, LAYOUT_Y, "<", on_layout, (void *)(intptr_t)-1);
-    s_layout = td_label(s_win, BAR_X, LAYOUT_Y, BAR_W, "");
-    td_widget_set_align(s_layout, TD_ALIGN_CENTER);
-    td_button(s_win, BAR_X + BAR_W + 1, LAYOUT_Y, ">", on_layout, (void *)(intptr_t)1);
-    for (int i = 0; i < SETTINGS; i++)
+    /*
+     * THE SAME FAULT AS THE MOUSE APP, ONE CONTRIBUTOR WORSE.
+     *
+     * The rows were laid out from fixed columns: name at 2, "<" or "-" at 17, a
+     * 20-column bar from 23, the "+" at 44 and the value at 50. On a 40-column
+     * panel the client is 38 wide, so the bar ran past the frame, the "+" and
+     * the value were off the glass, and the layout name was cut to "US
+     * (English". The ">" button was invisible too, so the layout could only be
+     * cycled backwards.
+     *
+     * And the "Try it" textbox was a fixed 44 columns at x 11, which does not
+     * merely overrun: a widget wider than the client is not drawn at all, so
+     * the box for testing the keyboard did not exist on this panel.
+     *
+     * Everything is measured from the client now. The bar takes what is left
+     * between the "-" and the "+", and the layout name is centred between "<"
+     * and ">" in whatever room they leave.
+     */
     {
-        td_label(s_win, 2, ROW_Y(i), 14, s_rows[i].name);
-        td_button(s_win, 17, ROW_Y(i), "-", on_minus, (void *)(intptr_t)i);
-        s_bar[i] = td_progress(s_win, BAR_X, ROW_Y(i), BAR_W);
-        td_button(s_win, BAR_X + BAR_W + 1, ROW_Y(i), "+", on_plus, (void *)(intptr_t)i);
-        s_value[i] = td_label(s_win, BAR_X + BAR_W + 7, ROW_Y(i), 8, "");
+        int cw = td_win_client(s_win).w;
+        int bar_x = 20;
+        int val_x = cw - 5;
+        int plus_x = val_x - 5;
+        int bar_w = plus_x - 1 - bar_x;
+
+        if (bar_w < 8)
+            bar_w = 8;
+        s_bar_x = bar_x;
+        s_bar_w = bar_w;
+
+        s_status = td_label(s_win, 2, 1, 0, "");
+
+        /* Layout gets its own geometry: it has no bar and no numeric value, so
+         * it can use the full width instead of borrowing the bar's columns --
+         * which left the name eight columns and cut "US (English)" to "US
+         * (Engl". "<" at 1, ">" at the right edge, the name between them. */
+        td_button(s_win, 1, LAYOUT_Y, "<", on_layout, (void *)(intptr_t)-1);
+        s_layout = td_label(s_win, 7, LAYOUT_Y, cw - 14, "");
+        td_widget_set_align(s_layout, TD_ALIGN_CENTER);
+        td_button(s_win, cw - 5, LAYOUT_Y, ">", on_layout, (void *)(intptr_t)1);
+
+        for (int i = 0; i < SETTINGS; i++)
+        {
+            td_label(s_win, 1, ROW_Y(i), 13, s_rows[i].name);
+            td_button(s_win, 15, ROW_Y(i), "-", on_minus, (void *)(intptr_t)i);
+            s_bar[i] = td_progress(s_win, bar_x, ROW_Y(i), bar_w);
+            td_button(s_win, plus_x, ROW_Y(i), "+", on_plus, (void *)(intptr_t)i);
+            s_value[i] = td_label(s_win, val_x, ROW_Y(i), 5, "");
+        }
+
+        /* "Try it" sized to the client, not a fixed 44. */
+        td_label(s_win, 1, 10, 0, "Try it:");
+        try_box = td_textbox(s_win, 9, 10, cw - 10, 200, NULL, NULL);
+        td_button(s_win, 1, 12, "Defaults", on_defaults, NULL);
+        s_note = td_label(s_win, 1, 13, 0,
+                          td_session_has_right(TD_RIGHT_SYSTEM)
+                              ? ""
+                              : "The system permission is required.");
     }
-    td_label(s_win, 2, 10, 0, "Try it:");
-    td_widget_t *try_box = td_textbox(s_win, 11, 10, 44, 200, NULL, NULL);
-    td_button(s_win, 2, 12, "Defaults", on_defaults, NULL);
-    s_note = td_label(s_win, 17, 12, 0, td_session_has_right(TD_RIGHT_SYSTEM) ? "" : "The system permission is required to change these.");
     td_widget_set_color(s_note, td_theme()->dim, TD_COLOR_DEFAULT);
     td_widget_focus(try_box);
     show();
