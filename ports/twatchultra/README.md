@@ -143,7 +143,7 @@ TinyDesk whole:
 | OTA | `TD_UPDATE_BOARD="twatchultra"` so this image will not be replaced by a UART desktop's. No update feed exists for this board yet. |
 | SD card | Hardware **unproven on this board** (see `board.example.conf`). Opt-in and commented out. |
 | Battery / PMU | No TinyDesk UI consumes it. The AXP2101 is used only to raise ALDO2. |
-| Buttons (three bars below the framebuffer) | **Painted, images only.** `main/display.c` draws the red/green/blue strip below the desktop with the Linux build's measured geometry (controller x 0..431, thirds at 158 and 295, black separators). Nothing reads them yet: a touch on the strip still maps to a taskbar cell. |
+| Buttons (three bars below the framebuffer) | **Painted, images only.** `main/display.c` draws a green strip below the desktop and a column of five green buttons down its left margin, both capped with rounded corners and both ending at the framebuffer's edges rather than the glass. Nothing reads them yet: a press on either is a dead zone in the touch driver. |
 | RTC (PCF85063A) | **Works.** `main/rtc.c` reads the chip at boot and seeds the system clock, so the desktop has a time with no network; it writes back when the time is set by Date & time or SNTP. Verified on the glass: the taskbar showed the correct UTC with Wi-Fi offline. Reading uses mainline's register map and refuses a stopped oscillator. |
 | Haptics | No TinyDesk integration. The DRV2605 is unused. |
 

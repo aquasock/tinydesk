@@ -515,30 +515,46 @@ static void panel_fill(uint16_t colour)
  * two black separators are kept: without them the strip is a single green band
  * and there is nothing to show where one button ends and the next begins.
  *
- * The geometry is the Linux driver's (patches/kernel/display/final/co5300.c,
- * co5300_paint_frame), which measured it on this glass:
+ * The strip has to be read as the bottom run of a frame drawn round the
+ * desktop, because that is what it is: the left column runs the framebuffer's
+ * full height and this runs its full width, and the end buttons of each are
+ * capped rather than square so that neither one runs into the glass.
  *
- *   controller x  22 .. 156  green
- *                157 .. 158  black separator
- *                159 .. 292  green
- *                293 .. 294  black separator
- *                295 .. 431  green
+ * Geometry, in the controller's coordinates (the visible glass is 22..431):
  *
- * Two differences from that build, both consequences of this port:
+ *   x  67 .. 172  green
+ *     173 .. 174  black separator
+ *     175 .. 279  green
+ *     280 .. 281  black separator
+ *     282 .. 386  green
  *
- *   * the first row is 460 rather than 445, because this framebuffer is 416
- *     rows tall where the Linux one was 400 -- the bars are 41 rows, not 57;
- *   * the strip is painted at its own controller coordinates rather than as
- *     part of the framebuffer's row bands, since it lies outside them.
+ * 67 and 386 are the framebuffer's own left and right edges, so the strip
+ * finishes where the desktop above it finishes. The leftmost and rightmost
+ * bars round the corners at their outer end -- both the one facing the desktop
+ * and the one facing the glass, which is what makes it a cap. The corners at
+ * the separators round on the desk side only, exactly as the left column's do.
+ * Between the caps the bottom edge is flush with the glass, like the left
+ * column's left edge.
  *
  * The colours are the Linux driver's full primary green, not the desktop's
  * palette: RGB565(0,63,0). It is the brightest thing on the glass and is meant
  * to be.
  */
+#define BTN_X0   (FB_X + PANEL_COL_OFFSET)                    /* 67: fb left */
+#define BTN_X1   (FB_X + PANEL_COL_OFFSET + DISPLAY_W - 1)    /* 386: fb right */
 #define BTN_Y0   (FB_Y + DISPLAY_H)      /* 461: first row below the framebuffer */
 #define BTN_Y1   (PANEL_H - 1)           /* 501: last row of the glass */
 #define BTN_SEP  2
 #define BTN_RADIUS 10
+#define BTN_N    3
+
+/* First column of bar i. The bars are not all the same width: 320 columns do
+ * not divide by BTN_N, so the remainder is spread one column at a time rather
+ * than left as a fat last bar. */
+static int btn_slot_x(int i)
+{
+    return BTN_X0 + (i * (BTN_X1 - BTN_X0 + 1)) / BTN_N;
+}
 
 /* Is (x, y) cut away by a rounded corner of radius BTN_RADIUS?
  *
@@ -595,49 +611,26 @@ static void paint_buttons(void)
 {
     static const uint16_t COL_GREEN = 0x07E0;
 
-    /*
-     * FULL CONTROLLER WIDTH, DIVIDED BY THE PANEL'S WIDTH, IN ONE WINDOW.
-     *
-     * Two corrections are folded in here, both found on the glass.
-     *
-     * First the width: the strip is divided by PANEL_W (410), not DISPLAY_W
-     * (320). The framebuffer is a window onto the glass; the buttons belong to
-     * the glass. Dividing by 320 made the third 106 columns instead of 136 and
-     * left the right-hand 90 unpainted, which read as three bars shifted left.
-     *
-     * Then the banding: writing the strip as four separate 11-row windows left
-     * two thin black lines across it. The rows are contiguous in this code, so
-     * the loss is the panel's own -- docs/panel-geometry.md recorded that the
-     * first row of a window is swallowed -- and four windows swallow four rows.
-     * One window with the chip select held across every row band removes the
-     * class of fault entirely, at the cost of refilling s_tx between transfers
-     * instead of filling it once.
-     */
-    const int cx0 = 0;                               /* controller column 0 */
-    const int cx1 = PANEL_COL_OFFSET + PANEL_W - 1;  /* 431: last visible */
-    const int width = cx1 - cx0 + 1;                 /* 432 */
-    const int edge1 = PANEL_COL_OFFSET + PANEL_W / 3;      /* 22 + 136 = 158 */
-    const int edge2 = PANEL_COL_OFFSET + 2 * (PANEL_W / 3);/* 22 + 273 = 295 */
+    /* One sacrificial column: exactly one pixel is lost at the top-left of a
+     * window (docs/panel-geometry.md, "The first row and column are
+     * swallowed"), so the window starts one column before the green and the
+     * dropped pixel is a black one. Column 66 is in the margin below the left
+     * column, which stops at row 460, so it costs nothing. A row cannot be
+     * spent the same way -- that would be the framebuffer's last row. */
+    const int wx = BTN_X0 - 1;                       /* 66 */
+    const int width = BTN_X1 - wx + 1;               /* 321 */
     const int band = (int)(sizeof(s_tx) / sizeof(s_tx[0])) / width;
+    const int arc_ty = BTN_Y0 + BTN_RADIUS;          /* centre, top corners */
+    const int arc_by = BTN_Y1 - BTN_RADIUS;          /* centre, bottom corners */
     int y = BTN_Y0;
     bool first = true;
-
-    /* The corners that face another bar are rounded, and nothing else is: the
-     * left bar's top right, both of the middle bar's, and the right bar's top
-     * left. The bottom edge is the glass edge and the outer top corners are
-     * the glass edge, so those stay square. Each centre is R in from its
-     * corner, which is what corner_notch() expects. */
-    const int arc_y = BTN_Y0 + BTN_RADIUS;
-    const int arc0_rx = edge1 - BTN_SEP - 1 - BTN_RADIUS;   /* left bar, top right */
-    const int arc1_lx = edge1 + BTN_RADIUS;                 /* middle bar, top left */
-    const int arc1_rx = edge2 - BTN_SEP - 1 - BTN_RADIUS;   /* middle bar, top right */
-    const int arc2_lx = edge2 + BTN_RADIUS;                 /* right bar, top left */
 
     if (band < 1)
         return;
 
-    /* The window is the whole strip; every transfer below continues it. */
-    set_window(cx0, BTN_Y0, width, BTN_Y1 - BTN_Y0 + 1);
+    /* The window is the whole strip; every transfer below continues it, so CS
+     * stays low and the panel sees one window rather than one per band. */
+    set_window(wx, BTN_Y0, width, BTN_Y1 - BTN_Y0 + 1);
     spi_device_acquire_bus(s_spi, portMAX_DELAY);
     gpio_set_level(LCD_CS, 0);
 
@@ -651,28 +644,34 @@ static void paint_buttons(void)
 
             for (int i = 0; i < width; i++)
             {
-                int x = cx0 + i;
-                uint16_t c;
+                int x = wx + i;
+                uint16_t c = 0x0000;
 
-                if (x < edge1 - BTN_SEP)
-                    c = COL_GREEN;
-                else if (x < edge1)
-                    c = 0x0000;
-                else if (x < edge2 - BTN_SEP)
-                    c = COL_GREEN;
-                else if (x < edge2)
-                    c = 0x0000;
-                else
-                    c = COL_GREEN;
+                if (x >= BTN_X0 && x <= BTN_X1)
+                {
+                    /* Which bar's columns this is, if any: a separator column
+                     * belongs to no bar, which is what leaves the gap. Green
+                     * starts two columns into every bar but the first, and ends
+                     * one column before the next bar begins. */
+                    for (int s = 0; s < BTN_N; s++)
+                    {
+                        int g0 = s == 0 ? BTN_X0 : btn_slot_x(s) + BTN_SEP;
+                        int g1 = btn_slot_x(s + 1) - 1;
 
-                /* The notch is black, the same black as the separators, so a
-                 * rounded corner reads as the green receding from the gap. */
-                if (c == COL_GREEN &&
-                    (corner_notch(x, yy, arc0_rx, arc_y, true, true) ||
-                     corner_notch(x, yy, arc1_lx, arc_y, false, true) ||
-                     corner_notch(x, yy, arc1_rx, arc_y, true, true) ||
-                     corner_notch(x, yy, arc2_lx, arc_y, false, true)))
-                    c = 0x0000;
+                        if (x < g0 || x > g1)
+                            continue;
+
+                        c = COL_GREEN;
+                        if (corner_notch(x, yy, g0 + BTN_RADIUS, arc_ty, false, true) ||
+                            corner_notch(x, yy, g1 - BTN_RADIUS, arc_ty, true, true) ||
+                            (s == 0 &&
+                             corner_notch(x, yy, g0 + BTN_RADIUS, arc_by, false, false)) ||
+                            (s == BTN_N - 1 &&
+                             corner_notch(x, yy, g1 - BTN_RADIUS, arc_by, true, false)))
+                            c = 0x0000;
+                        break;
+                    }
+                }
 
                 s_tx[r * width + i] = swap16(c);
             }
