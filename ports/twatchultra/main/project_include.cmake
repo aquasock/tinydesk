@@ -49,3 +49,37 @@ idf_build_set_property(COMPILE_DEFINITIONS "TD_OPEN_MAXIMIZED=1" APPEND)
 # has a Bluetooth keyboard. The keyboard itself is still built and still opens
 # from Sign in and the kiosk way out -- this removes the icon, not the feature.
 idf_build_set_property(COMPILE_DEFINITIONS "TD_HIDE_OSK_APP=1" APPEND)
+
+# --- WOLFSSH_STOREHANDLE: stops an aborted SFTP session leaking file handles
+#
+# Measured on this board on 2026-11-12: five killed transfers and the SD card
+# refuses every open -- from the shell too, `echo hi > /sd/x` returning 1 with
+# `vfs_fat: open: no free file descriptors`. Clean transfers do not leak: eight
+# 1 KiB puts in one session and a 233 KB transfer both leave the card writable.
+# So the leak is per abandoned session, and it is permanent until a reboot.
+#
+# THE MECHANISM, traced rather than guessed. This port uses wolfSSH's stdio
+# path, so `WFOPEN` maps to `wfopen` (ports/esp_idf/components/wolfssh_local/
+# include/wolfssh/port.h) and files land in ESP-IDF's VFS, whose FAT mount is
+# created with `max_files = 5` (tdsh_sdcard.c, SD_MAX_FILES). wolfSSH closes
+# those descriptors in two places: the SFTP CLOSE request, and
+# `SFTP_FreeHandles()` from `wolfSSH_SFTP_free()`. The second is compiled out
+# unless `WOLFSSH_STOREHANDLE` is defined, and `settings.h` only defines it
+# automatically for `WOLFSSH_FATFS` -- which is the *other* I/O path, the one
+# that talks to FatFs directly through a private descriptor pool. This port
+# never takes that path, so `WOLFSSH_STOREHANDLE` was off, the handle list was
+# never populated, and teardown had nothing to close.
+#
+# The consequence is that the leak only appears on an ABORTED session: a normal
+# one ends with the client's own CLOSE requests, which free the descriptors
+# whatever this setting says. That is why it looked like a size limit at first.
+#
+# With it defined, `SFTP_RecvOpen` records each descriptor in the handle list
+# and `SFTP_FreeHandles` closes whatever is left when the session ends. Both
+# halves are already in the vendored wolfSSH and are gated on this one macro --
+# no source file has to change, which matters because wolfSSH here lives in the
+# tinydesk-shell submodule and is not this project's to edit.
+#
+# Cost: one node per open file, ~300 bytes, from the SSH server's own 64 KiB
+# PSRAM heap. A handful of concurrently open files is what this watch does.
+idf_build_set_property(COMPILE_DEFINITIONS "WOLFSSH_STOREHANDLE" APPEND)
