@@ -135,6 +135,36 @@ static int cmd_play(tdsh_session_t *session, int argc, char **argv)
     return 0;
 }
 
+/*
+ * `pattern [0|1|2]` -- three generated images for checking the blit.
+ *
+ * It lives in the shell rather than on a menu row because it is an instrument,
+ * not a feature, and because the question it answers ("is the copy right?") has
+ * to be answerable before the thing that will really draw is connected.
+ */
+static int cmd_pattern(tdsh_session_t *session, int argc, char **argv)
+{
+    (void)session;
+
+    int what = argc >= 2 ? atoi(argv[1]) : 0;
+
+    if (!display_test_pattern(what))
+    {
+        printf("no framebuffer (%d)\n", what);
+        return 1;
+    }
+    printf("pattern %d drawn\n", what);
+    return 0;
+}
+
+static const tdsh_command_t s_pattern_cmd = {
+    "pattern",
+    "pattern [0|1|2]",
+    "Draw a test pattern: 0 bars, 1 grid, 2 edge frame",
+    cmd_pattern,
+    TDSH_CMD_INTERACTIVE,
+};
+
 static const tdsh_command_t s_play_cmd = {
     "play",
     "play <file.wav> | play stop",
@@ -189,10 +219,16 @@ bool link_init(void)
         return false;
     }
 
-    /* No picture support: the panel is a character terminal here, and the
-     * desktop is told so rather than being left to draw Sixel nobody shows. */
+    /* RGB565 pictures ARE supported now -- display_picture_rgb() copies the
+     * bitmap into the framebuffer and flushes it, which is what anything with a
+     * frame rather than a terminal needs (the Tamagotchi emulator's output is a
+     * 300x308 RGB565 buffer).
+     *
+     * 8-bit and run-length pictures are still not, and stay NULL: the desktop
+     * learns from these three what it can draw, so registering a sink that
+     * returns false would be worse than saying plainly that there is none. */
     td_picture_set_sink(NULL, NULL);
-    td_picture_set_rgb_sink(NULL, NULL);
+    td_picture_set_rgb_sink(display_picture_rgb, NULL);
     td_picture_set_runs_sink(NULL, NULL);
 
     /* The controller is held in reset by an expander pin until something
@@ -277,6 +313,9 @@ bool link_init(void)
 
     if (!gps_register_command())
         ESP_LOGW(TAG, "gps command did not register");
+
+    if (tdsh_register_command(&s_pattern_cmd) != 0)
+        ESP_LOGW(TAG, "pattern command did not register");
 
     charge_report(NULL);
 

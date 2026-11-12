@@ -91,6 +91,14 @@ void display_write(const uint8_t *buf, int len);
  * link.c registers them. */
 bool display_picture(void *user, int x, int y, const uint8_t *pixels, int w, int h);
 bool display_picture_rgb(void *user, int x, int y, const uint16_t *pixels, int w, int h);
+
+/* Draw a test pattern, for checking the blit path before trusting it.
+ *
+ * `what` is 0 for colour bars, 1 for a 1-pixel grid, 2 for a corner-and-edge
+ * frame. Each answers a different question: bars catch a stride or byte-order
+ * fault, the grid catches an off-by-one in the copy, and the frame catches
+ * clipping at the panel's edges. Returns false when there is no framebuffer. */
+bool display_test_pattern(int what);
 bool display_picture_runs(void *user, int x, int y, const uint16_t *runs, size_t words, int w, int h);
 void display_scanout_snapshot(uint32_t out[12]);
 void display_scanout_info(uint32_t out[8]);

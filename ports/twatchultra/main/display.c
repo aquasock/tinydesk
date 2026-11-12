@@ -25,6 +25,7 @@
 
 #include "display.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_heap_caps.h"
@@ -1402,14 +1403,141 @@ void display_write(const uint8_t *buf, int len)
     xTaskNotifyGive(s_paint_task);
 }
 
-/* ---- pictures: not supported ------------------------------------------- */
+/* ---- pictures ---------------------------------------------------------- */
 
-bool display_picture(void *user, int x, int y, const uint8_t *pixels, int w, int h)
-{
-    (void)user; (void)x; (void)y; (void)pixels; (void)w; (void)h;
-    return false;
-}
+/*
+ * RGB565 BITMAPS ARE SUPPORTED; the other two formats are not.
+ *
+ * This port said "no picture support" and stubbed all three, which is why
+ * td_picture_set_rgb_sink() is handed NULL in link_twatch.c. It is the natural
+ * sink for anything that has a frame rather than a terminal: a bitmap viewer, and
+ * the Tamagotchi emulator, whose output is a 300x308 RGB565 buffer.
+ *
+ * The work is genuinely small because the pieces already exist: s_fb is the
+ * framebuffer the painter draws into, and flush_rect() copies a rectangle out of
+ * it, byte-swaps it and pushes it. So this copies the bitmap in and flushes the
+ * rectangle.
+ *
+ * TWO THINGS IT DOES NOT DO. It does not touch s_shown -- the painter's record of
+ * which terminal cells it has drawn -- so the next repaint will overwrite these
+ * pixels. That is correct for an app that owns the screen and wrong for one that
+ * shares it, and the caller decides which by calling this only in the first case.
+ * And it does not clear the pixels to the right of a short row, so a bitmap that
+ * replaces a wider one leaves the old right-hand columns behind; the caller
+ * should paint its full width.
+ *
+ * The pixels are the caller's and may be in PSRAM; the copy is row by row into
+ * the framebuffer, which is also where the painter wants them.
+ */
 bool display_picture_rgb(void *user, int x, int y, const uint16_t *pixels, int w, int h)
+{
+    (void)user;
+
+    if (!s_fb || !pixels || w <= 0 || h <= 0)
+        return false;
+
+    /* Clip rather than refuse: a frame partly off the panel is a layout mistake
+     * worth showing as much of as possible, and refusing would make it a blank
+     * screen with no clue why. */
+    int x0 = x < 0 ? 0 : x;
+    int y0 = y < 0 ? 0 : y;
+    int x1 = x + w;
+    int y1 = y + h;
+
+    if (x1 > DISPLAY_W)
+        x1 = DISPLAY_W;
+    if (y1 > DISPLAY_H)
+        y1 = DISPLAY_H;
+    if (x0 >= x1 || y0 >= y1)
+        return false;
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (int r = y0; r < y1; r++)
+    {
+        const uint16_t *src = pixels + (size_t)(r - y) * w + (x0 - x);
+        memcpy(s_fb + (size_t)r * DISPLAY_W + x0, src,
+               (size_t)(x1 - x0) * sizeof(uint16_t));
+    }
+    xSemaphoreGive(s_lock);
+
+    flush_rect(x0, y0, x1, y1);
+    return true;
+}
+
+/*
+ * Test patterns, so the blit can be checked on its own.
+ *
+ * A bitmap that arrives wrong is indistinguishable from a bitmap that was wrong
+ * to begin with, and the emulator is a lot of code to blame. These are generated
+ * here, from arithmetic nobody can get wrong, and each targets a specific way a
+ * copy goes bad:
+ *
+ *   0  colour bars        a stride fault shears the bars; a byte-order fault
+ *                         swaps them (red and blue trade places)
+ *   1  one-pixel grid     an off-by-one in the row copy leaves a doubled or
+ *                         missing line, which is obvious on a uniform grid
+ *   2  edge frame         one pixel of border all round: if it is not visible
+ *                         on all four sides, the copy is clipping
+ */
+bool display_test_pattern(int what)
+{
+    /*
+     * HEAP, IN PSRAM, AND NOT A STATIC ARRAY. This was `static uint16_t
+     * img[DISPLAY_W * DISPLAY_H]` -- 256 KB of .bss -- and it did not fit:
+     * "region dram0_0_seg overflowed by 88896 bytes". Everything static in this
+     * component lands in internal DRAM by construction (extram.lf maps only
+     * libtinydesk, libtdsh and libmicropython to PSRAM), and internal DRAM is
+     * the board's scarcest resource at about 47 KB free.
+     *
+     * It is a test buffer, so nothing reads it but a memcpy; PSRAM is fine, and
+     * so is failing: a pattern that cannot allocate says so instead of
+     * corrupting something else. This is also the first hard number for the port
+     * -- a full-panel RGB565 buffer cannot live in internal RAM, which decides
+     * where the emulator's own frame goes.
+     */
+    uint16_t *img = (uint16_t *)malloc((size_t)DISPLAY_W * DISPLAY_H * sizeof(uint16_t));
+
+    if (!s_fb || !img)
+        return false;
+
+    switch (what)
+    {
+    case 0:
+    {
+        static const uint16_t bars[] = {
+            0xF800, 0x07E0, 0x001F, 0xFFFF, 0x0000, 0xFFE0, 0x07FF, 0xF81F,
+        };
+        for (int y = 0; y < DISPLAY_H; y++)
+            for (int x = 0; x < DISPLAY_W; x++)
+                img[(size_t)y * DISPLAY_W + x] = bars[(x * 8) / DISPLAY_W];
+        break;
+    }
+    case 1:
+        for (int y = 0; y < DISPLAY_H; y++)
+            for (int x = 0; x < DISPLAY_W; x++)
+                img[(size_t)y * DISPLAY_W + x] =
+                    (x % 16 == 0 || y % 16 == 0) ? 0xFFFF : 0x0000;
+        break;
+    case 2:
+    default:
+        for (int y = 0; y < DISPLAY_H; y++)
+            for (int x = 0; x < DISPLAY_W; x++)
+                img[(size_t)y * DISPLAY_W + x] =
+                    (x == 0 || y == 0 || x == DISPLAY_W - 1 || y == DISPLAY_H - 1)
+                        ? 0xFFFF : 0x0841;
+        break;
+    }
+
+    bool ok = display_picture_rgb(NULL, 0, 0, img, DISPLAY_W, DISPLAY_H);
+
+    free(img);
+    return ok;
+}
+
+/* Unsupported: 8-bit and run-length pictures. Kept as stubs rather than deleted
+ * so the sink contract stays complete, and so a caller that asks for one gets a
+ * clean false instead of a link error. */
+bool display_picture(void *user, int x, int y, const uint8_t *pixels, int w, int h)
 {
     (void)user; (void)x; (void)y; (void)pixels; (void)w; (void)h;
     return false;
