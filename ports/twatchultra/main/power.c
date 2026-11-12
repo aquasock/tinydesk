@@ -76,13 +76,16 @@
 #define PMU_ALDO1_VOLT      0x92
 #define PMU_ALDO2_VOLT      0x93
 #define PMU_BLDO2_VOLT      0x97
+#define PMU_BLDO1_VOLT      0x96
 #define PMU_LDO_EN          0x90
 #define PMU_ALDO1_EN_BIT    0
 #define PMU_ALDO2_EN_BIT    1
+#define PMU_BLDO1_EN_BIT    4
 #define PMU_BLDO2_EN_BIT    5
 /* 3.3 V: (3300 - 500) / 100 = 28 */
 #define PMU_ALDO1_3300MV    28
 #define PMU_ALDO2_3300MV    28
+#define PMU_BLDO1_3300MV    28
 #define PMU_BLDO2_3300MV    28
 
 /* The gauge. Registers from the AXP2101 driver this project carries in
@@ -316,6 +319,51 @@ bool board_speaker_rail_on(void)
 
 /* Raise ALDO2 to 3.3 V and enable it. Returns false only if the PMU does not
  * answer; a rail that is already up is a success. */
+/* Raise the AXP2101's BLDO1 to 3.3 V and enable it: the GNSS module's supply.
+ *
+ * BRD-003 assigns BLDO1 to the GNSS receiver, and it is bit 4 of 0x90 with the
+ * voltage in 0x96 -- one below the speaker's BLDO2 in both registers, which is
+ * the kind of adjacency that makes a copy-paste error easy and silent: raising
+ * BLDO2 instead would power the amplifier and leave the receiver dead, and
+ * nothing would report a fault, only an absence of satellites.
+ *
+ * The MIA-M10Q draws a few tens of milliamps once it is searching, so this is
+ * called only when the reader is wanted rather than at boot. */
+bool board_gnss_rail_on(void)
+{
+    uint8_t v = 0, en = 0;
+
+    if (!pmu_r(PMU_BLDO1_VOLT, &v) || !pmu_r(PMU_LDO_EN, &en))
+    {
+        ESP_LOGE(TAG, "PMU did not answer for BLDO1");
+        return false;
+    }
+
+    if ((v & 0x1F) != PMU_BLDO1_3300MV &&
+        !pmu_w(PMU_BLDO1_VOLT, (uint8_t)((v & 0xE0) | PMU_BLDO1_3300MV)))
+    {
+        ESP_LOGE(TAG, "could not set BLDO1 voltage");
+        return false;
+    }
+
+    if (!(en & (1u << PMU_BLDO1_EN_BIT)) &&
+        !pmu_w(PMU_LDO_EN, (uint8_t)(en | (1u << PMU_BLDO1_EN_BIT))))
+    {
+        ESP_LOGE(TAG, "could not enable BLDO1");
+        return false;
+    }
+
+    /* Read back, for the same reason the speaker's rail does: the values read
+     * before the writes say nothing about whether the writes landed. */
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    uint8_t v2 = 0, en2 = 0;
+    if (!pmu_r(PMU_BLDO1_VOLT, &v2) || !pmu_r(PMU_LDO_EN, &en2))
+        return false;
+
+    return (en2 & (1u << PMU_BLDO1_EN_BIT)) != 0;
+}
+
 bool board_display_rail_on(void)
 {
     uint8_t v, en;

@@ -35,6 +35,7 @@
 #include "pwrkey.h"
 #include "charge.h"
 #include "haptic.h"
+#include "gps.h"
 #include "nfc.h"
 #include "sound.h"
 #include "hal_mux.h"
@@ -273,6 +274,9 @@ bool link_init(void)
 
     if (!nfc_register_command())
         ESP_LOGW(TAG, "nfc command did not register");
+
+    if (!gps_register_command())
+        ESP_LOGW(TAG, "gps command did not register");
 
     charge_report(NULL);
 

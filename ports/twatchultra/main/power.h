@@ -52,6 +52,14 @@ bool board_display_rail_on(void);
  * silent shape as the haptic rail, which answers I2C with its supply off. */
 bool board_sd_rail_on(void);
 
+/* Raise the AXP2101's BLDO1 to 3.3 V and enable it: the GNSS module's supply.
+ *
+ * BRD-003 assigns BLDO1 to the GNSS receiver. Note the register adjacency to
+ * the speaker: BLDO1 is bit 4 of 0x90 and voltage 0x96, BLDO2 is bit 5 and
+ * 0x97. Powering the wrong one is silent -- the amplifier would come up and
+ * the receiver would stay dark, and the only symptom is no satellites. */
+bool board_gnss_rail_on(void);
+
 /* Raise the AXP2101's BLDO2 to 3.3 V and enable it: the speaker amp's supply.
  *
  * MUST RUN BEFORE THE I2S CHANNEL IS CREATED. With the rail down the MAX98357A
