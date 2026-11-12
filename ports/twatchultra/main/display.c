@@ -166,6 +166,10 @@ static bool s_pixel_owner;
  * overwrites it. With these, "suppressed is climbing and painted is not" is a
  * fact rather than an inference from a photograph. */
 static uint32_t s_paint_frames;
+
+/* A full repaint has been asked for and not yet done. Set from any task, acted
+ * on by paint_task, because only paint_task may touch s_tx or the SPI bus. */
+static volatile bool s_force_full;
 static uint32_t s_paint_suppressed;
 /* Where the cursor was last drawn. paint_cell inverts a cell when the cursor is
  * on it, but the cell's own colours are unchanged, so the comparison below
@@ -1240,6 +1244,17 @@ static void paint_task(void *arg)
 
         s_paint_frames++;
 
+        /* A whole-screen repaint was requested. Invalidate the record of what
+         * is on the glass so the comparison below finds every cell changed --
+         * which reuses the one code path that already knows how to paint and
+         * flush, rather than adding a second one beside it. */
+        if (s_force_full)
+        {
+            s_force_full = false;
+            memset(s_shown, 0xFF, TD_VT_MAX_ROWS * TD_VT_MAX_COLS * sizeof(*s_shown));
+            s_cur_col = s_cur_row = -1;
+        }
+
         for (int r = 0; r < s_rows; r++)
         {
             int row_x0 = DISPLAY_W, row_x1 = 0;
@@ -1625,6 +1640,153 @@ void display_pixels_claim(bool on)
      * repaint already in flight would otherwise finish over the picture), and
      * on release it has a full frame to draw. */
     xTaskNotifyGive(s_paint_task);
+}
+
+/*
+ * Force the whole framebuffer onto the glass, in one band per call.
+ *
+ * THIS IS THE DISCRIMINATOR FOR THE STRIPED-LEFTOVER FAULT.
+ *
+ * dcheck() compares the framebuffer with the cell grid, so it cannot see a fault
+ * between the framebuffer and the panel -- and the panel is write-only, so
+ * nothing here can read it back either. Run this on the broken screen:
+ *
+ *   strips gone   -> the framebuffer was right and the rectangles that should
+ *                    have pushed it were dropped or truncated by the painter's
+ *                    dirty-run logic. A bug in display.c's flush decisions.
+ *   strips remain -> the pixels are being sent and arriving wrong, so the fault
+ *                    is in the transfer path: window registers, chunking, or
+ *                    the panel's own memory wrap.
+ *
+ * Both are plausible and they have nothing in common, which is why guessing
+ * between them is expensive.
+ *
+ * It also repaints into s_fb from the grid first, so it corrects any cell whose
+ * pixels were wrong for whatever reason -- the point is to get to a known-good
+ * screen with one command.
+ */
+bool display_repaint_all(void)
+{
+    if (!s_vt || !s_paint_task)
+        return false;
+
+    /*
+     * ASK THE PAINTER; DO NOT DO IT HERE.
+     *
+     * The first version of this painted the cells and called flush_rect() from
+     * the shell's task. flush_rect() writes s_tx and takes the SPI bus, and
+     * paint_task does both as well -- there is no lock between them for those,
+     * because until now nothing else had ever called it. The result on the glass
+     * was a scrambled taskbar and a shell that never returned, which is a second
+     * writer winning a race it should not have been in.
+     *
+     * This is the same lesson as display_pixels_claim(): there is one framebuffer
+     * and one painter, and everything that wants the screen changed must go
+     * through the painter rather than beside it. So this sets a request and
+     * wakes the task, and the repaint happens on the task that owns s_tx.
+     */
+    s_force_full = true;
+    xTaskNotifyGive(s_paint_task);
+    return true;
+}
+
+/*
+ * Compare the glass against the model, in two independent ways.
+ *
+ * "Leftover pixels" has two very different causes and they belong to different
+ * code. Either the framebuffer does not hold what the cell grid says it should
+ * -- a painting or flushing fault, in this file -- or the cell grid itself does
+ * not know the screen is clean -- a window-manager fault, in wm.c, because the
+ * cells that should have been restored were never written back.
+ *
+ * Guessing between them is expensive, so this counts both:
+ *
+ *   fb_bad     cells whose 8x16 pixels in s_fb differ from what paint_cell()
+ *              would draw for the same cell. Non-zero means this file failed to
+ *              put the right pixels on the glass.
+ *   shown_bad  cells where s_shown disagrees with s_vt->cells. Non-zero means
+ *              the painter believes it has drawn something it has not, and the
+ *              next comparison will skip a cell that needs repainting.
+ *
+ * Both are counted against the live grid, so the caller should run it after
+ * whatever reproduces the fault and before anything else changes the screen.
+ */
+void display_check_cells(int *fb_bad, int *shown_bad, int *first_col, int *first_row)
+{
+    int fbb = 0, shb = 0, fc = -1, fr = -1;
+
+    if (!s_fb || !s_vt || !s_shown)
+    {
+        if (fb_bad)
+            *fb_bad = -1;
+        if (shown_bad)
+            *shown_bad = -1;
+        return;
+    }
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+
+    for (int r = 0; r < s_rows; r++)
+        for (int c = 0; c < s_cols; c++)
+        {
+            td_vcell_t want = s_vt->cells[r * TD_VT_MAX_COLS + c];
+            td_vcell_t *have = &s_shown[r * TD_VT_MAX_COLS + c];
+
+            if (want.ch != have->ch || want.fg != have->fg || want.bg != have->bg)
+            {
+                if (shb == 0)
+                {
+                    fc = c;
+                    fr = r;
+                }
+                shb++;
+            }
+
+            /* What the cell SHOULD look like, byte for byte. The cursor is
+             * excluded: it blinks, so its inversion is legitimately not what
+             * the grid says at any given instant. */
+            if (s_vt->cursor_visible && s_vt->cx == c && s_vt->cy == r)
+                continue;
+
+            const uint8_t *glyph = font8x16_glyph(want.ch);
+            uint16_t fg = s_palette[want.fg];
+            uint16_t bg = s_palette[want.bg];
+            bool bad = false;
+
+            for (int y = 0; y < CELL_H && !bad; y++)
+            {
+                uint8_t bits = (fg == bg || !glyph) ? 0 : glyph[y];
+                const uint16_t *dst = s_fb + (size_t)(r * CELL_H + y) * DISPLAY_W + c * CELL_W;
+
+                for (int bit = 0; bit < CELL_W; bit++)
+                    if (dst[bit] != ((bits & (0x80 >> bit)) ? fg : bg))
+                    {
+                        bad = true;
+                        break;
+                    }
+            }
+
+            if (bad)
+            {
+                if (fbb == 0 && fc < 0)
+                {
+                    fc = c;
+                    fr = r;
+                }
+                fbb++;
+            }
+        }
+
+    xSemaphoreGive(s_lock);
+
+    if (fb_bad)
+        *fb_bad = fbb;
+    if (shown_bad)
+        *shown_bad = shb;
+    if (first_col)
+        *first_col = fc;
+    if (first_row)
+        *first_row = fr;
 }
 
 bool display_pixels_claimed(void)

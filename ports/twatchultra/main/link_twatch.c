@@ -209,6 +209,84 @@ static int cmd_pattern(tdsh_session_t *session, int argc, char **argv)
     return 0;
 }
 
+/*
+ * `dcheck` -- is the glass what the model says, and is the model what the
+ * painter thinks it drew?
+ *
+ * Two counts, because "leftover pixels" has two owners: fb_bad is this port's
+ * display code, shown_bad is whatever failed to restore the cells. It exists
+ * because the Start menu leaves strips behind and guessing between those two
+ * causes costs more than measuring them.
+ */
+static int cmd_dcheck(tdsh_session_t *session, int argc, char **argv)
+{
+    (void)session;
+    (void)argc;
+    (void)argv;
+
+    int fb_bad = 0, shown_bad = 0, fc = -1, fr = -1;
+
+    display_check_cells(&fb_bad, &shown_bad, &fc, &fr);
+
+    printf("fb_bad=%d shown_bad=%d\n", fb_bad, shown_bad);
+    if (fc >= 0)
+        printf("first col=%d row=%d\n", fc, fr);
+
+    /* Also to the card: reading a 40-column terminal is fine when the answer is
+     * one line, but this runs while reproducing a rendering fault and the
+     * screen may be exactly what is wrong. */
+    {
+        FILE *f = fopen("/sd/dcheck.txt", "w");
+
+        if (f)
+        {
+            fprintf(f, "fb_bad=%d shown_bad=%d first=%d,%d\n",
+                    fb_bad, shown_bad, fc, fr);
+            fclose(f);
+        }
+    }
+
+    return (fb_bad || shown_bad) ? 1 : 0;
+}
+
+/*
+ * `repaint` -- push the whole screen again from the cell grid.
+ *
+ * The discriminator. If the strips disappear, the framebuffer was right and the
+ * painter failed to flush it; if they stay, the pixels are arriving wrong and
+ * the fault is in the transfer.
+ */
+static int cmd_repaint(tdsh_session_t *session, int argc, char **argv)
+{
+    (void)session;
+    (void)argc;
+    (void)argv;
+
+    if (!display_repaint_all())
+    {
+        printf("no framebuffer\n");
+        return 1;
+    }
+    printf("full repaint pushed\n");
+    return 0;
+}
+
+static const tdsh_command_t s_repaint_cmd = {
+    "repaint",
+    "repaint",
+    "Repaint the whole screen from the cell grid (discriminates strip faults)",
+    cmd_repaint,
+    TDSH_CMD_INTERACTIVE,
+};
+
+static const tdsh_command_t s_dcheck_cmd = {
+    "dcheck",
+    "dcheck",
+    "Compare the panel against the cell model (two fault counts)",
+    cmd_dcheck,
+    TDSH_CMD_INTERACTIVE,
+};
+
 static const tdsh_command_t s_pattern_cmd = {
     "pattern",
     "pattern [0|1|2|off|stats]",
@@ -368,6 +446,12 @@ bool link_init(void)
 
     if (tdsh_register_command(&s_pattern_cmd) != 0)
         ESP_LOGW(TAG, "pattern command did not register");
+
+    if (tdsh_register_command(&s_dcheck_cmd) != 0)
+        ESP_LOGW(TAG, "dcheck command did not register");
+
+    if (tdsh_register_command(&s_repaint_cmd) != 0)
+        ESP_LOGW(TAG, "repaint command did not register");
 
     charge_report(NULL);
 

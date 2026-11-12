@@ -107,6 +107,33 @@ bool display_picture_rgb(void *user, int x, int y, const uint16_t *pixels, int w
 void display_pixels_claim(bool on);
 bool display_pixels_claimed(void);
 
+/*
+ * Compare the framebuffer against the cell grid, and the grid against what the
+ * painter believes it has drawn.
+ *
+ * fb_bad counts cells whose pixels in the framebuffer differ from what the grid
+ * says they should be -- a painting or flushing fault in display.c. shown_bad
+ * counts cells where the painter's record disagrees with the grid -- a fault
+ * outside this file, in whatever failed to write the cells back.
+ *
+ * Returns -1 in either count when there is no framebuffer.
+ */
+void display_check_cells(int *fb_bad, int *shown_bad, int *first_col, int *first_row);
+
+/*
+ * Repaint the entire screen from the cell grid, in bands.
+ *
+ * THE DISCRIMINATOR for leftover strips. dcheck() compares the framebuffer with
+ * the model and cannot see a fault between the framebuffer and the glass, since
+ * the panel has no readback. Run this on a broken screen:
+ *
+ *   strips gone   -> the flush decisions dropped rectangles; the bug is in
+ *                    display.c's dirty-run logic.
+ *   strips remain -> the transfer itself is wrong: window registers, chunking,
+ *                    or the panel's memory wrap.
+ */
+bool display_repaint_all(void);
+
 /* Frames the painter drew, frames it skipped while pixels were owned, and the
  * current ownership. Lets a shell command show that suppression is real. */
 void display_paint_stats(uint32_t *painted, uint32_t *suppressed, bool *owned);
