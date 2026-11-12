@@ -99,17 +99,27 @@ static inline const char *btn_label(int i)
 }
 
 /* The right column's four arrow buttons. Top to bottom the column is a reserved
- * slot and then Left, Right, Up and Down, so index 0 has no label and the rest
- * are the arrow they send.
+ * slot and then Left, Right, Up and Down, labelled with the arrows themselves:
+ * U+2190, U+2192, U+2191 and U+2193.
  *
- * The words are used rather than arrow glyphs because the font is the desktop's
- * 8x16 and may not carry the arrows; a letter that is missing draws as a blank
- * button, which looks like a hit-test fault rather than a font gap. The longest
- * of the four, "Right", is 40 px in a 41 px inner face -- the tightest thing on
- * the glass, and the reason it is measured rather than assumed. */
+ * Arrows and not words, which is the reverse of the previous cycle's decision.
+ * That decision rested on a guess -- that the desktop's 8x16 font might not
+ * carry the arrow characters -- and the guess was wrong: all four are present,
+ * and looking at them was cheaper than reasoning about them. A glyph also fits
+ * where a word only just did: "Right" was 40 px in a 41 px face, one pixel of
+ * headroom, and an arrow is 8. The reserved slot stays blank.
+ *
+ * The strings are UTF-8 because the font is indexed by code point; display.c
+ * decodes them once at placement time. */
 static inline const char *right_label(int i)
 {
-    static const char *const labels[COL_N] = { "", "Left", "Right", "Up", "Down" };
+    static const char *const labels[COL_N] = {
+        "",
+        "\xe2\x86\x90",   /* U+2190 leftwards arrow */
+        "\xe2\x86\x92",   /* U+2192 rightwards arrow */
+        "\xe2\x86\x91",   /* U+2191 upwards arrow   */
+        "\xe2\x86\x93",   /* U+2193 downwards arrow */
+    };
 
     return i >= 0 && i < COL_N ? labels[i] : "";
 }

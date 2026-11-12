@@ -545,7 +545,12 @@ static void panel_fill(uint16_t colour)
  * pressable, a lit-up green frame competes with the desktop it frames.
  */
 #define COL_FILL  0x10A2         /* RGB565(2,5,2):     dark grey, ~8% */
-#define COL_EDGE  0x58CB         /* RGB565(11,22,11):  lighter grey, ~35% */
+/* NOT A NEUTRAL GREY, and the constant says so rather than the comment. A grey
+ * needs R and B equal to G; this packs to R=11, G=6, B=11, which is a violet.
+ * It was meant to be 0x5ACB, G=22, and the operator saw the colour on the glass
+ * and asked to keep it -- so it is recorded as what it is instead of being
+ * quietly corrected. The neutral equivalent is one constant away. */
+#define COL_EDGE  0x58CB         /* RGB565(11,6,11): violet, ~35% */
 #define BTN_BORDER 2
 
 /* Which corners of a button are rounded.
@@ -678,41 +683,106 @@ static void push_band(bool *first, size_t npix)
  * whatever rectangle they are given, which is what keeps them inside a rounded
  * button without the caller doing arithmetic twice.
  *
- * Yellow, because it reads on the dark grey face without competing with the grey
- * border around it -- and because it was chosen while the faces were green, is
- * still legible now, and changing a colour that works is not an improvement.
+ * White, so a label is the plainest thing on the button and the border is what
+ * carries the colour. It was yellow while the faces were full-primary green,
+ * where yellow was the only thing that read; on a dark grey face white is
+ * brighter and reads at a smaller apparent size, which matters for a glyph set
+ * that now includes arrows.
  */
-#define LABEL_FG 0xFFE0          /* RGB565(31,63,0): yellow */
+#define LABEL_FG 0xFFFF          /* RGB565(31,63,31): white */
 
-/* Where a label's glyph box starts, so the per-pixel test below is two
- * subtractions and a table lookup. The length is kept here rather than measured
- * per pixel: the test runs for every green pixel of every button, and strlen on
- * a short string is cheap but not free enough to call 40,000 times at boot. */
+/* A label, decoded once.
+ *
+ * The labels are UTF-8 because the arrow buttons are labelled with arrows --
+ * U+2190 to U+2193, three bytes each -- and the font is indexed by code point
+ * rather than by byte. Decoding at placement time rather than per pixel keeps
+ * the per-pixel path down to a subtraction, a divide and a table lookup, which
+ * matters because it runs for every face pixel of every button at boot, and it
+ * also makes the width calculation count the same units the renderer draws:
+ * counting bytes would have made an arrow four cells wide and pushed it out of
+ * its button.
+ *
+ * LABEL_MAX_CELLS is the longest label plus slack. A label longer than that is
+ * truncated rather than overrunning its button, because a clipped label still
+ * says something and an overflowing one corrupts the border.
+ */
+#define LABEL_MAX_CELLS 8
+
 typedef struct
 {
-    const char *text;
+    uint16_t cp[LABEL_MAX_CELLS];
+    int n;
     int x, y;
-    int len;
 } label_pos_t;
 
-static int label_width(const char *s)
+/* Decode UTF-8 into code points, stopping at cap. A malformed sequence yields
+ * '?' rather than being skipped: a visible placeholder is a bug report, while a
+ * silently missing character looks exactly like a button that does nothing. */
+static int utf8_cells(const char *s, uint16_t *out, int cap)
 {
-    return (int)strlen(s) * CELL_W;
+    const unsigned char *p = (const unsigned char *)s;
+    int n = 0;
+
+    while (*p && n < cap)
+    {
+        uint32_t cp;
+        int extra;
+
+        if (p[0] < 0x80)
+        {
+            cp = p[0];
+            extra = 0;
+        }
+        else if ((p[0] & 0xE0) == 0xC0)
+        {
+            cp = p[0] & 0x1Fu;
+            extra = 1;
+        }
+        else if ((p[0] & 0xF0) == 0xE0)
+        {
+            cp = p[0] & 0x0Fu;
+            extra = 2;
+        }
+        else if ((p[0] & 0xF8) == 0xF0)
+        {
+            cp = p[0] & 0x07u;
+            extra = 3;
+        }
+        else
+        {
+            cp = '?';
+            extra = 0;
+        }
+
+        for (int i = 1; i <= extra; i++)
+        {
+            if ((p[i] & 0xC0) != 0x80)
+            {
+                cp = '?';
+                break;
+            }
+            cp = (cp << 6) | (p[i] & 0x3Fu);
+        }
+        out[n++] = (uint16_t)cp;
+        p += 1 + extra;
+    }
+    return n;
 }
 
-/* Centre the text in the rectangle, but never let it start before the
+/* Centre the label in the rectangle, but never let it start before the
  * rectangle: a label wider than its button would otherwise spill into the
  * separator, and truncation on the left reads as a blank button. */
 static void label_place(const char *s, int x0, int x1, int y0, int y1, label_pos_t *out)
 {
-    int w = label_width(s), h = CELL_H;
-    int cx = x0 + (x1 - x0 + 1 - w) / 2;
-    int cy = y0 + (y1 - y0 + 1 - h) / 2;
+    int w, h = CELL_H;
+    int cx, cy;
 
-    out->text = s;
+    out->n = utf8_cells(s, out->cp, LABEL_MAX_CELLS);
+    w = out->n * CELL_W;
+    cx = x0 + (x1 - x0 + 1 - w) / 2;
+    cy = y0 + (y1 - y0 + 1 - h) / 2;
     out->x = cx < x0 ? x0 : cx;
     out->y = cy < y0 ? y0 : cy;
-    out->len = (int)strlen(s);
 }
 
 /* Is this pixel part of the label? Bit 7 of each glyph row is its leftmost
@@ -723,9 +793,9 @@ static bool label_bit(const label_pos_t *p, int x, int y)
     int idx = dx / CELL_W;
     const uint8_t *glyph;
 
-    if (dx < 0 || dy < 0 || dy >= CELL_H || idx >= p->len)
+    if (dx < 0 || dy < 0 || dy >= CELL_H || idx >= p->n)
         return false;
-    glyph = font8x16_glyph((uint8_t)p->text[idx]);
+    glyph = font8x16_glyph(p->cp[idx]);
     return glyph && (glyph[dy] & (0x80 >> (dx % CELL_W))) != 0;
 }
 
