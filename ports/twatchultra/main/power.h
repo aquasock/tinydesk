@@ -43,6 +43,13 @@ bool board_display_power_on(void);
  */
 bool board_display_rail_on(void);
 
+/* Raise the AXP2101's ALDO1 to 3.3 V and enable it: the SD card's supply.
+ *
+ * MUST RUN BEFORE THE SD STACK IS STARTED. An unpowered card does not answer,
+ * so a mount fails with a timeout that reads as a wiring fault -- the same
+ * silent shape as the haptic rail, which answers I2C with its supply off. */
+bool board_sd_rail_on(void);
+
 /* Power the DRV2605 haptic amplifier by raising XL9555 P06.
  *
  * MUST RUN BEFORE THE HAPTIC DRIVER IS PROBED. The chip answers I2C with its
@@ -54,6 +61,12 @@ bool board_haptic_power_on(void);
 /* Release the touch controller's reset, which lives on the expander, not on
  * an SoC GPIO. Must run before touch_init() talks to 0x1A. */
 bool board_touch_reset_release(void);
+
+/* Log ALDO1/ALDO2 and the LDO enable register, read back from the PMU.
+ *
+ * Call late enough to survive in the desktop's 64-line log ring: the same
+ * values logged at preinit are always scrolled away before anyone can look. */
+void board_log_rails(void);
 
 /* Log the expander's configuration and output registers. */
 void board_dump_expander(void);

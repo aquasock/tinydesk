@@ -155,6 +155,10 @@ bool link_init(void)
      * the rail reports a healthy part that never moves -- the failure BRD-005
      * records. A missing motor is not fatal: the desktop works without it and
      * says so in the log. */
+    /* Before the SD watcher's first mount attempt (it starts from a task, a
+     * few hundred ms later), and late enough to stay in the log ring. */
+    board_log_rails();
+
     if (!board_haptic_power_on())
     {
         ESP_LOGE(TAG, "haptic rail failed");

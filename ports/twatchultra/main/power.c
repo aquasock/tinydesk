@@ -8,6 +8,7 @@
 
 #include "power.h"
 
+#include "driver/gpio.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 
@@ -45,23 +46,17 @@
 
 
 /*
- * TOUCH RESET. Two sources disagree on which expander pin it is:
+ * TOUCH RESET. Two sources disagreed on which expander pin it is, and the
+ * board's own Arduino variant settles it:
  *
- *   LilyGoLib docs/hardware/lilygo-t-watch-ultra.md  "Expander GPIO10"
- *                                                    = linear 10 = P12
- *   Escapement .ai/core-reference.md TCH-005          "P08, port 1 bit 0"
- *                                                    = linear 8
+ *   Escapement .ai/core-reference.md TCH-005     "P08, port 1 bit 0"
+ *   arduino-esp32 lilygo_twatch_ultra variant    EXPANDS_TOUCH_RST = 8
  *
- * Both are plausible readings of the same board and I cannot settle it
- * without hardware in front of me, so both are driven high and the log says
- * so. Driving the wrong one costs nothing -- it is an unused expander pin --
- * and a controller held in reset is one of the two ways touch stays dead
- * (the other is failing the 0xD1 unlock, which bring_up() already logs).
- *
- * This is written to be deleted: once the right pin is known, keep one.
+ * LilyGo's prose hardware page said GPIO10, which is EXPANDS_SD_DET -- the SD
+ * card's insert switch. That is why the pin was wrong, and driving it as an
+ * output fought a physical switch.
  */
-#define TOUCH_RST_LINEAR_A  8    /* P08, per the Escapement reference */
-#define TOUCH_RST_LINEAR_B  10   /* per LilyGo's hardware documentation */
+#define TOUCH_RST_LINEAR_A  8    /* P08: EXPANDS_TOUCH_RST in the board variant */
 
 /* --- AXP2101 PMU, at 0x34 ------------------------------------------------
  *
@@ -73,10 +68,13 @@
  * for ALDO1..4 are bits 0..3 of 0x90.
  */
 #define PMU_ADDR            0x34
+#define PMU_ALDO1_VOLT      0x92
 #define PMU_ALDO2_VOLT      0x93
 #define PMU_LDO_EN          0x90
+#define PMU_ALDO1_EN_BIT    0
 #define PMU_ALDO2_EN_BIT    1
 /* 3.3 V: (3300 - 500) / 100 = 28 */
+#define PMU_ALDO1_3300MV    28
 #define PMU_ALDO2_3300MV    28
 
 static i2c_master_dev_handle_t s_pmu;
@@ -160,6 +158,73 @@ static bool pmu_w(uint8_t reg, uint8_t v)
     return d && i2c_master_transmit(d, b, sizeof(b), 100) == ESP_OK;
 }
 
+/*
+ * THE SD CARD SHARES ITS SPI BUS, AND THE OTHER TWO CHIPS HAVE TO BE SILENT.
+ *
+ * MISO/MOSI/SCLK are shared with the LoRa radio (CS 36) and the NFC reader
+ * (CS 4), per the board's Arduino variant. A chip select that floats low leaves
+ * that device driving MISO, and a second device on MISO corrupts every SD
+ * transaction -- the handshake fails at CMD8 with ESP_ERR_INVALID_RESPONSE,
+ * which reads like a wiring fault or a bad card and is neither.
+ *
+ * This board has already shown that signature once: BRD-004 records the NFC
+ * probe returning nothing "with MISO clamped low by something external", and
+ * that was on the Linux spi-mem stack rather than this one, so it says nothing
+ * about the cause -- only that a held MISO is a thing this hardware does.
+ *
+ * LilyGo's own bring-up, LilyGoUltra::initShareSPIPins(), drives exactly these
+ * pins high before the bus is used. This port never did, because until the SD
+ * card there was nothing in it on that bus.
+ */
+#define SHARED_SPI_CS_NFC   4
+#define SHARED_SPI_CS_LORA  36
+#define SHARED_SPI_CS_SD    21
+
+/* Raise ALDO1 to 3.3 V and enable it: the SD card's supply.
+ *
+ * BRD-003 records ALDO1 as the card's rail, and LilyGo's own PMU bring-up sets
+ * it to 3300 mV and enables it right beside the display's ALDO2, so the card is
+ * powered before anything tries to talk to it.
+ *
+ * Same silent failure as the haptic rail: an unpowered card does not answer, so
+ * a mount attempt fails with a timeout that reads as a wiring problem. This is
+ * called before the SD stack is started for that reason, not because the SD
+ * code needs it in any specific order.
+ *
+ * Returns false only if the PMU does not answer; a rail that is already up is a
+ * success. */
+bool board_sd_rail_on(void)
+{
+    uint8_t v, en;
+
+    if (!pmu_r(PMU_ALDO1_VOLT, &v) || !pmu_r(PMU_LDO_EN, &en))
+    {
+        ESP_LOGE(TAG, "PMU did not answer");
+        return false;
+    }
+
+    if ((v & 0x1F) != PMU_ALDO1_3300MV)
+    {
+        if (!pmu_w(PMU_ALDO1_VOLT, (uint8_t)((v & 0xE0) | PMU_ALDO1_3300MV)))
+        {
+            ESP_LOGE(TAG, "could not set ALDO1 voltage");
+            return false;
+        }
+    }
+    if (!(en & (1u << PMU_ALDO1_EN_BIT)))
+    {
+        if (!pmu_w(PMU_LDO_EN, (uint8_t)(en | (1u << PMU_ALDO1_EN_BIT))))
+        {
+            ESP_LOGE(TAG, "could not enable ALDO1");
+            return false;
+        }
+    }
+
+    ESP_LOGI(TAG, "PMU aldo1_v=%02x ldo_en=%02x", v, en);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    return true;
+}
+
 /* Raise ALDO2 to 3.3 V and enable it. Returns false only if the PMU does not
  * answer; a rail that is already up is a success. */
 bool board_display_rail_on(void)
@@ -192,6 +257,62 @@ bool board_display_rail_on(void)
     ESP_LOGI(TAG, "PMU aldo2_v=%02x ldo_en=%02x", v, en);
     vTaskDelay(pdMS_TO_TICKS(20));
     return true;
+}
+
+/* The board's pre-init hook: raise the SD card's rail before the shell's SD
+ * stack tries to mount anything.
+ *
+ * This overrides the weak default in ports/esp_idf/app/main.c, which is called
+ * from app_main before tdsh_espidf_init(). The port's own link_init() runs
+ * later, from the UI task, so anywhere in there would be too late. */
+void board_power_rails_preinit(void)
+{
+    gpio_config_t park = {
+        .pin_bit_mask = (1ULL << SHARED_SPI_CS_NFC) |
+                        (1ULL << SHARED_SPI_CS_LORA) |
+                        (1ULL << SHARED_SPI_CS_SD),
+        .mode = GPIO_MODE_OUTPUT,
+    };
+
+    if (!board_sd_rail_on())
+        ESP_LOGW(TAG, "SD rail did not come up; a card will not mount");
+
+    /* Park the other chips on the SD card's bus. See the note above. */
+    if (gpio_config(&park) == ESP_OK)
+    {
+        gpio_set_level(SHARED_SPI_CS_NFC, 1);
+        gpio_set_level(SHARED_SPI_CS_LORA, 1);
+        gpio_set_level(SHARED_SPI_CS_SD, 1);
+        ESP_LOGI(TAG, "spi cs parked");
+    }
+    else
+    {
+        ESP_LOGW(TAG, "could not park the shared spi chips");
+    }
+}
+
+/* Log the rails this port owns, by reading them back.
+ *
+ * Written because the same information was already being logged at preinit and
+ * that line was never once read: the desktop's log ring holds 64 lines and the
+ * preinit line is emitted before the panel has even been initialised, so it is
+ * always gone by the time anyone can open the Log Viewer. A diagnostic nobody
+ * can read is not a diagnostic.
+ *
+ * This runs from link_init, which is late enough to survive in the ring and
+ * still early enough to precede the SD watcher's first mount attempt.
+ * Compact so it fits the Log Viewer's 40 columns. */
+void board_log_rails(void)
+{
+    uint8_t a1 = 0xEE, a2 = 0xEE, en = 0xEE;
+
+    if (!pmu_r(PMU_ALDO1_VOLT, &a1) || !pmu_r(PMU_ALDO2_VOLT, &a2) ||
+        !pmu_r(PMU_LDO_EN, &en))
+    {
+        ESP_LOGW(TAG, "pmu silent");
+        return;
+    }
+    ESP_LOGI(TAG, "ald1 %02x ald2 %02x en %02x", a1, a2, en);
 }
 
 static bool reg_read(uint8_t reg, uint8_t *v)
@@ -267,25 +388,23 @@ static bool xl_pin_high(int linear)
  * line's state before this runs is the board's pull-up and not something this
  * code chose. Pulsing makes the starting state irrelevant.
  *
- * Two expander pins are driven because two sources disagree on which one the
- * panel's reset is -- see TOUCH_RST_LINEAR_A/B. Driving the wrong one costs
- * nothing: it is an unused pin. */
+ * ONE PIN, and the second one this used to drive was actively harmful. The
+ * hedge existed because two sources disagreed, but the board's own Arduino
+ * variant settles it: EXPANDS_TOUCH_RST is expander pin 8. The other candidate,
+ * pin 10, is EXPANDS_SD_DET -- the SD card's insert switch -- so driving it as
+ * an output fought a physical switch and told anything that reads it that no
+ * card was present. It is left alone now. */
 bool board_touch_reset_release(void)
 {
-    bool a_ok = xl_pin_set(TOUCH_RST_LINEAR_A, false);
-    bool b_ok = xl_pin_set(TOUCH_RST_LINEAR_B, false);
+    bool ok = xl_pin_set(TOUCH_RST_LINEAR_A, false);
 
     vTaskDelay(pdMS_TO_TICKS(20));
-
-    a_ok = xl_pin_high(TOUCH_RST_LINEAR_A) && a_ok;
-    b_ok = xl_pin_high(TOUCH_RST_LINEAR_B) && b_ok;
+    ok = xl_pin_high(TOUCH_RST_LINEAR_A) && ok;
 
     /* Compact so the line fits the Log Viewer's 40 columns. */
-    ESP_LOGI(TAG, "rst %d=%d %d=%d",
-             TOUCH_RST_LINEAR_A, a_ok ? 1 : 0,
-             TOUCH_RST_LINEAR_B, b_ok ? 1 : 0);
+    ESP_LOGI(TAG, "rst %d=%d", TOUCH_RST_LINEAR_A, ok ? 1 : 0);
     vTaskDelay(pdMS_TO_TICKS(60));
-    return a_ok || b_ok;
+    return ok;
 }
 
 /* Power the haptic amplifier by raising XL9555 P06.

@@ -97,3 +97,18 @@ CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING=y
 CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
 # Coexistence with Wi-Fi, which is how the desktop reaches telnet and OTA.
 CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+
+# --- FAT, for the SD card --------------------------------------------------
+# Long file names and UTF-8, matching every other ESP-IDF port here. Without
+# them the card mounts but every name is mangled to 8.3 and non-ASCII bytes
+# come back wrong, which makes a file browser useless -- and it fails quietly,
+# because the mount itself succeeds.
+#
+# THESE MUST LIVE HERE AND NOT JUST IN sdkconfig. sdkconfig is generated and
+# gitignored, so a change made only there is lost on a clean checkout and the
+# symptom returns with no diff to blame. Changing a default also requires
+# deleting the existing sdkconfig: it is only consulted when one is built from
+# scratch.
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_MAX_LFN=255
+CONFIG_FATFS_API_ENCODING_UTF_8=y

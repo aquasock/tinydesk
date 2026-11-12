@@ -318,6 +318,20 @@ static bool time_now(int64_t *utc)
  * correction survives a power cycle. Weak, like board_maintenance_start: the
  * shared code calls it and a port that has an RTC overrides it. Called after
  * the system clock has been set, whether by Date & time or by SNTP. */
+  /* Power rails a board needs before any subsystem starts talking on a bus.
+ *
+ * The SD card is the case this exists for: its supply is a PMU rail, the shell's
+ * SD stack mounts a card from tdsh_espidf_init() below, and an unpowered card
+ * does not answer -- so a rail left down shows up as a mount timeout that reads
+ * as a wiring fault. A board overrides this to raise whatever it needs; the
+ * default does nothing.
+ *
+ * Deliberately before tdsh_espidf_init() rather than in the port's link_init(),
+ * which runs later, from the UI task, after the SD stack has already tried. */
+__attribute__((weak)) void board_power_rails_preinit(void)
+{
+}
+
 __attribute__((weak)) void board_time_set_post(int64_t utc)
 {
     (void)utc;
@@ -736,6 +750,8 @@ void app_main(void)
     td_log_set_lock(log_lock, log_unlock, NULL);
     s_prev_vprintf = esp_log_set_vprintf(log_hook);
     fill_sysinfo();
+
+    board_power_rails_preinit();
 
     tdsh_espidf_config_t cfg = TDSH_ESP_IDF_CONFIG_DEFAULT();
     cfg.hostname = board_hostname();
