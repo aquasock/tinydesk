@@ -235,3 +235,30 @@ void board_time_set_post(int64_t utc)
     if (s_writeback && utc >= MIN_PLAUSIBLE)
         rtc_write(utc);
 }
+
+/*
+ * Set the system clock from a source this port owns, and let the chip follow.
+ *
+ * This is deliberately the same two steps the shared app's time_set() takes for
+ * SNTP and for Date & time: settimeofday, then board_time_set_post so the
+ * PCF85063A is corrected too. Reusing the sequence rather than calling
+ * settimeofday alone is what makes a GPS-set time survive a power cycle -- the
+ * whole point of having a battery-backed chip is that the better source writes
+ * through it.
+ *
+ * The plausibility floor is checked before anything is changed, so a bad
+ * sentence cannot move the clock even briefly.
+ */
+bool board_time_apply(int64_t utc)
+{
+    if (utc < MIN_PLAUSIBLE)
+        return false;
+
+    struct timeval tv = { .tv_sec = (time_t)utc, .tv_usec = 0 };
+
+    if (settimeofday(&tv, NULL) != 0)
+        return false;
+
+    board_time_set_post(utc);
+    return true;
+}

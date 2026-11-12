@@ -43,4 +43,17 @@ bool rtc_seed_system_clock(void);
  * SNTP), the new time goes to the chip too. */
 void rtc_writeback_enable(bool on);
 
+/*
+ * Set the system clock from a source this port owns, and write it through to
+ * the chip.
+ *
+ * The same two steps the shared app takes for SNTP: settimeofday, then
+ * board_time_set_post. Existing so a GPS time survives a power cycle the way a
+ * network time does; settimeofday alone would leave the chip holding the old
+ * value and the next boot would undo the correction.
+ *
+ * Refuses a time before 2020 and changes nothing in that case.
+ */
+bool board_time_apply(int64_t utc);
+
 #endif

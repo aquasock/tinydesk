@@ -93,6 +93,22 @@ void nmea_init(nmea_state_t *s);
 bool nmea_line(nmea_state_t *s, const char *line);
 
 /*
+ * The time in this state as seconds since the Unix epoch, UTC.
+ *
+ * Returns false when the date or the time is missing, or when the date is
+ * outside 2020..2100 -- the same plausibility floor the RTC seed uses, because
+ * a watch that boots to 1970 is worse than one that admits it does not know.
+ * Valid WITHOUT a fix: a receiver knows the time once it has decoded ephemeris,
+ * which is exactly the state this watch is in indoors.
+ */
+bool nmea_utc(const nmea_state_t *s, int64_t *out);
+
+/* The same conversion with no plausibility floor, for testing the day-count
+ * against known epochs (1970 is a legitimate value to compute and an
+ * illegitimate one to set a watch to). Do not use this to set a clock. */
+bool nmea_utc_raw(const nmea_state_t *s, int64_t *out);
+
+/*
  * The checksum NMEA uses: XOR of every byte between '$' and '*'.
  *
  * Exposed because a test wants to build a sentence and check it, and because a

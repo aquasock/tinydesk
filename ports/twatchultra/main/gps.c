@@ -20,9 +20,11 @@
 
 #include "gps.h"
 #include "power.h"
+#include "rtc.h"
 
 #include <stdio.h>
 #include <string.h>
+#include <sys/time.h>
 
 #include "driver/gpio.h"
 #include "driver/uart.h"
@@ -492,10 +494,12 @@ static int cmd_gps(tdsh_session_t *session, int argc, char **argv)
     (void)session;
 
     const bool raw = (argc >= 2 && strcmp(argv[1], "raw") == 0);
+    const bool settime = (argc >= 2 && strcmp(argv[1], "time") == 0);
 
-    if (argc >= 2 && !raw && strcmp(argv[1], "monitor") != 0 && strcmp(argv[1], "mon") != 0)
+    if (argc >= 2 && !raw && !settime &&
+        strcmp(argv[1], "monitor") != 0 && strcmp(argv[1], "mon") != 0)
     {
-        printf("usage: gps | gps monitor [s] | gps raw [s]\n");
+        printf("usage: gps | gps monitor [s] | gps raw [s] | gps time [s]\n");
         return 2;
     }
 
@@ -507,6 +511,82 @@ static int cmd_gps(tdsh_session_t *session, int argc, char **argv)
     }
 
     print_probe(&p);
+
+    if (settime)
+    {
+        /* A receiver indoors acquires the time long before it can fix, so the
+         * default window is generous but bounded: thirty seconds covers
+         * ephemeris decode at a window, and the command always returns. */
+        int secs = argc >= 3 ? atoi(argv[2]) : 30;
+        if (secs <= 0)
+            secs = 30;
+
+        nmea_state_t n;
+        nmea_init(&n);
+
+        printf("waiting for UTC, %d s\n", secs);
+
+        /* THE TIME IS APPLIED THE MOMENT IT IS VALID, not at the end of the
+         * window, and that is a correction rather than a nicety.
+         *
+         * The first version collected the UTC from the first valid sentence and
+         * then kept listening until the window expired before calling
+         * settimeofday -- so it set the clock to a value that was already up to
+         * the whole window old. Measured on this board: correction runs a
+         * minute apart reported the clock `was off +26 s` and then `+1 s`,
+         * which reads like drift and is really the setting routine handing the
+         * clock a stale reading. A time source that is right and is applied
+         * late is still a wrong clock.
+         *
+         * So the loop watches for a valid time and stops the moment it has one.
+         * The window is now only a bound on how long to wait, never a delay
+         * after the answer has arrived. */
+        int64_t utc = 0;
+        int64_t end = esp_timer_get_time() + (int64_t)secs * 1000000;
+
+        while (esp_timer_get_time() < end)
+        {
+            gps_pump(&n);
+
+            int64_t v;
+            if (nmea_utc(&n, &v))
+            {
+                utc = v;
+                break;
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+
+        if (!utc)
+        {
+            printf("no UTC -- %d sats, %u sentences\n",
+                   n.sats_used, n.sentences);
+            gps_close();
+            return 1;
+        }
+
+        /* Read the clock BEFORE changing it: this is the only measurement of
+         * how wrong it was, and it is taken as close to the write as possible
+         * so it is not contaminated by anything this command does afterwards. */
+        int64_t before = 0;
+        struct timeval tv0;
+        if (gettimeofday(&tv0, NULL) == 0)
+            before = (int64_t)tv0.tv_sec;
+
+        if (!board_time_apply(utc))
+        {
+            printf("clock refused %lld\n", (long long)utc);
+            gps_close();
+            return 1;
+        }
+
+        printf("clock set %lld\n", (long long)utc);
+        printf("was off %+lld s, sats %d\n", (long long)(utc - before), n.sats_used);
+
+        gps_close();
+        return 0;
+    }
 
     if (raw)
     {
@@ -552,8 +632,8 @@ static int cmd_gps(tdsh_session_t *session, int argc, char **argv)
 
 static const tdsh_command_t s_gps_cmd = {
     "gps",
-    "gps | gps monitor [s] | gps raw [s]",
-    "Probe the MIA-M10Q GNSS, stream its fix, or count sentence types",
+    "gps | gps monitor [s] | gps raw [s] | gps time [s]",
+    "Probe the MIA-M10Q GNSS, stream its fix, count sentence types, or set the clock",
     cmd_gps,
     TDSH_CMD_INTERACTIVE,
 };

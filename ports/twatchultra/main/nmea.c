@@ -180,6 +180,67 @@ static bool parse_date(const char *s, int *y, int *mo, int *d)
     return *mo >= 1 && *mo <= 12 && *d >= 1 && *d <= 31;
 }
 
+/* --- UTC to seconds since the epoch -------------------------------------- */
+
+/*
+ * DAYS FROM CIVIL DATE, without a lookup table and without a library.
+ *
+ * This is Howard Hinnant's algorithm, which works from a shift that starts the
+ * year in March so that the leap day falls at the end of it -- that single
+ * trick is what removes February from every special case, and it is why this
+ * is short enough to be trustworthy. The 719468 constant is the number of days
+ * from the civil epoch (0000-03-01) to 1970-01-01.
+ *
+ * Written out rather than taken from <time.h> because the C library's
+ * timegm() honours TZ on some platforms, and this must be UTC unconditionally:
+ * a GPS time converted through a local time zone is wrong by exactly the
+ * offset, which on a watch set to UTC-7 is seven hours and looks like a
+ * hardware fault.
+ */
+static int64_t days_from_civil(int y, unsigned m, unsigned d)
+{
+    y -= m <= 2;
+    const int64_t era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);              /* 0..399 */
+    const unsigned doy = (153U * (m + (m > 2 ? -3U : 9U)) + 2U) / 5U + d - 1U;
+    const unsigned doe = yoe * 365U + yoe / 4U - yoe / 100U + doy;
+    return era * 146097 + (int64_t)doe - 719468;
+}
+
+bool nmea_utc_raw(const nmea_state_t *s, int64_t *out)
+{
+    if (!out || !s->have_date || !s->have_time)
+        return false;
+
+    /* Range checks on the fields themselves, which the parser already applies
+     * to a decoded sentence but which also have to hold for a state built by
+     * hand. */
+    if (s->month < 1 || s->month > 12 || s->day < 1 || s->day > 31)
+        return false;
+    if (s->hour > 23 || s->minute > 59 || s->second_x100 > 6100)
+        return false;
+
+    int64_t days = days_from_civil(s->year, (unsigned)s->month, (unsigned)s->day);
+
+    *out = days * 86400
+           + (int64_t)s->hour * 3600
+           + (int64_t)s->minute * 60
+           + s->second_x100 / 100;
+    return true;
+}
+
+bool nmea_utc(const nmea_state_t *s, int64_t *out)
+{
+    /* The policy sits here rather than inside the arithmetic, so the
+     * arithmetic can be tested against known epoch values from 1970 onward --
+     * a date this function must refuse, but a value the day-count has to get
+     * right. Splitting them is what lets both be checked. */
+    if (s->year < 2020 || s->year > 2100)
+        return false;
+
+    return nmea_utc_raw(s, out);
+}
+
 static void do_gga(nmea_state_t *s, char **f, int n)
 {
     int v;

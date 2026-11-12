@@ -157,6 +157,108 @@ static void test_rmc_v_status(void)
     CHECK(!s.have_pos);     /* and therefore no position taken from it */
 }
 
+
+/* --- the epoch conversion ------------------------------------------------- */
+
+/* Build a state directly: this function's contract is about the fields, and
+ * going through sentences would test the parser a second time rather than this
+ * arithmetic. */
+static nmea_state_t st(int y, int mo, int d, int h, int mi, int sec)
+{
+    nmea_state_t s;
+    nmea_init(&s);
+    s.have_date = true;
+    s.year = y;
+    s.month = mo;
+    s.day = d;
+    s.have_time = true;
+    s.hour = h;
+    s.minute = mi;
+    s.second_x100 = sec * 100;
+    return s;
+}
+
+static void test_epoch_known_values(void)
+{
+    /* Each expectation computed independently of this code, by
+     * datetime.datetime(..., tzinfo=utc).timestamp() in Python. */
+    int64_t got = 0;
+    nmea_state_t s;
+
+    /* nmea_utc_raw, because 1970 and 2024 are below the setting floor and the
+     * ARITHMETIC is what this test is about; the floor has its own test. */
+    s = st(1970, 1, 1, 0, 0, 0);
+    CHECK(nmea_utc_raw(&s, &got));
+    CHECK(got == 0);
+
+    s = st(2024, 2, 29, 0, 0, 0);
+    CHECK(nmea_utc_raw(&s, &got));
+    CHECK(got == 1709164800);
+
+    s = st(2000, 2, 29, 12, 0, 0);
+    CHECK(nmea_utc_raw(&s, &got));
+    CHECK(got == 951825600);
+
+    /* The time this port actually read off the watch on 2026-11-12. */
+    s = st(2026, 11, 12, 20, 28, 41);
+    CHECK(nmea_utc(&s, &got));
+    CHECK(got == 1794515321);
+
+    s = st(2026, 12, 31, 23, 59, 59);
+    CHECK(nmea_utc(&s, &got));
+    CHECK(got == 1798761599);
+}
+
+static void test_epoch_leap_boundaries(void)
+{
+    int64_t got = 0;
+    nmea_state_t s;
+
+    /* One second either side of a leap day, and of a non-leap February, so a
+     * day-count that ignores the century rule shows up. */
+    s = st(2024, 2, 28, 23, 59, 59);
+    CHECK(nmea_utc_raw(&s, &got));
+    int64_t now = got;
+    s = st(2024, 2, 29, 0, 0, 0);
+    CHECK(nmea_utc_raw(&s, &got));
+    CHECK(got == now + 1);
+
+    /* 2100 is not a leap year: 153 days between 2100-01-01 and 2100-06-01,
+     * where 2099-01-01 to 2099-06-01 is 151. A naive +1-per-4-years gets this
+     * wrong by a day. */
+    s = st(2100, 12, 31, 23, 59, 59);
+    CHECK(nmea_utc(&s, &got));
+    CHECK(got == 4133980799);
+
+    /* And 2000 IS a leap year despite the century rule. */
+    s = st(2000, 3, 1, 0, 0, 0);
+    CHECK(nmea_utc_raw(&s, &got));
+    CHECK(got == 951868800);
+}
+
+static void test_epoch_rejects_implausible(void)
+{
+    int64_t got = -1;
+    nmea_state_t s;
+
+    /* Before the plausibility floor: refuse rather than set a clock to 1970. */
+    s = st(1970, 1, 1, 0, 0, 0);
+    s.have_time = true;
+    /* (the value itself is fine; the floor is 2020, so this must fail) */
+    CHECK(!nmea_utc(&s, &got));
+    CHECK(got == -1);
+
+    /* Missing date: GGA alone carries a time but no date, and a time without a
+     * date is not a moment. */
+    s = st(2026, 11, 12, 20, 28, 41);
+    s.have_date = false;
+    CHECK(!nmea_utc(&s, &got));
+
+    s = st(2026, 11, 12, 20, 28, 41);
+    s.have_time = false;
+    CHECK(!nmea_utc(&s, &got));
+}
+
 /* --- negative controls --------------------------------------------------- */
 
 static void test_bad_checksum_rejected(void)
@@ -243,6 +345,10 @@ int main(void)
     test_degrees_minutes_not_decimal();
     test_no_fix_has_no_position();
     test_rmc_v_status();
+
+    test_epoch_known_values();
+    test_epoch_leap_boundaries();
+    test_epoch_rejects_implausible();
 
     test_bad_checksum_rejected();
     test_truncated_rejected();
