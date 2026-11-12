@@ -10,6 +10,7 @@
 #define TWATCH_POWER_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "driver/i2c_master.h"
 #include "tinydesk/td_sysinfo.h"
@@ -96,5 +97,14 @@ void board_log_rails(void);
 
 /* Log the expander's configuration and output registers. */
 void board_dump_expander(void);
+
+/* Raw access to the AXP2101's register file, on the bus this port already owns.
+ *
+ * Exposed for the power key, which has to read the PMU's interrupt status and
+ * clear it: the AXP2101's IRQ line stays asserted until the status bits are
+ * written back, so a driver that never clears it is a driver that storms. Both
+ * return false when the PMU does not answer. */
+bool board_pmu_read(uint8_t reg, uint8_t *v);
+bool board_pmu_write(uint8_t reg, uint8_t v);
 
 #endif

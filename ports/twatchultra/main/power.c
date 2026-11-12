@@ -580,6 +580,18 @@ bool board_gpio_isr_init(void)
     return false;
 }
 
+/* See power.h: the power key needs the PMU's interrupt status, which means the
+ * register file the rest of this file keeps to itself. */
+bool board_pmu_read(uint8_t reg, uint8_t *v)
+{
+    return pmu_r(reg, v);
+}
+
+bool board_pmu_write(uint8_t reg, uint8_t v)
+{
+    return pmu_w(reg, v);
+}
+
 bool board_touch_reset_release(void)
 {
     bool ok = xl_pin_set(TOUCH_RST_LINEAR_A, false);

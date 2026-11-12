@@ -32,6 +32,7 @@
 #include "rtc.h"
 #include "touch.h"
 #include "pusher.h"
+#include "pwrkey.h"
 #include "haptic.h"
 #include "sound.h"
 #include "hal_mux.h"
@@ -195,6 +196,11 @@ bool link_init(void)
      * without the desktop asking. It is not fatal when it fails, and
      * `pusher.pin = -1` turns it off deliberately. */
     pusher_init(inject);
+
+    /* Pusher A, the power key, which is not a GPIO: the AXP2101 reports it on
+     * the PMU interrupt line. Failure is not fatal and is the expected outcome
+     * if the PMU is holding its IRQ line, which the driver refuses to arm on. */
+    pwrkey_init(inject);
 
     snprintf(s_platform, sizeof(s_platform),
              "ESP32-S3 T-Watch Ultra (%dx%d cells%s)",
