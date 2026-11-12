@@ -124,8 +124,16 @@ static void select_user(td_widget_t *list, void *user)
     td_checkbox_set(s_admin, s_selected.role >= TD_USER_ROLE_ADMIN);
     for (int i = 0; i < 7; i++)
         td_checkbox_set(s_rights[i], s_selected.rights & (1u << i));
-    note(s_selected.role == TD_USER_ROLE_ROOT ? "Root is protected. Its own password may be changed below." : manager() ? "Change role / permissions, or set a new password."
-                                                                                                                        : "Your permissions are set by an administrator.");
+    /* Shortened on a narrow window: the long form is 55 columns and the status
+     * line has 36, so it was cut at "...password m". */
+    const bool narrow = s_win && td_win_client(s_win).w < 60;
+    note(s_selected.role == TD_USER_ROLE_ROOT
+             ? (narrow ? "Root: only its password may change."
+                       : "Root is protected. Its own password may be changed below.")
+             : manager() ? (narrow ? "Change role, permissions or password."
+                                   : "Change role / permissions, or set a new password.")
+                         : (narrow ? "Permissions are set by an administrator."
+                                   : "Your permissions are set by an administrator."));
 }
 static void role_changed(td_widget_t *w, void *user)
 {
@@ -330,20 +338,76 @@ static void launch(void)
     s_win = td_win_create(&d);
     if (!s_win)
         return;
-    td_label(s_win, 1, 0, 20, "ACCOUNTS");
-    s_list = td_list(s_win, td_rect(1, 2, 20, 14), item, select_user, NULL);
-    td_label(s_win, 25, 0, 40, "Account name");
-    s_name = td_textbox(s_win, 25, 1, 44, 31, NULL, NULL);
-    s_admin = td_checkbox(s_win, 25, 3, "Administrator", false, role_changed, NULL);
-    for (int i = 0; i < 7; i++)
-        s_rights[i] = td_checkbox(s_win, i < 4 ? 25 : 49, 5 + (i < 4 ? i : i - 4), s_labels[i], false, rights_changed, NULL);
-    (void)td_button(s_win, 25, 9, "Create / Apply", apply, NULL);
-    td_label(s_win, 25, 10, 44, "Current password (when changing your own)");
-    s_old = td_textbox(s_win, 25, 11, 44, 128, NULL, NULL);
-    s_new = td_textbox(s_win, 25, 13, 44, 128, NULL, NULL);
-    s_confirm = td_textbox(s_win, 25, 15, 44, 128, NULL, NULL);
-    td_label(s_win, 25, 12, 44, "New password");
-    td_label(s_win, 25, 14, 44, "Confirm new password");
+    /*
+     * TWO COLUMNS DO NOT FIT 38.
+     *
+     * Upstream is an account list at x 1 width 20 and a form column at x 25
+     * width 44. On a 40-column panel the client is 38 wide, so the form column
+     * had 13 columns: "Administr", "Manage ac", "System se", "Current passw",
+     * "Change pass" and "Require pas" were all cut, and the 44-wide text fields
+     * ran off the glass.
+     *
+     * A narrow window stacks: the account list across the top, then the form one
+     * control per row with the short inline labels "Name", "Cur", "New" and
+     * "Con". The seven permission checkboxes pair up two to a row.
+     */
+    {
+        int cw = td_win_client(s_win).w;
+        bool narrow = cw < 60;
+
+        if (narrow)
+        {
+            int fw = cw - 2;
+            /* Shortened for the narrow window only: "Accounts" and "System"
+             * beside a Users dialog's own checkboxes read unambiguously, and
+             * the long forms are 19 columns each -- two of them exactly fill the
+             * row with no gap between. */
+            static const char *const short_labels[7] = {
+                "Accounts", "System", "Network", "Hardware", "Shared", "Clock", "Apps"};
+
+            td_label(s_win, 1, 0, 0, "ACCOUNTS");
+            s_list = td_list(s_win, td_rect(1, 1, fw, 3), item, select_user, NULL);
+
+            td_label(s_win, 1, 5, 0, "Name");
+            s_name = td_textbox(s_win, 6, 5, fw - 5, 31, NULL, NULL);
+            s_admin = td_checkbox(s_win, 1, 6, "Administrator", false, role_changed, NULL);
+
+            for (int i = 0; i < 7; i++)
+                s_rights[i] = td_checkbox(s_win, i % 2 ? 20 : 1, 7 + i / 2,
+                                          short_labels[i], false, rights_changed, NULL);
+
+            td_button(s_win, 1, 11, "Create / Apply", apply, NULL);
+            td_button(s_win, 20, 11, "New account", new_account, NULL);
+
+            td_label(s_win, 1, 12, 0, "Cur");
+            s_old = td_textbox(s_win, 6, 12, fw - 5, 128, NULL, NULL);
+            td_label(s_win, 1, 13, 0, "New");
+            s_new = td_textbox(s_win, 6, 13, fw - 5, 128, NULL, NULL);
+            td_label(s_win, 1, 14, 0, "Con");
+            s_confirm = td_textbox(s_win, 6, 14, fw - 5, 128, NULL, NULL);
+            td_button(s_win, 1, 15, "Change password", password, NULL);
+            td_button(s_win, 1, 16, "Remember login", remember, NULL);
+            td_button(s_win, 1, 17, "Require password at boot", require_password, NULL);
+        }
+        else
+        {
+            td_label(s_win, 1, 0, 20, "ACCOUNTS");
+            s_list = td_list(s_win, td_rect(1, 2, 20, 14), item, select_user, NULL);
+            td_label(s_win, 25, 0, 40, "Account name");
+            s_name = td_textbox(s_win, 25, 1, 44, 31, NULL, NULL);
+            s_admin = td_checkbox(s_win, 25, 3, "Administrator", false, role_changed, NULL);
+            for (int i = 0; i < 7; i++)
+                s_rights[i] = td_checkbox(s_win, i < 4 ? 25 : 49, 5 + (i < 4 ? i : i - 4),
+                                          s_labels[i], false, rights_changed, NULL);
+            (void)td_button(s_win, 25, 9, "Create / Apply", apply, NULL);
+            td_label(s_win, 25, 10, 44, "Current password (when changing your own)");
+            s_old = td_textbox(s_win, 25, 11, 44, 128, NULL, NULL);
+            s_new = td_textbox(s_win, 25, 13, 44, 128, NULL, NULL);
+            s_confirm = td_textbox(s_win, 25, 15, 44, 128, NULL, NULL);
+            td_label(s_win, 25, 12, 44, "New password");
+            td_label(s_win, 25, 14, 44, "Confirm new password");
+        }
+    }
     if (s_old)
     {
         td_textbox_set_buffer(s_old, s_old_password, sizeof(s_old_password));
@@ -359,14 +423,28 @@ static void launch(void)
         td_textbox_set_buffer(s_confirm, s_confirm_password, sizeof(s_confirm_password));
         s_confirm->secret = true;
     }
-    (void)td_button(s_win, 25, 16, "Change password", password, NULL);
-    (void)td_button(s_win, 1, 16, "New account", new_account, NULL);
-    (void)td_button(s_win, 1, 17, "Remember login", remember, NULL);
-    (void)td_button(s_win, 25, 17, "Require password at boot", require_password, NULL);
+    if (td_win_client(s_win).w >= 60)
+    {
+        (void)td_button(s_win, 25, 16, "Change password", password, NULL);
+        (void)td_button(s_win, 1, 16, "New account", new_account, NULL);
+        (void)td_button(s_win, 1, 17, "Remember login", remember, NULL);
+        (void)td_button(s_win, 25, 17, "Require password at boot", require_password, NULL);
+    }
+    /* The narrow branch above places those four itself, as part of its form. */
     if (ops()->hint_get)
     {
-        td_label(s_win, 25, 18, 44, "Password hint (shown at Sign in; optional)");
-        s_hint_box = td_textbox(s_win, 25, 19, 44, TD_HINT_MAX - 1, NULL, NULL);
+        int narrow = td_win_client(s_win).w < 60;
+        if (narrow)
+        {
+            td_label(s_win, 1, 18, 0, "Hint");
+            s_hint_box = td_textbox(s_win, 6, 18, td_win_client(s_win).w - 7,
+                                    TD_HINT_MAX - 1, NULL, NULL);
+        }
+        else
+        {
+            td_label(s_win, 25, 18, 44, "Password hint (shown at Sign in; optional)");
+            s_hint_box = td_textbox(s_win, 25, 19, 44, TD_HINT_MAX - 1, NULL, NULL);
+        }
         if (s_hint_box)
             td_textbox_set_buffer(s_hint_box, s_hint, sizeof(s_hint));
     }
