@@ -31,6 +31,7 @@
 #include "power.h"
 #include "rtc.h"
 #include "touch.h"
+#include "haptic.h"
 #include "hal_mux.h"
 #include "tinydesk/td_picture.h"
 #include "tinydesk/td_wm.h"
@@ -148,6 +149,24 @@ bool link_init(void)
      * drives it, so release it before the driver tries to talk. */
     board_touch_reset_release();
     s_touch = touch_init(inject);
+
+    /* Haptics last, and after its own rail switch. P06 gates the DRV2605's
+     * supply and the chip answers I2C without it, so probing before raising
+     * the rail reports a healthy part that never moves -- the failure BRD-005
+     * records. A missing motor is not fatal: the desktop works without it and
+     * says so in the log. */
+    if (!board_haptic_power_on())
+    {
+        ESP_LOGE(TAG, "haptic rail failed");
+    }
+    else if (!haptic_init())
+    {
+        ESP_LOGE(TAG, "no DRV2605 at 0x5A");
+    }
+    else
+    {
+        ESP_LOGI(TAG, "haptics on");
+    }
     snprintf(s_platform, sizeof(s_platform),
              "ESP32-S3 T-Watch Ultra (%dx%d cells%s)",
              display_cols(), display_rows(), s_touch ? ", touch" : "");

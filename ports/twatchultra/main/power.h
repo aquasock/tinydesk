@@ -43,6 +43,14 @@ bool board_display_power_on(void);
  */
 bool board_display_rail_on(void);
 
+/* Power the DRV2605 haptic amplifier by raising XL9555 P06.
+ *
+ * MUST RUN BEFORE THE HAPTIC DRIVER IS PROBED. The chip answers I2C with its
+ * supply switched off, so a driver that skips this reads a healthy device and
+ * then produces no movement -- a failure that looks exactly like a dead motor
+ * or a wrong effect library. */
+bool board_haptic_power_on(void);
+
 /* Release the touch controller's reset, which lives on the expander, not on
  * an SoC GPIO. Must run before touch_init() talks to 0x1A. */
 bool board_touch_reset_release(void);

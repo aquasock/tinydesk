@@ -68,6 +68,7 @@
 #include "freertos/task.h"
 #include "display.h"
 #include "edges.h"
+#include "haptic.h"
 #include "tinydesk/td_wm.h"
 #include "power.h"
 #include "tinydesk/td_vterm.h"
@@ -390,6 +391,8 @@ static void send_str(const char *s)
  * nothing: on the desktop the framebuffer is not a touch surface. */
 static void edge_press(const edge_hit_t *hit, int y)
 {
+    const char *key = NULL;
+
     (void)y;
 
     /* One short line per edge press, and short on purpose: the Log Viewer is 40
@@ -403,19 +406,30 @@ static void edge_press(const edge_hit_t *hit, int y)
     {
     case EDGE_LEFT:
         if (hit->index >= 0 && hit->index < COL_N)
-            send_str(s_fkey[hit->index]);
+            key = s_fkey[hit->index];
         break;
     case EDGE_RIGHT:
         if (hit->index >= 0 && hit->index < COL_N)
-            send_str(s_rkey[hit->index]);
+            key = s_rkey[hit->index];
         break;
     case EDGE_BOTTOM:
         if (hit->index >= 0 && hit->index < BTN_N)
-            send_str(s_bkey[hit->index]);
+            key = s_bkey[hit->index];
         break;
     default:
         break;
     }
+
+    if (!key)
+        return;                     /* inert: the top margin, or the reserved slot */
+
+    send_str(key);
+
+    /* AFTER the key, so the click coincides with the action rather than
+     * preceding it. Only when a key was actually sent: a press on the reserved
+     * slot or on inert glass does nothing, and buzzing for it would say
+     * something happened when nothing did. */
+    haptic_tap();
 }
 
 /* Emit a release if a press has stopped reporting.

@@ -88,7 +88,7 @@ than probed.
 ## What is not here
 
 No picture support: the desktop is told the panel has no Sixel, and the
-`display_picture*` hooks return false. No sound, no haptics, no PMU. Those are
+`display_picture*` hooks return false. No sound, no PMU. Those are
 all present on the board and none of them are needed to show a desktop.
 
 ## Status
@@ -145,7 +145,7 @@ TinyDesk whole:
 | Battery / PMU | No TinyDesk UI consumes it. The AXP2101 is used only to raise ALDO2. |
 | Buttons (the three margins) | **Painted and live.** `main/edges.h` holds the geometry, `main/display.c` paints it and `main/touch.c` hit-tests it, so a button and its target cannot drift apart. **Left column**, top to bottom: `F10` Start menu, `Esc` cancel, `F6` window switcher, `Super+D` show desktop, `F11` full screen, labelled with the key name stood on end, reading top to bottom so it is upright when the watch is read from the right-hand edge. Labels are the terminal's ANSI green. **Bottom strip**, left to right: `Tab`, `Enter`, `Ctrl+Q` back -- the same path as a window's `[x]`, so a window that has something to lose can refuse. **Right column**, top to bottom: reserved, then Left, Right, Up, Down arrows. Not F1 to F5: those are app keys (Files renames on F2, Editor finds on F3) and do nothing on the desktop, where these are the actions that otherwise need a mouse. Green, 10 px radius where a button faces a neighbour, and the end buttons of both columns and of the strip are capped on all four corners so they stop at the framebuffer's edges rather than running into the glass. |
 | RTC (PCF85063A) | **Works.** `main/rtc.c` reads the chip at boot and seeds the system clock, so the desktop has a time with no network; it writes back when the time is set by Date & time or SNTP. Verified on the glass: the taskbar showed the correct UTC with Wi-Fi offline. Reading uses mainline's register map and refuses a stopped oscillator. |
-| Haptics | No TinyDesk integration. The DRV2605 is unused. |
+| Haptics | **Works.** `main/haptic.c` drives the DRV2605 at 0x5A: library 1 (ERM, the chip's FEEDBACK register reads 0x36 so the motor is ERM and not LRA), internal trigger, Strong Click on each margin-button press only. The sequence follows LilyGo's own `initDrv()`/`vibrator()` split -- library and mode once at init, waveform and terminator on every tap. `board_haptic_power_on()` raises XL9555 P06 first, because the chip answers I2C with its supply off and that failure is silent. |
 
 ### What a partial update costs, and why it matters here
 
@@ -184,7 +184,7 @@ the line reporting it was too long to read.
 
 ### Known gaps
 
-No picture/Sixel support, no sound, no haptics, no PMU battery reporting.
+No picture/Sixel support, no sound, no PMU battery reporting.
 
 **Bluetooth is enabled for input.** The watch's input is a Bluetooth LE keyboard
 and mouse (`bt.enable = 1`, `CONFIG_BT_ENABLED=y` with NimBLE as a central):

@@ -25,6 +25,24 @@
 #define XL9555_CONFIG0  0x06
 
 #define DISP_EN_BIT     7       /* P07: the display rail's switch */
+#define DRV_EN_BIT      6       /* P06: the haptic driver's rail */
+
+/*
+ * THE HAPTIC RAIL IS A SEPARATE SWITCH AND IT IS OFF AT BOOT.
+ *
+ * P06 on the same expander gates the DRV2605's supply, and a PCA9555 comes up
+ * with every pin an input, so P06 floats until something drives it. The
+ * consequence is silent in the worst way: the chip still answers every I2C
+ * transaction, so a driver that only probes it reports success, and the motor
+ * does not move because it has no power. That is BRD-005's second silent
+ * failure -- "an ERM given the LRA library buzzes weakly or not at all" is the
+ * other -- and the two are easy to confuse with a dead motor.
+ *
+ * Two independent sources agree the bit is 6: LilyGoLib's
+ * POWER_HAPTIC_DRIVER case drives EXPANDS_DRV_EN, and this project's reference
+ * cites the same value from LilyGo's TinyPetz. Unlike the touch reset line,
+ * there is no disagreement to hedge around here. */
+
 
 /*
  * TOUCH RESET. Two sources disagree on which expander pin it is:
@@ -268,6 +286,20 @@ bool board_touch_reset_release(void)
              TOUCH_RST_LINEAR_B, b_ok ? 1 : 0);
     vTaskDelay(pdMS_TO_TICKS(60));
     return a_ok || b_ok;
+}
+
+/* Power the haptic amplifier by raising XL9555 P06.
+ *
+ * Same two-step as the display's switch: configure the pin as an output, then
+ * drive the latch. Idempotent, so calling it again after a reset cannot hurt,
+ * and it leaves the expander's other pins alone -- P07 in particular, which the
+ * display is running from. */
+bool board_haptic_power_on(void)
+{
+    bool ok = xl_pin_high(DRV_EN_BIT);
+
+    ESP_LOGI(TAG, "haptic rail P%02d %s", DRV_EN_BIT, ok ? "on" : "FAILED");
+    return ok;
 }
 
 bool board_display_power_on(void)
