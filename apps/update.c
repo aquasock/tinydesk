@@ -286,20 +286,67 @@ static void on_draw(td_window_t *win, int w, int h)
     ota()->status(&st);
     char line[240];
 
-    snprintf(line, sizeof(line), "Installed   TinyDesk %s  (built %s, ESP-IDF %s)", i.version, i.built, i.sdk);
-    td_textn(1, 0, line, w - 1, t->win_fg, t->win_bg, TD_BOLD);
-    snprintf(line, sizeof(line), "Running     from %s%s", i.running,
-             i.on_trial ? ", on trial: confirms itself 30 s after start-up" : ", confirmed");
-    td_textn(1, 1, line, w - 1, i.on_trial ? t->accent : t->win_fg, t->win_bg, 0);
-    if (i.other_version[0])
+    /*
+     * Three status lines, each written for a 78-column window: the first is 56
+     * columns, the second 68 when on trial, the third 45. On a 38-column client
+     * all three were cut, and the third lost the whole reason it exists --
+     * where updates go. Short forms keep what matters: the version, which slot
+     * is running, and where the next update lands.
+     */
+    const bool narrow_info = w < 60;
+
+    if (narrow_info)
+        /* The build date alone is 20 columns ("Nov 11 2026 18:50:22"), so only
+         * the date part is kept -- the time of day is never wanted. */
+        /* "Nov 11 2026 18:50:22" -> "Nov 11 2026": the date part only, since
+         * the time of day is never wanted and the whole thing overruns. */
+        snprintf(line, sizeof(line), "Installed  %s (%.11s)", i.version, i.built);
+    else
+        snprintf(line, sizeof(line), "Installed   TinyDesk %s  (built %s, ESP-IDF %s)",
+                 i.version, i.built, i.sdk);
+    td_textn(narrow_info ? 0 : 1, 0, line, w - (narrow_info ? 0 : 1),
+             t->win_fg, t->win_bg, TD_BOLD);
+
+    if (narrow_info)
+        snprintf(line, sizeof(line), "Running  %s%s", i.running, i.on_trial ? ", trial" : "");
+    else
+        snprintf(line, sizeof(line), "Running     from %s%s", i.running,
+                 i.on_trial ? ", on trial: confirms itself 30 s after start-up" : ", confirmed");
+    td_textn(narrow_info ? 0 : 1, 1, line, w - (narrow_info ? 0 : 1),
+             i.on_trial ? t->accent : t->win_fg, t->win_bg, 0);
+
+    if (narrow_info)
+    {
+        if (i.other_version[0])
+            snprintf(line, sizeof(line), "Next %s: %s", i.next, i.other_version);
+        else
+            snprintf(line, sizeof(line), "Next %s: empty", i.next);
+    }
+    else if (i.other_version[0])
         snprintf(line, sizeof(line), "Other slot  %s holds version %s", i.next, i.other_version);
     else
         snprintf(line, sizeof(line), "Other slot  %s is empty (updates go there)", i.next);
-    td_textn(1, 2, line, w - 1, t->dim, t->win_bg, 0);
 
-    td_text(1, 4, "Update from", t->win_fg, t->win_bg, 0);
-    td_textn(1, 5, "http:// or https:// URL of a TinyDesk .bin, or a file here (e.g. ~/tinydesk.bin)", w - 1,
-             t->dim, t->win_bg, 0);
+    td_textn(narrow_info ? 0 : 1, 2, line, w - (narrow_info ? 0 : 1), t->dim, t->win_bg, 0);
+
+    /*
+     * The label and the hint assume the wide form, where the field starts at
+     * column 13 and the example fits on one line. On a narrow window the field
+     * is its own row at column 0, so the label goes above it and the hint is
+     * shortened -- at 38 columns the original ran to "or a file here (e.g.
+     * ~/tinydesk.bin)" and was cut.
+     */
+    if (w < 60)
+    {
+        td_text(0, 4, "Update from", t->win_fg, t->win_bg, 0);
+        td_textn(0, 6, "A URL to a .bin, or a file path", w, t->dim, t->win_bg, 0);
+    }
+    else
+    {
+        td_text(1, 4, "Update from", t->win_fg, t->win_bg, 0);
+        td_textn(1, 5, "http:// or https:// URL of a TinyDesk .bin, or a file here (e.g. ~/tinydesk.bin)", w - 1,
+                 t->dim, t->win_bg, 0);
+    }
 
     /* The newest official release, once a check found it. */
     if (has_official())
@@ -388,27 +435,79 @@ static void launch(void)
     s_note[0] = '\0';
     if (!ota())
         return;
-    s_source = td_textbox(s_win, 13, 4, 62, TD_TEXT_MAX - 1, on_enter, NULL);
-    snprintf(s_url, sizeof(s_url), "https://");
-    td_textbox_set_buffer(s_source, s_url, (int)sizeof(s_url));
-    s_check = td_button(s_win, 1, 6, "Check", on_check, NULL);
-    s_install = td_button(s_win, 11, 6, "Install", on_install, NULL);
-    s_cancel = td_button(s_win, 23, 6, "Cancel", on_cancel, NULL);
-    if (has_official())
+    /*
+     * EVERY FIELD IS 62 OR 74 COLUMNS ON A WINDOW THAT ASKS FOR 78.
+     *
+     * On a 40-column panel the client is 38 wide: the URL field ran from column
+     * 13 to 74, the four buttons on row 6 came to 63 columns with "Check for
+     * official updates" alone at 28, the daily-check checkbox was 47, and the
+     * progress bar was 74. Check, Install, Cancel and the official button were
+     * all off the glass, so the app could not update anything.
+     *
+     * A narrow window stacks: the URL field on its own row, the three buttons
+     * on the next, and the official check and its checkbox below them, with
+     * shorter captions where the long ones cannot fit.
+     */
     {
-        s_official = td_button(s_win, 34, 6, "Check for official updates", on_official, NULL);
-        if (ota()->auto_check)
-            s_auto = td_checkbox(s_win, 1, 7, "Check for official updates daily and notify me",
-                                 ota()->auto_check(), on_auto, NULL);
-        td_ota_release_t r;
-        ota()->official(&r);
-        s_seen_checks = r.checks;
-        if (r.valid && r.newer)
-            td_widget_set_text(s_source, r.url);   /* known from the daily check */
+        int cw = td_win_client(s_win).w;
+        bool narrow = cw < 60;
+        int url_w = narrow ? cw - 2 : 62;
+        int url_x = narrow ? 0 : 13;
+        int btn_y = narrow ? 7 : 6;
+        int prog_y = narrow ? 13 : 12;
+
+        s_source = td_textbox(s_win, url_x, narrow ? 5 : 4, url_w,
+                              TD_TEXT_MAX - 1, on_enter, NULL);
+        snprintf(s_url, sizeof(s_url), "https://");
+        td_textbox_set_buffer(s_source, s_url, (int)sizeof(s_url));
+
+        if (narrow)
+        {
+            /* Check 9, Install 11, Cancel 10, back to back with no gaps:
+             * 0..8, 9..19, 20..29. */
+            s_check = td_button(s_win, 0, btn_y, "Check", on_check, NULL);
+            s_install = td_button(s_win, 9, btn_y, "Install", on_install, NULL);
+            s_cancel = td_button(s_win, 20, btn_y, "Cancel", on_cancel, NULL);
+        }
+        else
+        {
+            s_check = td_button(s_win, 1, btn_y, "Check", on_check, NULL);
+            s_install = td_button(s_win, 11, btn_y, "Install", on_install, NULL);
+            s_cancel = td_button(s_win, 23, btn_y, "Cancel", on_cancel, NULL);
+        }
+
+        if (has_official())
+        {
+            if (narrow)
+            {
+                /* "Check for official updates" is 28 columns and would leave
+                 * nothing beside it; on its own row with a shorter caption. */
+                s_official = td_button(s_win, 0, btn_y + 1, "Official...", on_official, NULL);
+                if (ota()->auto_check)
+                    s_auto = td_checkbox(s_win, 0, btn_y + 2, "Check daily",
+                                         ota()->auto_check(), on_auto, NULL);
+            }
+            else
+            {
+                s_official = td_button(s_win, 34, btn_y, "Check for official updates",
+                                       on_official, NULL);
+                if (ota()->auto_check)
+                    s_auto = td_checkbox(s_win, 1, 7,
+                                         "Check for official updates daily and notify me",
+                                         ota()->auto_check(), on_auto, NULL);
+            }
+            {
+                td_ota_release_t r;
+                ota()->official(&r);
+                s_seen_checks = r.checks;
+                if (r.valid && r.newer)
+                    td_widget_set_text(s_source, r.url);   /* known from the daily check */
+            }
+        }
+        s_progress = td_progress(s_win, narrow ? 0 : 1, prog_y, narrow ? cw : 74);
+        s_restart = td_button(s_win, narrow ? 0 : 1, -1, "Restart now", on_restart, NULL);
+        s_rollback = td_button(s_win, narrow ? 13 : 19, -1, "Roll back", on_rollback, NULL);
     }
-    s_progress = td_progress(s_win, 1, 12, 74);
-    s_restart = td_button(s_win, 1, -1, "Restart now", on_restart, NULL);
-    s_rollback = td_button(s_win, 19, -1, "Roll back", on_rollback, NULL);
     on_tick(s_win);
     td_widget_focus(s_source);
 }

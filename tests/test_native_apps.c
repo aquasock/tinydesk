@@ -240,7 +240,6 @@ static void check_controls(td_window_t *w, const char *app, bool audit)
 static const char *const s_narrow_todo[] = {
     "Settings",
     "Recycle Bin",
-    "Software Update",
     "Date & time",
 };
 
