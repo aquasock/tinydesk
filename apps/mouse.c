@@ -28,8 +28,10 @@ static const struct
 };
 
 #define ROW_Y(i) (3 + 2 * (i))
-#define BAR_X    23
-#define BAR_W    20
+/* The bar's geometry is computed from the client width now, so the click
+ * handler reads these rather than compiling in a position the panel may not
+ * have room for. */
+static int s_bar_x = 23, s_bar_w = 20;
 #define TARGET_Y 10
 
 static td_window_t *s_win;
@@ -114,10 +116,10 @@ static bool on_event(td_window_t *win, const td_event_t *ev)
         return false;
     for (int i = 0; i < SETTINGS; i++)
     {
-        if (ev->y != ROW_Y(i) || ev->x < BAR_X || ev->x >= BAR_X + BAR_W)
+        if (ev->y != ROW_Y(i) || ev->x < s_bar_x || ev->x >= s_bar_x + s_bar_w)
             continue;
         int span = s_rows[i].max - s_rows[i].min, step = s_rows[i].step;
-        int v = s_rows[i].min + (ev->x - BAR_X) * span / (BAR_W - 1);
+        int v = s_rows[i].min + (ev->x - s_bar_x) * span / (s_bar_w - 1);
         change(i, (v + step / 2) / step * step);
         return true;
     }
@@ -159,21 +161,55 @@ static void launch(void)
     td_sysinfo()->mouse->get(&s_set);
     s_hit_count = 0;
 
-    s_status = td_label(s_win, 2, 1, 0, "");
-    for (int i = 0; i < SETTINGS; i++)
+    /*
+     * THE BAR WAS FIXED AT 20 COLUMNS STARTING AT COLUMN 23, with the "+" at 44
+     * and the value at 50. On a 40-column panel the client is 38 wide, so the
+     * bar ran four columns past the frame and both the "+" button and the value
+     * were off the glass entirely -- the settings could be turned down but not
+     * up. The row below it lost "Hits: 0" to a single "H".
+     *
+     * Everything is measured from the client now, and the bar takes whatever is
+     * left between the "-" and the "+" so it fits any width.
+     */
     {
-        td_label(s_win, 2, ROW_Y(i), 14, s_rows[i].name);
-        td_button(s_win, 17, ROW_Y(i), "-", on_minus, (void *)(intptr_t)i);
-        s_bar[i] = td_progress(s_win, BAR_X, ROW_Y(i), BAR_W);
-        td_button(s_win, BAR_X + BAR_W + 1, ROW_Y(i), "+", on_plus, (void *)(intptr_t)i);
-        s_value[i] = td_label(s_win, BAR_X + BAR_W + 7, ROW_Y(i), 6, "");
+        int cw = td_win_client(s_win).w;
+        /* name at 1 (13 wide, "Acceleration" fits), "-" at 15, then the bar
+         * takes everything up to the value and the "+" at the right edge. */
+        int val_x = cw - 5;
+        int plus_x = val_x - 5;
+        int bar_x = 20;
+        int bar_w = plus_x - 1 - bar_x;
+
+        if (bar_w < 8)
+            bar_w = 8;
+
+        s_bar_x = bar_x;
+        s_bar_w = bar_w;
+
+        s_status = td_label(s_win, 2, 1, 0, "");
+
+        for (int i = 0; i < SETTINGS; i++)
+        {
+            td_label(s_win, 1, ROW_Y(i), 13, s_rows[i].name);
+            td_button(s_win, 15, ROW_Y(i), "-", on_minus, (void *)(intptr_t)i);
+            s_bar[i] = td_progress(s_win, bar_x, ROW_Y(i), bar_w);
+            td_button(s_win, plus_x, ROW_Y(i), "+", on_plus, (void *)(intptr_t)i);
+            s_value[i] = td_label(s_win, val_x, ROW_Y(i), 5, "");
+        }
+
+        /* The four targets, then "Hits: n" on the row below rather than at
+         * column 37 where it was cut to "H". */
+        td_label(s_win, 2, TARGET_Y, 0, "Try it:");
+        for (int i = 0; i < 4; i++)
+            td_button(s_win, 11 + 6 * i, TARGET_Y, "o", on_target, NULL);
+        s_hits = td_label(s_win, 2, TARGET_Y + 1, 0, "Hits: 0");
+
+        td_button(s_win, 2, 12, "Defaults", on_defaults, NULL);
+        s_note = td_label(s_win, 2, 13, 0,
+                          td_session_has_right(TD_RIGHT_SYSTEM)
+                              ? ""
+                              : "The system permission is required.");
     }
-    td_label(s_win, 2, TARGET_Y, 0, "Try it:");
-    for (int i = 0; i < 4; i++)
-        td_button(s_win, 11 + 6 * i, TARGET_Y, "o", on_target, NULL);
-    s_hits = td_label(s_win, 37, TARGET_Y, 0, "Hits: 0");
-    td_button(s_win, 2, 12, "Defaults", on_defaults, NULL);
-    s_note = td_label(s_win, 17, 12, 0, td_session_has_right(TD_RIGHT_SYSTEM) ? "" : "The system permission is required to change these.");
     td_widget_set_color(s_note, td_theme()->dim, TD_COLOR_DEFAULT);
     show();
 }
