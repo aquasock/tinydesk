@@ -86,11 +86,21 @@ static void update(void)
             case TD_BATT_DISCHARGING: state = " dis"; break;
             default: break;
             }
+            /* The cell's thermistor rides on the battery line because it is the
+             * same subject and a 26-row screen cannot spare a row for eight
+             * characters. `ntc511` is seven columns; the whole line is 32 of
+             * the 38 the window shows at 40x26. MILLIVOLTS, NOT DEGREES -- see
+             * td_battery_t and PMU-006. */
+            char ntc[16] = "";
+
+            if (b[0].ntc_millivolts > 0)
+                snprintf(ntc, sizeof(ntc), " ntc%d", b[0].ntc_millivolts);
+
             if (b[0].millivolts > 0)
-                td_widget_printf(s_batt, "Battery:%s  %d.%02d V%s", pct,
-                                 b[0].millivolts / 1000, (b[0].millivolts % 1000) / 10, state);
+                td_widget_printf(s_batt, "Battery:%s  %d.%02d V%s%s", pct,
+                                 b[0].millivolts / 1000, (b[0].millivolts % 1000) / 10, state, ntc);
             else
-                td_widget_printf(s_batt, "Battery:%s%s", pct, state);
+                td_widget_printf(s_batt, "Battery:%s%s%s", pct, state, ntc);
         }
     }
 

@@ -545,6 +545,82 @@ static void login_resize(void)
     }
 }
 
+  /* The battery line, including the cell's thermistor.
+ *
+ * WHY THIS EXISTS SEPARATELY. check_controls() only audits FOCUSABLE widgets,
+ * and these are labels, so the 40x26 pass says nothing about whether this line
+ * fits on the screen. Nothing in the suite supplied a battery either, so the
+ * thermistor branch was never rendered at all -- a passing suite that would
+ * have stayed passing whatever that code did.
+ *
+ * The row is checked at this board's narrowest grid, because that is where it
+ * would overflow if the format string grew: `ntc` plus a four-digit reading is
+ * the widest case the field can produce.
+ */
+static int s_ntc_mv;
+static int batt_read(td_battery_t *out, int max)
+{
+    if (!out || max < 1)
+        return 0;
+    memset(out, 0, sizeof(*out));
+    snprintf(out[0].label, sizeof(out[0].label), "Battery");
+    out[0].percent = 100;
+    out[0].millivolts = 4182;
+    out[0].state = TD_BATT_FULL;
+    out[0].ntc_millivolts = s_ntc_mv;
+    return 1;
+}
+
+static void battery_line(void)
+{
+    td_sysinfo_t with_batt = info;
+
+    with_batt.batteries = batt_read;
+    td_wm_set_screen_size(40, 26);
+    td_wm_close_all();
+
+    /* With a thermistor: the reading is on screen. 4095 is the widest value the
+     * 14-bit field can hold, so this is the worst case for width. */
+    s_ntc_mv = 4095;
+    td_set_sysinfo(&with_batt);
+    CHECK(td_app_launch("System Monitor"));
+    tick(1000);
+
+    bool found = false;
+    for (td_window_t *w = td_win_focused(); w; w = NULL)
+        for (td_widget_t *p = w->widgets; p; p = p->next)
+            if (!strncmp(td_widget_text(p), "Battery:", 8))
+            {
+                const char *t = td_widget_text(p);
+                found = true;
+                CHECK(strstr(t, "ntc4095") != NULL);
+                /* Must still fit the client, which is 38 columns at 40x26. */
+                CHECK((int)strlen(t) <= 38);
+            }
+    CHECK(found);
+    td_wm_close_all();
+
+    /* Without one: no `ntc` and no stray separator left behind. */
+    s_ntc_mv = 0;
+    CHECK(td_app_launch("System Monitor"));
+    tick(1000);
+    found = false;
+    for (td_window_t *w = td_win_focused(); w; w = NULL)
+        for (td_widget_t *p = w->widgets; p; p = p->next)
+            if (!strncmp(td_widget_text(p), "Battery:", 8))
+            {
+                const char *t = td_widget_text(p);
+                found = true;
+                CHECK(strstr(t, "ntc") == NULL);
+                CHECK((int)strlen(t) <= 38);
+            }
+    CHECK(found);
+
+    td_wm_close_all();
+    td_set_sysinfo(&info);
+    td_wm_set_screen_size(80, 24);
+}
+
 int main(int argc, char **argv)
 {
     bool audit = argc > 1 && !strcmp(argv[1], "--audit");
@@ -556,6 +632,7 @@ int main(int argc, char **argv)
     for (unsigned i = 0; i < sizeof(required) / sizeof(required[0]); i++)
         CHECK(registered(required[i]));
     layouts(audit, false);
+    battery_line();
     td_wm_set_screen_size(100, 30);
     layouts(audit, false);
     /* The T-Watch Ultra's grid: this is what the narrow layouts are for. */

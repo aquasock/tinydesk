@@ -254,9 +254,20 @@ void charge_on_irq(const uint8_t status[3])
     }
 }
 
+int charge_ts_mv(void)
+{
+    uint8_t h = 0, l = 0;
+
+    if (!board_pmu_read(REG_TS_VOLT_H, &h) || !board_pmu_read(REG_TS_VOLT_L, &l))
+        return -1;
+
+    /* 14 bits at 0.5 mV per step, which SensorLib's TS_STEP records. */
+    return (int)((((h & 0x3F) << 8) | l) * 5 / 10);
+}
+
 bool charge_ts_report(int *ts_mv, uint8_t *ctrl)
 {
-    uint8_t h = 0, l = 0, c = 0;
+    uint8_t c = 0;
 
     if (ts_mv)
         *ts_mv = -1;
@@ -271,18 +282,17 @@ bool charge_ts_report(int *ts_mv, uint8_t *ctrl)
     if (ctrl)
         *ctrl = c;
 
-    if (!board_pmu_read(REG_TS_VOLT_H, &h) || !board_pmu_read(REG_TS_VOLT_L, &l))
+    /* One decoder, in charge_ts_mv(), so the tick path and the boot line can
+     * never disagree about what 0x36/0x37 mean. Reported as millivolts and not
+     * as a temperature: turning a divider voltage into degrees needs the NTC's
+     * nominal resistance and beta, and a number invented from a guessed part
+     * number is exactly the plausible-looking lie PMU-006 records. */
+    int mv = charge_ts_mv();
+    if (mv < 0)
     {
         ESP_LOGW(TAG, "ts did not read");
         return false;
     }
-
-    /* 14 bits, 0.5 mV per step -- SensorLib's TS_STEP. Reported as millivolts
-     * and not as a temperature, because turning a divider voltage into degrees
-     * needs the NTC's part number and beta, and this board's schematic marks
-     * that position NC. A temperature invented from a guessed beta would be
-     * exactly the plausible-looking lie this project keeps recording. */
-    int mv = (int)((((h & 0x3F) << 8) | l) * 5 / 10);
 
     if (ts_mv)
         *ts_mv = mv;

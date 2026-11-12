@@ -507,7 +507,7 @@ td_sysinfo.h: typedef struct { int layout; int delay_ms; int rate; } td_keyboard
 td_sysinfo.h: typedef struct { bool (*status)(char *buf, int cap); void (*get)(td_keyboard_settings_t *s); bool (*set)(const td_keyboard_settings_t *s); const char *(*layout_name)(int i); } td_keyboard_ops_t;
 td_sysinfo.h: typedef struct { char label[24]; char path[48]; bool removable; uint64_t total, free; } td_drive_t;
 td_sysinfo.h: enum { TD_BATT_UNKNOWN = 0, TD_BATT_DISCHARGING, TD_BATT_CHARGING, TD_BATT_FULL, };
-td_sysinfo.h: typedef struct { char label[24]; int percent; int millivolts; int state; } td_battery_t;
+td_sysinfo.h: typedef struct { char label[24]; int percent; int millivolts; int state; int ntc_millivolts; } td_battery_t;
 td_sysinfo.h: enum { TD_BT_SLOT_KEYBOARD = 0, TD_BT_SLOT_MOUSE = 1, TD_BT_SLOT_COMBO = 2, TD_BT_SLOTS = 3 };
 td_sysinfo.h: typedef struct { const char *state; bool active; bool ready; bool connected; uint8_t addr[TD_BT_ADDR_LEN]; char name[TD_BT_NAME_LEN]; bool boot_protocol; uint32_t reports; bool paired; uint8_t paired_addr[TD_BT_ADDR_LEN]; char paired_name[TD_BT_NAME_LEN]; bool reconnects; char last[TD_BT_MESSAGE_LEN + 32]; } td_bt_slot_t;
 td_sysinfo.h: typedef enum { TD_BT_RADIO_OFF, TD_BT_RADIO_STARTING, TD_BT_RADIO_UP, TD_BT_RADIO_FAILED } td_bt_radio_t;

@@ -77,4 +77,11 @@ void charge_on_irq(const uint8_t status[3]);
  */
 bool charge_ts_report(int *ts_mv, uint8_t *ctrl);
 
+/*
+ * The TS pin in millivolts, or -1 when the PMU does not answer. No logging and
+ * no side effects, so a caller on a tick can use it -- System Monitor asks
+ * twice a second and must not fill the log ring with it.
+ */
+int charge_ts_mv(void);
+
 #endif

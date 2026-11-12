@@ -242,6 +242,13 @@ typedef struct
     int percent;                 /* 0..100, or -1 while unknown */
     int millivolts;              /* 0 while unknown */
     int state;                   /* TD_BATT_* */
+    int ntc_millivolts;          /* the cell's thermistor, 0 when the board has
+                                  * none. MILLIVOLTS AND NOT DEGREES: turning
+                                  * it into a temperature needs the NTC's
+                                  * nominal resistance and beta plus the
+                                  * charger's excitation current, and a board
+                                  * that does not know those must not print a
+                                  * plausible-looking number (PMU-006). */
 } td_battery_t;
 
     /* ------------------------------------------------------------ Bluetooth */

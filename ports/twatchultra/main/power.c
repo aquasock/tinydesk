@@ -7,6 +7,7 @@
  */
 
 #include "power.h"
+#include "charge.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -469,6 +470,16 @@ int board_battery_read(td_battery_t *out, int max)
         break;
     }
     out->state = state;
+
+    /* The cell's thermistor, if one is fitted. A board without one gets 0 and
+     * System Monitor says nothing about it (PMU-006). Read here rather than
+     * cached because the whole point is that it moves with the cell, which the
+     * die sensor cannot show. */
+    {
+        int ts = charge_ts_mv();
+
+        out->ntc_millivolts = ts > 0 ? ts : 0;
+    }
     return 1;
 }
 
