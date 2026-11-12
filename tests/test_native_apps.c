@@ -238,7 +238,6 @@ static void check_controls(td_window_t *w, const char *app, bool audit)
  * control on a narrow screen. Deleting a name from this list is how a fix is
  * proved, and the list should end up empty. */
 static const char *const s_narrow_todo[] = {
-    "Settings",
     "Date & time",
 };
 

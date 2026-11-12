@@ -350,12 +350,23 @@ static void on_draw(td_window_t *win, int w, int h)
     (void)w;
     (void)h;
     const td_theme_t *t = td_theme();
+    /*
+     * THE SIZE ROW'S CAPTIONS ARE DRAWN TEXT, NOT WIDGETS.
+     *
+     * In the wide layout the four size buttons sit at column 18 and these words
+     * label them from column 3. A narrow window moves the buttons to column 1,
+     * so the words were drawn UNDERNEATH them and only their tails showed --
+     * which is what "… ]icons" and "… ]nu" were. They go to the right of the
+     * button on a narrow window.
+     */
+    const int cap_x = w < 60 ? 12 : 3;
+
     td_text(1, 7, "Sizes", t->win_fg, t->win_bg, TD_BOLD);
-    td_text(3, 8, "Desktop icons", t->win_fg, t->win_bg, 0);
-    td_text(3, 9, "Start menu", t->win_fg, t->win_bg, 0);
-    td_text(3, 10, "Taskbar", t->win_fg, t->win_bg, 0);
-    td_text(3, 11, "Windows", t->win_fg, t->win_bg, 0);
-    td_text(3, 12, "Pictures", t->win_fg, t->win_bg, 0);
+    td_text(cap_x, 8, "Desktop icons", t->win_fg, t->win_bg, 0);
+    td_text(cap_x, 9, "Start menu", t->win_fg, t->win_bg, 0);
+    td_text(cap_x, 10, "Taskbar", t->win_fg, t->win_bg, 0);
+    td_text(cap_x, 11, "Windows", t->win_fg, t->win_bg, 0);
+    td_text(cap_x, 12, "Pictures", t->win_fg, t->win_bg, 0);
 }
 
 static void on_network(td_widget_t *w, void *user)
@@ -423,25 +434,63 @@ static void launch(void)
     if (!s_win)
         return;
 
+    /*
+     * TWO CONTROLS OVERRUN 38 COLUMNS, AND ONE ROW OVERLAPS ITSELF.
+     *
+     * "On-screen keyboard for text fields" is 38 columns, which is exactly the
+     * client -- a widget whose right edge lands ON the last column is inside, so
+     * the test only caught it because the checkbox adds its border to the
+     * caption and reaches past. And "Displays..." at column 24 shares row 17
+     * with "Software update..." at column 1, which is 25 wide and so ends at 25:
+     * the two overlap by two columns and Date & time... below them is clear.
+     *
+     * A narrow window shortens the captions that cannot fit and puts Displays...
+     * on a row of its own.
+     */
+    const bool narrow = td_win_client(s_win).w < 60;
+
     td_label(s_win, 1, 1, 0, "Theme");
     s_theme_box[0] = td_checkbox(s_win, 3, 2, td_theme_get(0)->name, false, on_theme, (void *)(intptr_t)0);
-    s_theme_box[1] = td_checkbox(s_win, 20, 2, td_theme_get(1)->name, false, on_theme, (void *)(intptr_t)1);
-    s_ascii = td_checkbox(s_win, 1, 4, "ASCII-only drawing (no UTF-8)", false, on_ascii, NULL);
+    s_theme_box[1] = td_checkbox(s_win, narrow ? 3 : 20, narrow ? 3 : 2, td_theme_get(1)->name,
+                                 false, on_theme, (void *)(intptr_t)1);
+    s_ascii = td_checkbox(s_win, 1, 4, narrow ? "ASCII-only drawing"
+                                              : "ASCII-only drawing (no UTF-8)",
+                          false, on_ascii, NULL);
     s_icons = td_checkbox(s_win, 1, 5, "Desktop icons", true, on_icons, NULL);
-    s_osk_box = td_checkbox(s_win, 1, 6, "On-screen keyboard for text fields", false, on_osk, NULL);
+    s_osk_box = td_checkbox(s_win, 1, 6, narrow ? "On-screen keyboard"
+                                                : "On-screen keyboard for text fields",
+                            false, on_osk, NULL);
     for (int i = 0; i < 4; i++)
-        s_size_btn[i] = td_button(s_win, 18, 8 + i, "Medium", on_size, (void *)(intptr_t)i);
-    s_detail_btn = td_button(s_win, 18, 12, "Normal", on_detail, NULL);
+        s_size_btn[i] = td_button(s_win, narrow ? 1 : 18, 8 + i, "Medium", on_size,
+                                  (void *)(intptr_t)i);
+    s_detail_btn = td_button(s_win, narrow ? 1 : 18, 12, "Normal", on_detail, NULL);
     s_pattern_label = td_label(s_win, 1, 14, 0, "");
     td_button(s_win, 3, 15, "Next pattern", on_pattern, NULL);
-    td_button(s_win, 1, 16, "Network...", on_network, NULL);
-    td_button(s_win, 16, 16, "Date & time...", on_datetime, NULL);
-    td_button(s_win, 1, 17, "Software update...", on_update, NULL);
-    td_button(s_win, 24, 17, "Displays...", on_displays, NULL);
-    if (td_sysinfo()->bt)
-        td_button(s_win, 1, 18, "Bluetooth...", on_bluetooth, NULL);
+    if (narrow)
+    {
+        /* Two per row: the client is at most 44 columns unmaximised and these
+         * are 12 to 16 wide each, so a pair fits and four single rows would not
+         * -- they ran past the bottom at the window's own size. */
+        td_button(s_win, 0, 16, "Network...", on_network, NULL);         /* 0..11 */
+        td_button(s_win, 13, 16, "Date/time...", on_datetime, NULL);     /* 13..28 */
+        td_button(s_win, 0, 17, "Update...", on_update, NULL);           /* 0..11 */
+        td_button(s_win, 13, 17, "Displays...", on_displays, NULL);      /* 13..27 */
+        if (td_sysinfo()->bt)
+            td_button(s_win, 0, 18, "Bluetooth...", on_bluetooth, NULL);
+    }
+    else
+    {
+        td_button(s_win, 1, 16, "Network...", on_network, NULL);
+        td_button(s_win, 16, 16, "Date & time...", on_datetime, NULL);
+        td_button(s_win, 1, 17, "Software update...", on_update, NULL);
+        td_button(s_win, 24, 17, "Displays...", on_displays, NULL);
+        if (td_sysinfo()->bt)
+            td_button(s_win, 1, 18, "Bluetooth...", on_bluetooth, NULL);
+    }
     td_button(s_win, 1, -1, "Close", on_close_btn, NULL);
-    s_status = td_label(s_win, 11, -1, 33, "");
+    /* "Close" is 9 columns at x1, so the status starts at 11 or it runs into
+     * the button's frame. */
+    s_status = td_label(s_win, 11, -1, narrow ? td_win_client(s_win).w - 11 : 33, "");
     td_widget_printf(s_status, "Settings of %.24s", td_session_user());
     update_labels();
 }
