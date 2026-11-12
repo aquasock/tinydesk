@@ -182,7 +182,6 @@ static volatile uint32_t s_irqs;
  * (0, 5, 6) and the three coordinate bytes are everything needed to tell a
  * press from a phantom. */
 static uint32_t s_reads;
-static uint32_t s_reports;
 static int s_logged_blocks;
 
 static void log_block(const char *what, const uint8_t *b)
@@ -607,12 +606,19 @@ static void poll_task(void *arg)
         }
         else if (s_reads % 300 == 0)
         {
-            /* irq first for the same 40-column reason as the bring-up line:
-             * the number that says whether the interrupt is doing the work has
-             * to survive the clip. */
-            ESP_LOGI(TAG, "irq%lu rd%lu p%lu",
-                     (unsigned long)s_irqs, (unsigned long)s_reads,
-                     (unsigned long)s_reports);
+            /* Two short fields, because the ring is 40 columns and the window
+             * is 38 of them: with the tag and a growing millisecond stamp ahead
+             * of it there are about thirteen characters left, which fits
+             * `i1488 r3000` and does not fit `irq1488 rd3000 p12`. This line
+             * was truncated on its first real use, which is why p is gone --
+             * presses are counted by the prs lines now that those are one per
+             * touch.
+             *
+             * i is the interrupt edge count: non-zero and climbing when the
+             * glass is touched, and flat when it is not. r is the bus reads,
+             * the number the whole change was about. */
+            ESP_LOGI(TAG, "i%lu r%lu",
+                     (unsigned long)s_irqs, (unsigned long)s_reads);
         }
 
         /* A block carries a press only if byte 6 has the validity marker, the
@@ -628,9 +634,24 @@ static void poll_task(void *arg)
 
             press = b[6] == ACK_BYTE && fingers > 0 &&
                     fingers <= MAX_FINGERS && (b[0] & 0x0F) == EVENT_DOWN;
-            if (press)
-                log_block("prs", b);
         }
+
+        /* Log the FIRST report of a touch and nothing while it is held.
+         *
+         * This used to log every press report, and the controller re-reports a
+         * held finger every ~66 ms, so a two-second hold wrote about thirty
+         * lines into a 64-line ring and a drag emptied it completely: the Log
+         * Viewer became unreadable exactly while something was being
+         * diagnosed with it. That is the third time this file records a
+         * diagnostic defeating itself, and unlike the 40-column truncations it
+         * was not a display limit but the log's own volume.
+         *
+         * The transition is the interesting event anyway -- the first block
+         * carries the position a press started at -- and s_pressed is only
+         * cleared by release_if_idle(), so it still holds the previous
+         * iteration's state here. */
+        if (press && !s_pressed)
+            log_block("prs", b);
 
         if (!press)
         {
@@ -644,7 +665,6 @@ static void poll_task(void *arg)
             edge_hit_t hit;
             bool app = td_wm_app_owns_screen();
 
-            s_reports++;
             s_last_press_us = esp_timer_get_time();
 
             edges_hit(x, y, &hit);
