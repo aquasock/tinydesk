@@ -10,6 +10,10 @@
 static td_window_t *s_win;
 static td_widget_t *s_free_bar, *s_free_txt, *s_min_bar, *s_min_txt, *s_ps_bar, *s_ps_txt;
 static td_widget_t *s_tasks, *s_uptime, *s_frame, *s_serial, *s_term;
+/* One line for the battery, or NULL on a board without one. Above the memory
+ * bars rather than below the statistics: power left is the thing a watch user
+ * looks for first, and on a 26-row screen the top is where the eye lands. */
+static td_widget_t *s_batt;
 
 static int percent(uint32_t part, uint32_t total)
 {
@@ -49,6 +53,42 @@ static void update(void)
         td_widget_printf(s_ps_txt, "%u KB free of %u", (unsigned)(pf / 1024u), (unsigned)(pt / 1024u));
     }
 
+    if (s_batt)
+    {
+        td_battery_t b[TD_MAX_BATTERIES];
+
+        int n = si->batteries ? si->batteries(b, TD_MAX_BATTERIES) : 0;
+
+        if (n <= 0)
+            td_widget_printf(s_batt, "Battery: n/a");
+        else
+        {
+            /* Voltage to two decimals in volts, the way a battery is quoted;
+             * a whole-millivolt figure wastes three of 38 columns. */
+            char pct[12] = "  --%";
+            const char *state = "";
+
+            /* Clamped, not trusted. A driver that hands back 400 would
+             * otherwise overflow the buffer, and "400%" is not a percentage
+             * either -- so out-of-range is treated as unknown, the same way a
+             * gauge that has not settled is. */
+            if (b[0].percent >= 0 && b[0].percent <= 100)
+                snprintf(pct, sizeof(pct), "%3d%%", b[0].percent);
+            switch (b[0].state)
+            {
+            case TD_BATT_CHARGING: state = " chg"; break;
+            case TD_BATT_FULL: state = " full"; break;
+            case TD_BATT_DISCHARGING: state = " dis"; break;
+            default: break;
+            }
+            if (b[0].millivolts > 0)
+                td_widget_printf(s_batt, "Battery:%s  %d.%02d V%s", pct,
+                                 b[0].millivolts / 1000, (b[0].millivolts % 1000) / 10, state);
+            else
+                td_widget_printf(s_batt, "Battery:%s%s", pct, state);
+        }
+    }
+
     char tasks[16] = "n/a", cpu[16] = "n/a";
     if (si->task_count)
         snprintf(tasks, sizeof(tasks), "%d", si->task_count());
@@ -86,6 +126,12 @@ static void on_close(td_window_t *win)
 {
     (void)win;
     s_win = NULL;
+    /* The widgets go with the window; a stale pointer would be written to on
+     * the next tick if one arrived before launch() ran again. */
+    s_batt = NULL;
+    s_free_bar = s_free_txt = s_min_bar = s_min_txt = NULL;
+    s_ps_bar = s_ps_txt = NULL;
+    s_tasks = s_uptime = s_frame = s_serial = s_term = NULL;
 }
 
 static void launch(void)
@@ -97,7 +143,13 @@ static void launch(void)
     }
     const td_sysinfo_t *si = td_sysinfo();
     bool psram = si->psram_total && si->psram_total() > 0;
-    int y = psram ? 1 : 0;    /* rows below the memory bars move down */
+    /* Somewhere above the memory bars if the board reports one. Probing here
+     * rather than in update() because the layout, not the reading, decides
+     * whether the row exists. */
+    td_battery_t probe[TD_MAX_BATTERIES];
+    bool batt = si->batteries && si->batteries(probe, TD_MAX_BATTERIES) > 0;
+    int top = batt ? 1 : 0;        /* everything shifts down for the battery */
+    int y = top + (psram ? 1 : 0); /* rows below the memory bars move down */
     td_window_desc_t d = {
         .title = "System Monitor",
         .rect = td_rect(4, 2, 56, 12 + y),
@@ -110,18 +162,19 @@ static void launch(void)
     if (!s_win)
         return;
 
-    td_label(s_win, 1, 1, 13, psram ? "Internal RAM" : "RAM in use");
-    s_free_bar = td_progress(s_win, 14, 1, 18);
-    s_free_txt = td_label(s_win, 33, 1, 0, "");
-    td_label(s_win, 1, 2, 13, "  peak use");
-    s_min_bar = td_progress(s_win, 14, 2, 18);
-    s_min_txt = td_label(s_win, 33, 2, 0, "");
+    s_batt = batt ? td_label(s_win, 1, 1, 0, "") : NULL;
+    td_label(s_win, 1, 1 + top, 13, psram ? "Internal RAM" : "RAM in use");
+    s_free_bar = td_progress(s_win, 14, 1 + top, 18);
+    s_free_txt = td_label(s_win, 33, 1 + top, 0, "");
+    td_label(s_win, 1, 2 + top, 13, "  peak use");
+    s_min_bar = td_progress(s_win, 14, 2 + top, 18);
+    s_min_txt = td_label(s_win, 33, 2 + top, 0, "");
     s_ps_bar = s_ps_txt = NULL;
     if (psram)
     {
-        td_label(s_win, 1, 3, 13, "PSRAM");
-        s_ps_bar = td_progress(s_win, 14, 3, 18);
-        s_ps_txt = td_label(s_win, 33, 3, 0, "");
+        td_label(s_win, 1, 3 + top, 13, "PSRAM");
+        s_ps_bar = td_progress(s_win, 14, 3 + top, 18);
+        s_ps_txt = td_label(s_win, 33, 3 + top, 0, "");
     }
     s_tasks = td_label(s_win, 1, 4 + y, 0, "");
     s_uptime = td_label(s_win, 1, 5 + y, 0, "");

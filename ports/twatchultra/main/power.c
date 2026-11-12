@@ -8,8 +8,12 @@
 
 #include "power.h"
 
+#include <stdio.h>
+#include <string.h>
+
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "tinydesk/td_sysinfo.h"
 #include "freertos/FreeRTOS.h"
 
 #define TAG "twatch-power"
@@ -79,6 +83,19 @@
 #define PMU_ALDO1_3300MV    28
 #define PMU_ALDO2_3300MV    28
 #define PMU_BLDO2_3300MV    28
+
+/* The gauge. Registers from the AXP2101 driver this project carries in
+ * patches/kernel/axp2101, which measured them on this board (PMU-001):
+ * capacity is 0xa4 bits 6:0 and anything above 100 means the gauge has not
+ * settled, voltage is 0x34 bits 5:0 above 0x35 giving 14 bits already in mV,
+ * and the charge state is 0x01 bits 2:0. */
+#define PMU_STATUS1         0x00
+#define PMU_STATUS2         0x01
+#define PMU_BATT_VOLT_H     0x34
+#define PMU_BATT_VOLT_L     0x35
+#define PMU_BATT_PERCENT    0xa4
+#define PMU_BATT_PRESENT    0x08        /* status1 bit 3 */
+#define PMU_CHRG_STATE_MASK 0x07        /* status2 bits 2:0 */
 
 static i2c_master_dev_handle_t s_pmu;
 
@@ -360,6 +377,71 @@ void board_log_rails(void)
         return;
     }
     ESP_LOGI(TAG, "ald1 %02x ald2 %02x en %02x", a1, a2, en);
+}
+
+/* The battery, for System Monitor.
+ *
+ * Reads the registers the kernel driver measured on this board rather than
+ * inferring anything: capacity straight from the gauge, voltage as a 14-bit
+ * millivolt value, and the charge state from the same bits mainline decodes.
+ *
+ * A GAUGE ABOVE 100 IS NOT A PERCENTAGE. PMU-001 records that a freshly
+ * powered AXP2101 reports more than 100 until its fuel gauge settles, and the
+ * kernel driver returns -ENODATA rather than reporting it. Same here: percent
+ * is -1, which System Monitor prints as "--%", because a wrong number on a
+ * battery is worse than no number.
+ *
+ * Cheap by design -- five register reads on a bus this port already owns, no
+ * allocation, no delay -- because System Monitor calls it twice a second. */
+int board_battery_read(td_battery_t *out, int max)
+{
+    uint8_t st1 = 0, st2 = 0, hi = 0, lo = 0, pct = 0;
+    int mv;
+    int state;
+
+    if (!out || max < 1)
+        return 0;
+    if (!pmu_r(PMU_STATUS1, &st1) || !pmu_r(PMU_STATUS2, &st2))
+        return 0;
+    if (!(st1 & PMU_BATT_PRESENT))
+        return 0;                      /* no cell, or not detected */
+
+    memset(out, 0, sizeof(*out));
+    snprintf(out->label, sizeof(out->label), "Battery");
+
+    out->percent = -1;
+    if (pmu_r(PMU_BATT_PERCENT, &pct))
+    {
+        int p = pct & 0x7F;
+
+        if (p <= 100)
+            out->percent = p;
+    }
+
+    out->millivolts = 0;
+    if (pmu_r(PMU_BATT_VOLT_H, &hi) && pmu_r(PMU_BATT_VOLT_L, &lo))
+    {
+        mv = ((hi & 0x3F) << 8) | lo;
+        if (mv > 0)
+            out->millivolts = mv;
+    }
+
+    switch (st2 & PMU_CHRG_STATE_MASK)
+    {
+    case 1:                            /* precharge */
+    case 2:                            /* constant current */
+    case 3:                            /* constant voltage */
+        state = TD_BATT_CHARGING;
+        break;
+    case 4:                            /* done */
+        state = TD_BATT_FULL;
+        break;
+    default:                           /* trickle, or nothing running */
+        state = TD_BATT_DISCHARGING;
+        break;
+    }
+    out->state = state;
+    return 1;
 }
 
 static bool reg_read(uint8_t reg, uint8_t *v)

@@ -332,6 +332,26 @@ __attribute__((weak)) void board_power_rails_preinit(void)
 {
 }
 
+  /* A board's batteries, read from whatever fuel gauge it has.
+ *
+ * System Monitor shows one line per battery. A board with no gauge leaves this
+ * alone and the app says "n/a", which is the same shape as every other optional
+ * capability here: the desktop must work on a board with nothing fitted.
+ *
+ * Called on every tick, so a port should read registers it already caches
+ * rather than starting a bus transaction per field. */
+__attribute__((weak)) int board_battery_read(td_battery_t *out, int max)
+{
+    (void)out;
+    (void)max;
+    return 0;
+}
+
+static int board_batteries(td_battery_t *out, int max)
+{
+    return board_battery_read(out, max);
+}
+
 __attribute__((weak)) void board_time_set_post(int64_t utc)
 {
     (void)utc;
@@ -587,6 +607,7 @@ static void fill_sysinfo(void)
     td_fs_stdio_redirect(TDSH_MOUNT_POINT "/sd", "/sd", tdsh_sdcard_mounted);
     s_info.drives = sd_drives;
     s_info.drive_eject = sd_eject;
+    s_info.batteries = board_batteries;
     s_info.extra = "Shell:     TinyDesk Shell " TDSH_VERSION;
     td_set_sysinfo(&s_info);
 }

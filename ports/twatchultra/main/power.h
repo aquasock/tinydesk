@@ -12,6 +12,7 @@
 #include <stdbool.h>
 
 #include "driver/i2c_master.h"
+#include "tinydesk/td_sysinfo.h"
 
 /* The board's single I2C bus, created on first use. NULL on failure. */
 i2c_master_bus_handle_t board_i2c(void);
@@ -68,6 +69,13 @@ bool board_haptic_power_on(void);
 /* Release the touch controller's reset, which lives on the expander, not on
  * an SoC GPIO. Must run before touch_init() talks to 0x1A. */
 bool board_touch_reset_release(void);
+
+/* The battery, for System Monitor, from the AXP2101's fuel gauge.
+ *
+ * Overrides the weak board_battery_read() in the shared ESP-IDF app. Returns
+ * the number of batteries filled in (0 when there is no cell or no gauge), and
+ * reports percent as -1 rather than a wrong number while the gauge settles. */
+int board_battery_read(td_battery_t *out, int max);
 
 /* Log ALDO1/ALDO2 and the LDO enable register, read back from the PMU.
  *

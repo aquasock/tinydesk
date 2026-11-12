@@ -26,6 +26,13 @@
 #ifndef TD_MAX_MONITORS
 #define TD_MAX_MONITORS 2
 #endif
+
+  /* Batteries a port may report to System Monitor. Two covers a phone or a
+ * laptop; a watch has one, and the array is a few dozen bytes a slot. */
+#ifndef TD_MAX_BATTERIES
+#define TD_MAX_BATTERIES 2
+#endif
+
 /* An extended screen (two terminals side by side or one above the other)
  * may be wider or taller than one terminal, up to these, while its
  * columns x rows still fit a buffer (TD_MAX_COLS * TD_MAX_ROWS cells). */

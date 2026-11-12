@@ -226,6 +226,24 @@ typedef struct
     uint64_t total, free;        /* bytes; 0: not known */
 } td_drive_t;
 
+    /* ------------------------------------------------------------ batteries */
+
+enum
+{
+    TD_BATT_UNKNOWN = 0,         /* no reading yet, or the gauge is not settled */
+    TD_BATT_DISCHARGING,
+    TD_BATT_CHARGING,
+    TD_BATT_FULL,
+};
+
+typedef struct
+{
+    char label[24];              /* "Battery"; a board may have more than one */
+    int percent;                 /* 0..100, or -1 while unknown */
+    int millivolts;              /* 0 while unknown */
+    int state;                   /* TD_BATT_* */
+} td_battery_t;
+
     /* ------------------------------------------------------------ Bluetooth */
 
     /* Bluetooth keyboards and mice, for the Bluetooth app and the bt command.
@@ -607,6 +625,12 @@ typedef struct
      * lets one go so it can be taken out; false with *why when it cannot. */
     int (*drives)(td_drive_t *out, int max);
     bool (*drive_eject)(const char *path, const char **why);
+
+        /* Optional: batteries, for System Monitor. batteries() fills up to max
+     * and returns how many there are; it is called every tick, so keep it to
+     * registers the port already has cached rather than a bus round trip per
+     * field. A board with no fuel gauge leaves it NULL and the app says so. */
+    int (*batteries)(td_battery_t *out, int max);
 } td_sysinfo_t;
 
     /* Install / read the port's sysinfo (never NULL; unset members are NULL). */

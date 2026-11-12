@@ -67,10 +67,13 @@
  * sound rather than a click, short enough not to be in the way of whatever the
  * program is doing. 80 ms at 16 kHz is 1280 samples, which fits one DMA buffer
  * and does not need the caller to wait for more. */
+/* 200 ms rather than 80. The first attempt was 80 ms at 18 per cent and could
+ * have been missed by a listener who was not sure what to expect; this is long
+ * enough to be unmistakable. A beep that might be inaudible is not a test. */
 #define BEEP_HZ        1000
-#define BEEP_MS        80
+#define BEEP_MS        200
 
-#define AMPLITUDE      6000        /* of 32767: audible, not startling */
+#define AMPLITUDE      12000       /* of 32767: clearly audible, not painful */
 
 static i2s_chan_handle_t s_tx;
 static bool s_tried;
@@ -80,14 +83,22 @@ static bool s_tried;
  * The period is computed rather than hardcoded so the frequency stays the
  * frequency if SOUND_RATE_HZ changes; at 16 kHz and 1 kHz it is 16, and the
  * division is exact. */
-static void beep_samples(int16_t *out, int count)
+static void beep_samples(int16_t *out, int frames)
 {
     const int period = SOUND_RATE_HZ / BEEP_HZ;
     const int half = period / 2;
     int i;
 
-    for (i = 0; i < count; i++)
-        out[i] = ((i % period) < half) ? AMPLITUDE : -AMPLITUDE;
+    /* One square period per `period` frames, written to both slots. The frame
+     * index drives the phase, not the sample index, so the left and right
+     * halves of a frame stay in step. */
+    for (i = 0; i < frames; i++)
+    {
+        int16_t v = ((i % period) < half) ? AMPLITUDE : -AMPLITUDE;
+
+        out[2 * i] = v;
+        out[2 * i + 1] = v;
+    }
 }
 
 bool sound_init(void)
@@ -95,8 +106,22 @@ bool sound_init(void)
     i2s_chan_config_t chan = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     i2s_std_config_t std = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SOUND_RATE_HZ),
-        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
-                                                   I2S_SLOT_MODE_MONO),
+         /* PHILIPS, not MSB, and STEREO, not mono -- both to match LilyGo.
+         *
+         * The first was a real bug: I2S_STD_MSB_SLOT_DEFAULT_CONFIG differs from
+         * the Philips form only in `bit_shift`, and that flag is the one-clock
+         * delay between the WS transition and the first data bit. The MAX98357A
+         * expects standard I2S, so MSB framing latches every sample one bit
+         * early, which decodes to rubbish rather than to an obvious error --
+         * the tone came out inaudible rather than wrong-sounding.
+         *
+         * The second is quieter but worth having: LilyGo sends stereo with both
+         * slots carrying the same sample (I2S_CHANNEL_FMT_ALL_RIGHT). In its
+         * default SD-mode configuration the amplifier outputs (L+R)/2, so a
+         * mono-left stream is half amplitude for free. Stereo with both slots
+         * filled is the full signal into that average. */
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+                                                        I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
             .bclk = PIN_I2S_BCLK,
@@ -150,28 +175,30 @@ bool sound_init(void)
     }
 
     /* Short enough for the Log Viewer's 40 columns. */
-    ESP_LOGI(TAG, "i2s %dHz bclk%d ws%d dout%d", SOUND_RATE_HZ,
+    ESP_LOGI(TAG, "i2s %dHz philips st bclk%d ws%d dout%d", SOUND_RATE_HZ,
              PIN_I2S_BCLK, PIN_I2S_WS, PIN_I2S_DOUT);
     return true;
 }
 
 void sound_beep(void)
 {
-    static int16_t buf[BEEP_MS * SOUND_RATE_HZ / 1000];
-    const int count = (int)(sizeof(buf) / sizeof(buf[0]));
+    /* Stereo frames: two samples each, so twice the buffer the mono version
+     * needed for the same tone length. */
+    static int16_t buf[2 * BEEP_MS * SOUND_RATE_HZ / 1000];
+    const int frames = BEEP_MS * SOUND_RATE_HZ / 1000;
     size_t written = 0;
 
     if (!s_tx)
         return;
 
-    beep_samples(buf, count);
+    beep_samples(buf, frames);
 
     /* Blocking on purpose, and bounded by the tone's own length: 80 ms of
      * samples at 16 kHz takes 80 ms to clock out. Called from the terminal's
      * path, which is the desktop's own task, so it must not be longer than
      * that -- this is the whole reason the beep is short. */
-    if (i2s_channel_write(s_tx, buf, (size_t)count * sizeof(buf[0]),
-                          &written, pdMS_TO_TICKS(200)) != ESP_OK)
+    if (i2s_channel_write(s_tx, buf, sizeof(buf), &written,
+                          pdMS_TO_TICKS(200)) != ESP_OK)
         ESP_LOGW(TAG, "beep write failed");
 }
 
