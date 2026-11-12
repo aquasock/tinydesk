@@ -98,6 +98,32 @@ static inline const char *btn_label(int i)
     return i >= 0 && i < BTN_N ? labels[i] : "";
 }
 
+/* The right column's four arrow buttons. Top to bottom the column is a reserved
+ * slot and then Left, Right, Up and Down, so index 0 has no label and the rest
+ * are the arrow they send.
+ *
+ * The words are used rather than arrow glyphs because the font is the desktop's
+ * 8x16 and may not carry the arrows; a letter that is missing draws as a blank
+ * button, which looks like a hit-test fault rather than a font gap. The longest
+ * of the four, "Right", is 40 px in a 41 px inner face -- the tightest thing on
+ * the glass, and the reason it is measured rather than assumed. */
+static inline const char *right_label(int i)
+{
+    static const char *const labels[COL_N] = { "", "Left", "Right", "Up", "Down" };
+
+    return i >= 0 && i < COL_N ? labels[i] : "";
+}
+
+/* The left column has no labels yet. The accessor exists rather than passing
+ * NULL, so adding them later is a table and nothing else -- and so an unlabelled
+ * column is a deliberate empty table rather than a missing feature the painter
+ * has to guard against. */
+static inline const char *left_label(int i)
+{
+    (void)i;
+    return "";
+}
+
 /* The top margin, above the framebuffer. Reserved for status icons, not a touch
  * target. */
 #define TOP_Y1   (FB_CY0 - 1)

@@ -544,8 +544,8 @@ static void panel_fill(uint16_t colour)
  * the point while the buttons were images; now that they are labelled and
  * pressable, a lit-up green frame competes with the desktop it frames.
  */
-#define COL_FILL  0x2104         /* RGB565(4,8,4):    dark grey, ~13% */
-#define COL_EDGE  0x8410         /* RGB565(16,32,16):  lighter grey, ~51% */
+#define COL_FILL  0x10A2         /* RGB565(2,5,2):     dark grey, ~8% */
+#define COL_EDGE  0x58CB         /* RGB565(11,22,11):  lighter grey, ~35% */
 #define BTN_BORDER 2
 
 /* Which corners of a button are rounded.
@@ -896,7 +896,7 @@ static corners_t column_corners(int s, bool desk_right)
 
 /* One column, at controller x0..x1. desk_right says which side the desktop is
  * on, which is the only thing that differs between the two. */
-static void paint_column(int x0, int x1, bool desk_right)
+static void paint_column(int x0, int x1, bool desk_right, const char *(*label_at)(int))
 {
     /* One sacrificial row and column: exactly one pixel is lost at the top-left
      * of a window (docs/panel-geometry.md, "The first row and column are
@@ -911,11 +911,28 @@ static void paint_column(int x0, int x1, bool desk_right)
     const int width = x1 - wx + 1;                  /* 46 */
     const int height = COL_Y1 - wy + 1;             /* 417 */
     const int band = (int)(sizeof(s_tx) / sizeof(s_tx[0])) / width;
+    label_pos_t label[COL_N];
     int y = wy;
     bool first = true;
 
     if (band < 1)
         return;
+
+    /* Labels are centred horizontally in the face inset by the BORDER, not by
+     * the radius. A column is only 45 px wide, so a 10 px inset on each side
+     * would leave 25 px and the word "Right" is 40 -- the tightest fit on the
+     * glass had to be measured rather than picked. The radius is not needed
+     * horizontally because a label is centred in an 83-row slot and the rounded
+     * corners only reach ten rows in from each end, so no glyph can land in one
+     * however wide it is; button_pixel() would clip it if it ever could. */
+    for (int s = 0; s < COL_N; s++)
+    {
+        int g0 = s == 0 ? COL_Y0 : col_slot_y(s) + BTN_SEP;
+        int g1 = col_slot_y(s + 1) - 1;
+
+        label_place(label_at(s), x0 + BTN_BORDER, x1 - BTN_BORDER,
+                    g0 + BTN_RADIUS, g1 - BTN_RADIUS, &label[s]);
+    }
 
     /* The window is the whole column; every transfer below continues it. */
     set_window(wx, wy, width, height);
@@ -951,6 +968,12 @@ static void paint_column(int x0, int x1, bool desk_right)
 
                         c = button_pixel(x, yy, x0, g0, x1, g1,
                                          column_corners(s, desk_right));
+                        /* Gated on the fill, so a glyph can never eat into the
+                         * border, and an empty label -- the reserved slot on the
+                         * right, the whole of the left column for now -- is a
+                         * no-op rather than a special case. */
+                        if (c == COL_FILL && label_bit(&label[s], x, yy))
+                            c = LABEL_FG;
                         break;
                     }
                 }
@@ -1161,8 +1184,8 @@ bool display_init(display_reply_fn reply)
     paint_buttons();
 
     /* Five down each margin, same treatment, mirrored. */
-    paint_column(LEFT_X0, LEFT_X1, true);
-    paint_column(RIGHT_X0, RIGHT_X1, false);
+    paint_column(LEFT_X0, LEFT_X1, true, left_label);
+    paint_column(RIGHT_X0, RIGHT_X1, false, right_label);
 
     s_cols = DISPLAY_MAX_COLS;
     s_rows = DISPLAY_MAX_ROWS;
