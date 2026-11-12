@@ -35,6 +35,7 @@
 #include "pwrkey.h"
 #include "charge.h"
 #include "haptic.h"
+#include "nfc.h"
 #include "sound.h"
 #include "hal_mux.h"
 #include "tinydesk/td_picture.h"
@@ -237,6 +238,15 @@ bool link_init(void)
         ESP_LOGI(TAG, "haptics on");
     }
 
+    /* The NFC reader, on the bus the SD card shares. It is not fatal when it
+     * does not answer and nothing above this line depends on it; the step is
+     * a probe, so what it establishes is the chip's identity and that the
+     * shared bus is quiet enough to talk on. Last of the peripherals because
+     * it is the only one that takes over a chip select on a bus another
+     * driver already owns. */
+    if (!nfc_probe())
+        ESP_LOGW(TAG, "no NFC reader");
+
     /* The BOOT pusher, last because it is the only input that can inject a key
      * without the desktop asking. It is not fatal when it fails, and
      * `pusher.pin = -1` turns it off deliberately. */
@@ -260,6 +270,9 @@ bool link_init(void)
      * tdsh_espidf_init() and this port has no earlier hook of its own. */
     if (tdsh_register_command(&s_play_cmd) != 0)
         ESP_LOGW(TAG, "play command did not register");
+
+    if (!nfc_register_command())
+        ESP_LOGW(TAG, "nfc command did not register");
 
     charge_report(NULL);
 
