@@ -508,14 +508,14 @@ static void panel_fill(uint16_t colour)
  * The glass has a strip below the desktop's 320x416 rectangle that nothing
  * draws into, and on the Linux build it carried three coloured bars -- red,
  * green, blue -- which are the board's three capacitive buttons. This paints
- * them again, images only: nothing reads them here yet, and a press on the
- * strip is a dead zone in the touch driver.
+ * them again, as buttons rather than images now: the touch driver reads a press
+ * here and sends the key the label names.
  *
- * ALL THREE BARS ARE GREEN, at the operator's request. The three-colour scheme
- * was the Linux build's and did nothing but name the bars; green reads as one
- * control group, which is what they are once they are Tab, Enter and Esc. The
- * two black separators are kept: without them the strip is a single green band
- * and there is nothing to show where one button ends and the next begins.
+ * Three bars, labelled Tab, Enter and Ctrl+Q. They were full-primary green,
+ * which named the three capacitive buttons of the Linux build and nothing else;
+ * they are grey now, because a lit-up frame around the desktop competes with
+ * the desktop. The two black separators are kept: without them the strip is one
+ * band with nothing to show where a button ends and the next begins.
  *
  * The strip has to be read as the bottom run of a frame drawn round the
  * desktop, because that is what it is: the left column runs the framebuffer's
@@ -524,11 +524,11 @@ static void panel_fill(uint16_t colour)
  *
  * Geometry, in the controller's coordinates (the visible glass is 22..431):
  *
- *   x  67 .. 172  green
+ *   x  67 .. 172  Tab
  *     173 .. 174  black separator
- *     175 .. 279  green
+ *     175 .. 279  Enter
  *     280 .. 281  black separator
- *     282 .. 386  green
+ *     282 .. 386  Ctrl+Q
  *
  * 67 and 386 are the framebuffer's own left and right edges, so the strip
  * finishes where the desktop above it finishes. The leftmost and rightmost
@@ -538,30 +538,105 @@ static void panel_fill(uint16_t colour)
  * Between the caps the bottom edge is flush with the glass, like the left
  * column's left edge.
  *
- * The colours are the Linux driver's full primary green, not the desktop's
- * palette: RGB565(0,63,0). It is the brightest thing on the glass and is meant
- * to be.
+ * The colours are grey rather than the Linux driver's full-primary green: a dark
+ * grey face with a lighter grey border, so the margins read as controls rather
+ * than as a signal. The green was the brightest thing on the glass, which was
+ * the point while the buttons were images; now that they are labelled and
+ * pressable, a lit-up green frame competes with the desktop it frames.
  */
+#define COL_FILL  0x2104         /* RGB565(4,8,4):    dark grey, ~13% */
+#define COL_EDGE  0x8410         /* RGB565(16,32,16):  lighter grey, ~51% */
+#define BTN_BORDER 2
 
-/* Is (x, y) cut away by a rounded corner of radius BTN_RADIUS?
+/* Which corners of a button are rounded.
  *
- * (ccx, ccy) is the arc's centre, which sits R in from each edge of the
- * corner and so R in from both. `bar_left` and `bar_down` say which way the
- * bar extends from that centre, and the notch is the quadrant it does not:
- * the top-right corner of a bar has bar_left and bar_down both set, so only
- * dx > 0 and dy < 0 is cut. Bounding to the R by R square at the corner is
- * what keeps the straight edges straight -- the distance test alone would cut
- * every pixel beyond the arc along that row, including a whole top row. */
-static bool corner_notch(int x, int y, int ccx, int ccy, bool bar_left, bool bar_down)
+ * A button is round only where it faces something: the edge that faces the
+ * desktop, and the outer end of a group. The edge that runs along the glass
+ * between buttons stays square, which is what makes a column read as one
+ * continuous run and the strip as one continuous run. */
+typedef struct
 {
-    int dx = x - ccx;
-    int dy = y - ccy;
-    int ax = bar_left ? dx : -dx;    /* > 0: past the arc, on the corner's side */
-    int ay = bar_down ? -dy : dy;
+    bool tl, tr, bl, br;
+} corners_t;
 
-    if (ax <= 0 || ay <= 0 || ax > BTN_RADIUS || ay > BTN_RADIUS)
+/* Is (x, y) inside the button at x0..x1 by y0..y1, rounded as `c` says?
+ *
+ * The rounded corners are circles of radius r whose centres sit r in from the
+ * corner, and a point in a corner's quadrant is inside when it is within r of
+ * that centre. Away from the corners there is no distance test at all -- only a
+ * bounds check -- which is what keeps the straight edges straight; applying the
+ * distance test everywhere would eat the whole row.
+ *
+ * Testing the only-rounded-corners shape rather than a true rounded rectangle
+ * is deliberate: the design rounds four specific corners, not all of them, and
+ * a general form would have to be told the radii per corner anyway. */
+static bool button_has(int x, int y, int x0, int y0, int x1, int y1, int r, corners_t c)
+{
+    int cx = x, cy = y;
+    int dx, dy;
+
+    if (x < x0 || x > x1 || y < y0 || y > y1)
         return false;
-    return ax * ax + ay * ay > BTN_RADIUS * BTN_RADIUS;
+    if (r <= 0)
+        return true;
+
+    if (y < y0 + r)
+    {
+        if (c.tl && x < x0 + r)
+        {
+            cx = x0 + r;
+            cy = y0 + r;
+        }
+        else if (c.tr && x > x1 - r)
+        {
+            cx = x1 - r;
+            cy = y0 + r;
+        }
+        else
+            return true;
+    }
+    else if (y > y1 - r)
+    {
+        if (c.bl && x < x0 + r)
+        {
+            cx = x0 + r;
+            cy = y1 - r;
+        }
+        else if (c.br && x > x1 - r)
+        {
+            cx = x1 - r;
+            cy = y1 - r;
+        }
+        else
+            return true;
+    }
+    else
+        return true;
+
+    dx = x - cx;
+    dy = y - cy;
+    return dx * dx + dy * dy <= r * r;
+}
+
+/* The colour of one pixel of a button: the border, the fill, or black outside.
+ *
+ * The border is the shape minus a copy of itself inset by BTN_BORDER. That is
+ * exact rather than approximate: inset every edge by t and reduce the radius by
+ * t, and the result is the set of points at distance t from the original, which
+ * is the offset curve for a convex shape. So the border is the same width on
+ * the straight edges as around a corner, with no thickening at the arcs. */
+static uint16_t button_pixel(int x, int y, int x0, int y0, int x1, int y1, corners_t c)
+{
+    int b = BTN_BORDER;
+    int r = BTN_RADIUS - b;
+
+    if (!button_has(x, y, x0, y0, x1, y1, BTN_RADIUS, c))
+        return 0x0000;
+    if (x1 - x0 + 1 <= 2 * b || y1 - y0 + 1 <= 2 * b)
+        return COL_FILL;                 /* too small to border; no button is */
+    if (!button_has(x, y, x0 + b, y0 + b, x1 - b, y1 - b, r < 0 ? 0 : r, c))
+        return COL_EDGE;
+    return COL_FILL;
 }
 
 /* Stream the band just filled in s_tx, continuing the window the caller opened.
@@ -603,10 +678,9 @@ static void push_band(bool *first, size_t npix)
  * whatever rectangle they are given, which is what keeps them inside a rounded
  * button without the caller doing arithmetic twice.
  *
- * Yellow, because the bars are full-primary green and a green label on green is
- * not a label. The colour is the brightest thing on the glass after the bars
- * themselves, which is the right emphasis for something meant to be read at a
- * glance.
+ * Yellow, because it reads on the dark grey face without competing with the grey
+ * border around it -- and because it was chosen while the faces were green, is
+ * still legible now, and changing a colour that works is not an improvement.
  */
 #define LABEL_FG 0xFFE0          /* RGB565(31,63,0): yellow */
 
@@ -655,21 +729,33 @@ static bool label_bit(const label_pos_t *p, int x, int y)
     return glyph && (glyph[dy] & (0x80 >> (dx % CELL_W))) != 0;
 }
 
+/* The corners of bottom bar s.
+ *
+ * The top edge faces the desktop, so both top corners are round on every bar --
+ * that is what opens the gap between neighbours. The bottom edge is the glass,
+ * where only the two outer ends of the strip are capped. */
+static corners_t bar_corners(int s)
+{
+    corners_t c;
+
+    c.tl = true;
+    c.tr = true;
+    c.bl = s == 0;
+    c.br = s == BTN_N - 1;
+    return c;
+}
+
 static void paint_buttons(void)
 {
-    static const uint16_t COL_GREEN = 0x07E0;
-
     /* One sacrificial column: exactly one pixel is lost at the top-left of a
      * window (docs/panel-geometry.md, "The first row and column are
-     * swallowed"), so the window starts one column before the green and the
-     * dropped pixel is a black one. Column 66 is in the margin below the left
-     * column, which stops at row 460, so it costs nothing. A row cannot be
+     * swallowed"), so the window starts one column before the first bar and
+     * the dropped pixel is a black one. Column 66 is in the margin below the
+     * left column, which stops at row 460, so it costs nothing. A row cannot be
      * spent the same way -- that would be the framebuffer's last row. */
     const int wx = BTN_X0 - 1;                       /* 66 */
     const int width = BTN_X1 - wx + 1;               /* 321 */
     const int band = (int)(sizeof(s_tx) / sizeof(s_tx[0])) / width;
-    const int arc_ty = BTN_Y0 + BTN_RADIUS;          /* centre, top corners */
-    const int arc_by = BTN_Y1 - BTN_RADIUS;          /* centre, bottom corners */
     label_pos_t label[BTN_N];
     int y = BTN_Y0;
     bool first = true;
@@ -677,8 +763,9 @@ static void paint_buttons(void)
     if (band < 1)
         return;
 
-    /* One label per bar, centred in its green face -- inside the corner radius
-     * rather than the bar's full rectangle, so a label cannot sit in a notch. */
+    /* One label per bar, centred inside the corner radius rather than in the
+     * bar's full rectangle, so a label cannot sit in a rounded corner and be
+     * clipped by the border. */
     for (int s = 0; s < BTN_N; s++)
     {
         int g0 = s == 0 ? BTN_X0 : btn_slot_x(s) + BTN_SEP;
@@ -721,19 +808,13 @@ static void paint_buttons(void)
                         if (x < g0 || x > g1)
                             continue;
 
-                        c = COL_GREEN;
-                        if (corner_notch(x, yy, g0 + BTN_RADIUS, arc_ty, false, true) ||
-                            corner_notch(x, yy, g1 - BTN_RADIUS, arc_ty, true, true) ||
-                            (s == 0 &&
-                             corner_notch(x, yy, g0 + BTN_RADIUS, arc_by, false, false)) ||
-                            (s == BTN_N - 1 &&
-                             corner_notch(x, yy, g1 - BTN_RADIUS, arc_by, true, false)))
-                            c = 0x0000;
-                        /* The label is drawn last, so a notch always wins: a
-                         * glyph pixel inside the corner radius would break the
-                         * rounded edge, and the label is centred well inside
-                         * it anyway. */
-                        else if (label_bit(&label[s], x, yy))
+                        c = button_pixel(x, yy, g0, BTN_Y0, g1, BTN_Y1,
+                                         bar_corners(s));
+                        /* Gated on the fill, so a glyph pixel can never eat
+                         * into the border: the label is centred well inside the
+                         * inset shape, but the gate is what makes that a rule
+                         * rather than a coincidence of the font's size. */
+                        if (c == COL_FILL && label_bit(&label[s], x, yy))
                             c = LABEL_FG;
                         break;
                     }
@@ -756,7 +837,7 @@ static void paint_buttons(void)
  * THE BUTTONS DOWN EACH EDGE.
  *
  * The same treatment as the strip below the framebuffer, turned through a right
- * angle: green slots stacked down the margins the framebuffer does not reach,
+ * angle: slots stacked down the margins the framebuffer does not reach,
  * with a 10 px radius on the corners that face a neighbour. Both margins get
  * it, mirrored, so the column on each side of the desktop is the same object
  * seen from a different side.
@@ -786,11 +867,37 @@ static void paint_buttons(void)
  * than what it looks like.
  */
  
+/* The corners of column button s, given which side the desktop is on.
+ *
+ * The desk-facing edge is the right one for the left column and the left one
+ * for the right column, and both of its corners are round on every button --
+ * that is what opens the gap between neighbours. The glass-facing edge is a
+ * continuous run, where only the two ends of the column are capped. */
+static corners_t column_corners(int s, bool desk_right)
+{
+    corners_t c;
+
+    if (desk_right)
+    {
+        c.tl = s == 0;
+        c.tr = true;
+        c.bl = s == COL_N - 1;
+        c.br = true;
+    }
+    else
+    {
+        c.tl = true;
+        c.tr = s == 0;
+        c.bl = true;
+        c.br = s == COL_N - 1;
+    }
+    return c;
+}
+
 /* One column, at controller x0..x1. desk_right says which side the desktop is
  * on, which is the only thing that differs between the two. */
 static void paint_column(int x0, int x1, bool desk_right)
 {
-    static const uint16_t COL_GREEN = 0x07E0;
     /* One sacrificial row and column: exactly one pixel is lost at the top-left
      * of a window (docs/panel-geometry.md, "The first row and column are
      * swallowed"). The row is 44, black margin, and the column is one to the
@@ -804,8 +911,6 @@ static void paint_column(int x0, int x1, bool desk_right)
     const int width = x1 - wx + 1;                  /* 46 */
     const int height = COL_Y1 - wy + 1;             /* 417 */
     const int band = (int)(sizeof(s_tx) / sizeof(s_tx[0])) / width;
-    const int arc_desk = desk_right ? x1 - BTN_RADIUS : x0 + BTN_RADIUS;
-    const int arc_glass = desk_right ? x0 + BTN_RADIUS : x1 - BTN_RADIUS;
     int y = wy;
     bool first = true;
 
@@ -833,8 +938,8 @@ static void paint_column(int x0, int x1, bool desk_right)
                 if (x >= x0 && x <= x1)
                 {
                     /* Which button's rows this is, if any: a separator row
-                     * belongs to no button, which is what leaves the gap.
-                     * Green starts two rows into every slot but the first, and
+                     * belongs to no button, which is what leaves the gap. The
+                     * fill starts two rows into every slot but the first, and
                      * ends one row before the next slot begins. */
                     for (int s = 0; s < COL_N; s++)
                     {
@@ -844,14 +949,8 @@ static void paint_column(int x0, int x1, bool desk_right)
                         if (yy < g0 || yy > g1)
                             continue;
 
-                        c = COL_GREEN;
-                        if (corner_notch(x, yy, arc_desk, g0 + BTN_RADIUS, desk_right, true) ||
-                            corner_notch(x, yy, arc_desk, g1 - BTN_RADIUS, desk_right, false) ||
-                            (s == 0 &&
-                             corner_notch(x, yy, arc_glass, g0 + BTN_RADIUS, !desk_right, true)) ||
-                            (s == COL_N - 1 &&
-                             corner_notch(x, yy, arc_glass, g1 - BTN_RADIUS, !desk_right, false)))
-                            c = 0x0000;
+                        c = button_pixel(x, yy, x0, g0, x1, g1,
+                                         column_corners(s, desk_right));
                         break;
                     }
                 }
