@@ -20,6 +20,7 @@ rs485.N.rx
 rs485.N.tx
 rs485.N.uart
 store.url
+touch.int
 update.url
 usb.host
 usb.kbd_delay

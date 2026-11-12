@@ -37,6 +37,16 @@
  *   * Coordinates: x = (b1 << 4) | (b3 >> 4), y = (b2 << 4) | (b3 & 0x0F),
  *     already in panel coordinates -- no swap, no scale (TCH-006).
  *
+ *   * The INT line is GPIO 12, active low, and the part drives it low then
+ *     releases it, so it is open-drain and the pull-up is part of the
+ *     contract (TCH-009). LilyGo's own initTouch() configures it
+ *     INPUT_PULLUP with a FALLING handler, and the handler does nothing but
+ *     set an event bit -- the I2C read happens in the consumer, never in the
+ *     interrupt. This driver does the same: the ISR only wakes this task.
+ *     Polling is NOT removed, because a lost pull-up or a wrong polarity
+ *     would otherwise lose touch entirely, whereas a slow poll degrades to
+ *     latency (TCH-009).
+ *
  * Output is SGR mouse reports, which is what the desktop reads: a terminal
  * mouse is the only input abstraction TinyDesk has, so the panel's absolute
  * coordinates are mapped onto the terminal's cell grid here rather than
@@ -63,7 +73,10 @@
 #include <string.h>
 
 #include "driver/i2c_master.h"
+#include "driver/gpio.h"
+#include "esp_attr.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "display.h"
@@ -71,6 +84,7 @@
 #include "haptic.h"
 #include "tinydesk/td_wm.h"
 #include "power.h"
+#include "tdsh_board.h"
 #include "tinydesk/td_vterm.h"
 
 #define TAG "twatch-touch"
@@ -102,10 +116,35 @@
 #define CHIP_9217       0x9217
 #define CHIP_9220       0x9220
 
-#define POLL_MS         20
 /* A pressed finger that stops reporting is treated as released after this,
  * because the controller never sends a release event of its own. */
 #define RELEASE_MS      250
+/* Wake-up period while a finger is down, and while nothing is touching.
+ *
+ * The interrupt wakes this task when the controller has a report, so neither
+ * number is the detection latency in normal use. They are the FALLBACK, and
+ * they are deliberately two rates: 20 ms while pressed keeps a drag up with
+ * the controller's own ~66 ms report period, and a slow 250 ms poll while
+ * idle costs almost nothing but means a dead INT line degrades touch to
+ * sluggish rather than losing it (TCH-009, verified in the Linux driver).
+ *
+ * Without the interrupt the active period is used unconditionally, which is
+ * exactly what this driver did before: ~50 reads a second on a bus shared
+ * with the PMU, the expander, the RTC and the haptic driver. */
+#define ACTIVE_MS       20
+#define IDLE_MS         250
+
+/* Floor between services when the interrupt keeps firing. The controller only
+ * pulses INT when it has something, so this should never bite -- but a stuck
+ * or noisy line would otherwise spin this task at hundreds of hertz on core 0,
+ * which is the core that owns the radios. */
+#define MIN_GAP_MS      5
+
+/* TP_INT, from arduino-esp32's lilygo_twatch_ultra variant and LilyGoLib's
+ * own initTouch(), and confirmed in the schematic net list as T_INT------IO12.
+ * `touch.int` in the board configuration overrides it; -1 means drive this
+ * driver by polling alone, which is the A/B control for the interrupt. */
+#define TOUCH_INT       12
 
 static i2c_master_bus_handle_t s_bus;
 static i2c_master_dev_handle_t s_dev;
@@ -113,7 +152,22 @@ static touch_input_fn s_input;
 static bool s_down;              /* pointer button down: only in pass-through */
 static bool s_pressed;           /* the controller is reporting a press */
 static int s_last_x = -1, s_last_y = -1;
-static int s_idle_ms;
+
+/* When the last press report arrived. RELEASE_MS is measured against this and
+ * not against a count of polls, because the poll period is no longer constant:
+ * an interrupt-woken loop runs at whatever rate the controller reports. The
+ * previous version counted polls and compared against RELEASE_MS / POLL_MS,
+ * which was correct only while every iteration took exactly one fixed poll
+ * period -- adding a 250 ms idle sleep to that arithmetic would have made a
+ * release take three seconds. */
+static int64_t s_last_press_us;
+static int64_t s_last_service_us;
+
+/* The interrupt path. -1 when it is not in use, in which case the loop falls
+ * back to a fixed 20 ms period. */
+static int s_int_pin = -1;
+static TaskHandle_t s_task;
+static volatile uint32_t s_irqs;
 
 /* Diagnostics. Touch is the one subsystem that so far failed with no evidence
  * at all: bring_up() succeeding and then no report ever arriving looks exactly
@@ -438,15 +492,19 @@ static void edge_press(const edge_hit_t *hit, int y)
  * so a held press that goes quiet is a release. Called both when a block is
  * not a press and when a press arrives where nothing is listening, so that the
  * count keeps running in every case -- and so that a finger which slides off
- * the glass does not leave the pointer latched down. */
+ * the glass does not leave the pointer latched down.
+ *
+ * MEASURED IN WALL TIME, NOT IN POLLS. The previous version incremented a
+ * counter once per iteration and compared it against RELEASE_MS / POLL_MS,
+ * which holds only while every iteration takes exactly one poll period. With
+ * the interrupt the loop wakes when the controller reports, so an iteration
+ * can be any length, and counting iterations would have tied the release to
+ * the wake rate instead of to the 250 ms the value means. */
 static void release_if_idle(void)
 {
     if (!s_pressed)
-    {
-        s_idle_ms = 0;
         return;
-    }
-    if (++s_idle_ms < (RELEASE_MS / POLL_MS))
+    if (esp_timer_get_time() - s_last_press_us < (int64_t)RELEASE_MS * 1000)
         return;
     if (s_down)
     {
@@ -457,12 +515,33 @@ static void release_if_idle(void)
         s_down = false;
     }
     s_pressed = false;
-    s_idle_ms = 0;
+}
+
+/* The controller has something to say. THIS DOES NOT TOUCH I2C.
+ *
+ * LilyGo's own handler does exactly one thing -- set an event-group bit -- and
+ * leaves the transfer to the consumer, and that split matters here: an I2C
+ * transfer inside an ISR would run with the cache and scheduler in a state the
+ * driver does not expect, and this bus is shared with four other parts. The
+ * notification coalesces, which is correct: several edges before the task runs
+ * still mean one read, and one read returns the controller's newest block. */
+static void IRAM_ATTR touch_isr(void *arg)
+{
+    (void)arg;
+    BaseType_t woken = pdFALSE;
+    TaskHandle_t t = s_task;
+
+    s_irqs++;
+    if (t)
+        vTaskNotifyGiveFromISR(t, &woken);
+    if (woken)
+        portYIELD_FROM_ISR();
 }
 
 static void poll_task(void *arg)
 {
     uint8_t b[REPORT_LEN];
+    bool first = true;
 
     (void)arg;
 
@@ -470,7 +549,37 @@ static void poll_task(void *arg)
     {
         bool press;
 
-        vTaskDelay(pdMS_TO_TICKS(POLL_MS));
+        /* Wait for the controller to say something, or for the period to run
+         * out. Both cases matter and neither is redundant:
+         *
+         *   - with a finger down the period is ACTIVE_MS, so the loop keeps
+         *     reading even if the part has stopped pulsing INT for a held
+         *     finger, and the release timeout still gets checked;
+         *   - with nothing touching it is IDLE_MS, so the interrupt is what
+         *     normally wakes us and the poll is only the safety net.
+         *
+         * A notification that arrives while the task is awake is left pending
+         * by ulTaskNotifyTake, so the next iteration returns immediately
+         * rather than sleeping through a report. */
+        if (s_int_pin >= 0)
+        {
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(s_pressed ? ACTIVE_MS : IDLE_MS));
+        }
+        else
+        {
+            vTaskDelay(pdMS_TO_TICKS(ACTIVE_MS));
+        }
+
+        /* Rate floor, see MIN_GAP_MS. Skipped on the first pass so the initial
+         * block is read without an artificial delay. */
+        if (!first && s_int_pin >= 0)
+        {
+            int64_t since = esp_timer_get_time() - s_last_service_us;
+            if (since < (int64_t)MIN_GAP_MS * 1000)
+                vTaskDelay(pdMS_TO_TICKS(MIN_GAP_MS - (int)(since / 1000)));
+        }
+        first = false;
+        s_last_service_us = esp_timer_get_time();
 
         /*
          * Read the WHOLE 15-byte block. A short read leaves the controller's
@@ -498,9 +607,12 @@ static void poll_task(void *arg)
         }
         else if (s_reads % 300 == 0)
         {
-            ESP_LOGI(TAG, "%lu rd %lu rep d%d",
-                     (unsigned long)s_reads, (unsigned long)s_reports,
-                     s_down ? 1 : 0);
+            /* irq first for the same 40-column reason as the bring-up line:
+             * the number that says whether the interrupt is doing the work has
+             * to survive the clip. */
+            ESP_LOGI(TAG, "irq%lu rd%lu p%lu",
+                     (unsigned long)s_irqs, (unsigned long)s_reads,
+                     (unsigned long)s_reports);
         }
 
         /* A block carries a press only if byte 6 has the validity marker, the
@@ -533,7 +645,7 @@ static void poll_task(void *arg)
             bool app = td_wm_app_owns_screen();
 
             s_reports++;
-            s_idle_ms = 0;
+            s_last_press_us = esp_timer_get_time();
 
             edges_hit(x, y, &hit);
 
@@ -624,10 +736,62 @@ bool touch_init(touch_input_fn input)
         return false;
     }
 
-    if (xTaskCreatePinnedToCore(poll_task, "tdtouch", 3072, NULL, 3,
-                                NULL, 0) != pdPASS)
-        return false;
+    /* The interrupt is configured before the task exists, so an edge during
+     * init has somewhere harmless to land: the handler sees a NULL task handle
+     * and does nothing, and the first idle poll catches that press. The task
+     * handle is what the handler notifies, so it has to be stored rather than
+     * discarded the way the old xTaskCreate call did. */
+    s_int_pin = tdsh_board_int("touch.int", TOUCH_INT);
+    if (s_int_pin >= 0)
+    {
+        gpio_config_t io = {
+            .pin_bit_mask = 1ULL << s_int_pin,
+            .mode = GPIO_MODE_INPUT,
+            /* Part of the contract rather than a nicety: the controller only
+             * pulls this line down and releases it, so without a pull-up the
+             * level floats and the edge either never arrives or arrives
+             * continuously (TCH-009). LilyGo configures the same pin the same
+             * way in its own initTouch(). */
+            .pull_up_en = GPIO_PULLUP_ENABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_NEGEDGE,
+        };
 
-    ESP_LOGI(TAG, "CST9217 up at 0x%02X", TOUCH_ADDR);
+        esp_err_t err = gpio_config(&io);
+        if (err == ESP_OK)
+        {
+            err = gpio_install_isr_service(0);
+            /* Another component may already own the service; joining it is
+             * exactly what this needs, so that is not a failure. */
+            if (err == ESP_ERR_INVALID_STATE)
+                err = ESP_OK;
+        }
+        if (err == ESP_OK)
+            err = gpio_isr_handler_add((gpio_num_t)s_int_pin, touch_isr, NULL);
+
+        if (err != ESP_OK)
+        {
+            /* Not fatal. Touch still works, at the poll rate it always used. */
+            ESP_LOGW(TAG, "no irq, poll only");
+            s_int_pin = -1;
+        }
+    }
+
+    if (xTaskCreatePinnedToCore(poll_task, "tdtouch", 3072, NULL, 3,
+                                &s_task, 0) != pdPASS)
+    {
+        s_int_pin = -1;
+        return false;
+    }
+
+    /* Short on purpose, and the MODE COMES FIRST: the Log Viewer is 40
+     * columns and silently truncates, so "CST9217 up at 0x1A irq 12" loses
+     * exactly the words that say whether the interrupt path or the fallback is
+     * running. That is the trap this file already records twice -- a diagnostic
+     * that gets clipped is not a diagnostic. "irq 12 up" survives. */
+    if (s_int_pin >= 0)
+        ESP_LOGI(TAG, "irq %d up", s_int_pin);
+    else
+        ESP_LOGI(TAG, "poll up");
     return true;
 }
