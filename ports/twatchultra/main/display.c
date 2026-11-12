@@ -538,6 +538,26 @@ static void panel_fill(uint16_t colour)
 #define BTN_Y0   (FB_Y + DISPLAY_H)      /* 461: first row below the framebuffer */
 #define BTN_Y1   (PANEL_H - 1)           /* 501: last row of the glass */
 #define BTN_SEP  2
+#define BTN_RADIUS 10
+
+/* Is (x, y) cut away by a rounded corner?
+ *
+ * The arc is a circle of radius BTN_RADIUS, and (ccx, ccy) is its centre,
+ * which sits R in from the corner horizontally and vertically. Only the R by R
+ * square at the corner is cut, and only the side facing away from the bar: a
+ * pixel above the bar but further along it is still bar, and without that
+ * bound the whole top row would be eaten. */
+static bool corner_notch(int x, int y, int ccx, int ccy, bool left)
+{
+    int dx = x - ccx;
+    int dy = y - ccy;
+
+    if (dy > 0 || dy < -BTN_RADIUS)
+        return false;
+    if (left ? (dx > 0 || dx < -BTN_RADIUS) : (dx < 0 || dx > BTN_RADIUS))
+        return false;
+    return dx * dx + dy * dy > BTN_RADIUS * BTN_RADIUS;
+}
 
 static void paint_buttons(void)
 {
@@ -570,6 +590,17 @@ static void paint_buttons(void)
     int y = BTN_Y0;
     bool first = true;
 
+    /* The corners that face another bar are rounded, and nothing else is: the
+     * left bar's top right, both of the middle bar's, and the right bar's top
+     * left. The bottom edge is the glass edge and the outer top corners are
+     * the glass edge, so those stay square. Each centre is R in from its
+     * corner, which is what corner_notch() expects. */
+    const int arc_y = BTN_Y0 + BTN_RADIUS;
+    const int arc0_rx = edge1 - BTN_SEP - 1 - BTN_RADIUS;   /* left bar, top right */
+    const int arc1_lx = edge1 + BTN_RADIUS;                 /* middle bar, top left */
+    const int arc1_rx = edge2 - BTN_SEP - 1 - BTN_RADIUS;   /* middle bar, top right */
+    const int arc2_lx = edge2 + BTN_RADIUS;                 /* right bar, top left */
+
     if (band < 1)
         return;
 
@@ -581,27 +612,38 @@ static void paint_buttons(void)
     while (y <= BTN_Y1)
     {
         int rows = BTN_Y1 - y + 1 > band ? band : BTN_Y1 - y + 1;
-        int i;
 
-        for (i = 0; i < width; i++)
+        for (int r = 0; r < rows; r++)
         {
-            int x = cx0 + i;
-            uint16_t c;
+            int yy = y + r;
 
-            if (x < edge1 - BTN_SEP)
-                c = COL_GREEN;
-            else if (x < edge1)
-                c = 0x0000;
-            else if (x < edge2 - BTN_SEP)
-                c = COL_GREEN;
-            else if (x < edge2)
-                c = 0x0000;
-            else
-                c = COL_GREEN;
+            for (int i = 0; i < width; i++)
+            {
+                int x = cx0 + i;
+                uint16_t c;
 
-            c = swap16(c);
-            for (int r = 0; r < rows; r++)
-                s_tx[r * width + i] = c;
+                if (x < edge1 - BTN_SEP)
+                    c = COL_GREEN;
+                else if (x < edge1)
+                    c = 0x0000;
+                else if (x < edge2 - BTN_SEP)
+                    c = COL_GREEN;
+                else if (x < edge2)
+                    c = 0x0000;
+                else
+                    c = COL_GREEN;
+
+                /* The notch is black, the same black as the separators, so a
+                 * rounded corner reads as the green receding from the gap. */
+                if (c == COL_GREEN &&
+                    (corner_notch(x, yy, arc0_rx, arc_y, false) ||
+                     corner_notch(x, yy, arc1_lx, arc_y, true) ||
+                     corner_notch(x, yy, arc1_rx, arc_y, false) ||
+                     corner_notch(x, yy, arc2_lx, arc_y, true)))
+                    c = 0x0000;
+
+                s_tx[r * width + i] = swap16(c);
+            }
         }
 
         {
