@@ -694,17 +694,24 @@ static void paint_buttons(void)
  * angle: green slots stacked down the margin the framebuffer does not reach,
  * with a 10 px radius on the corners that face a neighbour.
  *
- * Which corners those are follows the strip rather than being chosen again.
- * The strip sits on the bottom glass edge, so its bottom edge is square and the
+ * Which corners those are follows the strip rather than being chosen again. The
+ * strip sits on the bottom glass edge, so its bottom edge is square and the
  * corners at its separators are cut on the top edge, facing the desktop. This
- * column sits on the left glass edge, so its left edge is square and the
- * corners at its separators are cut on the right edge, facing the desktop. That
- * gives twelve arcs -- two at each of six separators -- and leaves the outer
- * ends of the column square, exactly as the strip's outer ends are.
+ * column sits on the left glass edge, so its corners at the separators are cut
+ * on the right edge, facing the desktop.
+ *
+ * The two end buttons are round on all four corners. That is what stops them
+ * running into the glass: with the corner cut, the green recedes from both the
+ * desktop edge and the glass edge at the top of the first and the bottom of the
+ * last, so the column ends in a finished cap rather than a square one. The
+ * three in between keep square left corners, because they are a continuous run
+ * down the glass and there is nothing there to turn.
  *
  * Geometry: the visible glass is controller 22..431, the framebuffer occupies
  * 67..386, so the left margin is controller 22..66 -- 45 columns -- running the
- * framebuffer's own height, rows 45..460. The strip below starts at 461, so the
+ * framebuffer's own height, rows 45..460. The buttons therefore finish exactly
+ * at the framebuffer's top and bottom edges, one at each, which is where the
+ * desktop starts and stops beside them. The strip below starts at 461, so the
  * two do not overlap. The margin above the framebuffer is left alone: the
  * operator intends it for status icons.
  */
@@ -735,28 +742,13 @@ static void paint_left_buttons(void)
     const int width = LEFT_X1 - wx + 1;             /* 46 */
     const int height = LEFT_Y1 - wy + 1;            /* 417 */
     const int band = (int)(sizeof(s_tx) / sizeof(s_tx[0])) / width;
-    const int arc_x = LEFT_X1 - BTN_RADIUS;         /* all arcs are on this edge */
-    const int n_arcs = (LEFT_N - 1) * 2;
-    int arc_y[(LEFT_N - 1) * 2];
-    bool arc_down[(LEFT_N - 1) * 2];
+    const int arc_rx = LEFT_X1 - BTN_RADIUS;         /* desktop-facing edge */
+    const int arc_lx = LEFT_X0 + BTN_RADIUS;         /* glass edge, ends only */
     int y = wy;
     bool first = true;
 
     if (band < 1)
         return;
-
-    for (int k = 1; k < LEFT_N; k++)
-    {
-        int b = left_slot_y(k);
-
-        /* The button above the separator: its last green row is b - 1, and the
-         * bar extends up from the arc, so this is a bottom corner. */
-        arc_y[2 * (k - 1)] = b - 1 - BTN_RADIUS;
-        arc_down[2 * (k - 1)] = false;
-        /* The button below it: green starts at b + 2, past the separator. */
-        arc_y[2 * (k - 1) + 1] = b + 2 + BTN_RADIUS;
-        arc_down[2 * (k - 1) + 1] = true;
-    }
 
     /* The window is the whole column; every transfer below continues it. */
     set_window(wx, wy, width, height);
@@ -770,31 +762,36 @@ static void paint_left_buttons(void)
         for (int r = 0; r < rows; r++)
         {
             int yy = y + r;
-            bool sep = false;
-
-            /* A separator is the first two rows of every slot but the first,
-             * so the green sits against the slot's own boundary. */
-            for (int k = 1; k < LEFT_N && !sep; k++)
-            {
-                int b = left_slot_y(k);
-
-                sep = yy == b || yy == b + 1;
-            }
 
             for (int i = 0; i < width; i++)
             {
                 int x = wx + i;
                 uint16_t c = 0x0000;
 
-                if (!sep && x >= LEFT_X0 && x <= LEFT_X1)
+                if (x >= LEFT_X0 && x <= LEFT_X1)
                 {
-                    c = COL_GREEN;
-                    for (int a = 0; a < n_arcs; a++)
-                        if (corner_notch(x, yy, arc_x, arc_y[a], true, arc_down[a]))
-                        {
+                    /* Which button's rows this is, if any: a separator row
+                     * belongs to no button, which is what leaves the gap.
+                     * Green starts two rows into every slot but the first, and
+                     * ends one row before the next slot begins. */
+                    for (int s = 0; s < LEFT_N; s++)
+                    {
+                        int g0 = s == 0 ? LEFT_Y0 : left_slot_y(s) + BTN_SEP;
+                        int g1 = left_slot_y(s + 1) - 1;
+
+                        if (yy < g0 || yy > g1)
+                            continue;
+
+                        c = COL_GREEN;
+                        if (corner_notch(x, yy, arc_rx, g0 + BTN_RADIUS, true, true) ||
+                            corner_notch(x, yy, arc_rx, g1 - BTN_RADIUS, true, false) ||
+                            (s == 0 &&
+                             corner_notch(x, yy, arc_lx, g0 + BTN_RADIUS, false, true)) ||
+                            (s == LEFT_N - 1 &&
+                             corner_notch(x, yy, arc_lx, g1 - BTN_RADIUS, false, false)))
                             c = 0x0000;
-                            break;
-                        }
+                        break;
+                    }
                 }
 
                 s_tx[r * width + i] = swap16(c);
