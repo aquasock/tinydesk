@@ -540,23 +540,55 @@ static void panel_fill(uint16_t colour)
 #define BTN_SEP  2
 #define BTN_RADIUS 10
 
-/* Is (x, y) cut away by a rounded corner?
+/* Is (x, y) cut away by a rounded corner of radius BTN_RADIUS?
  *
- * The arc is a circle of radius BTN_RADIUS, and (ccx, ccy) is its centre,
- * which sits R in from the corner horizontally and vertically. Only the R by R
- * square at the corner is cut, and only the side facing away from the bar: a
- * pixel above the bar but further along it is still bar, and without that
- * bound the whole top row would be eaten. */
-static bool corner_notch(int x, int y, int ccx, int ccy, bool left)
+ * (ccx, ccy) is the arc's centre, which sits R in from each edge of the
+ * corner and so R in from both. `bar_left` and `bar_down` say which way the
+ * bar extends from that centre, and the notch is the quadrant it does not:
+ * the top-right corner of a bar has bar_left and bar_down both set, so only
+ * dx > 0 and dy < 0 is cut. Bounding to the R by R square at the corner is
+ * what keeps the straight edges straight -- the distance test alone would cut
+ * every pixel beyond the arc along that row, including a whole top row. */
+static bool corner_notch(int x, int y, int ccx, int ccy, bool bar_left, bool bar_down)
 {
     int dx = x - ccx;
     int dy = y - ccy;
+    int ax = bar_left ? dx : -dx;    /* > 0: past the arc, on the corner's side */
+    int ay = bar_down ? -dy : dy;
 
-    if (dy > 0 || dy < -BTN_RADIUS)
+    if (ax <= 0 || ay <= 0 || ax > BTN_RADIUS || ay > BTN_RADIUS)
         return false;
-    if (left ? (dx > 0 || dx < -BTN_RADIUS) : (dx < 0 || dx > BTN_RADIUS))
-        return false;
-    return dx * dx + dy * dy > BTN_RADIUS * BTN_RADIUS;
+    return ax * ax + ay * ay > BTN_RADIUS * BTN_RADIUS;
+}
+
+/* Stream the band just filled in s_tx, continuing the window the caller opened.
+ *
+ * CS is held across bands so the panel sees one window -- the first row of a
+ * new window is partly swallowed, and four windows swallowed four rows. The
+ * first transfer carries RAMWR and the rest are continuations with no command
+ * and no address. */
+static void push_band(bool *first, size_t npix)
+{
+    spi_transaction_ext_t t = { 0 };
+
+    if (*first)
+    {
+        t.base.flags = SPI_TRANS_MODE_QIO;
+        t.base.cmd = CMD_PIXELS;
+        t.base.addr = ADDR_RAMWR;
+        *first = false;
+    }
+    else
+    {
+        t.base.flags = SPI_TRANS_MODE_QIO | SPI_TRANS_VARIABLE_CMD |
+                       SPI_TRANS_VARIABLE_ADDR | SPI_TRANS_VARIABLE_DUMMY;
+        t.command_bits = 0;
+        t.address_bits = 0;
+        t.dummy_bits = 0;
+    }
+    t.base.tx_buffer = s_tx;
+    t.base.length = npix * 16;
+    (void)spi_device_polling_transmit(s_spi, (spi_transaction_t *)&t);
 }
 
 static void paint_buttons(void)
@@ -636,39 +668,140 @@ static void paint_buttons(void)
                 /* The notch is black, the same black as the separators, so a
                  * rounded corner reads as the green receding from the gap. */
                 if (c == COL_GREEN &&
-                    (corner_notch(x, yy, arc0_rx, arc_y, false) ||
-                     corner_notch(x, yy, arc1_lx, arc_y, true) ||
-                     corner_notch(x, yy, arc1_rx, arc_y, false) ||
-                     corner_notch(x, yy, arc2_lx, arc_y, true)))
+                    (corner_notch(x, yy, arc0_rx, arc_y, true, true) ||
+                     corner_notch(x, yy, arc1_lx, arc_y, false, true) ||
+                     corner_notch(x, yy, arc1_rx, arc_y, true, true) ||
+                     corner_notch(x, yy, arc2_lx, arc_y, false, true)))
                     c = 0x0000;
 
                 s_tx[r * width + i] = swap16(c);
             }
         }
 
-        {
-            spi_transaction_ext_t t = { 0 };
+        push_band(&first, (size_t)(rows * width));
 
-            if (first)
+        y += rows;
+    }
+
+    gpio_set_level(LCD_CS, 1);
+    spi_device_release_bus(s_spi);
+}
+
+/*
+ * THE SEVEN BUTTONS DOWN THE LEFT EDGE.
+ *
+ * The same treatment as the strip below the framebuffer, turned through a right
+ * angle: seven green slots stacked down the margin the framebuffer does not
+ * reach, with a 10 px radius on the corners that face a neighbour.
+ *
+ * Which corners those are follows the strip rather than being chosen again.
+ * The strip sits on the bottom glass edge, so its bottom edge is square and the
+ * corners at its separators are cut on the top edge, facing the desktop. This
+ * column sits on the left glass edge, so its left edge is square and the
+ * corners at its separators are cut on the right edge, facing the desktop. That
+ * gives twelve arcs -- two at each of six separators -- and leaves the outer
+ * ends of the column square, exactly as the strip's outer ends are.
+ *
+ * Geometry: the visible glass is controller 22..431, the framebuffer occupies
+ * 67..386, so the left margin is controller 22..66 -- 45 columns -- running the
+ * framebuffer's own height, rows 45..460. The strip below starts at 461, so the
+ * two do not overlap. The margin above the framebuffer is left alone: the
+ * operator intends it for status icons.
+ */
+#define LEFT_X0   PANEL_COL_OFFSET                  /* 22: visible glass edge */
+#define LEFT_X1   (FB_X + PANEL_COL_OFFSET - 1)     /* 66: last column before fb */
+#define LEFT_Y0   FB_Y                              /* 45: framebuffer top row */
+#define LEFT_Y1   (FB_Y + DISPLAY_H - 1)            /* 460: framebuffer bottom */
+#define LEFT_N    7
+
+/* First row of slot i. Slots are not all the same height: 416 rows do not
+ * divide by seven, so the remainder is spread one row at a time rather than
+ * left as a fat last button. */
+static int left_slot_y(int i)
+{
+    return LEFT_Y0 + (i * (LEFT_Y1 - LEFT_Y0 + 1)) / LEFT_N;
+}
+
+static void paint_left_buttons(void)
+{
+    static const uint16_t COL_GREEN = 0x07E0;
+    /* One sacrificial row and column: exactly one pixel is lost at the top-left
+     * of a window (docs/panel-geometry.md, "The first row and column are
+     * swallowed"). Both fall outside the visible area -- column 21 is off the
+     * glass and row 44 is the black margin -- so paying them costs nothing and
+     * puts the green exactly where it is meant to be. */
+    const int wx = LEFT_X0 - 1;
+    const int wy = LEFT_Y0 - 1;
+    const int width = LEFT_X1 - wx + 1;             /* 46 */
+    const int height = LEFT_Y1 - wy + 1;            /* 417 */
+    const int band = (int)(sizeof(s_tx) / sizeof(s_tx[0])) / width;
+    const int arc_x = LEFT_X1 - BTN_RADIUS;         /* all arcs are on this edge */
+    const int n_arcs = (LEFT_N - 1) * 2;
+    int arc_y[(LEFT_N - 1) * 2];
+    bool arc_down[(LEFT_N - 1) * 2];
+    int y = wy;
+    bool first = true;
+
+    if (band < 1)
+        return;
+
+    for (int k = 1; k < LEFT_N; k++)
+    {
+        int b = left_slot_y(k);
+
+        /* The button above the separator: its last green row is b - 1, and the
+         * bar extends up from the arc, so this is a bottom corner. */
+        arc_y[2 * (k - 1)] = b - 1 - BTN_RADIUS;
+        arc_down[2 * (k - 1)] = false;
+        /* The button below it: green starts at b + 2, past the separator. */
+        arc_y[2 * (k - 1) + 1] = b + 2 + BTN_RADIUS;
+        arc_down[2 * (k - 1) + 1] = true;
+    }
+
+    /* The window is the whole column; every transfer below continues it. */
+    set_window(wx, wy, width, height);
+    spi_device_acquire_bus(s_spi, portMAX_DELAY);
+    gpio_set_level(LCD_CS, 0);
+
+    while (y < wy + height)
+    {
+        int rows = wy + height - y > band ? band : wy + height - y;
+
+        for (int r = 0; r < rows; r++)
+        {
+            int yy = y + r;
+            bool sep = false;
+
+            /* A separator is the first two rows of every slot but the first,
+             * so the green sits against the slot's own boundary. */
+            for (int k = 1; k < LEFT_N && !sep; k++)
             {
-                t.base.flags = SPI_TRANS_MODE_QIO;
-                t.base.cmd = CMD_PIXELS;
-                t.base.addr = ADDR_RAMWR;
-                first = false;
+                int b = left_slot_y(k);
+
+                sep = yy == b || yy == b + 1;
             }
-            else
+
+            for (int i = 0; i < width; i++)
             {
-                /* Continuation: no command, no address, CS still low. */
-                t.base.flags = SPI_TRANS_MODE_QIO | SPI_TRANS_VARIABLE_CMD |
-                               SPI_TRANS_VARIABLE_ADDR | SPI_TRANS_VARIABLE_DUMMY;
-                t.command_bits = 0;
-                t.address_bits = 0;
-                t.dummy_bits = 0;
+                int x = wx + i;
+                uint16_t c = 0x0000;
+
+                if (!sep && x >= LEFT_X0 && x <= LEFT_X1)
+                {
+                    c = COL_GREEN;
+                    for (int a = 0; a < n_arcs; a++)
+                        if (corner_notch(x, yy, arc_x, arc_y[a], true, arc_down[a]))
+                        {
+                            c = 0x0000;
+                            break;
+                        }
+                }
+
+                s_tx[r * width + i] = swap16(c);
             }
-            t.base.tx_buffer = s_tx;
-            t.base.length = (size_t)(rows * width) * 16;
-            (void)spi_device_polling_transmit(s_spi, (spi_transaction_t *)&t);
         }
+
+        push_band(&first, (size_t)(rows * width));
 
         y += rows;
     }
@@ -868,6 +1001,9 @@ bool display_init(display_reply_fn reply)
 
     /* The three button bars below the framebuffer, images only for now. */
     paint_buttons();
+
+    /* Seven more down the left margin, same treatment. */
+    paint_left_buttons();
 
     s_cols = DISPLAY_MAX_COLS;
     s_rows = DISPLAY_MAX_ROWS;
