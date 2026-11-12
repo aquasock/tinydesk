@@ -34,4 +34,28 @@ typedef struct
  */
 bool charge_report(charge_cfg_t *out);
 
+/*
+ * Enable the charging interrupts and act on them, called once at start-up.
+ *
+ * `vbus in` alone only says a cable arrived. The AXP2101 also reports when the
+ * cell actually starts taking current and when it has finished, on bank 2 of
+ * the same status block, and those are the transitions worth reacting to: a
+ * cable that is plugged into a dead charger, or a charge that stops early,
+ * looks identical to a working one if only VBUS is watched.
+ *
+ * Idempotent and safe to call before pwrkey_init(); it only writes two enable
+ * bits and leaves the rest alone.
+ */
+void charge_watch_enable(void);
+
+/*
+ * Handle one interrupt's worth of status bytes.
+ *
+ * Called by the power-key driver, which owns the GPIO and clears the status.
+ * This function does not touch the PMU; it only decides what the bits mean and
+ * logs the transitions, so the charge knowledge stays in one file and the
+ * button driver stays a button driver.
+ */
+void charge_on_irq(const uint8_t status[3]);
+
 #endif

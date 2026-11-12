@@ -198,6 +198,13 @@ bool link_init(void)
      * `pusher.pin = -1` turns it off deliberately. */
     pusher_init(inject);
 
+    /* The charge transitions first, then the pin. Order matters: enabling the
+     * charger's own interrupts can make a status bit pending, and pwrkey_init()
+     * is what clears the status and refuses to arm if the line is still low.
+     * Arming first would leave that guard looking at a line the next line of
+     * code was about to pull down. */
+    charge_watch_enable();
+
     /* Pusher A, the power key, which is not a GPIO: the AXP2101 reports it on
      * the PMU interrupt line. Failure is not fatal and is the expected outcome
      * if the PMU is holding its IRQ line, which the driver refuses to arm on. */

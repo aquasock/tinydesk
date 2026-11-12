@@ -60,6 +60,20 @@
 #define EN_CELL_CHARGE  (1u << 1)
 #define EN_TS_MEASURE   (1u << 1)
 
+/* Bank 2 of the same status block (0x4a, enable at 0x42). Bits from
+ * axp2101_regmap_irqs[]: CHARG is bit 3 and CHARG_DONE bit 4. These are the
+ * only two that distinguish "a cable is attached" from "the cell is actually
+ * taking current", which is the whole point of watching them. */
+#define PMU_IRQ2_EN     0x42
+#define IRQ2_CHARG      0x08
+#define IRQ2_CHARG_DONE 0x10
+
+/* What VBUS and the charger were last seen doing, so a transition is logged
+ * once rather than on every report the part sends while nothing changes. */
+#define UNKNOWN (-1)
+static int s_vbus = UNKNOWN;            /* -1 unknown, 0 out, 1 in */
+static int s_charging = UNKNOWN;        /* -1 unknown, 0 no, 1 yes */
+
 /*
  * WHAT THIS BOARD SHOULD BE DOING, so that the values are checked rather than
  * assumed. These are the AXP2101's own power-on defaults, measured on this
@@ -156,4 +170,79 @@ bool charge_report(charge_cfg_t *out)
     if (out)
         *out = c;
     return true;
+}
+
+void charge_watch_enable(void)
+{
+    uint8_t en;
+
+    if (!board_pmu_read(PMU_IRQ2_EN, &en))
+    {
+        ESP_LOGW(TAG, "pmu silent");
+        return;
+    }
+
+    if (!(en & (IRQ2_CHARG | IRQ2_CHARG_DONE)))
+    {
+        if (!board_pmu_write(PMU_IRQ2_EN, (uint8_t)(en | IRQ2_CHARG | IRQ2_CHARG_DONE)))
+        {
+            ESP_LOGW(TAG, "could not enable chg irqs");
+            return;
+        }
+    }
+
+    /* Read it back and report what STUCK, not what was written. This project has
+     * already been taught that lesson once: the speaker rail's log line printed
+     * the registers read before the write, so it reported what the rail had been
+     * and said nothing about whether the write landed. */
+    if (!board_pmu_read(PMU_IRQ2_EN, &en))
+    {
+        ESP_LOGW(TAG, "pmu silent");
+        return;
+    }
+    /* One short line: the enable byte, and whether both charge bits are in it.
+     * 0b1 means verified. */
+    ESP_LOGI(TAG, "irq2 %02x c%d", en,
+             (en & (IRQ2_CHARG | IRQ2_CHARG_DONE)) == (IRQ2_CHARG | IRQ2_CHARG_DONE));
+}
+
+void charge_on_irq(const uint8_t status[3])
+{
+    int vbus = s_vbus;
+    int charging = s_charging;
+
+    /* Bank 1: the cable. Reported by the part as two separate edge events, so
+     * either one settles the current state -- the plug bit means in and the
+     * removal bit means out, and they cannot both be set. */
+    if (status[1] & 0x80)
+        vbus = 1;                       /* IRQ1_VBUS_PLUG */
+    if (status[1] & 0x40)
+        vbus = 0;                       /* IRQ1_VBUS_REMOV */
+
+    /* Bank 2: the charger itself. */
+    if (status[2] & IRQ2_CHARG)
+        charging = 1;
+    if (status[2] & IRQ2_CHARG_DONE)
+        charging = 0;                   /* done is not charging; it is full */
+
+    /* Log the TRANSITION, not the state, and only when it moved. The part
+     * re-reports its pending bits until they are cleared, and the power-key
+     * driver clears them before this is called, but a repeated plug event is
+     * still possible if a charger bounces -- so compare rather than announce. */
+    if (vbus != s_vbus)
+    {
+        s_vbus = vbus;
+        if (vbus)
+            ESP_LOGI(TAG, "vbus in");
+        else
+            ESP_LOGI(TAG, "vbus out");
+    }
+    if (charging != s_charging)
+    {
+        s_charging = charging;
+        if (charging)
+            ESP_LOGI(TAG, "chg go");
+        else
+            ESP_LOGI(TAG, "chg done");
+    }
 }

@@ -10,6 +10,11 @@
 static td_window_t *s_win;
 static td_widget_t *s_free_bar, *s_free_txt, *s_min_bar, *s_min_txt, *s_ps_bar, *s_ps_txt;
 static td_widget_t *s_tasks, *s_uptime, *s_frame, *s_serial, *s_term;
+/* The chip's own temperature sensor, on its own row when the board has one.
+ * It used to share the Tasks/CPU line and was cut off at the window's edge --
+ * "Tasks: 18  CPU: 240 MHz  Chip" with no number after it, which is worse than
+ * not showing it, because it looks like a reading of nothing. */
+static td_widget_t *s_temp;
 /* One line for the battery, or NULL on a board without one. Above the memory
  * bars rather than below the statistics: power left is the thing a watch user
  * looks for first, and on a 26-row screen the top is where the eye lands. */
@@ -94,12 +99,16 @@ static void update(void)
         snprintf(tasks, sizeof(tasks), "%d", si->task_count());
     if (si->cpu_mhz)
         snprintf(cpu, sizeof(cpu), "%d MHz", si->cpu_mhz());
-    int t;
-    if (si->chip_temp && si->chip_temp(&t))
-        td_widget_printf(s_tasks, "Tasks: %-8s  CPU: %-9s  Chip: %s%d.%d °C", tasks, cpu, t < 0 ? "-" : "",
-                         (t < 0 ? -t : t) / 10, (t < 0 ? -t : t) % 10);
-    else
-        td_widget_printf(s_tasks, "Tasks: %-8s  CPU: %s", tasks, cpu);
+    td_widget_printf(s_tasks, "Tasks: %-8s  CPU: %s", tasks, cpu);
+    if (s_temp)
+    {
+        int t;
+        if (si->chip_temp && si->chip_temp(&t))
+            td_widget_printf(s_temp, "Chip: %s%d.%d °C", t < 0 ? "-" : "",
+                             (t < 0 ? -t : t) / 10, (t < 0 ? -t : t) % 10);
+        else
+            td_widget_printf(s_temp, "Chip: n/a");
+    }
 
     uint32_t s = td_uptime_ms() / 1000u;
     td_widget_printf(s_uptime, "Uptime: %02u:%02u:%02u",
@@ -132,6 +141,7 @@ static void on_close(td_window_t *win)
     s_free_bar = s_free_txt = s_min_bar = s_min_txt = NULL;
     s_ps_bar = s_ps_txt = NULL;
     s_tasks = s_uptime = s_frame = s_serial = s_term = NULL;
+    s_temp = NULL;
 }
 
 static void launch(void)
@@ -148,11 +158,16 @@ static void launch(void)
      * whether the row exists. */
     td_battery_t probe[TD_MAX_BATTERIES];
     bool batt = si->batteries && si->batteries(probe, TD_MAX_BATTERIES) > 0;
+    /* Same question for the temperature: ask once here, because it decides the
+     * layout rather than the reading. A sensor that fails to start would
+     * otherwise leave an empty row on a 26-row screen. */
+    int probe_t = 0;
+    bool temp = si->chip_temp && si->chip_temp(&probe_t);
     int top = batt ? 1 : 0;        /* everything shifts down for the battery */
     int y = top + (psram ? 1 : 0); /* rows below the memory bars move down */
     td_window_desc_t d = {
         .title = "System Monitor",
-        .rect = td_rect(4, 2, 56, 12 + y),
+        .rect = td_rect(4, 2, 56, 12 + y + (temp ? 1 : 0)),
         .flags = TD_WIN_MOVABLE | TD_WIN_CLOSABLE,
         .on_close = on_close,
         .on_tick = on_tick,
@@ -177,10 +192,12 @@ static void launch(void)
         s_ps_txt = td_label(s_win, 33, 3 + top, 0, "");
     }
     s_tasks = td_label(s_win, 1, 4 + y, 0, "");
-    s_uptime = td_label(s_win, 1, 5 + y, 0, "");
-    s_frame = td_label(s_win, 1, 6 + y, 0, "");
-    s_serial = td_label(s_win, 1, 7 + y, 0, "");
-    s_term = td_label(s_win, 1, 8 + y, 0, "");
+    s_temp = temp ? td_label(s_win, 1, 5 + y, 0, "") : NULL;
+    int r = 5 + y + (temp ? 1 : 0);
+    s_uptime = td_label(s_win, 1, r++, 0, "");
+    s_frame = td_label(s_win, 1, r++, 0, "");
+    s_serial = td_label(s_win, 1, r++, 0, "");
+    s_term = td_label(s_win, 1, r++, 0, "");
     update();
 }
 

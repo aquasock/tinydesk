@@ -53,6 +53,7 @@
 #include "freertos/task.h"
 #include "tdsh_board.h"
 
+#include "charge.h"
 #include "haptic.h"
 #include "power.h"
 
@@ -76,10 +77,6 @@
 #define IRQ1_PEK_FAL    0x02
 #define IRQ1_PEK_LONG   0x04
 #define IRQ1_PEK_SHORT  0x08
-#define IRQ1_BATT_REMOV 0x10
-#define IRQ1_BATT_PLUG  0x20
-#define IRQ1_VBUS_REMOV 0x40
-#define IRQ1_VBUS_PLUG  0x80
 
 /* Enter, as a terminal sends it -- the same key the BOOT pusher sends, and the
  * same one-line change to alter. */
@@ -166,13 +163,11 @@ static void pwrkey_task(void *arg)
             ESP_LOGI(TAG, "k%lu", (unsigned long)s_presses);
         }
 
-        /* Reported, never acted on. VBUS is why this driver is worth having
-         * beyond a button: it is the only path by which this port can notice
-         * the charger at all. */
-        if (st[1] & IRQ1_VBUS_PLUG)
-            ESP_LOGI(TAG, "vbus in");
-        if (st[1] & IRQ1_VBUS_REMOV)
-            ESP_LOGI(TAG, "vbus out");
+        /* The cable and the charger are charge.c's business, not this file's:
+         * this driver owns the pin and clears the status, and hands the bits
+         * over. That keeps "what a VBUS edge means" in one place instead of
+         * split between a button driver and a charge driver. */
+        charge_on_irq(st);
 
         /* A long press is the PMU's own power-off gesture and is not ours to
          * intercept; logged only so the log explains a shutdown. */
@@ -211,6 +206,12 @@ bool pwrkey_init(pwrkey_input_fn input)
             /* Compact, and the interesting one first: the 40-column ring cuts
              * the tail off anything longer. */
             ESP_LOGI(TAG, "st %02x%02x%02x", st[0], st[1], st[2]);
+            /* Let charge.c see the boot state as well, so its idea of whether
+             * the cable is in and the cell is charging starts from what the
+             * part actually reports rather than from unknown. Without this the
+             * first logged transition would be a removal with no matching
+             * arrival, which reads like a fault in the log. */
+            charge_on_irq(st);
             clear_status(st);
         }
     }
