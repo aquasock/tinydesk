@@ -124,14 +124,21 @@ static inline const char *right_label(int i)
     return i >= 0 && i < COL_N ? labels[i] : "";
 }
 
-/* The left column has no labels yet. The accessor exists rather than passing
- * NULL, so adding them later is a table and nothing else -- and so an unlabelled
- * column is a deliberate empty table rather than a missing feature the painter
- * has to guard against. */
+/* The left column, top to bottom: the five keys it sends.
+ *
+ * The labels name the key, not the action, for the same reason the bottom
+ * strip's do -- F10 is what a finger will read, and it is honest about being a
+ * key. They are stood on end, which is the only way they fit: this column is
+ * 41 px across inside its border and "Super+D" is 56 px wide.
+ *
+ * The column has the room the bottom strip does not. Its buttons are 81 to 83
+ * rows tall, so a seven-character label needs 56 rows of the 61 between the
+ * corner radii, and there are five rows to spare. */
 static inline const char *left_label(int i)
 {
-    (void)i;
-    return "";
+    static const char *const labels[COL_N] = { "F10", "Esc", "F6", "Super+D", "F11" };
+
+    return i >= 0 && i < COL_N ? labels[i] : "";
 }
 
 /* The top margin, above the framebuffer. Reserved for status icons, not a touch

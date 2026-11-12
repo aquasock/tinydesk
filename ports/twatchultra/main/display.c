@@ -689,7 +689,19 @@ static void push_band(bool *first, size_t npix)
  * brighter and reads at a smaller apparent size, which matters for a glyph set
  * that now includes arrows.
  */
-#define LABEL_FG 0xFFFF          /* RGB565(31,63,31): white */
+/* The terminal's green, taken from this port's own ANSI palette rather than
+ * written as an RGB565 constant. Index 2 is the green the terminal draws when a
+ * program asks for green text -- {0,205,0}, RGB565 0x0660 -- so a label in this
+ * colour is the same colour as terminal green output rather than an approximation
+ * of it. Reading the palette instead of hardcoding the value means the labels
+ * follow it if the palette is ever changed, which is the kind of drift that is
+ * invisible until someone compares two screens. */
+#define LABEL_ANSI 2
+
+static inline uint16_t label_fg(void)
+{
+    return s_palette[LABEL_ANSI];
+}
 
 /* A label, decoded once.
  *
@@ -712,7 +724,8 @@ typedef struct
 {
     uint16_t cp[LABEL_MAX_CELLS];
     int n;
-    int x, y;
+    int x, y;        /* top-left of the label's bounding box */
+    bool rot;        /* stood on end, reading bottom to top */
 } label_pos_t;
 
 /* Decode UTF-8 into code points, stopping at cap. A malformed sequence yields
@@ -772,13 +785,24 @@ static int utf8_cells(const char *s, uint16_t *out, int cap)
 /* Centre the label in the rectangle, but never let it start before the
  * rectangle: a label wider than its button would otherwise spill into the
  * separator, and truncation on the left reads as a blank button. */
-static void label_place(const char *s, int x0, int x1, int y0, int y1, label_pos_t *out)
+/* Centre the label in the rectangle, rotated if asked.
+ *
+ * A rotation swaps the bounding box's dimensions, which is the whole reason the
+ * columns are labelled this way. A column face is 41 px across and the left
+ * column's longest duty is Super+D at seven characters, 56 px: it cannot be laid
+ * out horizontally at all, and the first thing that would have gone wrong is
+ * that the text overran its border. Stood on end it needs 56 of the 61 rows a
+ * slot offers and 16 of the 41 columns. */
+static void label_place(const char *s, int x0, int x1, int y0, int y1, bool rot,
+                        label_pos_t *out)
 {
-    int w, h = CELL_H;
+    int w, h;
     int cx, cy;
 
     out->n = utf8_cells(s, out->cp, LABEL_MAX_CELLS);
-    w = out->n * CELL_W;
+    out->rot = rot;
+    w = rot ? CELL_H : out->n * CELL_W;
+    h = rot ? out->n * CELL_W : CELL_H;
     cx = x0 + (x1 - x0 + 1 - w) / 2;
     cy = y0 + (y1 - y0 + 1 - h) / 2;
     out->x = cx < x0 ? x0 : cx;
@@ -787,16 +811,53 @@ static void label_place(const char *s, int x0, int x1, int y0, int y1, label_pos
 
 /* Is this pixel part of the label? Bit 7 of each glyph row is its leftmost
  * pixel, which is the same convention paint_cell() uses for the terminal. */
+/* Is this pixel part of the label?
+ *
+ * Upright, the glyph's row index is the pixel's y offset and its column index
+ * comes from the x offset; bit 7 of each glyph row is its leftmost pixel, the
+ * same convention paint_cell() uses for the terminal.
+ *
+ * Rotated a quarter turn counter-clockwise, the mapping runs backwards through
+ * the same table: the glyph's own rows become the pixel's columns and its
+ * columns become the pixel's rows. The letter's top edge ends up on the left,
+ * so glyph row 0 is the leftmost column, and its left edge ends up along the
+ * bottom, so the leftmost bit is in the last row of the character's 8-row band.
+ * The characters are laid out from the bottom up, which is what makes the text
+ * read bottom to top -- and reads correctly left to right if the watch is turned
+ * a quarter turn clockwise, which is the orientation the column is designed for.
+ */
 static bool label_bit(const label_pos_t *p, int x, int y)
 {
     int dx = x - p->x, dy = y - p->y;
-    int idx = dx / CELL_W;
+    int idx, gy, gx;
     const uint8_t *glyph;
 
-    if (dx < 0 || dy < 0 || dy >= CELL_H || idx >= p->n)
+    if (dx < 0 || dy < 0)
         return false;
+
+    if (!p->rot)
+    {
+        if (dy >= CELL_H)
+            return false;
+        idx = dx / CELL_W;
+        if (idx >= p->n)
+            return false;
+        gy = dy;
+        gx = dx % CELL_W;
+    }
+    else
+    {
+        if (dx >= CELL_H)
+            return false;
+        if (dy >= p->n * CELL_W)
+            return false;
+        idx = p->n - 1 - dy / CELL_W;   /* the first character is at the bottom */
+        gy = dx;                        /* glyph top edge -> left  */
+        gx = (CELL_W - 1) - (dy % CELL_W);  /* glyph left edge -> bottom */
+    }
+
     glyph = font8x16_glyph(p->cp[idx]);
-    return glyph && (glyph[dy] & (0x80 >> (dx % CELL_W))) != 0;
+    return glyph && (glyph[gy] & (0x80 >> gx)) != 0;
 }
 
 /* The corners of bottom bar s.
@@ -842,7 +903,7 @@ static void paint_buttons(void)
         int g1 = btn_slot_x(s + 1) - 1;
 
         label_place(btn_label(s), g0 + BTN_RADIUS, g1 - BTN_RADIUS,
-                    BTN_Y0 + BTN_RADIUS, BTN_Y1 - BTN_RADIUS, &label[s]);
+                    BTN_Y0 + BTN_RADIUS, BTN_Y1 - BTN_RADIUS, false, &label[s]);
     }
 
     /* The window is the whole strip; every transfer below continues it, so CS
@@ -885,7 +946,7 @@ static void paint_buttons(void)
                          * inset shape, but the gate is what makes that a rule
                          * rather than a coincidence of the font's size. */
                         if (c == COL_FILL && label_bit(&label[s], x, yy))
-                            c = LABEL_FG;
+                            c = label_fg();
                         break;
                     }
                 }
@@ -966,7 +1027,8 @@ static corners_t column_corners(int s, bool desk_right)
 
 /* One column, at controller x0..x1. desk_right says which side the desktop is
  * on, which is the only thing that differs between the two. */
-static void paint_column(int x0, int x1, bool desk_right, const char *(*label_at)(int))
+static void paint_column(int x0, int x1, bool desk_right, bool rot,
+                         const char *(*label_at)(int))
 {
     /* One sacrificial row and column: exactly one pixel is lost at the top-left
      * of a window (docs/panel-geometry.md, "The first row and column are
@@ -1001,7 +1063,7 @@ static void paint_column(int x0, int x1, bool desk_right, const char *(*label_at
         int g1 = col_slot_y(s + 1) - 1;
 
         label_place(label_at(s), x0 + BTN_BORDER, x1 - BTN_BORDER,
-                    g0 + BTN_RADIUS, g1 - BTN_RADIUS, &label[s]);
+                    g0 + BTN_RADIUS, g1 - BTN_RADIUS, rot, &label[s]);
     }
 
     /* The window is the whole column; every transfer below continues it. */
@@ -1043,7 +1105,7 @@ static void paint_column(int x0, int x1, bool desk_right, const char *(*label_at
                          * right, the whole of the left column for now -- is a
                          * no-op rather than a special case. */
                         if (c == COL_FILL && label_bit(&label[s], x, yy))
-                            c = LABEL_FG;
+                            c = label_fg();
                         break;
                     }
                 }
@@ -1254,8 +1316,8 @@ bool display_init(display_reply_fn reply)
     paint_buttons();
 
     /* Five down each margin, same treatment, mirrored. */
-    paint_column(LEFT_X0, LEFT_X1, true, left_label);
-    paint_column(RIGHT_X0, RIGHT_X1, false, right_label);
+    paint_column(LEFT_X0, LEFT_X1, true, true, left_label);
+    paint_column(RIGHT_X0, RIGHT_X1, false, false, right_label);
 
     s_cols = DISPLAY_MAX_COLS;
     s_rows = DISPLAY_MAX_ROWS;
