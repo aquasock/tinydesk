@@ -404,21 +404,52 @@ static void on_draw(td_window_t *win, int w, int h)
 {
     (void)win;
     const td_theme_t *t = td_theme();
-    td_text(0, 0, "Device", t->win_fg, t->win_bg, 0);
-    td_text(30, 0, "Unit", t->win_fg, t->win_bg, 0);
+    /*
+     * The field labels are drawn as text, positioned for the wide form: "Unit"
+     * at column 30, the "ms" at 63, the note under four rows of controls. On a
+     * narrow window the controls are stacked instead, so those labels land on
+     * top of the fields -- "0  10  t" and "[ ]uRepeat every 1000" were the
+     * result. The note and the list's column heading go under the stacked form
+     * instead.
+     */
+    const bool narrow = w < 60;
     const td_mb_serial_t *rtu = td_mb_serial();
     int lines = rtu ? rtu->ports : 0;
-    td_text(42, 0, lines >= 2 ? "IP[:port], rtu1 or rtu2" : lines == 1 ? "IP[:port] or rtu"
-                                                                       : "IP[:port] (Modbus TCP)",
-            t->dim, t->win_bg, 0);
-    td_text(0, 1, "Table", t->win_fg, t->win_bg, 0);
-    td_text(0, 2, "Address", t->win_fg, t->win_bg, 0);
-    td_text(16, 2, "Count", t->win_fg, t->win_bg, 0);
-    td_text(0, 3, "Values", t->win_fg, t->win_bg, 0);
-    td_text(63, 2, "ms", t->win_fg, t->win_bg, 0);
-    td_textn(0, 4, U->note[0] ? U->note : "Double-click a value in the list to change it.", w,
+    int list_hdr_y;
+
+    if (narrow)
+    {
+        /* Inline labels, short enough to sit beside their field: Dev, Unit,
+         * Addr, Cnt, Vals. Nothing is drawn above the fields -- a caption row
+         * each would cost more than the fields on 23 rows. */
+        td_text(0, 0, "Dev", t->dim, t->win_bg, 0);
+        td_text(w - 17, 0, "Unit", t->dim, t->win_bg, 0);
+        td_text(0, 2, "Addr", t->dim, t->win_bg, 0);
+        td_text(14, 2, "Cnt", t->dim, t->win_bg, 0);
+        td_text(0, 4, "Vals", t->dim, t->win_bg, 0);
+        list_hdr_y = 7;                 /* 5 rows of form, note at 6 */
+    }
+    else
+    {
+        td_text(0, 0, "Device", t->win_fg, t->win_bg, 0);
+        td_text(30, 0, "Unit", t->win_fg, t->win_bg, 0);
+        td_text(42, 0, lines >= 2 ? "IP[:port], rtu1 or rtu2" : lines == 1 ? "IP[:port] or rtu"
+                                                                           : "IP[:port] (Modbus TCP)",
+                t->dim, t->win_bg, 0);
+        td_text(0, 1, "Table", t->win_fg, t->win_bg, 0);
+        td_text(0, 2, "Address", t->win_fg, t->win_bg, 0);
+        td_text(16, 2, "Count", t->win_fg, t->win_bg, 0);
+        td_text(0, 3, "Values", t->win_fg, t->win_bg, 0);
+        td_text(63, 2, "ms", t->win_fg, t->win_bg, 0);
+        list_hdr_y = 5;
+    }
+
+    td_textn(0, narrow ? 6 : 4,
+             U->note[0] ? U->note : "Double-click a value to change it.", w,
              U->note[0] ? t->accent : t->dim, t->win_bg, 0);
-    td_textn(0, 5, is_bits(s_table) ? " Addr   Value" : " Addr   Decimal  Hex      Signed", w, t->dim, t->win_bg, 0);
+    td_textn(0, list_hdr_y,
+             is_bits(s_table) ? " Addr   Value" : " Addr   Decimal  Hex      Signed",
+             w, t->dim, t->win_bg, 0);
 
     uint16_t port;
     int clients;
@@ -479,19 +510,72 @@ static void launch(void)
         return;
     }
 
-    s_target = td_textbox(s_win, 8, 0, 20, TD_TEXT_MAX - 1, on_enter_read, NULL);
-    s_unit = td_textbox(s_win, 35, 0, 5, 3, on_enter_read, NULL);
-    s_table_btn = td_button(s_win, 8, 1, table_caption(s_table), on_table, NULL);
-    s_addr = td_textbox(s_win, 8, 2, 6, 5, on_enter_read, NULL);
-    s_count = td_textbox(s_win, 22, 2, 4, 3, on_enter_read, NULL);
-    td_button(s_win, 28, 2, "Read", on_read, NULL);
-    s_repeat = td_checkbox(s_win, 37, 2, "Repeat every", false, on_repeat, NULL);
-    s_interval = td_textbox(s_win, 54, 2, 8, 7, on_interval, NULL);
-    s_values = td_textbox(s_win, 8, 3, 30, TD_TEXT_MAX - 1, on_write, NULL);
-    td_button(s_win, 40, 3, "Write", on_write, NULL);
-    s_list = td_list(s_win, td_rect(0, LIST_Y, -1, -1), get_item, on_activate, NULL);
-    td_scrollbar(s_win, -1, LIST_Y, -1, s_list);
-    s_server = td_checkbox(s_win, 0, -1, "TCP server", td_mb_server_status(NULL, NULL, NULL), on_server, NULL);
+    /*
+     * THE FORM IS FOUR ROWS OF CONTROLS ACROSS 72 COLUMNS, WHICH DOES NOT FIT 38.
+     *
+     * Upstream puts the value and the button on the same row: Address at x 8
+     * with Count at 22, Read at 28, Repeat at 37 and the interval at 54, and a
+     * "ms" label at 63. On a 40-column panel the client is 38 wide, so
+     * everything from column 38 on was off the glass -- Read, Repeat and the
+     * interval all vanished.
+     *
+     * Narrow windows stack instead: a label line, then the field, for each of
+     * the four, and one row of buttons at the bottom of the form. The list
+     * keeps everything left over.
+     */
+    {
+        int cw = td_win_client(s_win).w;
+        bool narrow = cw < 60;
+
+        if (narrow)
+        {
+            int row = 0;
+            int fw = cw - 2;               /* field width inside the frame */
+
+            /* Short INLINE labels rather than a label row per field: four
+             * caption rows would cost more than the fields themselves on a
+             * 23-row client, and "Dev"/"Addr"/"Cnt"/"Vals" are unambiguous
+             * beside the value they name. */
+            s_target = td_textbox(s_win, 4, row, fw - 20, TD_TEXT_MAX - 1, on_enter_read, NULL);
+            s_unit = td_textbox(s_win, fw - 9, row, 4, 3, on_enter_read, NULL);
+            row++;
+
+            s_table_btn = td_button(s_win, 0, row, table_caption(s_table), on_table, NULL);
+            row++;
+
+            s_addr = td_textbox(s_win, 5, row, 6, 5, on_enter_read, NULL);
+            s_count = td_textbox(s_win, 19, row, 5, 3, on_enter_read, NULL);
+            row++;
+
+            s_repeat = td_checkbox(s_win, 0, row, "Repeat every", false, on_repeat, NULL);
+            s_interval = td_textbox(s_win, 17, row, 6, 7, on_interval, NULL);
+            row++;
+
+            s_values = td_textbox(s_win, 5, row, fw - 14, TD_TEXT_MAX - 1, on_write, NULL);
+            td_button(s_win, fw - 8, row, "Write", on_write, NULL);
+            row++;
+
+            /* Note row, then the list heading, then the list. */
+            s_list = td_list(s_win, td_rect(0, row + 2, -1, -3), get_item, on_activate, NULL);
+            td_scrollbar(s_win, -1, row + 2, -3, s_list);
+        }
+        else
+        {
+            s_target = td_textbox(s_win, 8, 0, 20, TD_TEXT_MAX - 1, on_enter_read, NULL);
+            s_unit = td_textbox(s_win, 35, 0, 5, 3, on_enter_read, NULL);
+            s_table_btn = td_button(s_win, 8, 1, table_caption(s_table), on_table, NULL);
+            s_addr = td_textbox(s_win, 8, 2, 6, 5, on_enter_read, NULL);
+            s_count = td_textbox(s_win, 22, 2, 4, 3, on_enter_read, NULL);
+            td_button(s_win, 28, 2, "Read", on_read, NULL);
+            s_repeat = td_checkbox(s_win, 37, 2, "Repeat every", false, on_repeat, NULL);
+            s_interval = td_textbox(s_win, 54, 2, 8, 7, on_interval, NULL);
+            s_values = td_textbox(s_win, 8, 3, 30, TD_TEXT_MAX - 1, on_write, NULL);
+            td_button(s_win, 40, 3, "Write", on_write, NULL);
+            s_list = td_list(s_win, td_rect(0, LIST_Y, -1, -1), get_item, on_activate, NULL);
+            td_scrollbar(s_win, -1, LIST_Y, -1, s_list);
+        }
+        s_server = td_checkbox(s_win, 0, -1, "TCP server", td_mb_server_status(NULL, NULL, NULL), on_server, NULL);
+    }
 
     td_widget_set_text(s_target, "127.0.0.1");
     td_widget_set_text(s_unit, "1");
