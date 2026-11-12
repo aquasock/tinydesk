@@ -163,7 +163,10 @@ static void on_draw(td_window_t *win, int w, int h)
     (void)win;
     (void)h;
     const td_theme_t *t = td_theme();
-    td_text(1, 0, "Drag display 2 beside display 1, or select it and use the arrow keys.", t->dim, t->win_bg, 0);
+    /* Shorter on a narrow window: the long line was cut at "...or s". */
+    td_text(1, 0, w < 60 ? "Drag display 2 beside display 1."
+                         : "Drag display 2 beside display 1, or select it and use the arrow keys.",
+            t->dim, t->win_bg, 0);
     int aw = w - 2;
     td_fill(td_rect(1, AREA_Y, aw, AREA_H), ' ', t->win_fg, t->desktop_bg);
     td_screens_layout_t l;
@@ -184,8 +187,16 @@ static void on_draw(td_window_t *win, int w, int h)
     draw_box(b1, ext ? "1" : "1 | 2", ext && s_sel == 0, ext && l.main == 0, true);
     if (ext)
         draw_box(b2, "2", s_sel == 1, l.main == 1, td_screen2_attached());
-    td_text(1, 21, "Move a window to the other display: Alt+Shift+Left / Right,", t->dim, t->win_bg, 0);
-    td_text(1, 22, "Win+Shift+Left / Right, or Other display in its title bar menu.", t->dim, t->win_bg, 0);
+    /* These two lines were drawn at fixed rows 21 and 22, which on a 23-row
+     * client is where the message and the Close button live -- so the help text
+     * was painted straight over them ("[ Close ]+Left / Right, or Other disp").
+     * On a narrow window they are dropped entirely: the rows do not exist, and
+     * a keyboard hint is the least important thing on the screen. */
+    if (w >= 60)
+    {
+        td_text(1, 21, "Move a window to the other display: Alt+Shift+Left / Right,", t->dim, t->win_bg, 0);
+        td_text(1, 22, "Win+Shift+Left / Right, or Other display in its title bar menu.", t->dim, t->win_bg, 0);
+    }
 }
 
 /* Where display 2 goes when its box is dropped with its corner at x, y
@@ -326,6 +337,20 @@ static void update(void)
         char st[64] = "";
         if (o->status)
             o->status(s_sel, st, sizeof(st));
+        /* The platform's wording is its own and can be long ("the board's link
+         * until a client connects"); on a narrow window it is cut where the
+         * sentence would end anyway rather than mid-word. */
+        if (td_win_client(s_win).w < 60)
+        {
+            size_t max = (size_t)(td_win_client(s_win).w - 2);
+            if (max > 5 && strlen(st) > max - 5)
+            {
+                /* Keep whole words. */
+                while (st[max - 5] && st[max - 5] != ' ')
+                    st[max - 5] = '\0';
+                st[max - 5] = '\0';
+            }
+        }
         td_widget_printf(s_status, "Now: %s", st);
     }
     else
@@ -355,7 +380,10 @@ static void update(void)
         td_widget_set_text(s_rot_note, "a change applies at the next start");
     }
     else
-        td_widget_set_text(s_rot_note, "set by its terminal: turn or resize that window");
+        td_widget_set_text(s_rot_note,
+                           td_win_client(s_win).w < 60
+                               ? "set by its terminal"
+                               : "set by its terminal: turn or resize that window");
     td_checkbox_set(s_main, ext && l.main == s_sel);
     td_widget_set_visible(s_main, ext);
     td_win_invalidate(s_win);
@@ -560,23 +588,84 @@ static void launch(void)
     if (!s_win)
         return;
     s_sel = 0;
-    td_button(s_win, 1, 11, "Identify", on_identify, NULL);
-    /* Buttons keep the width of their first caption: make room. */
-    s_mode = td_button(s_win, 14, 11, "Duplicate these displays", on_mode, NULL);
-    s_pick[0] = td_button(s_win, 1, 12, "* Display 1", on_pick, (void *)(intptr_t)0);
-    s_pick[1] = td_button(s_win, 17, 12, "* Display 2", on_pick, (void *)(intptr_t)1);
-    td_label(s_win, 1, 13, 0, "Shown on");
-    s_source = td_button(s_win, 14, 13, "This terminal ", on_source, NULL);
-    s_source_label = td_label(s_win, 33, 13, 39, "");
-    s_status = td_label(s_win, 14, 14, 58, "");
-    td_label(s_win, 1, 15, 0, "Resolution");
-    s_res = td_button(s_win, 14, 15, "Auto (its terminal's size)", on_res, NULL);
-    td_label(s_win, 1, 16, 0, "Orientation");
-    s_rot = td_button(s_win, 14, 16, "Landscape (flipped) 180\xC2\xB0", on_rot, NULL);
-    s_rot_note = td_label(s_win, 14, 17, 58, "");
-    s_main = td_checkbox(s_win, 1, 19, "Make this my main display (taskbar, new windows)", false, on_main, NULL);
-    s_msg = td_label(s_win, 1, -2, 70, "");
-    td_button(s_win, 1, -1, "Close", on_close_btn, NULL);
+
+    /*
+     * THE CONTROL COLUMN IS THE CLIENT'S WIDTH, NOT A FIXED 14.
+     *
+     * This window asked for 74x27 and laid its controls out at columns 14, 17,
+     * 33 and 39 -- right for a desktop, impossible on a 40-column panel, where
+     * the client is 38 wide. So the value column and every button after it were
+     * off the glass, and two of them vanished outright (the Orientation button
+     * and the display pickers sat at x=17 on a narrower row than they needed).
+     *
+     * The narrow layout puts the label on its own row and the control beneath
+     * it, which is the only way to fit a 24-column caption like "Duplicate
+     * these displays" in 38 columns. The wide layout is upstream's, unchanged.
+     */
+    {
+        int cw = td_win_client(s_win).w;
+        int ch = td_win_client(s_win).h;
+        bool narrow = cw < 60;
+        int row = AREA_Y + AREA_H + 1;      /* below the diagram */
+
+        if (narrow)
+        {
+            /* The help lines at the bottom are the first thing to give up a row:
+             * 23 rows cannot hold the diagram, seven controls, the message and
+             * both lines of help, and the help was being drawn OVER the Close
+             * button. One short line stays. */
+            td_button(s_win, 1, row, "Identify", on_identify, NULL);
+            row++;
+
+            s_mode = td_button(s_win, 1, row, "Duplicate these displays", on_mode, NULL);
+            row++;
+
+            s_pick[0] = td_button(s_win, 1, row, "Display 1", on_pick, (void *)(intptr_t)0);
+            s_pick[1] = td_button(s_win, 16, row, "Display 2", on_pick, (void *)(intptr_t)1);
+            row++;
+
+            s_source = td_button(s_win, 1, row, "This terminal ", on_source, NULL);
+            s_source_label = td_label(s_win, 15, row, 0, "");
+            row++;
+
+            s_status = td_label(s_win, 1, row, 0, "");
+            row++;
+
+            s_res = td_button(s_win, 1, row, "Auto (its size)", on_res, NULL);
+            row++;
+
+            s_rot = td_button(s_win, 1, row, "Landscape 180\xC2\xB0", on_rot, NULL);
+            row++;
+
+            s_rot_note = td_label(s_win, 1, row, 0, "");
+            row++;
+
+            s_main = td_checkbox(s_win, 1, row, "Main display", false, on_main, NULL);
+
+            s_msg = td_label(s_win, 1, ch - 2, 0, "");
+            td_button(s_win, 1, ch - 1, "Close", on_close_btn, NULL);
+        }
+        else
+        {
+            td_button(s_win, 1, 11, "Identify", on_identify, NULL);
+            /* Buttons keep the width of their first caption: make room. */
+            s_mode = td_button(s_win, 14, 11, "Duplicate these displays", on_mode, NULL);
+            s_pick[0] = td_button(s_win, 1, 12, "* Display 1", on_pick, (void *)(intptr_t)0);
+            s_pick[1] = td_button(s_win, 17, 12, "* Display 2", on_pick, (void *)(intptr_t)1);
+            td_label(s_win, 1, 13, 0, "Shown on");
+            s_source = td_button(s_win, 14, 13, "This terminal ", on_source, NULL);
+            s_source_label = td_label(s_win, 33, 13, 39, "");
+            s_status = td_label(s_win, 14, 14, 58, "");
+            td_label(s_win, 1, 15, 0, "Resolution");
+            s_res = td_button(s_win, 14, 15, "Auto (its terminal's size)", on_res, NULL);
+            td_label(s_win, 1, 16, 0, "Orientation");
+            s_rot = td_button(s_win, 14, 16, "Landscape (flipped) 180\xC2\xB0", on_rot, NULL);
+            s_rot_note = td_label(s_win, 14, 17, 58, "");
+            s_main = td_checkbox(s_win, 1, 19, "Make this my main display (taskbar, new windows)", false, on_main, NULL);
+            s_msg = td_label(s_win, 1, -2, 70, "");
+            td_button(s_win, 1, -1, "Close", on_close_btn, NULL);
+        }
+    }
     update();
 }
 
