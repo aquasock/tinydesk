@@ -134,6 +134,39 @@ static void *s_bell_user;
 static td_vcell_t *s_shown;
 static uint16_t *s_fb;
 static int s_cols, s_rows;
+
+/*
+ * WHO MAY WRITE THE FRAMEBUFFER.
+ *
+ * Two things draw here: the paint task, from the terminal's cell grid, and
+ * display_picture_rgb(), from a bitmap. They cannot both be right, because the
+ * painter decides what to redraw by comparing each cell against s_shown -- its
+ * record of what it has already drawn -- and a bitmap blit does not change that
+ * record. So after a blit the painter still believes the screen holds the old
+ * cells, and the next notification (a blinking cursor, the taskbar clock, one
+ * line of console output) repaints those cells straight back over the picture.
+ * On the glass that reads as the console bleeding through the image in strips,
+ * and it is the correct behaviour of an uncoordinated pair of writers.
+ *
+ * So ownership is explicit. An app that draws pixels claims the framebuffer,
+ * the painter stops painting, and on release the painter's record is
+ * invalidated so the next frame repaints everything -- because by then the
+ * screen holds a picture, not the cells s_shown describes.
+ *
+ * This is a mode and not a lock because there is nothing to serialise: while it
+ * is set there is exactly one writer, and while it is clear there is exactly
+ * one other.
+ */
+static bool s_pixel_owner;
+
+/* How many frames the painter actually drew, and how many it skipped because
+ * something else owned the pixels. Counters rather than a flag because the
+ * question "is the painter being suppressed?" cannot be answered by looking at
+ * a bitmap -- the bitmap looks the same either way until the next repaint
+ * overwrites it. With these, "suppressed is climbing and painted is not" is a
+ * fact rather than an inference from a photograph. */
+static uint32_t s_paint_frames;
+static uint32_t s_paint_suppressed;
 /* Where the cursor was last drawn. paint_cell inverts a cell when the cursor is
  * on it, but the cell's own colours are unchanged, so the comparison below
  * cannot see the cursor leaving: the cell would stay inverted on the glass for
@@ -1192,6 +1225,21 @@ static void paint_task(void *arg)
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
         xSemaphoreTake(s_lock, portMAX_DELAY);
+
+        /* Someone else owns the pixels. Take the notification and drop it --
+         * not painting is the whole point, and the cursor bookkeeping has to
+         * stay consistent for when ownership comes back. */
+        if (s_pixel_owner)
+        {
+            s_paint_suppressed++;
+            s_cur_col = s_cur_row = -1;
+            s_vt->dirty = false;
+            xSemaphoreGive(s_lock);
+            continue;
+        }
+
+        s_paint_frames++;
+
         for (int r = 0; r < s_rows; r++)
         {
             int row_x0 = DISPLAY_W, row_x1 = 0;
@@ -1532,6 +1580,66 @@ bool display_test_pattern(int what)
 
     free(img);
     return ok;
+}
+
+/*
+ * Claim or release the framebuffer for an app that draws pixels.
+ *
+ * While claimed, the paint task stops painting entirely, so a blit survives the
+ * next cursor blink or taskbar tick. On release the painter's record of what it
+ * has drawn (s_shown) is invalidated so the following frame repaints every cell:
+ * the screen holds a picture by then, and a cell-by-cell comparison against
+ * s_shown would find nothing to do and leave the picture up under the desktop.
+ *
+ * Idempotent in both directions, so a caller that claims twice and releases
+ * twice does not corrupt the state. Releasing when nothing was claimed is a
+ * no-op rather than a forced full repaint.
+ */
+void display_pixels_claim(bool on)
+{
+    if (!s_vt || !s_shown)
+        return;
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+
+    if (on == s_pixel_owner)
+    {
+        xSemaphoreGive(s_lock);
+        return;
+    }
+
+    s_pixel_owner = on;
+
+    if (!on)
+    {
+        /* Nothing on the glass matches what the painter believes, so make it
+         * believe nothing: 0xFF is a cell value the grid cannot hold (the same
+         * trick display_init() uses). */
+        memset(s_shown, 0xFF, TD_VT_MAX_ROWS * TD_VT_MAX_COLS * sizeof(*s_shown));
+        s_cur_col = s_cur_row = -1;
+    }
+
+    xSemaphoreGive(s_lock);
+
+    /* Wake the painter either way: on claim it has to notice and stop (a
+     * repaint already in flight would otherwise finish over the picture), and
+     * on release it has a full frame to draw. */
+    xTaskNotifyGive(s_paint_task);
+}
+
+bool display_pixels_claimed(void)
+{
+    return s_pixel_owner;
+}
+
+void display_paint_stats(uint32_t *painted, uint32_t *suppressed, bool *owned)
+{
+    if (painted)
+        *painted = s_paint_frames;
+    if (suppressed)
+        *suppressed = s_paint_suppressed;
+    if (owned)
+        *owned = s_pixel_owner;
 }
 
 /* Unsupported: 8-bit and run-length pictures. Kept as stubs rather than deleted

@@ -92,6 +92,25 @@ void display_write(const uint8_t *buf, int len);
 bool display_picture(void *user, int x, int y, const uint8_t *pixels, int w, int h);
 bool display_picture_rgb(void *user, int x, int y, const uint16_t *pixels, int w, int h);
 
+/*
+ * Claim or release the framebuffer for an app that draws pixels.
+ *
+ * While claimed the desktop's paint task does not paint, so a blitted image
+ * survives cursor blinks and taskbar ticks. On release the painter repaints the
+ * whole screen, because by then the glass holds a picture rather than the cells
+ * it was tracking.
+ *
+ * An app that owns the screen MUST claim before its first blit and release when
+ * it exits or hands the screen back, or the two writers fight: the painter will
+ * repaint cells over the image, which looks like the console bleeding through.
+ */
+void display_pixels_claim(bool on);
+bool display_pixels_claimed(void);
+
+/* Frames the painter drew, frames it skipped while pixels were owned, and the
+ * current ownership. Lets a shell command show that suppression is real. */
+void display_paint_stats(uint32_t *painted, uint32_t *suppressed, bool *owned);
+
 /* Draw a test pattern, for checking the blit path before trusting it.
  *
  * `what` is 0 for colour bars, 1 for a 1-pixel grid, 2 for a corner-and-edge

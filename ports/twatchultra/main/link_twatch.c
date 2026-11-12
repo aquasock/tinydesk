@@ -142,25 +142,77 @@ static int cmd_play(tdsh_session_t *session, int argc, char **argv)
  * not a feature, and because the question it answers ("is the copy right?") has
  * to be answerable before the thing that will really draw is connected.
  */
+/* Print the paint counters and put them on the card.
+ *
+ * The file is not belt-and-braces: once the panel is owned the USB mirror goes
+ * stale, because the desktop's diff stream stops describing what is on the
+ * glass. A diagnostic that only exists in the terminal is unreadable exactly
+ * when it is wanted. */
+static void report_paint(int what)
+{
+    uint32_t painted = 0, suppressed = 0;
+    bool owned = false;
+
+    display_paint_stats(&painted, &suppressed, &owned);
+
+    printf("own=%d painted=%lu skip=%lu\n", owned ? 1 : 0,
+           (unsigned long)painted, (unsigned long)suppressed);
+
+    FILE *f = fopen("/sd/pattern.txt", "w");
+
+    if (f)
+    {
+        fprintf(f, "own=%d painted=%lu skip=%lu what=%d\n", owned ? 1 : 0,
+                (unsigned long)painted, (unsigned long)suppressed, what);
+        fclose(f);
+    }
+}
+
 static int cmd_pattern(tdsh_session_t *session, int argc, char **argv)
 {
     (void)session;
 
+    /* `pattern stats` reads the counters without touching the picture or the
+     * ownership -- the only way to ask "is the painter still suppressed?" after
+     * waiting. */
+    if (argc >= 2 && strcmp(argv[1], "stats") == 0)
+    {
+        report_paint(-1);
+        return 0;
+    }
+
+    /* `pattern off` hands the screen back. It is the other half of the test:
+     * the bars should stay put while the picture is up and the desktop should
+     * come back whole afterwards, and both halves have to be demonstrable. */
+    if (argc >= 2 && (strcmp(argv[1], "off") == 0 || strcmp(argv[1], "release") == 0))
+    {
+        display_pixels_claim(false);
+        report_paint(-2);
+        return 0;
+    }
+
     int what = argc >= 2 ? atoi(argv[1]) : 0;
+
+    /* Claim before drawing, or the painter repaints the cells it still thinks
+     * are on the glass and the console bleeds through the picture in strips. */
+    display_pixels_claim(true);
 
     if (!display_test_pattern(what))
     {
+        display_pixels_claim(false);
         printf("no framebuffer (%d)\n", what);
         return 1;
     }
     printf("pattern %d drawn\n", what);
+    report_paint(what);
+    printf("pattern off to release\n");
     return 0;
 }
 
 static const tdsh_command_t s_pattern_cmd = {
     "pattern",
-    "pattern [0|1|2]",
-    "Draw a test pattern: 0 bars, 1 grid, 2 edge frame",
+    "pattern [0|1|2|off|stats]",
+    "Draw a test pattern (0 bars, 1 grid, 2 frame) or off to release",
     cmd_pattern,
     TDSH_CMD_INTERACTIVE,
 };
