@@ -594,6 +594,67 @@ static void push_band(bool *first, size_t npix)
     (void)spi_device_polling_transmit(s_spi, (spi_transaction_t *)&t);
 }
 
+/* ---- labels on the margins ---------------------------------------------
+ *
+ * The margins are painted with the desktop's own 8x16 font, at its own size,
+ * so a button's label is the same text as everything else on the glass rather
+ * than a second typeface invented for the margins. The font is the one the
+ * terminal uses (font8x16.c, CELL_W by CELL_H), and the labels are centred in
+ * whatever rectangle they are given, which is what keeps them inside a rounded
+ * button without the caller doing arithmetic twice.
+ *
+ * Yellow, because the bars are full-primary green and a green label on green is
+ * not a label. The colour is the brightest thing on the glass after the bars
+ * themselves, which is the right emphasis for something meant to be read at a
+ * glance.
+ */
+#define LABEL_FG 0xFFE0          /* RGB565(31,63,0): yellow */
+
+/* Where a label's glyph box starts, so the per-pixel test below is two
+ * subtractions and a table lookup. The length is kept here rather than measured
+ * per pixel: the test runs for every green pixel of every button, and strlen on
+ * a short string is cheap but not free enough to call 40,000 times at boot. */
+typedef struct
+{
+    const char *text;
+    int x, y;
+    int len;
+} label_pos_t;
+
+static int label_width(const char *s)
+{
+    return (int)strlen(s) * CELL_W;
+}
+
+/* Centre the text in the rectangle, but never let it start before the
+ * rectangle: a label wider than its button would otherwise spill into the
+ * separator, and truncation on the left reads as a blank button. */
+static void label_place(const char *s, int x0, int x1, int y0, int y1, label_pos_t *out)
+{
+    int w = label_width(s), h = CELL_H;
+    int cx = x0 + (x1 - x0 + 1 - w) / 2;
+    int cy = y0 + (y1 - y0 + 1 - h) / 2;
+
+    out->text = s;
+    out->x = cx < x0 ? x0 : cx;
+    out->y = cy < y0 ? y0 : cy;
+    out->len = (int)strlen(s);
+}
+
+/* Is this pixel part of the label? Bit 7 of each glyph row is its leftmost
+ * pixel, which is the same convention paint_cell() uses for the terminal. */
+static bool label_bit(const label_pos_t *p, int x, int y)
+{
+    int dx = x - p->x, dy = y - p->y;
+    int idx = dx / CELL_W;
+    const uint8_t *glyph;
+
+    if (dx < 0 || dy < 0 || dy >= CELL_H || idx >= p->len)
+        return false;
+    glyph = font8x16_glyph((uint8_t)p->text[idx]);
+    return glyph && (glyph[dy] & (0x80 >> (dx % CELL_W))) != 0;
+}
+
 static void paint_buttons(void)
 {
     static const uint16_t COL_GREEN = 0x07E0;
@@ -609,11 +670,23 @@ static void paint_buttons(void)
     const int band = (int)(sizeof(s_tx) / sizeof(s_tx[0])) / width;
     const int arc_ty = BTN_Y0 + BTN_RADIUS;          /* centre, top corners */
     const int arc_by = BTN_Y1 - BTN_RADIUS;          /* centre, bottom corners */
+    label_pos_t label[BTN_N];
     int y = BTN_Y0;
     bool first = true;
 
     if (band < 1)
         return;
+
+    /* One label per bar, centred in its green face -- inside the corner radius
+     * rather than the bar's full rectangle, so a label cannot sit in a notch. */
+    for (int s = 0; s < BTN_N; s++)
+    {
+        int g0 = s == 0 ? BTN_X0 : btn_slot_x(s) + BTN_SEP;
+        int g1 = btn_slot_x(s + 1) - 1;
+
+        label_place(btn_label(s), g0 + BTN_RADIUS, g1 - BTN_RADIUS,
+                    BTN_Y0 + BTN_RADIUS, BTN_Y1 - BTN_RADIUS, &label[s]);
+    }
 
     /* The window is the whole strip; every transfer below continues it, so CS
      * stays low and the panel sees one window rather than one per band. */
@@ -656,6 +729,12 @@ static void paint_buttons(void)
                             (s == BTN_N - 1 &&
                              corner_notch(x, yy, g1 - BTN_RADIUS, arc_by, true, false)))
                             c = 0x0000;
+                        /* The label is drawn last, so a notch always wins: a
+                         * glyph pixel inside the corner radius would break the
+                         * rounded edge, and the label is centred well inside
+                         * it anyway. */
+                        else if (label_bit(&label[s], x, yy))
+                            c = LABEL_FG;
                         break;
                     }
                 }

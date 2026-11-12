@@ -79,6 +79,25 @@
 #define BTN_SEP     2
 #define BTN_RADIUS 10
 
+/* What each button is called on the glass.
+ *
+ * The label names the key the button sends, not the action it performs: "Tab"
+ * and "Enter" are what a finger will read, and "Ctrl+Q" is honest about being
+ * a key rather than pretending to be a Back button that behaves differently
+ * from the key. Kept beside the geometry because a label and a duty that
+ * disagree is the same class of fault as a button and a hit test that
+ * disagree, and it is avoided the same way -- by keeping them together.
+ *
+ * A function rather than an array so that a translation unit which includes
+ * this header for the geometry alone -- touch.c does -- does not carry an
+ * unused table. */
+static inline const char *btn_label(int i)
+{
+    static const char *const labels[BTN_N] = { "Tab", "Enter", "Ctrl+Q" };
+
+    return i >= 0 && i < BTN_N ? labels[i] : "";
+}
+
 /* The top margin, above the framebuffer. Reserved for status icons, not a touch
  * target. */
 #define TOP_Y1   (FB_CY0 - 1)
