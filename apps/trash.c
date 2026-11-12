@@ -774,8 +774,11 @@ static void on_draw(td_window_t *win, int w, int h)
     (void)w;
     (void)h;
     const td_theme_t *t = td_theme();
-    td_text(2, 0, "Name                   From                   Deleted              Size", t->win_fg, t->win_bg,
-            TD_BOLD);
+    /* The full header is 78 columns. A narrow window gets the two that matter:
+     * what it is and how big it is. */
+    td_textn(1, 0, w < 60 ? "Name                    Size"
+                          : "Name                   From                   Deleted              Size",
+             w - 1, t->win_fg, t->win_bg, TD_BOLD);
 }
 
 static void launch(void)
@@ -796,7 +799,7 @@ static void launch(void)
         .title = "Recycle Bin",
         .rect = td_rect(-1, -1, 78, 19),
         .min_w = 54,
-        .min_h = 10,
+        .min_h = 12,   /* the narrow layout needs five rows below the list */
         .flags = TD_WIN_MOVABLE | TD_WIN_CLOSABLE | TD_WIN_RESIZABLE,
         .on_draw = on_draw,
         .on_close = on_close,
@@ -808,15 +811,55 @@ static void launch(void)
         s_rows = NULL;
         return;
     }
-    s_list = td_list(s_win, td_rect(1, 1, -2, -6), list_item, on_activate, NULL);
-    td_scrollbar(s_win, -1, 1, -6, s_list);
-    td_button(s_win, 1, -4, "Restore", on_restore, NULL);
-    td_button(s_win, 13, -4, "Delete", on_delete, NULL);
-    td_button(s_win, 24, -4, "Empty bin", on_empty, NULL);
-    td_button(s_win, 38, -4, "Refresh", on_refresh, NULL);
-    s_size_btn = td_button(s_win, 1, -2, "Size: 1 MB", on_size, NULL);
-    s_keep_btn = td_button(s_win, 18, -2, "Delete after: never", on_keep, NULL);
-    s_status = td_label(s_win, 45, -2, 0, "");
+    /*
+     * FOUR BUTTONS AND A 23-COLUMN PHRASE DO NOT FIT 38 COLUMNS.
+     *
+     * Upstream puts Restore, Delete, Empty bin and Refresh on one row at
+     * columns 1, 13, 24 and 38 -- "Refresh" alone is 11 wide from column 38 --
+     * and "Delete after: never" at column 18, which reaches 40. On a 40-column
+     * panel Refresh was off the glass and the retention phrase was cut.
+     *
+     * A narrow window puts the four buttons on one row without gaps (Restore 11,
+     * Delete 10, Empty bin 13, Refresh 11 = 45, so they wrap to two rows) and the
+     * retention buttons on a row of their own.
+     */
+    {
+        int cw = td_win_client(s_win).w;
+
+        if (cw >= 60)
+        {
+            s_list = td_list(s_win, td_rect(1, 1, -2, -6), list_item, on_activate, NULL);
+            td_scrollbar(s_win, -1, 1, -6, s_list);
+            td_button(s_win, 1, -4, "Restore", on_restore, NULL);
+            td_button(s_win, 13, -4, "Delete", on_delete, NULL);
+            td_button(s_win, 24, -4, "Empty bin", on_empty, NULL);
+            td_button(s_win, 38, -4, "Refresh", on_refresh, NULL);
+            s_size_btn = td_button(s_win, 1, -2, "Size: 1 MB", on_size, NULL);
+            s_keep_btn = td_button(s_win, 18, -2, "Delete after: never", on_keep, NULL);
+            s_status = td_label(s_win, 45, -2, 0, "");
+        }
+        else
+        {
+            /* Five rows below the list: actions, more actions, retention,
+             * more retention, status. Back to back with no gaps. */
+            s_list = td_list(s_win, td_rect(0, 1, -1, -7), list_item, on_activate, NULL);
+            td_scrollbar(s_win, -1, 1, -7, s_list);
+
+            td_button(s_win, 0, -5, "Restore", on_restore, NULL);      /* 0..10 */
+            td_button(s_win, 11, -5, "Delete", on_delete, NULL);       /* 11..20 */
+            td_button(s_win, 21, -5, "Empty bin", on_empty, NULL);     /* 21..33 */
+
+            td_button(s_win, 0, -4, "Refresh", on_refresh, NULL);      /* 0..10 */
+
+            s_size_btn = td_button(s_win, 0, -3, "Size: 1 MB", on_size, NULL);
+
+            /* "Delete after: 1 MB" is 23 columns; on its own row it fits. */
+            s_keep_btn = td_button(s_win, 0, -2, "Delete after: never", on_keep, NULL);
+            /* Its own row: 25 columns beside the retention button leaves 13,
+             * which cut "0 items, 0 B of 1 MB" to "0 items, 0 B o". */
+            s_status = td_label(s_win, 0, -1, cw, "");
+        }
+    }
     td_widget_set_color(s_status, td_theme()->dim, TD_COLOR_DEFAULT);
     td_widget_focus(s_list);
     reload();

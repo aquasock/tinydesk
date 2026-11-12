@@ -239,7 +239,6 @@ static void check_controls(td_window_t *w, const char *app, bool audit)
  * proved, and the list should end up empty. */
 static const char *const s_narrow_todo[] = {
     "Settings",
-    "Recycle Bin",
     "Date & time",
 };
 
