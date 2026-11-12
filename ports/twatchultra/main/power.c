@@ -551,6 +551,35 @@ static bool xl_pin_high(int linear)
  * pin 10, is EXPANDS_SD_DET -- the SD card's insert switch -- so driving it as
  * an output fought a physical switch and told anything that reads it that no
  * card was present. It is left alone now. */
+/* Install the GPIO interrupt service once for every driver that wants one.
+ *
+ * See power.h for why this is idempotent: `gpio_install_isr_service()` reports
+ * "GPIO isr service already installed" through GPIO_CHECK, which logs at ERROR
+ * level, so a second caller puts an E line in the log at every boot for a
+ * condition that is exactly what was wanted. The static flag makes the second
+ * and later calls silent no-ops. */
+bool board_gpio_isr_init(void)
+{
+    static bool s_installed;
+    static bool s_failed;
+
+    if (s_installed)
+        return true;
+    if (s_failed)
+        return false;
+
+    esp_err_t err = gpio_install_isr_service(0);
+    if (err == ESP_OK || err == ESP_ERR_INVALID_STATE)
+    {
+        s_installed = true;
+        return true;
+    }
+
+    ESP_LOGE(TAG, "isr service: %s", esp_err_to_name(err));
+    s_failed = true;
+    return false;
+}
+
 bool board_touch_reset_release(void)
 {
     bool ok = xl_pin_set(TOUCH_RST_LINEAR_A, false);

@@ -70,6 +70,17 @@ bool board_haptic_power_on(void);
  * an SoC GPIO. Must run before touch_init() talks to 0x1A. */
 bool board_touch_reset_release(void);
 
+/* Install the GPIO interrupt service, once, for every driver that wants one.
+ *
+ * IDEMPOTENT, AND THAT IS THE POINT. `gpio_install_isr_service()` logs at ERROR
+ * level when the service is already installed -- GPIO_CHECK reports "GPIO isr
+ * service already installed" and returns ESP_ERR_INVALID_STATE. With the touch
+ * panel and the BOOT pusher both wanting an interrupt, the second caller was
+ * putting an E line in the log at every boot, which looks like a fault and is
+ * not. One guarded installer removes both the error and the ordering question:
+ * any driver may call this and only the first call does anything. */
+bool board_gpio_isr_init(void);
+
 /* The battery, for System Monitor, from the AXP2101's fuel gauge.
  *
  * Overrides the weak board_battery_read() in the shared ESP-IDF app. Returns

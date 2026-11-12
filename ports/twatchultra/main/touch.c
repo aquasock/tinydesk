@@ -778,14 +778,8 @@ bool touch_init(touch_input_fn input)
         };
 
         esp_err_t err = gpio_config(&io);
-        if (err == ESP_OK)
-        {
-            err = gpio_install_isr_service(0);
-            /* Another component may already own the service; joining it is
-             * exactly what this needs, so that is not a failure. */
-            if (err == ESP_ERR_INVALID_STATE)
-                err = ESP_OK;
-        }
+        if (err == ESP_OK && !board_gpio_isr_init())
+            err = ESP_FAIL;
         if (err == ESP_OK)
             err = gpio_isr_handler_add((gpio_num_t)s_int_pin, touch_isr, NULL);
 

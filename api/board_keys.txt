@@ -15,6 +15,7 @@ lcd.font
 lcd.mirror
 lcd.pclk_mhz
 lcd.rotation
+pusher.pin
 rs485.N.de
 rs485.N.rx
 rs485.N.tx

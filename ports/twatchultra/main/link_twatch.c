@@ -31,6 +31,7 @@
 #include "power.h"
 #include "rtc.h"
 #include "touch.h"
+#include "pusher.h"
 #include "haptic.h"
 #include "sound.h"
 #include "hal_mux.h"
@@ -189,6 +190,12 @@ bool link_init(void)
     {
         ESP_LOGI(TAG, "haptics on");
     }
+
+    /* The BOOT pusher, last because it is the only input that can inject a key
+     * without the desktop asking. It is not fatal when it fails, and
+     * `pusher.pin = -1` turns it off deliberately. */
+    pusher_init(inject);
+
     snprintf(s_platform, sizeof(s_platform),
              "ESP32-S3 T-Watch Ultra (%dx%d cells%s)",
              display_cols(), display_rows(), s_touch ? ", touch" : "");
