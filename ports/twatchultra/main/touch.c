@@ -95,6 +95,16 @@
  * because the controller never sends a release event of its own. */
 #define RELEASE_MS      250
 
+/* First panel row that is below the framebuffer, and so not the desktop.
+ *
+ * display.c paints the three bars from glass row 461 (FB_Y + DISPLAY_H), but
+ * the part reads a few pixels high near the bottom of the glass: TCH-004
+ * measured 2 and 3 px on a bar painted from 445. So the guard sits three rows
+ * above the paint rather than on it, which costs the taskbar its bottom three
+ * rows -- descender space, almost always blank -- and buys the property that a
+ * press anywhere on a bar is never read as a press on the taskbar. */
+#define STRIP_Y0        (DISPLAY_ORIGIN_Y + DISPLAY_H - 3)	/* 458 */
+
 static i2c_master_bus_handle_t s_bus;
 static i2c_master_dev_handle_t s_dev;
 static touch_input_fn s_input;
@@ -264,11 +274,12 @@ static void emit(bool press, int col, int row)
  * where the finger is and the right-hand fifth of the screen is unreachable --
  * the mapping was scaling the whole glass onto the desktop's grid.
  *
- * A touch below the framebuffer -- the three bars on the glass under the
- * display -- clamps to the bottom row, which is the taskbar. That is where
- * those bars belong: they are the Start button, the middle of the bar and the
- * clock, and at 40 columns their centres come out at columns 0, 14 and 31 of
- * the taskbar without any special case. */
+ * The clamp to the last row and column is a safety net and nothing more. A
+ * touch below the framebuffer used to rely on it, which was wrong: the three
+ * bars on the glass under the display are not taskbar cells, and mapping them
+ * as if they were put panel x 22..100 on the Start button and panel x 221..431
+ * on the clock's Date and time shortcut. They are filtered out before this is
+ * called, at STRIP_Y0. */
 static void to_cell(int x, int y, int *col, int *row)
 {
     int cw = DISPLAY_W / display_cols();
@@ -286,6 +297,24 @@ static void to_cell(int x, int y, int *col, int *row)
         *col = display_cols() - 1;
     if (*row >= display_rows())
         *row = display_rows() - 1;
+}
+
+/* Emit a release if a press has stopped reporting.
+ *
+ * This part has no release event: a lifted finger simply stops being reported,
+ * so a held press that goes quiet is a release. Called both when a block is
+ * not a press and when a press arrives outside the desktop, so that the count
+ * keeps running in either case. */
+static void release_if_idle(void)
+{
+    int col, row;
+
+    if (!s_down || ++s_idle_ms < (RELEASE_MS / POLL_MS))
+        return;
+    to_cell(s_last_x, s_last_y, &col, &row);
+    emit(false, col, row);
+    s_down = false;
+    s_idle_ms = 0;
 }
 
 static void poll_task(void *arg)
@@ -350,27 +379,33 @@ static void poll_task(void *arg)
 
         if (!press)
         {
-            /* This part has no release event: a lifted finger simply stops
-             * being reported, so a held press that goes quiet is a release. */
-            if (s_down && ++s_idle_ms >= (RELEASE_MS / POLL_MS))
-            {
-                int col, row;
-
-                to_cell(s_last_x, s_last_y, &col, &row);
-                emit(false, col, row);
-                s_down = false;
-                s_idle_ms = 0;
-            }
+            release_if_idle();
             continue;
         }
-
-        s_idle_ms = 0;
-        s_reports++;
 
         {
             int x = (b[1] << 4) | (b[3] >> 4);
             int y = (b[2] << 4) | (b[3] & 0x0F);
             int col, row;
+
+            /* Counted before the strip is filtered: this is the count of
+             * presses the controller reported, and the strip is one of the
+             * things worth knowing about when its buttons are wired up. */
+            s_reports++;
+
+            /* The strip below the framebuffer is the board's three capacitive
+             * buttons, and they have no duties yet, so a press there is a dead
+             * zone. It still runs the release path: a finger that slides down
+             * off the framebuffer has left the desktop, and the drag it was
+             * carrying should end at its last on-screen cell rather than stay
+             * latched for ever. */
+            if (y >= STRIP_Y0)
+            {
+                release_if_idle();
+                continue;
+            }
+
+            s_idle_ms = 0;
 
             to_cell(x, y, &col, &row);
             s_last_x = x;
