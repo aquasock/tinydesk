@@ -477,6 +477,21 @@ if(TD_BUILD_TESTS)
     target_include_directories(test_task_snapshot PRIVATE tests)
     target_link_libraries(test_task_snapshot PRIVATE tinydesk_core)
     add_test(NAME test_task_snapshot COMMAND test_task_snapshot)
+    add_executable(test_wav tests/test_wav.c)
+    target_include_directories(test_wav PRIVATE tests)
+    target_link_libraries(test_wav PRIVATE tinydesk_core)
+    set_target_properties(test_wav PROPERTIES C_STANDARD 11)
+    target_compile_options(test_wav PRIVATE ${TD_WARNINGS})
+    add_test(NAME test_wav COMMAND test_wav)
+    # These two tests #include the port's .c file, so CMake does not otherwise
+    # know that editing it should rebuild them -- ninja reports "no work to do"
+    # and the test runs against the previous compile. That is the difference
+    # between a test that checks the code and one that checks a memory of it,
+    # and it was found by a negative control that silently did nothing.
+    set_property(SOURCE tests/test_wav.c APPEND PROPERTY OBJECT_DEPENDS
+                 ${CMAKE_CURRENT_SOURCE_DIR}/ports/twatchultra/main/wav.c)
+    set_property(SOURCE tests/test_ts_convert.c APPEND PROPERTY OBJECT_DEPENDS
+                 ${CMAKE_CURRENT_SOURCE_DIR}/ports/twatchultra/main/ts_convert.c)
     add_executable(test_ts_convert tests/test_ts_convert.c)
     target_include_directories(test_ts_convert PRIVATE tests)
     target_link_libraries(test_ts_convert PRIVATE tinydesk_core)

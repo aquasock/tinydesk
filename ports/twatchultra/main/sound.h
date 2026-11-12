@@ -41,4 +41,29 @@ void sound_bell(void *user);
  * emulator receives a BEL. */
 void board_bell(void);
 
+/*
+ * Play a 16-bit PCM WAV file from the filesystem.
+ *
+ * `path` is a real path in the ESP-IDF VFS, so the SD card is "/sd/..." and the
+ * shell's own littlefs is "/...". The file is STREAMED, not loaded: a WAV of a
+ * few minutes is tens of megabytes and this board has 8 MiB of PSRAM shared with
+ * everything else, so the only workable shape is read-a-chunk, write-a-chunk.
+ *
+ * The I2S rate and slot count are reconfigured from the file's own header and
+ * restored afterwards, so a 44.1 kHz stereo file plays at 44.1 kHz and a later
+ * beep still comes out at 16 kHz.
+ *
+ * Returns false when the file cannot be opened, the header is not a WAV this
+ * player decodes, or the channel is missing. It runs on the caller's task, so
+ * an app that calls it must not be the one drawing the screen: the desktop's
+ * UI task would stop repainting for the length of the track.
+ */
+bool sound_play_wav(const char *path);
+
+/* Stop whatever sound_play_wav() is playing, from another task. */
+void sound_stop(void);
+
+/* True while a file is playing. */
+bool sound_is_playing(void);
+
 #endif

@@ -41,6 +41,18 @@
 
 #include "sound.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include <errno.h>
+
+#include "wav.h"
+
 #include <string.h>
 
 #include "driver/i2s_std.h"
@@ -212,6 +224,276 @@ void sound_beep(void)
      * attempts ended up. Short, for the Log Viewer's 40 columns. */
     ESP_LOGI(TAG, "beep %u/%u %s", (unsigned)written, (unsigned)want,
              err == ESP_OK ? "ok" : esp_err_to_name(err));
+}
+
+/* ------------------------------------------------------------ wav playback */
+
+/*
+ * Streaming playback, so a tens-of-megabytes file costs a few kilobytes of RAM.
+ *
+ * The size of the read is chosen against the DMA's own depth: four buffers of
+ * 1024 frames is 4096 frames, which at 44.1 kHz is 93 ms of audio already
+ * queued. A 4 KiB read at the 172 KiB/s the stream needs is under 25 ms of
+ * file I/O, so the queue has roughly a 4x margin and a single slow read cannot
+ * empty it. That margin is the whole design; without it a hiccup on a shared
+ * SPI bus becomes an audible gap.
+ */
+#define WAV_CHUNK       4096
+#define WAV_STACK       4096
+#define WAV_TASK_PRIO   4
+
+static char s_path[192];            /* the caller's string does not outlive the call */
+static volatile bool s_playing;
+static volatile bool s_stop;
+static TaskHandle_t s_player;
+
+/* The rate and slot count to restore after a file, so the beep stays a beep. */
+static uint32_t s_home_rate = SOUND_RATE_HZ;
+
+bool sound_is_playing(void)
+{
+    return s_playing;
+}
+
+void sound_stop(void)
+{
+    s_stop = true;
+}
+
+static bool set_std(uint32_t rate, bool stereo)
+{
+    i2s_std_clk_config_t clk = I2S_STD_CLK_DEFAULT_CONFIG(rate);
+    i2s_std_slot_config_t slot = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+                                                                   stereo ? I2S_SLOT_MODE_STEREO
+                                                                          : I2S_SLOT_MODE_MONO);
+
+    if (!s_tx)
+        return false;
+
+    /* The channel must be stopped before either is changed, or the change is
+     * ignored -- the API says so and a silent no-op here would play the whole
+     * file at the wrong rate. */
+    if (i2s_channel_disable(s_tx) != ESP_OK)
+        return false;
+    if (i2s_channel_reconfig_std_clock(s_tx, &clk) != ESP_OK)
+        return false;
+    if (i2s_channel_reconfig_std_slot(s_tx, &slot) != ESP_OK)
+        return false;
+    return i2s_channel_enable(s_tx) == ESP_OK;
+}
+
+/* Write one buffer, retrying on timeout rather than dropping it: a dropped
+ * buffer is a click, and this is the inner loop of the whole feature. */
+static bool write_all(const uint8_t *p, size_t n)
+{
+    while (n > 0)
+    {
+        size_t wrote = 0;
+        esp_err_t err = i2s_channel_write(s_tx, p, n, &wrote, pdMS_TO_TICKS(1000));
+
+        if (err != ESP_OK && err != ESP_ERR_TIMEOUT)
+            return false;
+        if (wrote == 0)
+        {
+            if (s_stop)
+                return false;
+            continue;                       /* timed out with nothing taken */
+        }
+        p += wrote;
+        n -= wrote;
+    }
+    return true;
+}
+
+static void play_task(void *arg)
+{
+    const char *path = (const char *)arg;   /* s_path, copied by the caller */
+    FILE *f = NULL;
+    uint8_t *hdr = NULL;
+    uint8_t *buf = NULL;
+    int16_t *dup = NULL;
+    wav_info_t info;
+    size_t got;
+    uint32_t left;
+    uint32_t rate_before = s_home_rate;
+    bool mono = false;
+    bool reconfigured = false;
+
+    f = fopen(path, "rb");
+    if (!f)
+    {
+        /* WHY it failed, not just that it did. "no file" cost a cycle of
+         * guessing at paths: a wrong path and an unreadable one and a
+         * filesystem that is not mounted all look identical without errno, and
+         * this watch gives no shell for finding out by hand. The errno name is
+         * short enough for the 40-column ring. */
+        ESP_LOGE(TAG, "open: %s", strerror(errno));
+        goto done;
+    }
+
+    /* A header is small, but chunks can push `data` a long way in and a file
+     * carrying cover art can carry it megabytes in. 64 KiB covers anything
+     * sane; past that the search gives up with an explanation rather than
+     * reading a whole file looking for it. */
+    hdr = malloc(65536);
+    buf = malloc(WAV_CHUNK);
+    if (!hdr || !buf)
+    {
+        ESP_LOGE(TAG, "no ram");
+        goto done;
+    }
+
+    got = fread(hdr, 1, 65536, f);
+    {
+        wav_status_t st = wav_parse(hdr, got, &info);
+
+        if (st != WAV_OK)
+        {
+            ESP_LOGE(TAG, "wav: %s", wav_status_str(st));
+            goto done;
+        }
+    }
+
+    if (info.format != 1 || info.bits != 16 || info.channels < 1 || info.channels > 2 ||
+        info.rate < 8000 || info.rate > 96000)
+    {
+        /* Short, because these are the numbers that say why. */
+        ESP_LOGE(TAG, "fmt%d %db %dch %lu", info.format, info.bits, info.channels,
+                 (unsigned long)info.rate);
+        goto done;
+    }
+
+    mono = info.channels == 1;
+
+    /* How much is really there: a file whose header was written before its data
+     * can claim more than the filesystem holds, and reading past the end would
+     * play whatever the allocator had. */
+    if (fseek(f, 0, SEEK_END) == 0)
+    {
+        long real = ftell(f);
+        long avail = real > 0 ? (long)(real - (long)info.data_offset) : 0;
+
+        if (avail <= 0)
+        {
+            ESP_LOGE(TAG, "no data");
+            goto done;
+        }
+        if ((uint32_t)avail < info.data_bytes)
+            info.data_bytes = (uint32_t)avail;
+    }
+    if (fseek(f, (long)info.data_offset, SEEK_SET) != 0)
+    {
+        ESP_LOGE(TAG, "seek failed");
+        goto done;
+    }
+
+    if (!set_std(info.rate, !mono))
+    {
+        ESP_LOGE(TAG, "i2s reconfig");
+        goto done;
+    }
+    reconfigured = true;
+
+    s_playing = true;
+    left = info.data_bytes;
+
+    /* One short line, then silence: a per-chunk log would bury the ring, which
+     * is the mistake this port has already recorded twice. */
+    ESP_LOGI(TAG, "play %luHz %s %lus", (unsigned long)info.rate, mono ? "mono" : "st",
+             (unsigned long)(info.data_bytes / (info.rate * (mono ? 2 : 4))));
+
+    while (left > 0 && !s_stop)
+    {
+        size_t want = left < WAV_CHUNK ? left : WAV_CHUNK;
+        size_t n = fread(buf, 1, want, f);
+
+        if (n == 0)
+            break;
+        left -= (uint32_t)n;
+
+        if (mono)
+        {
+            /* Duplicate into both slots. The amplifier averages (L+R)/2 in its
+             * default SD mode, so a mono file sent to one slot plays at half
+             * amplitude -- the same trap sound_init() records for the beep. */
+            size_t frames = n / 2, i;
+
+            /* Allocated with the read buffer: a static array here would be 8 KiB
+             * of permanent internal RAM for a path most files never take. */
+            if (!dup)
+            {
+                dup = malloc(WAV_CHUNK * 2);
+                if (!dup)
+                {
+                    ESP_LOGE(TAG, "no ram");
+                    break;
+                }
+            }
+            for (i = 0; i < frames && i < WAV_CHUNK / 2; i++)
+            {
+                int16_t v = (int16_t)((uint16_t)buf[2 * i] | ((uint16_t)buf[2 * i + 1] << 8));
+
+                dup[2 * i] = v;
+                dup[2 * i + 1] = v;
+            }
+            if (!write_all((const uint8_t *)dup, frames * 4))
+                break;
+        }
+        else if (!write_all(buf, n))
+            break;
+    }
+
+    ESP_LOGI(TAG, "stop");
+
+done:
+    if (reconfigured)
+        set_std(rate_before, true);      /* the beep's own configuration */
+    s_playing = false;
+    s_stop = false;
+    free(hdr);
+    free(buf);
+    free(dup);
+    if (f)
+        fclose(f);
+    s_player = NULL;
+    vTaskDelete(NULL);
+}
+
+bool sound_play_wav(const char *path)
+{
+    if (!path || !path[0])
+        return false;
+    if (!s_tx)
+    {
+        ESP_LOGW(TAG, "no channel");
+        return false;
+    }
+    if (s_playing)
+    {
+        ESP_LOGW(TAG, "already playing");
+        return false;
+    }
+
+    /* COPY THE PATH BEFORE STARTING THE TASK. A caller's string is very often a
+     * stack buffer -- a command handler's argv, an app's local -- and it is gone
+     * by the time this task runs, so handing the pointer over would read freed
+     * stack and open whatever path happened to be there. */
+    if (strlen(path) >= sizeof(s_path))
+    {
+        ESP_LOGE(TAG, "path too long");
+        return false;
+    }
+    snprintf(s_path, sizeof(s_path), "%s", path);
+
+    s_stop = false;
+    if (xTaskCreatePinnedToCore(play_task, "tdwav", WAV_STACK, (void *)s_path, WAV_TASK_PRIO,
+                                &s_player, 0) != pdPASS)
+    {
+        ESP_LOGE(TAG, "no task");
+        s_player = NULL;
+        return false;
+    }
+    return true;
 }
 
 /* The terminal's BEL. The user pointer exists because the vterm's callbacks all

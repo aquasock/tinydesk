@@ -45,6 +45,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "tdsh_board.h"
+#include "tdsh.h"
 
 #define RX_BUFFER        8192
 #define TX_BUFFER        1024
@@ -96,6 +97,49 @@ static int take_injected(uint8_t *buf, int cap)
 }
 
 /* ---- link --------------------------------------------------------------- */
+
+/* ------------------------------------------------------------- play command */
+
+/*
+ * `play <path> [stop]` -- because a watch with a speaker and no way to hand it a
+ * file is not a testable speaker. Short on output: the Log Viewer is 40 columns
+ * and the player itself logs the interesting line.
+ */
+static int cmd_play(tdsh_session_t *session, int argc, char **argv)
+{
+    (void)session;
+
+    if (argc >= 2 && strcmp(argv[1], "stop") == 0)
+    {
+        sound_stop();
+        return 0;
+    }
+    if (argc < 2)
+    {
+        printf("usage: play <file.wav> | play stop\n");
+        return 2;
+    }
+    if (sound_is_playing())
+    {
+        printf("already playing\n");
+        return 1;
+    }
+    if (!sound_play_wav(argv[1]))
+    {
+        printf("cannot play %s\n", argv[1]);
+        return 1;
+    }
+    printf("playing\n");
+    return 0;
+}
+
+static const tdsh_command_t s_play_cmd = {
+    "play",
+    "play <file.wav> | play stop",
+    "Play a 16-bit PCM WAV through the speaker",
+    cmd_play,
+    TDSH_CMD_INTERACTIVE,
+};
 
 bool link_init(void)
 {
@@ -212,6 +256,11 @@ bool link_init(void)
 
     /* What the PMU is currently configured to do about charging. Read only:
      * see charge.c for why the first move on a battery is measurement. */
+    /* The play command, registered here because link_init() runs after
+     * tdsh_espidf_init() and this port has no earlier hook of its own. */
+    if (tdsh_register_command(&s_play_cmd) != 0)
+        ESP_LOGW(TAG, "play command did not register");
+
     charge_report(NULL);
 
     /* The battery's NTC input, if one is fitted. Read and logged only: this
