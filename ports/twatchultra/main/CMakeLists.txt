@@ -5,12 +5,12 @@
 include("${CMAKE_CURRENT_LIST_DIR}/../../esp_idf/app/app.cmake")
 
 idf_component_register(
-    SRCS "link_twatch.c" "display.c" "touch.c" "power.c" "rtc.c" "haptic.c" "font8x16.c" ${TD_ESP_APP_SRCS}
+    SRCS "link_twatch.c" "display.c" "touch.c" "power.c" "rtc.c" "haptic.c" "sound.c" "font8x16.c" ${TD_ESP_APP_SRCS}
     EMBED_TXTFILES "${TD_BOARD_BUILTIN_CONF}"
     INCLUDE_DIRS "." "${TD_ESP_APP_DIR}"
     LDFRAGMENTS "extram.lf"
     REQUIRES ${TD_ESP_APP_REQUIRES} esp_driver_spi esp_driver_i2c esp_driver_gpio
-             esp_driver_usb_serial_jtag
+             esp_driver_i2s esp_driver_usb_serial_jtag
 )
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Wextra -Werror)
 

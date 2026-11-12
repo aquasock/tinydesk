@@ -32,6 +32,7 @@
 #include "rtc.h"
 #include "touch.h"
 #include "haptic.h"
+#include "sound.h"
 #include "hal_mux.h"
 #include "tinydesk/td_picture.h"
 #include "tinydesk/td_wm.h"
@@ -149,6 +150,19 @@ bool link_init(void)
      * drives it, so release it before the driver tries to talk. */
     board_touch_reset_release();
     s_touch = touch_init(inject);
+
+    /* The speaker, and the terminal's BEL routed to it. A board with no
+     * amplifier answers nothing and the desktop is unaffected, so a failure
+     * here is logged and not fatal -- the same shape as the haptics below. */
+    if (sound_init())
+    {
+        display_set_bell(sound_bell, NULL);
+        ESP_LOGI(TAG, "sound on");
+    }
+    else
+    {
+        ESP_LOGE(TAG, "no speaker");
+    }
 
     /* Haptics last, and after its own rail switch. P06 gates the DRV2605's
      * supply and the chip answers I2C without it, so probing before raising

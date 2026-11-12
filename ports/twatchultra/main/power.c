@@ -70,12 +70,15 @@
 #define PMU_ADDR            0x34
 #define PMU_ALDO1_VOLT      0x92
 #define PMU_ALDO2_VOLT      0x93
+#define PMU_BLDO2_VOLT      0x97
 #define PMU_LDO_EN          0x90
 #define PMU_ALDO1_EN_BIT    0
 #define PMU_ALDO2_EN_BIT    1
+#define PMU_BLDO2_EN_BIT    5
 /* 3.3 V: (3300 - 500) / 100 = 28 */
 #define PMU_ALDO1_3300MV    28
 #define PMU_ALDO2_3300MV    28
+#define PMU_BLDO2_3300MV    28
 
 static i2c_master_dev_handle_t s_pmu;
 
@@ -221,6 +224,50 @@ bool board_sd_rail_on(void)
     }
 
     ESP_LOGI(TAG, "PMU aldo1_v=%02x ldo_en=%02x", v, en);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    return true;
+}
+
+/* Raise BLDO2 to 3.3 V and enable it: the MAX98357A speaker amplifier's supply.
+ *
+ * BRD-003 assigns BLDO2 to the speaker, and LilyGo's PMU bring-up sets it to
+ * 3300 mV and enables it beside the display's ALDO2 and the card's ALDO1.
+ *
+ * The amplifier is a class-D I2S DAC: with its rail down it accepts every I2S
+ * clock and produces silence, which is the same silent-stub shape as the
+ * haptic chip with P06 low and the SD card with ALDO1 low. That is why this is
+ * called before the I2S channel is created rather than after.
+ *
+ * Returns false only if the PMU does not answer; a rail that is already up is a
+ * success. */
+bool board_speaker_rail_on(void)
+{
+    uint8_t v, en;
+
+    if (!pmu_r(PMU_BLDO2_VOLT, &v) || !pmu_r(PMU_LDO_EN, &en))
+    {
+        ESP_LOGE(TAG, "PMU did not answer");
+        return false;
+    }
+
+    if ((v & 0x1F) != PMU_BLDO2_3300MV)
+    {
+        if (!pmu_w(PMU_BLDO2_VOLT, (uint8_t)((v & 0xE0) | PMU_BLDO2_3300MV)))
+        {
+            ESP_LOGE(TAG, "could not set BLDO2 voltage");
+            return false;
+        }
+    }
+    if (!(en & (1u << PMU_BLDO2_EN_BIT)))
+    {
+        if (!pmu_w(PMU_LDO_EN, (uint8_t)(en | (1u << PMU_BLDO2_EN_BIT))))
+        {
+            ESP_LOGE(TAG, "could not enable BLDO2");
+            return false;
+        }
+    }
+
+    ESP_LOGI(TAG, "PMU bldo2_v=%02x ldo_en=%02x", v, en);
     vTaskDelay(pdMS_TO_TICKS(20));
     return true;
 }

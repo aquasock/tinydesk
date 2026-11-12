@@ -75,6 +75,13 @@ typedef void (*display_reply_fn)(const char *data, int len);
 /* Panel, terminal and painting task; false on error. */
 bool display_init(display_reply_fn reply);
 
+/* What to call when the terminal receives a BEL.
+ *
+ * The renderer owns the vterm, so it is the only thing that can install this;
+ * the port decides what a beep means. After display_init(), because the vterm
+ * is initialised there and an earlier call would be overwritten. */
+void display_set_bell(void (*fn)(void *user), void *user);
+
 /* Feed terminal output. Bytes are parsed into the td_vterm and the painter is
  * woken; nothing is drawn on this call. */
 void display_write(const uint8_t *buf, int len);

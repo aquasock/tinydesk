@@ -70,6 +70,20 @@ typedef struct
     void *dcs_user;
     bool sixel;
     int cell_w, cell_h;
+
+    /* Optional: a BEL character in ordinary text calls bell(bell_user).
+     *
+     * BEL is the one way a terminal program asks for attention, and it is the
+     * only sound hook a terminal needs: a program that wants a beep emits 0x07
+     * and every terminal since the ASR-33 has rung for it. Nothing here decides
+     * what that means -- a port with no speaker ignores it, as this renderer
+     * did before -- but it means an app needs no new API to ask for one.
+     *
+     * Not called for a BEL that is part of a sequence: OSC strings are
+     * terminated by BEL (ESC ] 0 ; title BEL), so a terminal that beeped on
+     * every 0x07 would buzz every time an app set its window title. */
+    void (*bell)(void *user);
+    void *bell_user;
 } td_vterm_t;
 
 /* Reset to a blank screen of the given size (clamped to the maximum). */

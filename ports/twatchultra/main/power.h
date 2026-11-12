@@ -50,6 +50,13 @@ bool board_display_rail_on(void);
  * silent shape as the haptic rail, which answers I2C with its supply off. */
 bool board_sd_rail_on(void);
 
+/* Raise the AXP2101's BLDO2 to 3.3 V and enable it: the speaker amp's supply.
+ *
+ * MUST RUN BEFORE THE I2S CHANNEL IS CREATED. With the rail down the MAX98357A
+ * clocks in every sample and outputs silence, so the failure reads as a broken
+ * I2S configuration rather than as an unpowered amplifier. */
+bool board_speaker_rail_on(void);
+
 /* Power the DRV2605 haptic amplifier by raising XL9555 P06.
  *
  * MUST RUN BEFORE THE HAPTIC DRIVER IS PROBED. The chip answers I2C with its

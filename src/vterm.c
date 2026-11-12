@@ -222,8 +222,15 @@ static void control_char(td_vterm_t *vt, uint8_t b)
     case '\t':
         vt->cx = clamp((vt->cx / 8 + 1) * 8, 0, vt->cols - 1);
         break;
+    case 0x07:
+         /* BEL. Reached only in the ground state: the OSC handler consumes a
+         * BEL of its own as the string terminator, so a program setting its
+         * window title does not ring. Nothing is drawn. */
+        if (vt->bell)
+            vt->bell(vt->bell_user);
+        break;
     default:
-        break;   /* BEL and others: ignore */
+        break;   /* other control characters: ignore */
     }
 }
 

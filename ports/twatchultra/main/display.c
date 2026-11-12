@@ -126,6 +126,10 @@
 static spi_device_handle_t s_spi;
 static SemaphoreHandle_t s_lock;
 static td_vterm_t *s_vt;
+/* Set before display_init() and installed after it, since init clears the
+ * struct. A BEL with nothing registered stays silent. */
+static void (*s_bell)(void *user);
+static void *s_bell_user;
 static td_vcell_t *s_shown;
 static uint16_t *s_fb;
 static int s_cols, s_rows;
@@ -1262,6 +1266,17 @@ static void vt_reply(void *user, const char *data, int len)
 int display_cols(void) { return s_cols; }
 int display_rows(void) { return s_rows; }
 
+void display_set_bell(void (*fn)(void *user), void *user)
+{
+    s_bell = fn;
+    s_bell_user = user;
+    if (s_vt)
+    {
+        s_vt->bell = fn;
+        s_vt->bell_user = user;
+    }
+}
+
 bool display_init(display_reply_fn reply)
 {
     spi_bus_config_t bus = {
@@ -1357,6 +1372,8 @@ bool display_init(display_reply_fn reply)
      * have to reach the desktop as input. */
     s_vt->reply = vt_reply;
     s_vt->reply_user = NULL;
+    s_vt->bell = s_bell;
+    s_vt->bell_user = s_bell_user;
     s_vt->cell_w = CELL_W;
     s_vt->cell_h = CELL_H;
 
