@@ -242,14 +242,24 @@ typedef struct
     int percent;                 /* 0..100, or -1 while unknown */
     int millivolts;              /* 0 while unknown */
     int state;                   /* TD_BATT_* */
-    int ntc_millivolts;          /* the cell's thermistor, 0 when the board has
-                                  * none. MILLIVOLTS AND NOT DEGREES: turning
-                                  * it into a temperature needs the NTC's
-                                  * nominal resistance and beta plus the
-                                  * charger's excitation current, and a board
-                                  * that does not know those must not print a
-                                  * plausible-looking number (PMU-006). */
+    int ntc_millivolts;          /* the cell's thermistor raw voltage, 0 when
+                                  * the board has none. Always the honest
+                                  * figure: a board that does not know the
+                                  * thermistor's part or the excitation current
+                                  * can report this and nothing more, and must
+                                  * not invent a temperature from it. */
+    int ntc_tenths_c;            /* the same reading as a temperature, in
+                                  * tenths of a degree, or TD_NTC_* below. Only
+                                  * for a board that knows its thermistor: the
+                                  * two must agree, since this is the voltage
+                                  * converted rather than measured twice. */
 } td_battery_t;
+
+ /* Values for ntc_tenths_c that are not temperatures. */
+#define TD_NTC_NONE      (-1000)  /* no reading: no thermistor, or a fault */
+#define TD_NTC_NOT_TEMP  (-1001)  /* a voltage, but the pin is not in battery-
+                                   * thermistor mode, so it is not the cell's
+                                   * temperature */
 
     /* ------------------------------------------------------------ Bluetooth */
 

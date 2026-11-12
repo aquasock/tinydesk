@@ -84,4 +84,19 @@ bool charge_ts_report(int *ts_mv, uint8_t *ctrl);
  */
 int charge_ts_mv(void);
 
+/*
+ * The cell's thermistor in tenths of a degree Celsius, or a sentinel when it
+ * cannot be known. -1000 means "no reading", -1001 means "a reading, but the
+ * pin is not in battery-thermistor mode".
+ *
+ * THIS IS A REAL CONVERSION, not a fitted curve. PMU-007 records the source:
+ * the AXP2101 datasheet's Table 6-3, which tabulates the TH11-3H103F reference
+ * thermistor from -20 to 60 C as resistance, detected voltage and ADC code at
+ * 50 uA. The current source is READ from reg50H[1:0] rather than assumed,
+ * because this board reports 60 uA where the table assumes 50 -- and because a
+ * conversion that assumes the wrong current is wrong by four to five degrees
+ * while looking perfectly plausible.
+ */
+int charge_ts_tenths_c(void);
+
 #endif

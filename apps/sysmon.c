@@ -87,13 +87,25 @@ static void update(void)
             default: break;
             }
             /* The cell's thermistor rides on the battery line because it is the
-             * same subject and a 26-row screen cannot spare a row for eight
-             * characters. `ntc511` is seven columns; the whole line is 32 of
-             * the 38 the window shows at 40x26. MILLIVOLTS, NOT DEGREES -- see
-             * td_battery_t and PMU-006. */
-            char ntc[16] = "";
+             * same subject and a 26-row screen cannot spare a row for ten
+             * characters. A temperature when the board knows its thermistor,
+             * otherwise the raw voltage -- `ntc29.3` and `ntc497` are both nine
+             * columns, so the line is 33 of the 38 the window shows at 40x26
+             * either way.
+             *
+             * The voltage is the fallback rather than the display of choice: a
+             * board without the part data can report it honestly, and a board
+             * with the data should not make the user convert it by hand. */
+            char ntc[20] = "";
 
-            if (b[0].ntc_millivolts > 0)
+            if (b[0].ntc_tenths_c >= -400 && b[0].ntc_tenths_c <= 1250)
+            {
+                int t = b[0].ntc_tenths_c;
+                int a = t < 0 ? -t : t;
+
+                snprintf(ntc, sizeof(ntc), " ntc%s%d.%d", t < 0 ? "-" : "", a / 10, a % 10);
+            }
+            else if (b[0].ntc_millivolts > 0)
                 snprintf(ntc, sizeof(ntc), " ntc%d", b[0].ntc_millivolts);
 
             if (b[0].millivolts > 0)

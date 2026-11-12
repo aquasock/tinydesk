@@ -479,6 +479,10 @@ int board_battery_read(td_battery_t *out, int max)
         int ts = charge_ts_mv();
 
         out->ntc_millivolts = ts > 0 ? ts : 0;
+        /* The same reading converted, not measured again: one bus transaction
+         * pair, two views of it. A board that has the part data reports both
+         * and they cannot disagree. */
+        out->ntc_tenths_c = charge_ts_tenths_c();
     }
     return 1;
 }

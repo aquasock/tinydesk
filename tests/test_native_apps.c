@@ -558,6 +558,7 @@ static void login_resize(void)
  * the widest case the field can produce.
  */
 static int s_ntc_mv;
+static int s_ntc_tenths;
 static int batt_read(td_battery_t *out, int max)
 {
     if (!out || max < 1)
@@ -568,6 +569,7 @@ static int batt_read(td_battery_t *out, int max)
     out[0].millivolts = 4182;
     out[0].state = TD_BATT_FULL;
     out[0].ntc_millivolts = s_ntc_mv;
+    out[0].ntc_tenths_c = s_ntc_tenths;
     return 1;
 }
 
@@ -579,47 +581,75 @@ static void battery_line(void)
     td_wm_set_screen_size(40, 26);
     td_wm_close_all();
 
-    /* With a thermistor: the reading is on screen. 4095 is the widest value the
-     * 14-bit field can hold, so this is the worst case for width. */
-    s_ntc_mv = 4095;
+    /* 1. With a temperature: the board knows its thermistor, so the line shows
+     * degrees rather than making the user convert volts. */
+    s_ntc_tenths = 293;          /* 29.3 C */
+    s_ntc_mv = 494;
     td_set_sysinfo(&with_batt);
     CHECK(td_app_launch("System Monitor"));
     tick(1000);
-
-    bool found = false;
-    for (td_window_t *w = td_win_focused(); w; w = NULL)
-        for (td_widget_t *p = w->widgets; p; p = p->next)
-            if (!strncmp(td_widget_text(p), "Battery:", 8))
-            {
-                const char *t = td_widget_text(p);
-                found = true;
-                CHECK(strstr(t, "ntc4095") != NULL);
-                /* Must still fit the client, which is 38 columns at 40x26. */
-                CHECK((int)strlen(t) <= 38);
-            }
-    CHECK(found);
+    {
+        bool found = false;
+        for (td_window_t *w = td_win_focused(); w; w = NULL)
+            for (td_widget_t *p = w->widgets; p; p = p->next)
+                if (!strncmp(td_widget_text(p), "Battery:", 8))
+                {
+                    const char *t = td_widget_text(p);
+                    found = true;
+                    CHECK(strstr(t, "ntc29.3") != NULL);
+                    CHECK(strstr(t, "ntc494") == NULL);
+                    CHECK((int)strlen(t) <= 38);
+                }
+        CHECK(found);
+    }
     td_wm_close_all();
 
-    /* Without one: no `ntc` and no stray separator left behind. */
+    /* 2. Without one, but with a voltage: the honest fallback. 4095 is the
+     * widest value the 14-bit field can hold, so this is the worst case for
+     * width as well as the fallback path. */
+    s_ntc_tenths = TD_NTC_NONE;
+    s_ntc_mv = 4095;
+    CHECK(td_app_launch("System Monitor"));
+    tick(1000);
+    {
+        bool found = false;
+        for (td_window_t *w = td_win_focused(); w; w = NULL)
+            for (td_widget_t *p = w->widgets; p; p = p->next)
+                if (!strncmp(td_widget_text(p), "Battery:", 8))
+                {
+                    const char *t = td_widget_text(p);
+                    found = true;
+                    CHECK(strstr(t, "ntc4095") != NULL);
+                    CHECK((int)strlen(t) <= 38);
+                }
+        CHECK(found);
+    }
+    td_wm_close_all();
+
+    /* 3. Neither: no `ntc` and no stray separator left behind. */
+    s_ntc_tenths = TD_NTC_NONE;
     s_ntc_mv = 0;
     CHECK(td_app_launch("System Monitor"));
     tick(1000);
-    found = false;
-    for (td_window_t *w = td_win_focused(); w; w = NULL)
-        for (td_widget_t *p = w->widgets; p; p = p->next)
-            if (!strncmp(td_widget_text(p), "Battery:", 8))
-            {
-                const char *t = td_widget_text(p);
-                found = true;
-                CHECK(strstr(t, "ntc") == NULL);
-                CHECK((int)strlen(t) <= 38);
-            }
-    CHECK(found);
+    {
+        bool found = false;
+        for (td_window_t *w = td_win_focused(); w; w = NULL)
+            for (td_widget_t *p = w->widgets; p; p = p->next)
+                if (!strncmp(td_widget_text(p), "Battery:", 8))
+                {
+                    const char *t = td_widget_text(p);
+                    found = true;
+                    CHECK(strstr(t, "ntc") == NULL);
+                    CHECK((int)strlen(t) <= 38);
+                }
+        CHECK(found);
+    }
 
     td_wm_close_all();
     td_set_sysinfo(&info);
     td_wm_set_screen_size(80, 24);
 }
+
 
 int main(int argc, char **argv)
 {

@@ -49,6 +49,7 @@
 #include "freertos/task.h"
 
 #include "power.h"
+#include "ts_convert.h"
 #include "tinydesk/td_sysinfo.h"
 
 #define TAG "twatch-chg"
@@ -252,6 +253,28 @@ void charge_on_irq(const uint8_t status[3])
         else
             ESP_LOGI(TAG, "chg done");
     }
+}
+
+
+int charge_ts_tenths_c(void)
+{
+    /* The arithmetic is in ts_convert.c, which a host test compiles and sweeps;
+     * this function only fetches the two numbers it needs off the bus. */
+    uint8_t h = 0, l = 0, ctrl = 0;
+    unsigned raw;
+
+    if (!board_pmu_read(REG_TS_VOLT_H, &h) || !board_pmu_read(REG_TS_VOLT_L, &l) ||
+        !board_pmu_read(REG_TS_PIN_CTRL, &ctrl))
+        return TD_NTC_NONE;
+
+    /* The part's open-pin code, in the raw field: 0x2000 would scale to 4096 mV,
+     * above every row of the table, and would otherwise read as a very cold
+     * battery instead of as a fault. */
+    raw = ((unsigned)(h & 0x3F) << 8) | l;
+    if (raw == 0x2000)
+        return TD_NTC_NONE;
+
+    return ts_tenths_c((int)(raw * 5 / 10), ctrl);
 }
 
 int charge_ts_mv(void)
