@@ -506,17 +506,23 @@ static void panel_fill(uint16_t colour)
  * The glass has a strip below the desktop's 320x416 rectangle that nothing
  * draws into, and on the Linux build it carried three coloured bars -- red,
  * green, blue -- which are the board's three capacitive buttons. This paints
- * them again, images only: nothing reads them here yet, and the touch driver
- * still maps a press on the strip to a taskbar cell.
+ * them again, images only: nothing reads them here yet, and a press on the
+ * strip is a dead zone in the touch driver.
+ *
+ * ALL THREE BARS ARE GREEN, at the operator's request. The three-colour scheme
+ * was the Linux build's and did nothing but name the bars; green reads as one
+ * control group, which is what they are once they are Tab, Enter and Esc. The
+ * two black separators are kept: without them the strip is a single green band
+ * and there is nothing to show where one button ends and the next begins.
  *
  * The geometry is the Linux driver's (patches/kernel/display/final/co5300.c,
  * co5300_paint_frame), which measured it on this glass:
  *
- *   controller x  22 .. 156  red
+ *   controller x  22 .. 156  green
  *                157 .. 158  black separator
  *                159 .. 292  green
  *                293 .. 294  black separator
- *                295 .. 431  blue
+ *                295 .. 431  green
  *
  * Two differences from that build, both consequences of this port:
  *
@@ -525,9 +531,9 @@ static void panel_fill(uint16_t colour)
  *   * the strip is painted at its own controller coordinates rather than as
  *     part of the framebuffer's row bands, since it lies outside them.
  *
- * The colours are the Linux driver's full primaries, not the desktop's palette:
- * RGB565(31,0,0), (0,63,0), (0,0,31). They are the brightest thing on the
- * glass and are meant to be.
+ * The colours are the Linux driver's full primary green, not the desktop's
+ * palette: RGB565(0,63,0). It is the brightest thing on the glass and is meant
+ * to be.
  */
 #define BTN_Y0   (FB_Y + DISPLAY_H)      /* 461: first row below the framebuffer */
 #define BTN_Y1   (PANEL_H - 1)           /* 501: last row of the glass */
@@ -535,7 +541,7 @@ static void panel_fill(uint16_t colour)
 
 static void paint_buttons(void)
 {
-    static const uint16_t COL_RED = 0xF800, COL_GREEN = 0x07E0, COL_BLUE = 0x001F;
+    static const uint16_t COL_GREEN = 0x07E0;
 
     /*
      * FULL CONTROLLER WIDTH, DIVIDED BY THE PANEL'S WIDTH, IN ONE WINDOW.
@@ -583,7 +589,7 @@ static void paint_buttons(void)
             uint16_t c;
 
             if (x < edge1 - BTN_SEP)
-                c = COL_RED;
+                c = COL_GREEN;
             else if (x < edge1)
                 c = 0x0000;
             else if (x < edge2 - BTN_SEP)
@@ -591,7 +597,7 @@ static void paint_buttons(void)
             else if (x < edge2)
                 c = 0x0000;
             else
-                c = COL_BLUE;
+                c = COL_GREEN;
 
             c = swap16(c);
             for (int r = 0; r < rows; r++)
