@@ -33,6 +33,7 @@
 #include "touch.h"
 #include "pusher.h"
 #include "pwrkey.h"
+#include "charge.h"
 #include "haptic.h"
 #include "sound.h"
 #include "hal_mux.h"
@@ -201,6 +202,10 @@ bool link_init(void)
      * the PMU interrupt line. Failure is not fatal and is the expected outcome
      * if the PMU is holding its IRQ line, which the driver refuses to arm on. */
     pwrkey_init(inject);
+
+    /* What the PMU is currently configured to do about charging. Read only:
+     * see charge.c for why the first move on a battery is measurement. */
+    charge_report(NULL);
 
     snprintf(s_platform, sizeof(s_platform),
              "ESP32-S3 T-Watch Ultra (%dx%d cells%s)",
