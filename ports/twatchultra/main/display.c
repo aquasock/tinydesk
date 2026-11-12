@@ -446,13 +446,39 @@ static void flush_rect(int x0, int y0, int x1, int y1)
 
     w = x1 - x0;
 
-    /* How many rows one transaction can carry: as many as fit in s_tx, which
-     * is a fixed size. A full-width band is 16 rows; an 8-pixel column is 640,
-     * so a single changed column goes out as ONE transaction instead of 24.
-     * That matters because each transaction re-programs the window registers
-     * (two QSPI writes) and takes the bus, so at narrow widths the per-call
-     * overhead dominated the pixel data. */
+    /*
+     * How many rows one transaction can carry: as many as fit in s_tx, CAPPED
+     * AT BAND_ROWS.
+     *
+     * The cap is the fix for the leftover strips, and it is a correction to a
+     * reasoning error rather than a new idea. This used to be purely a buffer
+     * calculation -- 5120 pixels of s_tx, so a full-width band is 16 rows and
+     * an 8-pixel column is 640 -- with the comment arguing that a narrow column
+     * should therefore go out as ONE transaction to save window-programming
+     * overhead. The overhead argument was true and the conclusion was wrong,
+     * because this panel does not tolerate a tall narrow window:
+     *
+     *   LCD-009 (already in this project's reference): a 45x356 single-transfer
+     *   window tears into diagonal splits, while the same rectangle in 2-row
+     *   bands is clean. "Not width, not X, not height," that record says, and it
+     *   left the root cause open.
+     *
+     * What the leftover-strips investigation adds is the missing half: the
+     * strip fault that `repaint` clears is fixed by a FULL-WIDTH push and
+     * produced by the incremental one, and the difference between them is this
+     * number. A full-width flush is 16 rows and works every time; a narrow one
+     * was hundreds of rows and dropped bands.
+     *
+     * So the height is capped at what is known to work, whatever the width. The
+     * cost is real and small: an 8x416 column becomes 26 transactions instead of
+     * one, and the icon-column case that motivated the old reasoning -- 23 rows
+     * of 8 pixels -- becomes 2 transactions instead of 1. Each extra transaction
+     * reprograms the window registers twice, which at 40 MHz is noise against
+     * the pixels.
+     */
     band = (int)(sizeof(s_tx) / sizeof(s_tx[0])) / w;
+    if (band > BAND_ROWS)
+        band = BAND_ROWS;
     if (band < 1)
         band = 1;
 
