@@ -39,6 +39,9 @@ typedef struct
     uint8_t desk;           /* bit 0: the on-screen keyboard opens for text
                              * fields; bit 1: icons stay where they are put
                              * (not arranged); 0 in older blobs */
+    uint8_t bar_top;        /* 1: the taskbar on the top edge (0 = bottom, also
+                             * in older blobs, which are zero-filled past what
+                             * was read) */
 } settings_blob_t;
 
 #define LEGACY_SIZE 8   /* magic + theme, ascii, pattern, hide_icons */
@@ -53,6 +56,7 @@ static td_trash_prefs_t s_trash;
 static td_window_t *s_win;
 static td_widget_t *s_theme_box[2], *s_ascii, *s_icons, *s_osk_box, *s_pattern_label, *s_status;
 static td_widget_t *s_size_btn[4];      /* desktop icons, start menu, taskbar, windows */
+static td_widget_t *s_bar_top;          /* the taskbar on the top edge */
 static td_widget_t *s_detail_btn;       /* pictures: Normal / Fine */
 
 static uint8_t size_code(td_ui_size_t s)
@@ -191,6 +195,9 @@ void td_settings_apply_saved(void)
     td_wm_set_icon_size(code_size(b.icon_size));
     td_wm_set_start_menu_size(code_size(b.menu_size));
     td_wm_set_taskbar_size(code_size(b.bar_size));
+    td_wm_set_taskbar_top(b.bar_top != 0);
+    if (s_bar_top)
+        td_checkbox_set(s_bar_top, td_wm_taskbar_top());
     td_wm_set_window_size(b.win_size == 1 ? TD_UI_MEDIUM : b.win_size == 2 ? TD_UI_LARGE
                                                                            : TD_UI_SMALL);
     td_canvas_set_detail(b.picture_detail == 1 ? TD_CANVAS_QUAD : TD_CANVAS_HALF);
@@ -219,6 +226,7 @@ bool td_settings_save(void)
         .icon_size = size_code(td_wm_icon_size()),
         .menu_size = size_code(td_wm_start_menu_size()),
         .bar_size = size_code(td_wm_taskbar_size()),
+        .bar_top = td_wm_taskbar_top() ? 1 : 0,
         .editor = s_editor.completion ? 1 : 0,
         .win_size = (uint8_t)(td_wm_window_size() == TD_UI_MEDIUM ? 1 : td_wm_window_size() == TD_UI_LARGE ? 2
                                                                                                            : 0),
@@ -369,6 +377,16 @@ static void on_draw(td_window_t *win, int w, int h)
     td_text(cap_x, 12, "Pictures", t->win_fg, t->win_bg, 0);
 }
 
+/* The taskbar's edge. Everything geometric follows from td_wm_taskbar_top(),
+ * so this only has to set it and let the desktop redraw. */
+static void on_bar_top(td_widget_t *w, void *user)
+{
+    (void)user;
+    td_wm_set_taskbar_top(td_checkbox_get(w));
+    changed();
+    td_full_redraw();
+}
+
 static void on_network(td_widget_t *w, void *user)
 {
     (void)w;
@@ -464,6 +482,9 @@ static void launch(void)
         s_size_btn[i] = td_button(s_win, narrow ? 1 : 18, 8 + i, "Medium", on_size,
                                   (void *)(intptr_t)i);
     s_detail_btn = td_button(s_win, narrow ? 1 : 18, 12, "Normal", on_detail, NULL);
+    s_bar_top = td_checkbox(s_win, 1, 13, narrow ? "Taskbar at top"
+                                                 : "Taskbar at the top of the screen",
+                            td_wm_taskbar_top(), on_bar_top, NULL);
     s_pattern_label = td_label(s_win, 1, 14, 0, "");
     td_button(s_win, 3, 15, "Next pattern", on_pattern, NULL);
     if (narrow)

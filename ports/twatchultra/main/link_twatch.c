@@ -214,6 +214,11 @@ bool link_init(void)
      * see charge.c for why the first move on a battery is measurement. */
     charge_report(NULL);
 
+    /* The battery's NTC input, if one is fitted. Read and logged only: this
+     * never writes register 0x50, because changing the TS pin's mode changes
+     * what the charger uses to decide whether a cell is safe to charge. */
+    charge_ts_report(NULL, NULL);
+
     snprintf(s_platform, sizeof(s_platform),
              "ESP32-S3 T-Watch Ultra (%dx%d cells%s)",
              display_cols(), display_rows(), s_touch ? ", touch" : "");

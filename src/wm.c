@@ -177,6 +177,7 @@ static const td_desktop_provider_t *s_provider;
   /* Taskbar hit areas, filled in while composing. */
 #define TASKBAR_START_W 7
 static td_ui_size_t s_icon_size = TD_UI_MEDIUM, s_menu_size = TD_UI_MEDIUM, s_bar_size = TD_UI_MEDIUM;
+static bool s_bar_top;      /* the taskbar on the top edge, not the bottom */
 static const char *s_launch_icon;   /* glyph of the app being launched */
 static struct
 {
@@ -286,10 +287,24 @@ static int taskbar_h(void)
         return 0;
     return s_bar_size == TD_UI_LARGE ? 2 : 1;
 }
+
+/*
+ * The taskbar's top row, wherever it is.
+ *
+ * ONE HELPER, USED BY BOTH THE PAINTER AND THE HIT TEST, which is the whole
+ * reason it exists: this file has already been bitten once by a bar that was
+ * drawn in one place and hit-tested in another, and moving the bar multiplies
+ * the number of places that could disagree. Every caller that used to compute
+ * `main_bottom() - taskbar_h()` for itself now asks here instead.
+ */
+static int taskbar_y(void)
+{
+    return s_bar_top ? main_y() : main_bottom() - taskbar_h();
+}
 static bool in_taskbar(int x, int y)
 {
-    return taskbar_visible() && x >= main_x() && x < main_x() + main_w() && y >= main_bottom() - taskbar_h() &&
-           y < main_bottom();
+    return taskbar_visible() && x >= main_x() && x < main_x() + main_w() && y >= taskbar_y() &&
+           y < taskbar_y() + taskbar_h();
 }
 
 int td_wm_desktop_rows(void)
@@ -303,7 +318,14 @@ static td_rect_t desk_of(td_rect_t m)
 {
     td_rect_t main = main_mon();
     if (m.x == main.x && m.y == main.y && m.w == main.w && m.h == main.h)
+    {
+        /* The bar takes rows off whichever edge it is on. Subtracting from the
+         * height alone is only correct at the bottom: at the top it would
+         * leave a window starting under the bar and running off the screen. */
         m.h -= taskbar_h();
+        if (s_bar_top)
+            m.y += taskbar_h();
+    }
     return m;
 }
 
@@ -1142,7 +1164,18 @@ static void menu_open_at(int x, int y, const char *const *items, const char *con
     if (h > desk)
         h = desk;
     x = clamp(x, 0, s_cols - w);
-    y = clamp(y, 0, desk - h);        /* keep it above the taskbar */
+    /* Keep the menu inside the desktop, whichever edge the taskbar is on.
+     *
+     * The desktop's rows are main_y() .. main_y() + td_wm_desktop_rows(), and
+     * a top bar eats the first taskbar_h() of them. Clamping to `desk - h`
+     * assumed the desktop began at screen row 0, which was true only for a
+     * bottom bar on a single display -- with a top bar it would let a popup
+     * start above the bar and with a second monitor the origin is not 0
+     * either. Both ends are absolute rows now. */
+    {
+        int desk_y = main_y() + (s_bar_top ? taskbar_h() : 0);
+        y = clamp(y, desk_y, desk_y + desk - h);
+    }
 
     s_menu.rect = td_rect(x, y, w, h);
     s_menu.is_start = is_start;
@@ -1290,6 +1323,22 @@ td_ui_size_t td_wm_taskbar_size(void)
     return s_bar_size;
 }
 
+void td_wm_set_taskbar_top(bool on)
+{
+    if (on == s_bar_top)
+        return;
+    s_bar_top = on;
+    s_menu_open = false;
+    /* The desktop did not change size, but everything in it moved, so the
+     * renderer has to be told rather than left to diff against a stale
+     * picture. */
+    td_wm_set_screen_size(s_cols, s_rows);
+}
+bool td_wm_taskbar_top(void)
+{
+    return s_bar_top;
+}
+
 const char *td_ui_size_name(td_ui_size_t size)
 {
     return size == TD_UI_SMALL ? "Small" : size == TD_UI_LARGE ? "Large"
@@ -1342,7 +1391,12 @@ void td_wm_toggle_start_menu(void)
     glyphs[n] = NULL;
     items[n++] = "Exit";
     bool with_glyphs = s_menu_size != TD_UI_SMALL;
-    menu_open_at(main_x(), main_bottom(), items, with_glyphs ? glyphs : NULL, n, s_menu_size == TD_UI_LARGE ? 2 : 1,
+    /* The menu hangs off the bar's inner edge: upward from the bottom edge, or
+     * downward from a top bar. menu_open_at() clamps into the desktop either
+     * way, so a menu too tall for the space overflows the other way rather
+     * than off the screen. */
+    menu_open_at(main_x(), s_bar_top ? main_y() + taskbar_h() : main_bottom(), items,
+                 with_glyphs ? glyphs : NULL, n, s_menu_size == TD_UI_LARGE ? 2 : 1,
                  start_menu_chosen, NULL, true);
 }
 
@@ -1645,7 +1699,7 @@ static void draw_taskbar(void)
 {
     const td_theme_t *t = td_theme();
     int h = taskbar_h();
-    int y = main_bottom() - h;                /* top row of the taskbar */
+    int y = taskbar_y();                      /* top row of the taskbar */
     int x0 = main_x();                        /* on the main display */
     td_fill(td_rect(x0, y, main_w(), h), ' ', t->taskbar_fg, t->taskbar_bg);
 
@@ -1752,7 +1806,7 @@ static void taskbar_click(int x)
 {
     if (x >= s_clock_x0 && x < s_clock_x1 && s_clock && s_clock->click)
     {
-        s_clock->click(TD_BUTTON_LEFT, x, main_bottom() - 1);
+        s_clock->click(TD_BUTTON_LEFT, x, taskbar_y() + taskbar_h() - 1);
         return;
     }
     if (x >= s_tray_net_x0 && x < s_tray_net_x1)
@@ -1963,7 +2017,12 @@ static int slot_x(int col)
 static int slot_y(int row)
 {
     int per = icons_per_column(), span = td_wm_desktop_rows() - 1 - icon_h();
-    return main_y() + 1 + (per > 1 && span > 0 ? row * span / (per - 1) : row * icon_h());
+    /* The grid starts inside the desktop area, which a top taskbar pushes
+     * down. Without this the first row of icons lands behind the bar -- drawn
+     * and hit-tested correctly, just invisible, which is the sort of fault
+     * that gets blamed on the icons. */
+    int top = main_y() + (s_bar_top ? taskbar_h() : 0);
+    return top + 1 + (per > 1 && span > 0 ? row * span / (per - 1) : row * icon_h());
 }
 
 static td_rect_t icon_rect(int i)
@@ -2522,7 +2581,7 @@ void td_wm_compose(td_buffer_t *back)
         if (taskbar_visible())
         {
             int h = taskbar_h();
-            td_pictures_cover(0, td_pictures_count(), td_rect(main_x(), main_bottom() - h, main_w(), h));
+            td_pictures_cover(0, td_pictures_count(), td_rect(main_x(), taskbar_y(), main_w(), h));
             draw_taskbar();
             if (s_menu_open)
             {

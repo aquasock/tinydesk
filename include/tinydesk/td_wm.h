@@ -293,6 +293,14 @@ void td_wm_set_start_menu_size(td_ui_size_t size);
 td_ui_size_t td_wm_start_menu_size(void);
 void td_wm_set_taskbar_size(td_ui_size_t size);
 td_ui_size_t td_wm_taskbar_size(void);
+
+ /* Which edge the taskbar sits on. Bottom is the default and what every
+ * existing port does; top suits a watch or a small panel where the bar reads
+ * better at the top of the display. The desktop keeps the same number of rows
+ * either way -- only where they are changes -- so nothing that fits today
+ * stops fitting. */
+void td_wm_set_taskbar_top(bool on);
+bool td_wm_taskbar_top(void);
  /* Window frames: small = one title row, buttons [-][x] (the default);
  * medium = buttons [ - ][ x ] and a wider resize corner; large = the same
  * with two title rows. Windows grow or shrink by the title bar's change,

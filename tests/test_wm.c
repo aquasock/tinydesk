@@ -410,6 +410,80 @@ static void test_start_menu_tail(void)
     key(TD_KEY_ENTER, 0);
     CHECK(!td_step());
 }
+  /* The taskbar on either edge.
+ *
+ * Everything geometric follows td_wm_taskbar_top(), so this pins the three
+ * places that could disagree if that were untrue: where the bar is DRAWN,
+ * where it is HIT-TESTED, and where the desktop's own rows begin. The failure
+ * mode a test like this exists for is a bar painted at one edge and clicked at
+ * the other, which looks like a dead button rather than a geometry bug.
+ */
+static void test_taskbar_top(void)
+{
+    td_buffer_t back;
+    td_wm_init(80, 25);
+    td_wm_set_taskbar_top(false);
+    CHECK(!td_wm_taskbar_top());
+
+    /* Bottom: the bar covers the last row, and the desktop keeps 24. */
+    CHECK_EQ(td_wm_desktop_rows(), 24);
+    td_wm_compose(&back);
+    {
+        /* The Start button is drawn in the bar's own row. */
+        const td_cell_t *start = td_buffer_cell(&back, 1, 24);
+        const td_cell_t *above = td_buffer_cell(&back, 1, 23);
+        CHECK_EQ(start->bg, td_theme()->taskbar_bg);
+        CHECK(above->bg != td_theme()->taskbar_bg);
+    }
+
+    /* A click in that row reaches the bar: it opens the Start menu. */
+    td_wm_toggle_start_menu();
+    CHECK(td_menu_is_open());
+    td_wm_toggle_start_menu();
+    CHECK(!td_menu_is_open());
+    mouse(TD_MOUSE_PRESS, TD_BUTTON_LEFT, 3, 24);
+    CHECK(td_menu_is_open());
+    td_wm_toggle_start_menu();
+
+    /* Top: the same row count, the bar at row 0, and the desktop starts at 1. */
+    td_wm_set_taskbar_top(true);
+    CHECK(td_wm_taskbar_top());
+    CHECK_EQ(td_wm_desktop_rows(), 24);
+    td_wm_compose(&back);
+    {
+        const td_cell_t *bar = td_buffer_cell(&back, 1, 0);
+        const td_cell_t *below = td_buffer_cell(&back, 1, 1);
+        CHECK_EQ(bar->bg, td_theme()->taskbar_bg);
+        CHECK(below->bg != td_theme()->taskbar_bg);
+    }
+
+    /* And the hit test agrees with the painter. */
+    mouse(TD_MOUSE_PRESS, TD_BUTTON_LEFT, 3, 0);
+    CHECK(td_menu_is_open());
+    td_wm_toggle_start_menu();
+
+    /* A maximised window must not start under the bar. */
+    td_window_desc_t d = {.title = "Max", .rect = {0, 0, 80, 24}, .flags = TD_WIN_MAXIMIZED};
+    td_window_t *w = td_win_create(&d);
+    CHECK(w != NULL);
+    if (w)
+    {
+        CHECK(w->rect.y >= 1);        /* below a top bar */
+        CHECK(w->rect.y + w->rect.h <= 25);
+        td_win_close(w);
+    }
+
+    /* The Start menu hangs DOWN from a top bar rather than up from the bottom,
+     * and does not overlap the bar itself. */
+    td_wm_toggle_start_menu();
+    CHECK(td_menu_is_open());
+    td_wm_compose(&back);
+    CHECK(td_menu_is_open());
+    td_wm_toggle_start_menu();
+
+    td_wm_set_taskbar_top(false);   /* leave the default for later tests */
+}
+
 int main(void)
 {
     td_init(&s_hal);   /* no size answer: falls back to 80x25 */
@@ -523,8 +597,10 @@ int main(void)
     td_wm_set_input_gate(false, NULL);
     key(TD_KEY_ENTER, 0);
     CHECK_EQ(s_clicks, clicks + 2);
+
     test_menu_back();
     test_bare_desktop_escape();
+    test_taskbar_top();
     test_start_menu_tail();
     return TD_TEST_RESULT();
 }

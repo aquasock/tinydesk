@@ -44,8 +44,12 @@
 #include "charge.h"
 
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "power.h"
+#include "tinydesk/td_sysinfo.h"
 
 #define TAG "twatch-chg"
 
@@ -56,6 +60,9 @@
 #define REG_ICC         0x62
 #define REG_ITERM       0x63
 #define REG_CV          0x64
+#define REG_TS_VOLT_H   0x36
+#define REG_TS_VOLT_L   0x37
+#define REG_TS_PIN_CTRL 0x50
 
 #define EN_CELL_CHARGE  (1u << 1)
 #define EN_TS_MEASURE   (1u << 1)
@@ -245,4 +252,45 @@ void charge_on_irq(const uint8_t status[3])
         else
             ESP_LOGI(TAG, "chg done");
     }
+}
+
+bool charge_ts_report(int *ts_mv, uint8_t *ctrl)
+{
+    uint8_t h = 0, l = 0, c = 0;
+
+    if (ts_mv)
+        *ts_mv = -1;
+    if (ctrl)
+        *ctrl = 0;
+
+    if (!board_pmu_read(REG_TS_PIN_CTRL, &c))
+    {
+        ESP_LOGW(TAG, "pmu silent");
+        return false;
+    }
+    if (ctrl)
+        *ctrl = c;
+
+    if (!board_pmu_read(REG_TS_VOLT_H, &h) || !board_pmu_read(REG_TS_VOLT_L, &l))
+    {
+        ESP_LOGW(TAG, "ts did not read");
+        return false;
+    }
+
+    /* 14 bits, 0.5 mV per step -- SensorLib's TS_STEP. Reported as millivolts
+     * and not as a temperature, because turning a divider voltage into degrees
+     * needs the NTC's part number and beta, and this board's schematic marks
+     * that position NC. A temperature invented from a guessed beta would be
+     * exactly the plausible-looking lie this project keeps recording. */
+    int mv = (int)((((h & 0x3F) << 8) | l) * 5 / 10);
+
+    if (ts_mv)
+        *ts_mv = mv;
+
+    /* Two short lines: the control register and the raw volts, so the reading
+     * can be judged rather than trusted. 0x50 says how the pin is wired up in
+     * the part's own opinion; the volts say what is on it. */
+    ESP_LOGI(TAG, "ts ctl%02x", c);
+    ESP_LOGI(TAG, "ts %dmV", mv);
+    return true;
 }

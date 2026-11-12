@@ -58,4 +58,23 @@ void charge_watch_enable(void);
  */
 void charge_on_irq(const uint8_t status[3]);
 
+/*
+ * Read the TS pin and report what it says about a battery thermistor.
+ *
+ * THE TS PIN IS THE BATTERY'S NTC INPUT, not an ambient sensor: it exists so
+ * the charger can refuse to charge a cell that is too hot or too cold, and its
+ * reading is a VOLTAGE across an external resistor divider, not a temperature
+ * the part computes. So the raw millivolts are logged alongside any decoded
+ * temperature, because the decode depends on an NTC part number this project
+ * does not know -- the schematic marks the NTC position "NC".
+ *
+ * An absent thermistor is not an error to the part. A floating TS pin still
+ * produces a plausible number, so the only way to tell a fitted NTC from an
+ * empty pad is to look at what the pin actually reads and whether it moves.
+ *
+ * Returns false when the PMU does not answer; the pin's state is reported in
+ * *ts_mv and *ctrl regardless.
+ */
+bool charge_ts_report(int *ts_mv, uint8_t *ctrl);
+
 #endif

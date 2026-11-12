@@ -663,6 +663,8 @@ td_wm.h: void td_wm_set_start_menu_size(td_ui_size_t size);
 td_wm.h: td_ui_size_t td_wm_start_menu_size(void);
 td_wm.h: void td_wm_set_taskbar_size(td_ui_size_t size);
 td_wm.h: td_ui_size_t td_wm_taskbar_size(void);
+td_wm.h: void td_wm_set_taskbar_top(bool on);
+td_wm.h: bool td_wm_taskbar_top(void);
 td_wm.h: void td_wm_set_window_size(td_ui_size_t size);
 td_wm.h: td_ui_size_t td_wm_window_size(void);
 td_wm.h: int td_wm_title_rows(void);
