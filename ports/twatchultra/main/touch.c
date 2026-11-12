@@ -387,6 +387,13 @@ static void send_wheel(int y)
  * nothing: on the desktop the framebuffer is not a touch surface. */
 static void edge_press(const edge_hit_t *hit, int y)
 {
+    /* One short line per edge press, and short on purpose: the Log Viewer is 40
+     * columns and truncates silently. This is what distinguishes the three ways
+     * a margin button can fail -- no line means the press was not on an edge at
+     * all, `e0` means the region was classified but not the button, and a
+     * plausible line with the wrong action means the index. */
+    ESP_LOGI(TAG, "e%d i%d", (int)hit->region, hit->index);
+
     switch (hit->region)
     {
     case EDGE_LEFT:

@@ -14,15 +14,27 @@
  * unpainted. One definition, used by both, makes that class of fault
  * impossible rather than merely unlikely.
  *
- * TWO COORDINATE SYSTEMS, AND THEY ARE NOT THE SAME.
+ * TWO COORDINATE SYSTEMS, AND THEY ARE NOT THE SAME. Getting this wrong cost a
+ * build: the left column was dead over its outer half and the bottom strip was
+ * shifted 22 px, while the code read as if both were correct.
  *
- * The framebuffer is a window onto the glass, offset by DISPLAY_ORIGIN_X/Y, and
- * the controller's RAM starts a further PANEL_COL_OFFSET to the left of that.
- * So a desktop pixel maps to controller x + DISPLAY_ORIGIN_X + PANEL_COL_OFFSET
- * but controller y + DISPLAY_ORIGIN_Y. Everything below is in controller
- * coordinates, which is what both the painter and the touch controller use --
- * the touch part reports 410x502 exactly (TCH-006), so no conversion is needed
- * on that side at all.
+ * The framebuffer is a window onto the glass, inset by DISPLAY_ORIGIN_X/Y, and
+ * the panel's controller RAM is a further PANEL_COL_OFFSET wider than the
+ * visible glass -- 432 columns of RAM behind 410 columns of glass, with the
+ * glass starting at RAM column 22. Two consequences, and they differ by axis:
+ *
+ *   CONTROLLER coordinates  what the painter writes. Everything defined below
+ *                           is in these, because the painter is where a wrong
+ *                           number is visible.
+ *   PANEL coordinates       what the touch controller reports: 0..409 across
+ *                           the visible glass and nothing else (TCH-006 says it
+ *                           reports 410x502, and 410 is the glass, not the RAM).
+ *
+ * So panel x = controller x - PANEL_COL_OFFSET, and panel y = controller y,
+ * because the RAM is wider than the glass and not taller. That is the whole
+ * conversion and it lives in edges_hit(), at the one point where the two spaces
+ * meet, so the painter never has to think about it and the hit test never sees
+ * controller numbers by accident.
  */
 #ifndef TWATCH_EDGES_H
 #define TWATCH_EDGES_H
@@ -129,8 +141,20 @@ typedef struct
     int index;       /* button within the group, top-to-bottom or left-to-right */
 } edge_hit_t;
 
-static inline void edges_hit(int x, int y, edge_hit_t *hit)
+/* What a point on the glass is, given a point in PANEL coordinates -- the
+ * numbers the touch controller reports, 0..409 by 0..501.
+ *
+ * The constants above are controller coordinates, so the x arrives 22 columns
+ * to the left of where they were measured; adding PANEL_COL_OFFSET puts it
+ * back. y needs nothing, because the RAM is wider than the glass and not
+ * taller. A caller that passed controller coordinates instead would be off by
+ * exactly that 22 columns, which reads as "the column is dead on its outer
+ * half" rather than as an obvious error. */
+static inline void edges_hit(int panel_x, int panel_y, edge_hit_t *hit)
 {
+    int x = panel_x + PANEL_COL_OFFSET;
+    int y = panel_y;
+
     hit->region = EDGE_NONE;
     hit->index = -1;
 
