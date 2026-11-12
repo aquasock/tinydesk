@@ -3083,7 +3083,22 @@ static void dispatch_key(const td_event_t *ev)
     {
         if (desktop_key(ev))
             return;
-        if (ev->key == TD_KEY_ENTER || ev->key == TD_KEY_ESC)
+         /* ENTER opens the Start menu on a bare desktop; ESCAPE deliberately does
+         * not, though it used to.
+         *
+         * The pair made sense as a keyboard affordance when the desktop was the
+         * only input surface: Enter and Escape are the two keys a keyboard-only
+         * user would try. It stopped making sense once this port gave Escape a
+         * labelled button and put a Start button in the same column. A key whose
+         * whole meaning is "get me out" was opening the launcher, and Escape is
+         * already spoken for everywhere else -- it closes dialogs, abandons a
+         * rename, backs out of a menu.
+         *
+         * Nothing is lost: Enter still opens the menu here, F10 opens it from
+         * anywhere, the taskbar has its Start button, and a desktop icon can be
+         * run from the keyboard. What this costs is the old symmetry, and the
+         * symmetry was the only thing it had. */
+        if (ev->key == TD_KEY_ENTER)
             td_wm_toggle_start_menu();
         return;
     }

@@ -282,6 +282,47 @@ static void test_menu_back(void)
     CHECK(!td_menu_is_open());
 }
 
+/* Escape on a bare desktop does not open the Start menu; Enter does.
+ *
+ * The pair used to be symmetric, which made sense when a keyboard was the only
+ * way to reach the launcher. It stopped making sense once this port gave Escape
+ * a labelled button: a key whose whole meaning is "get me out" was opening the
+ * launcher, and Escape is already the cancel key everywhere else.
+ *
+ * Icons are switched off for this test because that is the state on the
+ * T-Watch Ultra, and because it is the only state that reaches the changed
+ * line -- with icons on, desktop_key() claims Escape first to clear the icon
+ * selection.
+ */
+static void test_bare_desktop_escape(void)
+{
+    td_wm_init(80, 25);
+    td_desktop_set_icons(false);
+
+    CHECK(!td_menu_is_open());
+    key(TD_KEY_ESC, 0);
+    CHECK(!td_menu_is_open());
+
+    /* Enter still opens it: nothing was taken away, only unsymmetrised. */
+    key(TD_KEY_ENTER, 0);
+    CHECK(td_menu_is_open());
+    key(TD_KEY_ESC, 0);
+    CHECK(!td_menu_is_open());
+
+    /* And Escape after that is still not a launcher key. */
+    key(TD_KEY_ESC, 0);
+    CHECK(!td_menu_is_open());
+
+    /* F10 is the Start button's key and must keep working, since it is what
+     * the left column's top button sends. */
+    key(TD_KEY_F10, 0);
+    CHECK(td_menu_is_open());
+    key(TD_KEY_F10, 0);
+    CHECK(!td_menu_is_open());
+
+    td_desktop_set_icons(true);
+}
+
 static void test_icons_and_hover(void)
 {
     static td_buffer_t back;
@@ -483,6 +524,7 @@ int main(void)
     key(TD_KEY_ENTER, 0);
     CHECK_EQ(s_clicks, clicks + 2);
     test_menu_back();
+    test_bare_desktop_escape();
     test_start_menu_tail();
     return TD_TEST_RESULT();
 }
