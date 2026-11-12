@@ -226,7 +226,34 @@ static void check_controls(td_window_t *w, const char *app, bool audit)
                 CHECK(fits);
         }
 }
-static void layouts(bool audit)
+/* Apps whose narrow layout is not done yet.
+ *
+ * The 40x26 pass exists because that is the T-Watch Ultra's grid, and it found
+ * real faults the 80 and 100 column passes could not: Files put its Delete
+ * button off a 38-column client, so the file manager could not delete a file,
+ * and MQTT and Modbus resolved their lists to zero rows at their own minimum
+ * size. Those are fixed.
+ *
+ * Every name here is a KNOWN DEFECT, not an exemption: each one still clips a
+ * control on a narrow screen. Deleting a name from this list is how a fix is
+ * proved, and the list should end up empty. */
+static const char *const s_narrow_todo[] = {
+    "Settings",
+    "Recycle Bin",
+    "Remote Desktop",
+    "Software Update",
+    "Date & time",
+};
+
+static bool narrow_todo(const char *name)
+{
+    for (unsigned i = 0; i < sizeof(s_narrow_todo) / sizeof(s_narrow_todo[0]); i++)
+        if (!strcmp(name, s_narrow_todo[i]))
+            return true;
+    return false;
+}
+
+static void layouts(bool audit, bool narrow)
 {
     for (int large = 0; large <= 1; large++)
     {
@@ -238,6 +265,9 @@ static void layouts(bool audit)
             /* The keyboard never takes the focus and draws its own keys
              * (no widgets to clip): tests/test_wm.c covers it. */
             if (!strcmp(name, "On-screen keyboard"))
+                continue;
+            /* Narrow screens: the apps whose layout is still to be done. */
+            if (narrow && narrow_todo(name))
                 continue;
             td_wm_close_all();
             CHECK(td_app_launch(name));
@@ -255,9 +285,12 @@ static void layouts(bool audit)
             }
         }
         td_wm_close_all();
-        td_datetime_open();
-        tick(1000);
-        check_controls(td_win_focused(), "Date & time", audit);
+        if (!narrow || !narrow_todo("Date & time"))
+        {
+            td_datetime_open();
+            tick(1000);
+            check_controls(td_win_focused(), "Date & time", audit);
+        }
     }
     td_wm_close_all();
     td_wm_set_window_size(TD_UI_SMALL);
@@ -524,9 +557,12 @@ int main(int argc, char **argv)
     const char *required[] = {"Task Manager", "Users", "Mouse", "Keyboard", "Pixels", "Image Viewer", "About"};
     for (unsigned i = 0; i < sizeof(required) / sizeof(required[0]); i++)
         CHECK(registered(required[i]));
-    layouts(audit);
+    layouts(audit, false);
     td_wm_set_screen_size(100, 30);
-    layouts(audit);
+    layouts(audit, false);
+    /* The T-Watch Ultra's grid: this is what the narrow layouts are for. */
+    td_wm_set_screen_size(40, 26);
+    layouts(audit, true);
     td_wm_set_screen_size(80, 24);
     if (!audit)
     {

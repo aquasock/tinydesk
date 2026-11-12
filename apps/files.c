@@ -720,14 +720,34 @@ static void open_window(void)
         return;
     }
     s_path_label = td_label(s_win, 0, 0, 0, "");
-    s_list = td_list(s_win, td_rect(0, 1, -1, -1), get_item, on_activate, NULL);
+    /* -3 rows below the client leaves two for the button rows when narrow. */
+    s_list = td_list(s_win, td_rect(0, 1, -1, td_win_client(s_win).w >= 46 ? -1 : -3),
+                     get_item, on_activate, NULL);
     td_list_set_multi(s_list, true);   /* Ctrl+click, Shift+click, drag over rows, Ctrl+A */
-    td_scrollbar(s_win, -1, 1, -1, s_list);
-    td_button(s_win, 0, -1, "Open", on_activate, NULL);
-    td_button(s_win, 9, -1, "New", on_new, NULL);
-    td_button(s_win, 17, -1, "Folder", on_folder, NULL);
-    td_button(s_win, 28, -1, "Rename", on_rename, NULL);
-    td_button(s_win, 39, -1, "Delete", on_delete, NULL);
+    td_scrollbar(s_win, -1, 1, td_win_client(s_win).w >= 46 ? -1 : -3, s_list);
+    /*
+     * Five captions cannot share a 38-column row: Open 8, New 7, Folder 10,
+     * Rename 10 and Delete 10 come to 45 with no gaps between them, so on this
+     * panel Delete was off the glass and could not be pressed -- the file
+     * manager could not delete a file. Shortening them to "Ren"/"Del" still
+     * overruns, so a narrow window puts them on two rows instead.
+     */
+    if (td_win_client(s_win).w >= 46)
+    {
+        td_button(s_win, 0, -1, "Open", on_activate, NULL);
+        td_button(s_win, 9, -1, "New", on_new, NULL);
+        td_button(s_win, 17, -1, "Folder", on_folder, NULL);
+        td_button(s_win, 28, -1, "Rename", on_rename, NULL);
+        td_button(s_win, 39, -1, "Delete", on_delete, NULL);
+    }
+    else
+    {
+        td_button(s_win, 0, -2, "Open", on_activate, NULL);
+        td_button(s_win, 9, -2, "New", on_new, NULL);
+        td_button(s_win, 17, -2, "Folder", on_folder, NULL);
+        td_button(s_win, 0, -1, "Rename", on_rename, NULL);
+        td_button(s_win, 11, -1, "Delete", on_delete, NULL);
+    }
     td_widget_focus(s_list);
 }
 

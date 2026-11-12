@@ -37,6 +37,13 @@
 #define WIN_H       21
 #define LIST_W      30
 
+/* How much room this window actually got. The wide layout is a 30-column list
+ * beside a details pane; a narrow one stacks them and needs neither constant.
+ * Set once in launch() and read by item(), wrap_summary() and on_draw(). */
+static int s_cw = WIN_W - 2, s_ch = WIN_H - 3;
+static int s_list_w = LIST_W;
+static bool s_narrow;
+
 typedef struct
 {
     char id[32], title[41], version[16], summary[161], category[24];
@@ -521,15 +528,22 @@ static const char *item(td_widget_t *w, int index, int *fg, void *user)
                                                                      : " (installed)";
     if (td_store_cannot_run(e))
         *fg = td_theme()->dim;
-    snprintf(text, sizeof(text), "%.*s%s", LIST_W - 3 - (int)strlen(mark), e->title, mark);
+    snprintf(text, sizeof(text), "%.*s%s",
+             s_list_w - 3 - (int)strlen(mark) > 0
+                 ? s_list_w - 3 - (int)strlen(mark)
+                 : 0,
+             e->title, mark);
     return text;
 }
 
 /* The summary over up to four lines of the details column. */
 static void wrap_summary(const char *text)
 {
-    const int width = WIN_W - LIST_W - 7;
-    for (int i = 0; i < 4; i++)
+    const int width = s_narrow ? s_cw - 2 : WIN_W - LIST_W - 7;
+    /* Two lines on a narrow window: see the row arithmetic in launch(). */
+    const int lines = s_narrow ? 2 : 4;
+
+    for (int i = 0; i < lines; i++)
     {
         while (*text == ' ')
             text++;
@@ -547,6 +561,8 @@ static void wrap_summary(const char *text)
         td_widget_set_text(s_sum[i], line);
         text += n;
     }
+    for (int i = lines; i < 4; i++)
+        td_widget_set_text(s_sum[i], "");
 }
 
 static void show_details(void)
@@ -555,7 +571,9 @@ static void show_details(void)
     bool busy = s_phase != P_IDLE;
     if (i < 0 || i >= s_count)
     {
-        td_widget_set_text(s_title, s_count ? "Choose an app on the left." : "");
+        td_widget_set_text(s_title, s_count ? (s_narrow ? "Choose an app above."
+                                                          : "Choose an app on the left.")
+                                              : "");
         td_widget_set_text(s_meta, "");
         wrap_summary("");
         td_widget_set_text(s_state, "");
@@ -923,8 +941,9 @@ static void on_draw(td_window_t *win, int w, int h)
     (void)win;
     const td_theme_t *t = td_theme();
     td_fill(td_rect(0, 0, w, h), ' ', t->win_fg, t->win_bg);
-    for (int y = 1; y < h - 4; y++)
-        td_text(LIST_W + 2, y, "\xE2\x94\x82", t->dim, t->win_bg, 0);   /* U+2502 */
+    if (!s_narrow)
+        for (int y = 1; y < h - 4; y++)
+            td_text(LIST_W + 2, y, "\xE2\x94\x82", t->dim, t->win_bg, 0);   /* U+2502 */
 }
 
 static void on_close(td_window_t *win)
@@ -974,21 +993,92 @@ static void launch(void)
         s_apps = NULL;
         return;
     }
-    const int x = LIST_W + 4;
-    s_list = td_list(s_win, td_rect(1, 1, LIST_W, WIN_H - 7), item, on_install, NULL);
-    td_scrollbar(s_win, LIST_W + 1, 1, WIN_H - 7, s_list);
-    s_title = td_label(s_win, x, 1, 0, "");
-    s_meta = td_label(s_win, x, 2, 0, "");
-    for (int i = 0; i < 4; i++)
-        s_sum[i] = td_label(s_win, x, 4 + i, 0, "");
-    s_state = td_label(s_win, x, 9, 0, "");
-    s_install = td_button(s_win, x, 11, "Install", on_install, NULL);
-    s_remove = td_button(s_win, x + 14, 11, "Uninstall", on_remove, NULL);
-    s_progress = td_progress(s_win, 1, WIN_H - 5, WIN_W - 4);
-    s_note = td_label(s_win, 1, WIN_H - 4, 0, "");
-    s_refresh = td_button(s_win, 1, -1, "Refresh", on_refresh, NULL);
-    if (card())   /* room for apps on the SD card */
-        s_on_card = td_checkbox(s_win, 14, -1, "Install on the SD card", true, NULL, NULL);
+    /*
+     * A 30-COLUMN LIST BESIDE A DETAILS PANE DOES NOT FIT 38.
+     *
+     * Upstream is a 78x21 window: the list takes columns 1 to 30, a divider at
+     * 32, and the details start at 34 with 44 columns for the title, summary,
+     * state and two buttons. On a 40-column panel the details pane began at
+     * column 34 and had four columns, so the title, summary and state were
+     * invisible and Install and Uninstall were off the glass -- the Store could
+     * be browsed but not used.
+     *
+     * A narrow window stacks: the list across the top, then the details below
+     * it, with Install and Uninstall on their own row.
+     */
+    {
+        td_rect_t cl = td_win_client(s_win);
+        int x;
+
+        s_cw = cl.w;
+        s_ch = cl.h;
+        s_narrow = cl.w < 60;
+
+        if (s_narrow)
+        {
+            /*
+             * Rows are counted from both ends, so nothing can collide: the
+             * bottom three are the progress bar, the note and the Refresh row,
+             * and the details take what is left under the list.
+             *
+             * The summary gets TWO lines here rather than four. Four plus the
+             * title, meta, state and buttons do not fit under a list long enough
+             * to be worth scrolling, and two lines of a catalogue description
+             * is enough to decide whether to press Install.
+             */
+            int progress_y = cl.h - 3;
+            int note_y = cl.h - 2;
+            int refresh_y = cl.h - 1;
+            int btn_y = progress_y - 2;
+            int state_y = btn_y - 1;
+            int sum_y = state_y - 2;              /* two summary lines */
+            int meta_y = sum_y - 1;
+            int title_y = meta_y - 1;
+            int list_h = title_y - 1;             /* rows 0 .. title_y-2 */
+
+            if (list_h < 3)
+                list_h = 3;
+
+            s_list_w = cl.w - 2;
+            s_list = td_list(s_win, td_rect(0, 0, s_list_w, list_h), item, on_install, NULL);
+            td_scrollbar(s_win, cl.w - 1, 0, list_h, s_list);
+
+            x = 0;
+            s_title = td_label(s_win, x, title_y, 0, "");
+            s_meta = td_label(s_win, x, meta_y, 0, "");
+            for (int i = 0; i < 4; i++)
+                s_sum[i] = td_label(s_win, x, sum_y + i, 0, "");
+                /* only the first two have a row; see show_details */
+            s_state = td_label(s_win, x, state_y, 0, "");
+            s_install = td_button(s_win, 0, btn_y, "Install", on_install, NULL);
+            s_remove = td_button(s_win, 14, btn_y, "Uninstall", on_remove, NULL);
+
+            s_progress = td_progress(s_win, 0, progress_y, cl.w);
+            s_note = td_label(s_win, 0, note_y, 0, "");
+            s_refresh = td_button(s_win, 0, refresh_y, "Refresh", on_refresh, NULL);
+            if (card())
+                s_on_card = td_checkbox(s_win, 12, refresh_y, "On SD card", true, NULL, NULL);
+        }
+        else
+        {
+            x = LIST_W + 4;
+            s_list_w = LIST_W;
+            s_list = td_list(s_win, td_rect(1, 1, LIST_W, WIN_H - 7), item, on_install, NULL);
+            td_scrollbar(s_win, LIST_W + 1, 1, WIN_H - 7, s_list);
+            s_title = td_label(s_win, x, 1, 0, "");
+            s_meta = td_label(s_win, x, 2, 0, "");
+            for (int i = 0; i < 4; i++)
+                s_sum[i] = td_label(s_win, x, 4 + i, 0, "");
+            s_state = td_label(s_win, x, 9, 0, "");
+            s_install = td_button(s_win, x, 11, "Install", on_install, NULL);
+            s_remove = td_button(s_win, x + 14, 11, "Uninstall", on_remove, NULL);
+            s_progress = td_progress(s_win, 1, WIN_H - 5, WIN_W - 4);
+            s_note = td_label(s_win, 1, WIN_H - 4, 0, "");
+            s_refresh = td_button(s_win, 1, -1, "Refresh", on_refresh, NULL);
+            if (card())   /* room for apps on the SD card */
+                s_on_card = td_checkbox(s_win, 14, -1, "Install on the SD card", true, NULL, NULL);
+        }
+    }
     td_list_set_count(s_list, 0);
     show_details();
     start_catalog();

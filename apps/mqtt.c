@@ -367,7 +367,7 @@ static void launch(void)
         .rect = td_rect(-1, -1, 76, 20),
         .flags = TD_WIN_DEFAULT,
         .min_w = 75,
-        .min_h = 12,
+        .min_h = 16,   /* the narrow form is six rows plus the list */
         .on_draw = on_draw,
         .on_close = on_close,
         .on_tick = on_tick,
