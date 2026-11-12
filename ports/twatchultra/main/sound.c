@@ -71,9 +71,10 @@
  * have been missed by a listener who was not sure what to expect; this is long
  * enough to be unmistakable. A beep that might be inaudible is not a test. */
 #define BEEP_HZ        1000
-#define BEEP_MS        200
+#define BEEP_MS        250
 
-#define AMPLITUDE      12000       /* of 32767: clearly audible, not painful */
+#define AMPLITUDE      26000       /* of 32767: 80 per cent, as loud as a
+                                    * watch speaker is likely to get */
 
 static i2s_chan_handle_t s_tx;
 static bool s_tried;
@@ -186,20 +187,31 @@ void sound_beep(void)
      * needed for the same tone length. */
     static int16_t buf[2 * BEEP_MS * SOUND_RATE_HZ / 1000];
     const int frames = BEEP_MS * SOUND_RATE_HZ / 1000;
+    const size_t want = sizeof(buf);
     size_t written = 0;
+    esp_err_t err;
 
     if (!s_tx)
+    {
+        ESP_LOGW(TAG, "beep: no channel");
         return;
+    }
 
     beep_samples(buf, frames);
 
-    /* Blocking on purpose, and bounded by the tone's own length: 80 ms of
-     * samples at 16 kHz takes 80 ms to clock out. Called from the terminal's
-     * path, which is the desktop's own task, so it must not be longer than
-     * that -- this is the whole reason the beep is short. */
-    if (i2s_channel_write(s_tx, buf, sizeof(buf), &written,
-                          pdMS_TO_TICKS(200)) != ESP_OK)
-        ESP_LOGW(TAG, "beep write failed");
+    /* The timeout is well beyond the tone's own length rather than equal to it.
+     * 200 ms of stereo samples at 16 kHz is 25,600 bytes, which takes 200 ms to
+     * clock out; with four DMA buffers only the first 1024 frames queue
+     * immediately, so a 200 ms timeout sat exactly on the boundary and would
+     * have failed or truncated intermittently. */
+    err = i2s_channel_write(s_tx, buf, want, &written, pdMS_TO_TICKS(1000));
+
+    /* REPORT WHAT ACTUALLY HAPPENED. This line is the difference between "the
+     * amp is silent" and "we never handed it any samples", and without it the
+     * two are indistinguishable from the outside -- which is where the last two
+     * attempts ended up. Short, for the Log Viewer's 40 columns. */
+    ESP_LOGI(TAG, "beep %u/%u %s", (unsigned)written, (unsigned)want,
+             err == ESP_OK ? "ok" : esp_err_to_name(err));
 }
 
 /* The terminal's BEL. The user pointer exists because the vterm's callbacks all

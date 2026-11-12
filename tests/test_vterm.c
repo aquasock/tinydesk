@@ -14,6 +14,16 @@ static void on_reply(void *user, const char *data, int len)
     s_reply[len] = '\0';
 }
 
+static int s_bells;
+static int s_bell_at_cx;   /* cursor position when the bell fired */
+
+static void on_bell(void *user)
+{
+    (void)user;
+    s_bells++;
+    s_bell_at_cx = s_vt.cx;
+}
+
 static void put(const char *s)
 {
     td_vterm_write(&s_vt, (const uint8_t *)s, (int)strlen(s));
@@ -120,6 +130,55 @@ static void test_utf8_and_resize(void)
     CHECK(row_is(1, "last"));
 }
 
+/* BEL calls the bell callback, and only when it is a real BEL.
+ *
+ * The distinction matters and is the reason this is a test rather than a look
+ * on the glass: an OSC string is terminated by BEL (ESC ] 0 ; title BEL), so a
+ * terminal that rang on every 0x07 would buzz whenever a program set its window
+ * title. The first version of this hook was written into the ground-state
+ * control-character switch for exactly that reason, and this checks it.
+ */
+static void test_bell(void)
+{
+    td_vterm_init(&s_vt, 20, 4);
+    s_vt.bell = on_bell;
+    s_vt.bell_user = NULL;
+    s_bells = 0;
+
+    put("a\a");                 /* a plain BEL in text */
+    CHECK_EQ(s_bells, 1);
+
+    put("b\a\a");              /* two in a row, both count */
+    CHECK_EQ(s_bells, 3);
+
+    /* An OSC title, terminated by BEL: must NOT ring. */
+    put("\x1b]0;window title\x7");
+    CHECK_EQ(s_bells, 3);
+
+    /* A BEL INSIDE a CSI sequence DOES ring, and that is deliberate rather
+     * than an oversight: ECMA-48 makes BEL a control function executed wherever
+     * it appears, and xterm rings for BEL mid-sequence too. Written down
+     * because the first version of this test asserted the opposite and failed,
+     * and the tempting fix would have been to "correct" working code. */
+    put("\x1b[3\a1m");
+    CHECK_EQ(s_bells, 4);
+
+    put("c\a");
+    CHECK_EQ(s_bells, 5);
+
+    /* The callback runs without disturbing the text around it. */
+    td_vterm_init(&s_vt, 20, 4);
+    s_vt.bell = on_bell;
+    s_bells = 0;
+    put("XY\aZ");
+    CHECK_EQ(s_bells, 1);
+    CHECK(row_is(0, "XYZ"));
+
+    /* A terminal with no callback ignores BEL and does not crash. */
+    td_vterm_init(&s_vt, 20, 4);
+    put("\a\a");
+}
+
 int main(void)
 {
     td_vterm_init(&s_vt, 10, 4);
@@ -131,6 +190,7 @@ int main(void)
     put("\x1b[?2026h\x1b"
         "c");
     CHECK(!s_vt.synchronized_output);
+    test_bell();
     test_text_and_newlines();
     test_wrap_and_scroll();
     test_csi();

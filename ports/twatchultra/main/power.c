@@ -284,8 +284,32 @@ bool board_speaker_rail_on(void)
         }
     }
 
-    ESP_LOGI(TAG, "PMU bldo2_v=%02x ldo_en=%02x", v, en);
+    /* READ BACK, do not report the pre-write values. `v` and `en` above were
+     * read before the writes, so logging them says what the rail looked like
+     * and nothing about whether the write landed -- which is exactly the
+     * question a failure here would need answered. */
     vTaskDelay(pdMS_TO_TICKS(20));
+    {
+        uint8_t v2 = 0, en2 = 0;
+
+        if (!pmu_r(PMU_BLDO2_VOLT, &v2) || !pmu_r(PMU_LDO_EN, &en2))
+        {
+            ESP_LOGE(TAG, "bldo2 readback failed");
+            return false;
+        }
+
+        /* Compact for the Log Viewer's 40 columns: voltage in mV, and the
+         * enable byte, which bit 5 of is this rail. */
+        ESP_LOGI(TAG, "bldo2 %dmV en%02x bit5=%d",
+                 (int)(v2 & 0x1F) * 100 + 500, en2,
+                 (en2 >> PMU_BLDO2_EN_BIT) & 1);
+
+        if (!(en2 & (1u << PMU_BLDO2_EN_BIT)))
+        {
+            ESP_LOGE(TAG, "BLDO2 did not stay enabled");
+            return false;
+        }
+    }
     return true;
 }
 
@@ -376,7 +400,11 @@ void board_log_rails(void)
         ESP_LOGW(TAG, "pmu silent");
         return;
     }
-    ESP_LOGI(TAG, "ald1 %02x ald2 %02x en %02x", a1, a2, en);
+    /* The enable byte on its own line: it carries the haptic rail (P06 is the
+     * expander, not this) and ALDO1, ALDO2 and BLDO2, and putting it last on
+     * the previous line meant the Log Viewer's 40 columns cut it off -- which
+     * is how a rail state went unread earlier in this port's life. */
+    ESP_LOGI(TAG, "en %02x ald1 %02x ald2 %02x", en, a1, a2);
 }
 
 /* The battery, for System Monitor.
