@@ -229,8 +229,19 @@ static void set_window(int x, int y, int w, int h)
     reg_write(0x2B, ras, 4);
 }
 
+/* Push w*h pixels from s_tx at RAW controller coordinates, byte-swapped and
+ * already in the buffer. The framebuffer converters below add their own
+ * offsets; this one is for the areas outside the framebuffer, where those
+ * offsets do not apply. */
+static void push_pixels_raw(int cx, int cy, int w, int h);
+
 /* Push w*h byte-swapped pixels from s_tx, CS held across the whole stream. */
 static void push_pixels(int x, int y, int w, int h)
+{
+    push_pixels_raw(x + FB_X + PANEL_COL_OFFSET, y + FB_Y, w, h);
+}
+
+static void push_pixels_raw(int cx, int cy, int w, int h)
 {
     size_t npix = (size_t)w * h;
     uint16_t *p = s_tx;
@@ -238,7 +249,7 @@ static void push_pixels(int x, int y, int w, int h)
     bool first = true;
     esp_err_t err = ESP_OK;
 
-    set_window(x + FB_X + PANEL_COL_OFFSET, y + FB_Y, w, h);
+    set_window(cx, cy, w, h);
 
     spi_device_acquire_bus(s_spi, portMAX_DELAY);
     gpio_set_level(LCD_CS, 0);
@@ -488,6 +499,136 @@ static void panel_fill(uint16_t colour)
     }
 }
 
+
+/*
+ * THE THREE BUTTONS BELOW THE FRAMEBUFFER.
+ *
+ * The glass has a strip below the desktop's 320x416 rectangle that nothing
+ * draws into, and on the Linux build it carried three coloured bars -- red,
+ * green, blue -- which are the board's three capacitive buttons. This paints
+ * them again, images only: nothing reads them here yet, and the touch driver
+ * still maps a press on the strip to a taskbar cell.
+ *
+ * The geometry is the Linux driver's (patches/kernel/display/final/co5300.c,
+ * co5300_paint_frame), which measured it on this glass:
+ *
+ *   controller x  22 .. 156  red
+ *                157 .. 158  black separator
+ *                159 .. 292  green
+ *                293 .. 294  black separator
+ *                295 .. 431  blue
+ *
+ * Two differences from that build, both consequences of this port:
+ *
+ *   * the first row is 460 rather than 445, because this framebuffer is 416
+ *     rows tall where the Linux one was 400 -- the bars are 41 rows, not 57;
+ *   * the strip is painted at its own controller coordinates rather than as
+ *     part of the framebuffer's row bands, since it lies outside them.
+ *
+ * The colours are the Linux driver's full primaries, not the desktop's palette:
+ * RGB565(31,0,0), (0,63,0), (0,0,31). They are the brightest thing on the
+ * glass and are meant to be.
+ */
+#define BTN_Y0   (FB_Y + DISPLAY_H)      /* 461: first row below the framebuffer */
+#define BTN_Y1   (PANEL_H - 1)           /* 501: last row of the glass */
+#define BTN_SEP  2
+
+static void paint_buttons(void)
+{
+    static const uint16_t COL_RED = 0xF800, COL_GREEN = 0x07E0, COL_BLUE = 0x001F;
+
+    /*
+     * FULL CONTROLLER WIDTH, DIVIDED BY THE PANEL'S WIDTH, IN ONE WINDOW.
+     *
+     * Two corrections are folded in here, both found on the glass.
+     *
+     * First the width: the strip is divided by PANEL_W (410), not DISPLAY_W
+     * (320). The framebuffer is a window onto the glass; the buttons belong to
+     * the glass. Dividing by 320 made the third 106 columns instead of 136 and
+     * left the right-hand 90 unpainted, which read as three bars shifted left.
+     *
+     * Then the banding: writing the strip as four separate 11-row windows left
+     * two thin black lines across it. The rows are contiguous in this code, so
+     * the loss is the panel's own -- docs/panel-geometry.md recorded that the
+     * first row of a window is swallowed -- and four windows swallow four rows.
+     * One window with the chip select held across every row band removes the
+     * class of fault entirely, at the cost of refilling s_tx between transfers
+     * instead of filling it once.
+     */
+    const int cx0 = 0;                               /* controller column 0 */
+    const int cx1 = PANEL_COL_OFFSET + PANEL_W - 1;  /* 431: last visible */
+    const int width = cx1 - cx0 + 1;                 /* 432 */
+    const int edge1 = PANEL_COL_OFFSET + PANEL_W / 3;      /* 22 + 136 = 158 */
+    const int edge2 = PANEL_COL_OFFSET + 2 * (PANEL_W / 3);/* 22 + 273 = 295 */
+    const int band = (int)(sizeof(s_tx) / sizeof(s_tx[0])) / width;
+    int y = BTN_Y0;
+    bool first = true;
+
+    if (band < 1)
+        return;
+
+    /* The window is the whole strip; every transfer below continues it. */
+    set_window(cx0, BTN_Y0, width, BTN_Y1 - BTN_Y0 + 1);
+    spi_device_acquire_bus(s_spi, portMAX_DELAY);
+    gpio_set_level(LCD_CS, 0);
+
+    while (y <= BTN_Y1)
+    {
+        int rows = BTN_Y1 - y + 1 > band ? band : BTN_Y1 - y + 1;
+        int i;
+
+        for (i = 0; i < width; i++)
+        {
+            int x = cx0 + i;
+            uint16_t c;
+
+            if (x < edge1 - BTN_SEP)
+                c = COL_RED;
+            else if (x < edge1)
+                c = 0x0000;
+            else if (x < edge2 - BTN_SEP)
+                c = COL_GREEN;
+            else if (x < edge2)
+                c = 0x0000;
+            else
+                c = COL_BLUE;
+
+            c = swap16(c);
+            for (int r = 0; r < rows; r++)
+                s_tx[r * width + i] = c;
+        }
+
+        {
+            spi_transaction_ext_t t = { 0 };
+
+            if (first)
+            {
+                t.base.flags = SPI_TRANS_MODE_QIO;
+                t.base.cmd = CMD_PIXELS;
+                t.base.addr = ADDR_RAMWR;
+                first = false;
+            }
+            else
+            {
+                /* Continuation: no command, no address, CS still low. */
+                t.base.flags = SPI_TRANS_MODE_QIO | SPI_TRANS_VARIABLE_CMD |
+                               SPI_TRANS_VARIABLE_ADDR | SPI_TRANS_VARIABLE_DUMMY;
+                t.command_bits = 0;
+                t.address_bits = 0;
+                t.dummy_bits = 0;
+            }
+            t.base.tx_buffer = s_tx;
+            t.base.length = (size_t)(rows * width) * 16;
+            (void)spi_device_polling_transmit(s_spi, (spi_transaction_t *)&t);
+        }
+
+        y += rows;
+    }
+
+    gpio_set_level(LCD_CS, 1);
+    spi_device_release_bus(s_spi);
+}
+
 static void paint_task(void *arg)
 {
     (void)arg;
@@ -676,6 +817,9 @@ bool display_init(display_reply_fn reply)
     /* Then wipe the margins this port never writes, which still hold whatever
      * the previous firmware left in the controller's RAM. */
     panel_fill(0);
+
+    /* The three button bars below the framebuffer, images only for now. */
+    paint_buttons();
 
     s_cols = DISPLAY_MAX_COLS;
     s_rows = DISPLAY_MAX_ROWS;
