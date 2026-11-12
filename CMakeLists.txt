@@ -413,6 +413,16 @@ if(TD_BUILD_TESTS)
     set_target_properties(test_desktop PROPERTIES C_STANDARD 11)
     target_compile_options(test_desktop PRIVATE ${TD_WARNINGS})
     add_test(NAME test_desktop COMMAND test_desktop)
+    # The T-Watch Ultra's glass margins: geometry, hit test and the coordinate
+    # spaces between them. Pure arithmetic, so it needs no hardware -- which is
+    # the point, because the three faults it was written for were all found on
+    # the glass and all three were arithmetic.
+    add_executable(test_twatch_edges tests/test_twatch_edges.c)
+    target_include_directories(test_twatch_edges PRIVATE ports/twatchultra/main)
+    set_target_properties(test_twatch_edges PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+    target_compile_options(test_twatch_edges PRIVATE ${TD_WARNINGS})
+    add_test(NAME test_twatch_edges COMMAND test_twatch_edges)
+
     add_executable(test_trash tests/test_trash.c ports/common/td_fs_stdio.c)
     target_include_directories(test_trash PRIVATE ports/common)
     target_link_libraries(test_trash PRIVATE tinydesk_apps)
