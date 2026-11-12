@@ -720,12 +720,25 @@ static inline uint16_t label_fg(void)
  */
 #define LABEL_MAX_CELLS 8
 
+/* How a label is stood on end, if at all.
+ *
+ * Not a bool, because there are two distinct quarter turns and they read in
+ * opposite directions: CCW puts the first character at the bottom and reads
+ * upward, CW puts it at the top and reads downward. They are exact 180-degree
+ * rotations of each other, so one is the other read from the far edge. */
+typedef enum
+{
+    LABEL_UPRIGHT = 0,   /* normal, left to right */
+    LABEL_CCW,           /* first character at the bottom, reads upward */
+    LABEL_CW,            /* first character at the top, reads downward */
+} label_rot_t;
+
 typedef struct
 {
     uint16_t cp[LABEL_MAX_CELLS];
     int n;
     int x, y;        /* top-left of the label's bounding box */
-    bool rot;        /* stood on end, reading bottom to top */
+    label_rot_t rot;
 } label_pos_t;
 
 /* Decode UTF-8 into code points, stopping at cap. A malformed sequence yields
@@ -793,7 +806,7 @@ static int utf8_cells(const char *s, uint16_t *out, int cap)
  * out horizontally at all, and the first thing that would have gone wrong is
  * that the text overran its border. Stood on end it needs 56 of the 61 rows a
  * slot offers and 16 of the 41 columns. */
-static void label_place(const char *s, int x0, int x1, int y0, int y1, bool rot,
+static void label_place(const char *s, int x0, int x1, int y0, int y1, label_rot_t rot,
                         label_pos_t *out)
 {
     int w, h;
@@ -801,8 +814,8 @@ static void label_place(const char *s, int x0, int x1, int y0, int y1, bool rot,
 
     out->n = utf8_cells(s, out->cp, LABEL_MAX_CELLS);
     out->rot = rot;
-    w = rot ? CELL_H : out->n * CELL_W;
-    h = rot ? out->n * CELL_W : CELL_H;
+    w = rot == LABEL_UPRIGHT ? out->n * CELL_W : CELL_H;
+    h = rot == LABEL_UPRIGHT ? CELL_H : out->n * CELL_W;
     cx = x0 + (x1 - x0 + 1 - w) / 2;
     cy = y0 + (y1 - y0 + 1 - h) / 2;
     out->x = cx < x0 ? x0 : cx;
@@ -817,14 +830,21 @@ static void label_place(const char *s, int x0, int x1, int y0, int y1, bool rot,
  * comes from the x offset; bit 7 of each glyph row is its leftmost pixel, the
  * same convention paint_cell() uses for the terminal.
  *
- * Rotated a quarter turn counter-clockwise, the mapping runs backwards through
- * the same table: the glyph's own rows become the pixel's columns and its
- * columns become the pixel's rows. The letter's top edge ends up on the left,
- * so glyph row 0 is the leftmost column, and its left edge ends up along the
- * bottom, so the leftmost bit is in the last row of the character's 8-row band.
- * The characters are laid out from the bottom up, which is what makes the text
- * read bottom to top -- and reads correctly left to right if the watch is turned
- * a quarter turn clockwise, which is the orientation the column is designed for.
+ * Rotated a quarter turn, the mapping runs backwards through the same table: the
+ * glyph's own rows become the pixel's columns and its columns become the pixel's
+ * rows.
+ *
+ * Counter-clockwise puts the letter's top edge on the left, so glyph row 0 is
+ * the leftmost column, and its left edge along the bottom, so the leftmost bit
+ * is in the last row of the character's 8-row band; characters are laid out from
+ * the bottom up, which makes the text read bottom to top.
+ *
+ * Clockwise is that turned through 180 degrees, which is what the left column
+ * uses: the letter's top edge is on the right, so glyph row 0 is the rightmost
+ * column, and its left edge is at the top, so the leftmost bit is in the first
+ * row of the band; characters are laid out from the top down. The two are exact
+ * opposites, so the same column reads upright from either edge of the watch
+ * depending on which way it is turned.
  */
 static bool label_bit(const label_pos_t *p, int x, int y)
 {
@@ -835,7 +855,7 @@ static bool label_bit(const label_pos_t *p, int x, int y)
     if (dx < 0 || dy < 0)
         return false;
 
-    if (!p->rot)
+    if (p->rot == LABEL_UPRIGHT)
     {
         if (dy >= CELL_H)
             return false;
@@ -851,9 +871,19 @@ static bool label_bit(const label_pos_t *p, int x, int y)
             return false;
         if (dy >= p->n * CELL_W)
             return false;
-        idx = p->n - 1 - dy / CELL_W;   /* the first character is at the bottom */
-        gy = dx;                        /* glyph top edge -> left  */
-        gx = (CELL_W - 1) - (dy % CELL_W);  /* glyph left edge -> bottom */
+
+        if (p->rot == LABEL_CCW)
+        {
+            idx = p->n - 1 - dy / CELL_W;   /* first character at the bottom */
+            gy = dx;                        /* glyph top edge -> left  */
+            gx = (CELL_W - 1) - (dy % CELL_W);  /* glyph left edge -> bottom */
+        }
+        else
+        {
+            idx = dy / CELL_W;                  /* first character at the top */
+            gy = (CELL_H - 1) - dx;             /* glyph top edge -> right */
+            gx = dy % CELL_W;                   /* glyph left edge -> top  */
+        }
     }
 
     glyph = font8x16_glyph(p->cp[idx]);
@@ -903,7 +933,7 @@ static void paint_buttons(void)
         int g1 = btn_slot_x(s + 1) - 1;
 
         label_place(btn_label(s), g0 + BTN_RADIUS, g1 - BTN_RADIUS,
-                    BTN_Y0 + BTN_RADIUS, BTN_Y1 - BTN_RADIUS, false, &label[s]);
+                    BTN_Y0 + BTN_RADIUS, BTN_Y1 - BTN_RADIUS, LABEL_UPRIGHT, &label[s]);
     }
 
     /* The window is the whole strip; every transfer below continues it, so CS
@@ -1027,7 +1057,7 @@ static corners_t column_corners(int s, bool desk_right)
 
 /* One column, at controller x0..x1. desk_right says which side the desktop is
  * on, which is the only thing that differs between the two. */
-static void paint_column(int x0, int x1, bool desk_right, bool rot,
+static void paint_column(int x0, int x1, bool desk_right, label_rot_t rot,
                          const char *(*label_at)(int))
 {
     /* One sacrificial row and column: exactly one pixel is lost at the top-left
@@ -1316,8 +1346,8 @@ bool display_init(display_reply_fn reply)
     paint_buttons();
 
     /* Five down each margin, same treatment, mirrored. */
-    paint_column(LEFT_X0, LEFT_X1, true, true, left_label);
-    paint_column(RIGHT_X0, RIGHT_X1, false, false, right_label);
+    paint_column(LEFT_X0, LEFT_X1, true, LABEL_CW, left_label);
+    paint_column(RIGHT_X0, RIGHT_X1, false, LABEL_UPRIGHT, right_label);
 
     s_cols = DISPLAY_MAX_COLS;
     s_rows = DISPLAY_MAX_ROWS;

@@ -133,7 +133,13 @@ static inline const char *right_label(int i)
  *
  * The column has the room the bottom strip does not. Its buttons are 81 to 83
  * rows tall, so a seven-character label needs 56 rows of the 61 between the
- * corner radii, and there are five rows to spare. */
+ * corner radii, and there are five rows to spare.
+ *
+ * Turned clockwise, so the labels read top to bottom: the operator reads the
+ * watch from the edge opposite the one the counter-clockwise version suited.
+ * Each character is still upright with respect to that edge, and the two
+ * directions are 180 degrees apart, so this is the same column read from the
+ * other side rather than a different arrangement. */
 static inline const char *left_label(int i)
 {
     static const char *const labels[COL_N] = { "F10", "Esc", "F6", "Super+D", "F11" };
