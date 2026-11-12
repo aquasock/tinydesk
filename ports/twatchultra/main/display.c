@@ -688,11 +688,11 @@ static void paint_buttons(void)
 }
 
 /*
- * THE SEVEN BUTTONS DOWN THE LEFT EDGE.
+ * THE BUTTONS DOWN THE LEFT EDGE.
  *
  * The same treatment as the strip below the framebuffer, turned through a right
- * angle: seven green slots stacked down the margin the framebuffer does not
- * reach, with a 10 px radius on the corners that face a neighbour.
+ * angle: green slots stacked down the margin the framebuffer does not reach,
+ * with a 10 px radius on the corners that face a neighbour.
  *
  * Which corners those are follows the strip rather than being chosen again.
  * The strip sits on the bottom glass edge, so its bottom edge is square and the
@@ -712,10 +712,10 @@ static void paint_buttons(void)
 #define LEFT_X1   (FB_X + PANEL_COL_OFFSET - 1)     /* 66: last column before fb */
 #define LEFT_Y0   FB_Y                              /* 45: framebuffer top row */
 #define LEFT_Y1   (FB_Y + DISPLAY_H - 1)            /* 460: framebuffer bottom */
-#define LEFT_N    7
+#define LEFT_N    5
 
 /* First row of slot i. Slots are not all the same height: 416 rows do not
- * divide by seven, so the remainder is spread one row at a time rather than
+ * divide by LEFT_N, so the remainder is spread one row at a time rather than
  * left as a fat last button. */
 static int left_slot_y(int i)
 {
