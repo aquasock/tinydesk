@@ -251,6 +251,37 @@ static void test_icon_labels_utf8(void)
     td_desktop_set_provider(NULL);
 }
 
+/* Back out of the start menu: Escape and Ctrl+Q both close it, anything else
+ * with Ctrl still reaches the menu's own handling.
+ *
+ * Ctrl+Q is what a port with a physical back button sends, and a back button
+ * that does nothing when a menu is open is the one place it is most obviously
+ * wanted. The failure mode is silent either way -- the menu simply stays up --
+ * so it is worth a test rather than a look on the glass. */
+static void test_menu_back(void)
+{
+    td_wm_init(80, 25);
+    td_app_register(&s_app_a);
+
+    td_wm_toggle_start_menu();
+    CHECK(td_menu_is_open());
+    key('q', TD_MOD_CTRL);
+    CHECK(!td_menu_is_open());
+
+    td_wm_toggle_start_menu();
+    CHECK(td_menu_is_open());
+    key(TD_KEY_ESC, 0);
+    CHECK(!td_menu_is_open());
+
+    /* A bare 'q' is type-ahead, not back: it must leave the menu open. */
+    td_wm_toggle_start_menu();
+    CHECK(td_menu_is_open());
+    key('q', 0);
+    CHECK(td_menu_is_open());
+    key(TD_KEY_ESC, 0);
+    CHECK(!td_menu_is_open());
+}
+
 static void test_icons_and_hover(void)
 {
     static td_buffer_t back;
@@ -451,6 +482,7 @@ int main(void)
     td_wm_set_input_gate(false, NULL);
     key(TD_KEY_ENTER, 0);
     CHECK_EQ(s_clicks, clicks + 2);
+    test_menu_back();
     test_start_menu_tail();
     return TD_TEST_RESULT();
 }

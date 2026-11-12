@@ -317,14 +317,47 @@ static void to_cell(int x, int y, int *col, int *row)
 
 /* A key, as the terminal would send it: the desktop's input parser turns these
  * back into key events, so an edge press is indistinguishable from the same key
- * on a Bluetooth keyboard. CSI 11~ to 15~ are F1 to F5. */
+ * on a Bluetooth keyboard.
+ *
+ * WHICH KEYS, AND WHY NOT F1 TO F5. The first version sent F1..F5, which was
+ * wrong for the same reason the panel stopped being a pointer: those are app
+ * keys. On the desktop they do nothing at all, and inside a window they are
+ * already spoken for -- Files renames on F2 and reloads on F5, Editor finds on
+ * F3 and runs on F5, Terminal forwards them to the shell. Five physical buttons
+ * spent on functions that only ever fire inside a window, while the things that
+ * lost their mouse go unmapped. These are window manager actions, and they are
+ * the ones that keep the desktop usable with no pointer on the glass:
+ *
+ *   1  F10      the Start menu -- otherwise reachable only from the taskbar or
+ *               an icon, both of which need a mouse
+ *   2  Esc      cancel: closes a dialog, abandons a rename, backs out of a menu
+ *   3  F6       the window switcher, the only way to change focus
+ *   4  Super+D  show the desktop, and again to bring it all back -- the only way
+ *               to restore a minimised window, since F6 skips hidden ones
+ *   5  F11      full screen for the focused window
+ *
+ * Super+D goes in xterm's modifyOtherKeys form, ESC [ 27 ; 9 ; d ~, because
+ * there is no single byte for it and the parser already understands that shape.
+ * A lone Esc is the one key here that waits: 0x1b is the start of every escape
+ * sequence, so the parser resolves it on TD_ESC_TIMEOUT_MS, which is 50 ms. */
 static const char *const s_fkey[LEFT_N] = {
-    "\x1b[11~", "\x1b[12~", "\x1b[13~", "\x1b[14~", "\x1b[15~",
+    "\x1b[21~",             /* F10     Start menu */
+    "\x1b",                 /* Esc     cancel */
+    "\x1b[17~",             /* F6      window switcher */
+    "\x1b[27;9;100~",       /* Super+D show desktop */
+    "\x1b[23~",             /* F11     full screen */
 };
 
-/* Left to right: Tab, Enter, Esc. */
+/* Left to right: Tab, Enter, Back.
+ *
+ * Back is Ctrl+Q because that is what the window manager already treats as
+ * "close the focused window" -- the same path as its [x], routed through
+ * td_win_request_close() so a window that has something to lose can refuse; the
+ * Editor asks about unsaved changes and everything else closes outright. It is
+ * Ctrl+Q rather than Alt+F4 because a terminal only passes Alt+F4 through when
+ * the terminal layer chooses to, and this one is injecting the bytes itself. */
 static const char *const s_bkey[BTN_N] = {
-    "\t", "\r", "\x1b",
+    "\t", "\r", "\x11",
 };
 
 static void send_str(const char *s)

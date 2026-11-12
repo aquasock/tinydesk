@@ -1394,6 +1394,16 @@ static const char *menu_name(int i, void *user)
 
 static void menu_key(const td_event_t *ev)
 {
+     /* Back out of the menu, the same as Escape. Ctrl+Q is what a port with a
+     * back button sends, and "back" is most obviously wanted here, so it closes
+     * the menu rather than falling through to the type-ahead below -- which is
+     * where it would otherwise land, matching nothing. */
+    if (ev->key == 'q' && ev->mods == TD_MOD_CTRL)
+    {
+        s_menu_open = false;
+        s_dirty = true;
+        return;
+    }
     switch (ev->key)
     {
     case TD_KEY_UP:
