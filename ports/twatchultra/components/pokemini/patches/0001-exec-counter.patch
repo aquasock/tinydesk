@@ -1,0 +1,13 @@
+--- /tmp/xx_clean.c	2026-11-09 14:42:13.119288328 -0700
++++ MinxCPU_XX.c	2026-11-09 14:42:13.127479276 -0700
+@@ -20,8 +20,10 @@
+ 
+ #include "MinxCPU.h"
+ 
++unsigned long g_exec_count = 0;
+ int MinxCPU_Exec(void)
+ {
++	g_exec_count++;
+ 	uint8_t I8A, I8B;
+ 	uint16_t I16;
+ 

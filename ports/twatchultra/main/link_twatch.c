@@ -40,6 +40,7 @@
 #include "sound.h"
 #include "nes.h"
 #include "tama.h"
+#include "pmbench.h"
 #include "hal_mux.h"
 #include "tinydesk/td_picture.h"
 #include "tinydesk/td_wm.h"
@@ -460,6 +461,9 @@ bool link_init(void)
 
     if (!nes_register_command())
         ESP_LOGW(TAG, "nes command did not register");
+
+    if (!pmbench_register_command())
+        ESP_LOGW(TAG, "pmbench command did not register");
 
     if (!touch_register_command())
         ESP_LOGW(TAG, "touchdump command did not register");
