@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "ht24lc08.h"
 #include "splb32.h"
 #include "segmap.h"
 #include "render.h"
@@ -34,6 +35,15 @@
 _Static_assert(SEG_LCD_W + 2 * TMC_PAD == TMC_FRAME_W, "frame width does not fit the artwork");
 _Static_assert(SEG_LCD_H + 2 * TMC_PAD == TMC_FRAME_H, "frame height does not fit the artwork");
 _Static_assert(SEG_DOT == TMC_DOT && SEG_GAP == TMC_GAP, "dot pitch disagrees with segmap.h");
+
+/* The save image must be exactly the EEPROM's own size. ht24lc08_save() memcpys
+ * HT24LC08_SIZE bytes into the caller's buffer with no length argument, and
+ * tmc_eeprom_load() passes TMC_EEPROM_BYTES on the way back, so a mismatch is an
+ * out-of-bounds write on save and an out-of-bounds read on load. It was 512
+ * against 1024 for several cycles and cost a reboot on every `tama stop`; this
+ * assertion is the mechanism that stops it recurring. */
+_Static_assert(TMC_EEPROM_BYTES == HT24LC08_SIZE,
+               "save image size must match the emulated EEPROM");
 
 /* The bezel is black, matching the desktop behind a full-screen app, so only
  * the LCD itself is visible. It is deliberately NOT the LCD's off colour:

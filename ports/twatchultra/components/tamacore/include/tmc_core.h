@@ -52,8 +52,28 @@
 #define TMC_ROM_SIG2    0x10
 #define TMC_ROM_SIG3    0x49
 
-/* EEPROM save image: the guest's persistent state. */
-#define TMC_EEPROM_BYTES 512
+/*
+ * EEPROM save image: the guest's persistent state.
+ *
+ * 1024, NOT 512, and the difference was a memory-safety bug rather than a
+ * wrong number. The serial EEPROM is a 24LC08 -- 8 Kbit, so 1024 bytes -- and
+ * `ht24lc08_save()` memcpys HT24LC08_SIZE bytes into the caller's buffer. With
+ * this constant at 512 every save wrote 512 bytes past a 512-byte stack array,
+ * smashing the caller's frame. On the watch that surfaced as a reboot: the
+ * overflow ran up through cmd_tama into tdsh's parser frame and corrupted the
+ * FILE* it was about to close, so `tama stop` ended in
+ *
+ *     assert failed: check_lock_nonzero locks.c:307
+ *     (lock != NULL && "Uninitialized lock used")
+ *
+ * -- a crash in the shell, three calls away from the line that caused it. The
+ * load path read 512 bytes past its buffer for the same reason.
+ *
+ * tmc_core.c asserts this equals HT24LC08_SIZE at compile time, because the
+ * only real defence against a size constant drifting from the device it
+ * describes is to make the build fail when they disagree.
+ */
+#define TMC_EEPROM_BYTES 1024
 
 typedef struct tmc tmc;
 
