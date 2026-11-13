@@ -1712,6 +1712,81 @@ bool display_picture_rgb(void *user, int x, int y, const uint16_t *pixels, int w
 }
 
 /*
+ * Push a picture row by row, without ever materialising a converted frame.
+ *
+ * WHAT THIS SAVES, measured rather than argued. display_picture_rgb() above
+ * copies the caller's bitmap into s_fb and then flush_rect() copies the same
+ * pixels straight back out of s_fb into s_tx. Neither copy is free: s_fb is
+ * 320x416x2 = 260 KB of PSRAM, far larger than the cache, so writing it is a
+ * stream of cache misses and reading it back is another. On the NES this round
+ * trip measured 705,665 us of CPU inside the blit over one second at 19 fps on
+ * 2026-11-12 -- 37,140 us of a 52,980 us frame, 70 percent of the budget to
+ * move 61,440 pixels. The picture was being converted into PSRAM, copied across
+ * PSRAM, and copied out of PSRAM before anything reached the panel.
+ *
+ * This path goes from the caller's own representation to s_tx in ONE pass, and
+ * s_tx is internal SRAM. The only PSRAM read left is whatever the caller's
+ * source costs.
+ *
+ * WHY OWNERSHIP IS A PRECONDITION AND NOT A COMMENT. The tempting shortcut is
+ * to let this quietly fall back, but a fallback would hide a real fault: the
+ * cell painter READS s_fb and decides what to repaint by comparing it against
+ * its own record, so a picture pushed through here without ownership would be
+ * painted over on the next notification, and repaint/dcheck -- the two commands
+ * whose entire job is to say whether the glass matches the framebuffer -- would
+ * both start reporting on a framebuffer nobody is drawing into. Refusing makes
+ * the mistake loud at the call site instead of visible only on the glass.
+ */
+bool display_picture_rows(void *ctx, int x, int y, int w, int h, display_row_fn fn)
+{
+    int x0, y0, x1, y1, dw, col, band;
+
+    if (!s_fb || !fn || w <= 0 || h <= 0)
+        return false;
+    if (!s_pixel_owner)
+        return false;
+
+    /* Clipped the same way display_picture_rgb() clips, and for the same
+     * reason: a picture partly off the panel shows as much of itself as fits, so
+     * a layout mistake stays visible instead of becoming a blank screen. */
+    x0 = x < 0 ? 0 : x;
+    y0 = y < 0 ? 0 : y;
+    x1 = x + w;
+    y1 = y + h;
+
+    if (x1 > DISPLAY_W)
+        x1 = DISPLAY_W;
+    if (y1 > DISPLAY_H)
+        y1 = DISPLAY_H;
+    if (x0 >= x1 || y0 >= y1)
+        return false;
+
+    dw = x1 - x0;
+    col = x0 - x;
+
+    /* Same band arithmetic and the same BAND_ROWS cap as flush_rect(), because
+     * the cap is a property of this panel and not of the copy: a tall narrow
+     * window tears (LCD-009), so the height is bounded whatever the width. */
+    band = (int)(sizeof(s_tx) / sizeof(s_tx[0])) / dw;
+    if (band > BAND_ROWS)
+        band = BAND_ROWS;
+    if (band < 1)
+        band = 1;
+
+    for (int yy = y0; yy < y1; yy += band)
+    {
+        int rows = (y1 - yy) > band ? band : (y1 - yy);
+
+        for (int r = 0; r < rows; r++)
+            fn(ctx, (yy + r) - y, col, s_tx + (size_t)r * dw, dw);
+
+        push_pixels(x0, yy, dw, rows);
+    }
+
+    return true;
+}
+
+/*
  * Paint the whole framebuffer one colour, in one go.
  *
  * This exists for the difference between an app that draws a PICTURE and one

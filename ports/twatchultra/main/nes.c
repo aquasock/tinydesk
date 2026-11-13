@@ -53,8 +53,32 @@ static const char *TAG = "nes";
 #define NES_FRAME_US    (1000000.0 / 60.0988)
 
 static nes_t *s_nes;
-static uint8_t *s_vidbuf;          /* PSRAM, 272x240 palette indices */
-static uint16_t *s_row;            /* one converted row, for the blit      */
+/* Where the NES frame buffer comes from: see the allocation in nes_start().
+ * 0 is the shipped arrangement (heap, internal if it fits, else PSRAM); 1 is the
+ * internal-DRAM experiment, which requires a rebuild to change.
+ *
+ * MEASURED, 2026-11-12, Zelda title screen, 25-second runs:
+ *
+ *   0 (heap -> PSRAM)   42 fps   blit 8,647 us/frame   internal free 143,275
+ *   1 (static internal) 45 fps   blit 8,070 us/frame   internal free  77,475
+ *
+ * So the whole prize is 3 fps for 65,800 bytes of internal DRAM held for the
+ * life of the firmware -- and with the radio initialised that puts internal free
+ * below the 65,536 tdsh's SSH server demands, so SSH stops starting. Not worth
+ * it, which is why 0 is the default and this is kept only so the experiment is
+ * not run twice.
+ *
+ * The number that made it not worth it is also the useful finding: moving the
+ * frame buffer into SRAM saved only 577 us of an 8,647 us blit. The prediction
+ * was several milliseconds, and it was wrong because the blit is dominated by
+ * the SPI push and not by reading the buffer. */
+#define NES_VIDBUF_STATIC 0
+
+static uint8_t *s_vidbuf;          /* 272x240 palette indices        */
+/* Which pool the frame buffer actually came from: true for internal DRAM, false
+ * for PSRAM. Reported by `nes status`, because the two produce very different
+ * frame times and a measurement is worthless if it does not say which it had. */
+static bool s_vidbuf_internal;
 static TaskHandle_t s_task;
 static volatile bool s_run;
 static volatile bool s_paused;
@@ -95,6 +119,14 @@ static volatile uint32_t s_us_blit;    /* last second: time inside the blit     
  */
 static uint16_t s_pal[256];
 
+/* The same 256 colours with each pixel's bytes exchanged into the order the
+ * panel wants on the wire (display.h: display_swap16). It exists so the blit
+ * can emit panel-ready values straight from a table lookup: the interchange is
+ * then done 256 times at start instead of 61,440 times per frame, and -- more
+ * to the point -- it lets the row callback write into the transmit band
+ * directly, which is what removes the full-frame copy through PSRAM. */
+static uint16_t s_pal_tx[256];
+
 /* The blit's own duration, picked up by the task loop after nes_emulate returns.
  * A file-scope variable rather than a return value because the core calls the
  * blit through a function pointer. */
@@ -125,6 +157,27 @@ static void build_palette(void)
 
         s_pal[192 + i] = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
     }
+
+    for (int i = 0; i < 256; i++)
+        s_pal_tx[i] = display_swap16(s_pal[i]);
+}
+
+/*
+ * Give the frame buffer back, if it was ever the heap's to give.
+ *
+ * With NES_VIDBUF_STATIC the buffer is a linker-placed array and freeing it
+ * would be a heap corruption bug rather than a no-op, so the release goes
+ * through here and the static case does nothing. Every teardown path calls this
+ * instead of heap_caps_free() so that turning the experiment on or off cannot
+ * leave a stray free behind.
+ */
+static void vidbuf_release(void)
+{
+#if !NES_VIDBUF_STATIC
+    if (s_vidbuf)
+        heap_caps_free(s_vidbuf);
+#endif
+    s_vidbuf = NULL;
 }
 
 /* --- the blit ------------------------------------------------------------- */
@@ -132,35 +185,72 @@ static void build_palette(void)
 /*
  * Called once per frame by the core with the finished 272x240 index buffer.
  *
- * THE OVERDRAW IS SKIPPED, not copied. `NES_SCREEN_PITCH` is 8 + 256 + 8 because
- * the PPU writes eight pixels of slop on each side for a sprite that starts
- * there; presenting that would show a 272-pixel-wide picture and put the game
- * eight pixels off centre. So the source pointer is advanced by
- * `NES_SCREEN_OVERDRAW` on every row and only 256 pixels are converted.
+ * THE OVERDRAW IS SKIPPED, not presented. `NES_SCREEN_PITCH` is 8 + 256 + 8
+ * because the PPU writes eight pixels of slop on each side for a sprite that
+ * starts there; showing that would put the game eight pixels off centre. So the
+ * row fetch starts `NES_SCREEN_OVERDRAW` into each row and only 256 pixels are
+ * converted.
  *
- * The conversion is a LUT copy into a row buffer, then one blit of the whole
- * image. Building the image in a scratch buffer and calling display_picture_rgb()
- * once per FRAME rather than once per ROW matters: each call takes the
- * framebuffer lock, reprograms the panel window registers and pushes over QSPI,
- * so sixteen calls per frame would be sixteen window setups for one picture.
+ * IT NO LONGER BUILDS A FRAME. This used to convert all 61,440 pixels into a
+ * 120 KB PSRAM scratch buffer and hand that to display_picture_rgb(), which
+ * copied it into the 260 KB PSRAM framebuffer and immediately copied it back out
+ * into the transmit band. Measured on the watch at 19 fps, the blit was 705,665
+ * us of CPU per second -- 37,140 us of a 52,980 us frame, 70 percent of it --
+ * for an image that lives in 61,440 bytes before conversion. Three passes over
+ * external memory to reach 5120-byte band of internal RAM.
+ *
+ * display_picture_rows() inverts the arrangement: it drives the band loop and
+ * asks for one row at a time, so the palette lookup writes straight into the
+ * transmit band. One PSRAM read per pixel, none written, and the scratch buffer
+ * is gone entirely.
+ *
+ * The band size that call chooses is 16 rows, which is BAND_ROWS and a property
+ * of this panel -- a taller window tears (LCD-009). So a frame is 15 window
+ * setups either way; what changed is the memory traffic, not the protocol.
  */
+static void nes_fill_row(void *ctx, int row, int col, uint16_t *dst, int n)
+{
+    const uint8_t *buf = (const uint8_t *)ctx;
+
+    if (!buf || row < 0 || row >= NES_SCREEN_HEIGHT || col < 0)
+        return;
+    if (col + n > NES_SCREEN_WIDTH)
+        n = NES_SCREEN_WIDTH - col;
+    if (n <= 0)
+        return;
+
+    const uint8_t *src = NES_SCREEN_GETPTR(buf, col, row);
+
+    /* s_pal_tx, not s_pal: the destination is the panel's transmit band, and the
+     * values are already in the order the wire wants. */
+    for (int x = 0; x < n; x++)
+        dst[x] = s_pal_tx[src[x]];
+}
+
 static void nes_blit(uint8_t *buf)
 {
-    if (!buf || !s_row)
+    if (!buf)
         return;
 
     int64_t b0 = esp_timer_get_time();
 
-    for (int y = 0; y < NES_SCREEN_HEIGHT; y++)
+    /* `buf` is the pointer the core was given, so it is the context the row
+     * callback reads rather than the file-scope copy: if those two ever
+     * disagreed, the picture would come from the wrong place and neither
+     * counter would notice. */
+    if (!display_picture_rows((void *)buf, NES_OX, NES_OY,
+                              NES_SCREEN_WIDTH, NES_SCREEN_HEIGHT, nes_fill_row))
     {
-        const uint8_t *src = NES_SCREEN_GETPTR(buf, 0, y);
-        uint16_t *dst = s_row + (size_t)y * NES_SCREEN_WIDTH;
-
-        for (int x = 0; x < NES_SCREEN_WIDTH; x++)
-            dst[x] = s_pal[src[x]];
+        /* Ownership not claimed, or no framebuffer. Nothing was drawn, and the
+         * only reason to be here is a start-up ordering fault -- say so rather
+         * than leaving a black screen with a healthy frame counter. */
+        static bool warned;
+        if (!warned)
+        {
+            warned = true;
+            printf("blit refused: pixels not claimed\n");
+        }
     }
-
-    display_picture_rgb(NULL, NES_OX, NES_OY, s_row, NES_SCREEN_WIDTH, NES_SCREEN_HEIGHT);
 
     s_us_blit_last = (uint32_t)(esp_timer_get_time() - b0);
 }
@@ -399,49 +489,80 @@ bool nes_start(const char *rom_path)
     }
 
     /*
-     * THE FRAME BUFFER, FROM PSRAM. 272x240 is 65,280 bytes and it is the single
-     * largest thing this component needs; internal DRAM on this board idles near
-     * 66 KB free and tdsh wants 65,536 of it for the SSH server, so a static
-     * array here would break a peripheral that has nothing to do with the NES.
-     * That is not hypothetical -- it is EMU-018, learned with the Tamagotchi's
-     * 4 KB of dirty-row tables.
+     * THE FRAME BUFFER: INTERNAL RAM IF IT FITS, PSRAM OTHERWISE. 272x240 is
+     * 65,280 bytes, and it is touched twice per pixel per frame -- the PPU writes
+     * it, the blit reads it -- so which pool it lives in decides the cost of both
+     * halves of the frame, not just one.
+     *
+     * It was PSRAM unconditionally, and the reason was sound at the time: 4,148
+     * bytes of static .bss once starved tdsh's SSH server of its 65,536-byte
+     * floor (EMU-018), so a fixed 65 KB array in internal DRAM was clearly
+     * unaffordable. Two things have changed since. Free internal now reads
+     * 143,275 bytes when the radio is never initialised, and this allocation is
+     * made at `nes` start rather than at boot -- so it is a heap request that is
+     * returned on stop, not a permanent claim, which is the same refcount
+     * discipline the Tamagotchi's frame buffer follows.
+     *
+     * It is a REQUEST, NOT AN ASSUMPTION. Internal DRAM is fragmented by the
+     * time an app runs, so a 65,280-byte contiguous block may simply not exist
+     * however much total free is reported -- and the answer is a property of the
+     * running system, not something that can be read off a size report. So the
+     * result is recorded in s_vidbuf_internal and reported by `nes status`, and
+     * the same firmware works either way. A silent fallback would leave the next
+     * measurement quoting a number for a pool it was not using.
      *
      * Set AFTER loading, always: nes_loadfile() calls nes_reset(), which nulls
      * vidbuf, so a buffer installed beforehand is silently discarded and the PPU
      * renders nothing while the emulator reports a healthy frame rate. That cost
      * two benchmark runs on the host (NES-001).
      */
-    s_vidbuf = (uint8_t *)heap_caps_malloc((size_t)NES_SCREEN_PITCH * NES_SCREEN_HEIGHT,
-                                           MALLOC_CAP_SPIRAM);
+    const size_t vidbytes = (size_t)NES_SCREEN_PITCH * NES_SCREEN_HEIGHT;
+
+#if NES_VIDBUF_STATIC
+    /* THE EXPERIMENT: a fixed array in internal DRAM, which bypasses the heap
+     * entirely and therefore its fragmentation. Nothing below asks for memory,
+     * so nothing can fall back.
+     *
+     * It exists because the heap route cannot work on this board: a running
+     * desktop leaves internal DRAM with 143,275 bytes free but only a 49,152-byte
+     * largest block, and vidbuf needs 65,280 contiguous. Measured, not assumed --
+     * `nes status` reported `vidbuf=PSRAM` with the internal attempt in place.
+     *
+     * WHAT IT COSTS, and this is why it is a switch and not the default: the
+     * array is claimed at boot by the linker, so it is gone whether or not the
+     * emulator is running. With the radio initialised that takes internal free
+     * from 102,615 to about 37,000, below the 65,536 tdsh's SSH server demands,
+     * so SSH would stop starting. That is EMU-018's lesson being paid again by
+     * the other route -- the memory has to come from somewhere.
+     */
+    static uint8_t s_vidbuf_static[(size_t)NES_SCREEN_PITCH * NES_SCREEN_HEIGHT];
+    s_vidbuf = s_vidbuf_static;
+    s_vidbuf_internal = true;
+#else
+    s_vidbuf = (uint8_t *)heap_caps_malloc(vidbytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    s_vidbuf_internal = (s_vidbuf != NULL);
+
+    if (!s_vidbuf)
+        s_vidbuf = (uint8_t *)heap_caps_malloc(vidbytes, MALLOC_CAP_SPIRAM);
 
     if (!s_vidbuf)
     {
-        printf("no psram for the frame buffer\n");
+        printf("no memory for the frame buffer\n");
         return false;
     }
+#endif
 
-    /* One converted frame, so the blit is one call per frame rather than one per
-     * scanline. Also PSRAM: 120 KB. */
-    if (!s_row)
-    {
-        s_row = (uint16_t *)heap_caps_malloc((size_t)NES_SCREEN_WIDTH * NES_SCREEN_HEIGHT *
-                                             sizeof(uint16_t), MALLOC_CAP_SPIRAM);
-
-        if (!s_row)
-        {
-            heap_caps_free(s_vidbuf);
-            s_vidbuf = NULL;
-            printf("no psram for the converted frame\n");
-            return false;
-        }
-    }
+    printf("vidbuf %u bytes in %s (internal free=%u largest=%u)\n",
+           (unsigned)vidbytes, s_vidbuf_internal ? "INTERNAL" : "PSRAM",
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 
     s_nes->vidbuf = NULL;   /* in case a previous run left it set */
 
     if (nes_loadfile(s_rom_path) < 0)
     {
         printf("unable to load %s (unsupported mapper?)\n", s_rom_path);
-        heap_caps_free(s_vidbuf);
+        vidbuf_release();
         s_vidbuf = NULL;
         return false;
     }
@@ -458,7 +579,7 @@ bool nes_start(const char *rom_path)
     if (!display_fill(0x0000))
     {
         display_pixels_claim(false);
-        heap_caps_free(s_vidbuf);
+        vidbuf_release();
         s_vidbuf = NULL;
         printf("no framebuffer\n");
         return false;
@@ -493,7 +614,7 @@ bool nes_start(const char *rom_path)
         s_task = NULL;
         display_margins_set(DISPLAY_MARGINS_DESKTOP);
         display_pixels_claim(false);
-        heap_caps_free(s_vidbuf);
+        vidbuf_release();
         s_vidbuf = NULL;
         printf("no task\n");
         return false;
@@ -522,11 +643,13 @@ void nes_stop(void)
     nes_shutdown();
     s_nes = NULL;
 
-    heap_caps_free(s_vidbuf);
+    vidbuf_release();
     s_vidbuf = NULL;
 
-    /* s_row is kept between runs: it is a fixed 120 KB that never changes size,
-     * and reallocating it on every start would fragment PSRAM for no benefit. */
+    /* The converted-frame buffer is gone with the old blit: there is nothing to
+     * keep between runs because there is nothing to convert into. That returns
+     * 120 KB of PSRAM to the pool on every stop instead of holding it for the
+     * life of the firmware. */
 
     display_margins_set(DISPLAY_MARGINS_DESKTOP);
     display_pixels_claim(false);
@@ -641,6 +764,8 @@ static int cmd_nes(tdsh_session_t *session, int argc, char **argv)
 
         if (s_nes)
             printf("rom=%s paused=%d\n", s_rom_path, s_paused ? 1 : 0);
+
+        printf("vidbuf=%s\n", s_vidbuf_internal ? "INTERNAL" : "PSRAM");
 
         return 0;
     }

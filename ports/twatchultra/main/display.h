@@ -93,6 +93,40 @@ bool display_picture(void *user, int x, int y, const uint8_t *pixels, int w, int
 bool display_picture_rgb(void *user, int x, int y, const uint16_t *pixels, int w, int h);
 
 /*
+ * Push a picture that the caller converts as it goes, so no full RGB565 image
+ * has to exist in memory first.
+ *
+ * display_picture_rgb() needs the whole picture in one buffer, writes it into
+ * the framebuffer (260 KB, in PSRAM) and then reads it back out to fill the
+ * transmit band. Measured on the NES at 19 fps, that round trip cost 37 ms of
+ * a 53 ms frame: the bitmap was copied in and immediately copied out again, and
+ * both halves crossed the PSRAM bus. This entry point exists so a caller that
+ * already holds something cheaper than a converted frame -- palette indices,
+ * a packed bitplane, a generator -- can hand over one row at a time instead.
+ *
+ * The callback fills `n` pixels starting at source column `col` of source row
+ * `row`, into `dst`, ALREADY IN PANEL BYTE ORDER: the panel wants each 16-bit
+ * pixel high byte first, so a native RGB565 value has to be swapped before it
+ * lands in the transmit buffer. Doing that in the callback costs nothing when
+ * the values come from a palette that was swapped once, whereas asking this
+ * side to swap afterwards means a second pass over the band in the hot path.
+ * `display_swap16()` is here for callers that have no table to pre-swap.
+ *
+ * REFUSES, returning false, unless display_pixels_claim(true) is in force. See
+ * the definition for why that is a precondition rather than a suggestion; the
+ * caller is expected to fall back to display_picture_rgb().
+ */
+typedef void (*display_row_fn)(void *ctx, int row, int col, uint16_t *dst, int n);
+
+bool display_picture_rows(void *ctx, int x, int y, int w, int h, display_row_fn fn);
+
+/* Byte-swap a pixel into the order the panel expects on the wire. */
+static inline uint16_t display_swap16(uint16_t v)
+{
+    return (uint16_t)((v >> 8) | (v << 8));
+}
+
+/*
  * Claim or release the framebuffer for an app that draws pixels.
  *
  * While claimed the desktop's paint task does not paint, so a blitted image
