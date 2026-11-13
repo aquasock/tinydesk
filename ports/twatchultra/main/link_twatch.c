@@ -38,6 +38,7 @@
 #include "gps.h"
 #include "nfc.h"
 #include "sound.h"
+#include "tama.h"
 #include "hal_mux.h"
 #include "tinydesk/td_picture.h"
 #include "tinydesk/td_wm.h"
@@ -452,6 +453,9 @@ bool link_init(void)
 
     if (tdsh_register_command(&s_repaint_cmd) != 0)
         ESP_LOGW(TAG, "repaint command did not register");
+
+    if (!tama_register_command())
+        ESP_LOGW(TAG, "tama command did not register");
 
     charge_report(NULL);
 
