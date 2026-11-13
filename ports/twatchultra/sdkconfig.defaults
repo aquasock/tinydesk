@@ -98,6 +98,27 @@ CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
 # Coexistence with Wi-Fi, which is how the desktop reaches telnet and OTA.
 CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
 
+# --- Wi-Fi buffers: internal DRAM is the scarce memory ---------------------
+# The ESP32-S3's Wi-Fi driver takes its receive and transmit buffers from
+# INTERNAL DMA-capable RAM, never PSRAM, and it takes them at esp_wifi_init()
+# whether or not a network is later joined. Each buffer is 1600 bytes, so the
+# IDF default pair (16 static RX + 16 static TX) holds 51,200 bytes of internal
+# DRAM for as long as the firmware runs -- against a heap that otherwise has
+# roughly 72 KB free at idle and once dipped to 35 KB, which is below the
+# 65,536 bytes tdsh's SSH server demands before it will start.
+#
+# 8 + 8 static holds 25,600 bytes and is still comfortably more than a transfer
+# needs: SFTP measures 17.2 KiB/s here, nowhere near what eight 1600-byte
+# buffers sustain, and the dynamic pools below absorb bursts. RX_BA_WIN must
+# stay at or under 2 x STATIC_RX_BUFFER_NUM, so it comes down with it.
+#
+# Measured, not assumed: see the log for the heap delta at both settings.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_RX_BA_WIN=8
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM=16
+
 # --- FAT, for the SD card --------------------------------------------------
 # Long file names and UTF-8, matching every other ESP-IDF port here. Without
 # them the card mounts but every name is mangled to 8.3 and non-ASCII bytes
