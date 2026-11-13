@@ -669,6 +669,17 @@ static void poll_task(void *arg)
 
             edges_hit(x, y, &hit);
 
+            /* Who owns the glass decides whether the margins are controls at
+             * all. `app` is the desktop's own answer and it is not enough:
+             * display_pixels_claim() is the port's, and an application that
+             * draws pixels without being a window manager window -- the
+             * Tamagotchi emulator -- claims the framebuffer without ever
+             * making td_wm_app_owns_screen() true. So a press on Enter while
+             * the guest had the screen sent Enter to the hidden shell, which
+             * is the fault this line fixes. Ownership is the honest signal and
+             * it is already the contract the painter honours. */
+            bool owned = display_pixels_claimed();
+
             /* The action fires once per touch, on the first report, not once
              * per report: the controller re-reports the same finger about
              * every 66 ms while it is held, which would be a hundred presses a
@@ -676,8 +687,19 @@ static void poll_task(void *arg)
             if (!s_pressed)
             {
                 s_pressed = true;
-                if (!app)
+                if (owned)
+                {
+                    /* Inert, and logged once per press so the suppression is
+                     * visible rather than merely believed. No haptic either:
+                     * a buzz with no action says something happened when
+                     * nothing did, which is the rule edge_press() already
+                     * follows for the reserved slot. */
+                    ESP_LOGI(TAG, "e%d i%d off", (int)hit.region, hit.index);
+                }
+                else if (!app)
+                {
                     edge_press(&hit, y);
+                }
             }
 
             /* An application that owns the screen gets the panel as a pointer,

@@ -417,7 +417,11 @@ if(TD_BUILD_TESTS)
     # spaces between them. Pure arithmetic, so it needs no hardware -- which is
     # the point, because the three faults it was written for were all found on
     # the glass and all three were arithmetic.
-    add_executable(test_twatch_edges tests/test_twatch_edges.c)
+    # font8x16.c is here so the label test can ask whether the font really has
+    # the degree sign, rather than assuming a code point the table might not
+    # carry. The table is generated and portable, so this costs nothing.
+    add_executable(test_twatch_edges tests/test_twatch_edges.c
+                   ports/twatchultra/main/font8x16.c)
     target_include_directories(test_twatch_edges PRIVATE ports/twatchultra/main)
     set_target_properties(test_twatch_edges PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
     target_compile_options(test_twatch_edges PRIVATE ${TD_WARNINGS})

@@ -179,6 +179,11 @@ static int s_cur_col = -1, s_cur_row = -1;
 static TaskHandle_t s_paint_task;
 static display_reply_fn s_reply;
 
+/* Which labels the margin buttons carry. See display_margins_set(). Read by
+ * paint_buttons() and by paint_margins(), both of which run on the task that
+ * currently owns the glass. */
+static display_margins_t s_margin_mode;
+
 #define BAND_ROWS 16
 
 /*
@@ -995,12 +1000,15 @@ static void paint_buttons(void)
     /* One label per bar, centred inside the corner radius rather than in the
      * bar's full rectangle, so a label cannot sit in a rounded corner and be
      * clipped by the border. */
+    const char *(*label_at)(int) = (s_margin_mode == DISPLAY_MARGINS_APP) ? btn_label_app
+                                                                        : btn_label;
+
     for (int s = 0; s < BTN_N; s++)
     {
         int g0 = s == 0 ? BTN_X0 : btn_slot_x(s) + BTN_SEP;
         int g1 = btn_slot_x(s + 1) - 1;
 
-        label_place(btn_label(s), g0 + BTN_RADIUS, g1 - BTN_RADIUS,
+        label_place(label_at(s), g0 + BTN_RADIUS, g1 - BTN_RADIUS,
                     BTN_Y0 + BTN_RADIUS, BTN_Y1 - BTN_RADIUS, LABEL_UPRIGHT, &label[s]);
     }
 
@@ -1219,6 +1227,56 @@ static void paint_column(int x0, int x1, bool desk_right, label_rot_t rot,
 
     gpio_set_level(LCD_CS, 1);
     spi_device_release_bus(s_spi);
+}
+
+/* All three margin groups, painted in the current mode.
+ *
+ * The one place that decides what the margins say, so display_init() and
+ * display_margins_set() cannot disagree about the order or the arguments --
+ * which is the same reason the geometry lives in one header. */
+static void paint_margins(void)
+{
+    const char *(*col_label)(int) = (s_margin_mode == DISPLAY_MARGINS_APP) ? blank_label
+                                                                          : left_label;
+
+    paint_buttons();
+    paint_column(LEFT_X0, LEFT_X1, true, LABEL_CW, col_label);
+    paint_column(RIGHT_X0, RIGHT_X1, false, LABEL_UPRIGHT,
+                 (s_margin_mode == DISPLAY_MARGINS_APP) ? blank_label : right_label);
+}
+
+/*
+ * Say what the margins mean: the desktop's keys, or an app's inert glass.
+ *
+ * THE CALLER MUST BE THE ONLY WRITER OF THE GLASS when this runs -- either
+ * display_init(), before the paint task exists, or an app that has already
+ * called display_pixels_claim(true). That is not a stylistic preference: this
+ * paints the margins synchronously, the margin painters use s_tx and the SPI
+ * bus, and paint_task uses the same two for the framebuffer. Under ownership
+ * the painter takes its notification and returns without touching either
+ * (DSP-005's rule), so a claimed caller has the bus to itself; anything else
+ * would be the second-writer race that scrambled the taskbar once already.
+ *
+ * It is deliberately NOT routed through paint_task as a flag like
+ * display_repaint_all(). It cannot be: the interesting transition -- an app
+ * taking the screen -- happens while the painter is suppressed, so a request
+ * left for the painter would be dropped exactly when it is wanted. Ownership is
+ * what makes the synchronous version safe, so ownership is what it requires.
+ */
+void display_margins_set(display_margins_t mode)
+{
+    if (!s_fb || mode == s_margin_mode)
+        return;
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_margin_mode = mode;
+    paint_margins();
+    xSemaphoreGive(s_lock);
+}
+
+display_margins_t display_margins_get(void)
+{
+    return s_margin_mode;
 }
 
 static void paint_task(void *arg)
@@ -1447,12 +1505,10 @@ bool display_init(display_reply_fn reply)
      * the previous firmware left in the controller's RAM. */
     panel_fill(0);
 
-    /* The three button bars below the framebuffer, images only for now. */
-    paint_buttons();
-
-    /* Five down each margin, same treatment, mirrored. */
-    paint_column(LEFT_X0, LEFT_X1, true, LABEL_CW, left_label);
-    paint_column(RIGHT_X0, RIGHT_X1, false, LABEL_UPRIGHT, right_label);
+    /* The margins: three bars below the framebuffer, five down each side. One
+     * call, because the labels they carry depend on the mode and there is one
+     * place that decides it. */
+    paint_margins();
 
     s_cols = DISPLAY_MAX_COLS;
     s_rows = DISPLAY_MAX_ROWS;

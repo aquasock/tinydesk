@@ -126,6 +126,40 @@ bool display_pixels_claimed(void);
 bool display_fill(uint16_t colour);
 
 /*
+ * What the margin buttons say, and by implication what they do.
+ *
+ * DESKTOP is the default: the columns carry their key names and the strip
+ * carries Tab, Enter and Ctrl+Q, matching what pressing them sends.
+ *
+ * APP is for while an application owns the screen. The columns go blank and the
+ * strip shows a degree circle, because under ownership touch.c refuses the
+ * margins outright -- they are wired to a guest application in the next cycle --
+ * and a label naming a key that is no longer sent is the label/duty
+ * disagreement edges.h exists to prevent.
+ *
+ * The glass outside the framebuffer is never blanked as a side effect of
+ * display_fill(): these are separate, and the margins stay painted in both
+ * modes, only with different text.
+ */
+typedef enum
+{
+    DISPLAY_MARGINS_DESKTOP = 0,
+    DISPLAY_MARGINS_APP,
+} display_margins_t;
+
+/*
+ * Set the mode and repaint the margins.
+ *
+ * CALL ONLY AS THE SOLE WRITER OF THE GLASS: from display_init(), before the
+ * paint task exists, or just after display_pixels_claim(true). It paints
+ * synchronously because the transition into APP happens while the painter is
+ * suppressed and a request left for the painter would be dropped exactly then.
+ * See the definition for the whole argument.
+ */
+void display_margins_set(display_margins_t mode);
+display_margins_t display_margins_get(void);
+
+/*
  * Compare the framebuffer against the cell grid, and the grid against what the
  * painter believes it has drawn.
  *

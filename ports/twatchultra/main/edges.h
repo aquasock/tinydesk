@@ -147,6 +147,37 @@ static inline const char *left_label(int i)
     return i >= 0 && i < COL_N ? labels[i] : "";
 }
 
+/*
+ * WHAT THE MARGINS SAY WHILE AN APP OWNS THE SCREEN.
+ *
+ * The columns go blank and the strip shows a degree circle. This is not
+ * decoration and it is not a second set of duties arriving quietly: it is the
+ * glass telling the truth about what the buttons do, because while an app owns
+ * the screen they do nothing at all (touch.c refuses them -- see
+ * display_pixels_claimed() there). A button labelled "Enter" that sends no
+ * Enter is exactly the label/duty disagreement this file was built to prevent,
+ * so the label has to stop claiming a job it is not doing.
+ *
+ * The degree circle on the strip is the shape the buttons will take when they
+ * are wired to the guest, which is the next cycle's work; showing it now makes
+ * the difference between "disabled" and "broken" visible at a glance.
+ *
+ * U+00B0 is written as UTF-8 by hand because the label machinery decodes UTF-8
+ * into code points and the font has the glyph at 0x00B0. It is one character
+ * wide in the 41 px strip, so it fits without the rotation the columns need.
+ */
+static inline const char *blank_label(int i)
+{
+    (void)i;
+    return "";
+}
+
+static inline const char *btn_label_app(int i)
+{
+    (void)i;
+    return "\xc2\xb0";       /* U+00B0 DEGREE SIGN */
+}
+
 /* The top margin, above the framebuffer. Reserved for status icons, not a touch
  * target. */
 #define TOP_Y1   (FB_CY0 - 1)

@@ -276,6 +276,24 @@ bool tama_start(const char *rom_path)
         return false;
     }
 
+    /*
+     * THE MARGINS STOP CLAIMING TO BE DESKTOP KEYS.
+     *
+     * touch.c already refuses them while the pixels are claimed, so pressing
+     * Enter no longer types into the hidden shell -- but a button still reading
+     * "Enter" would then be a label describing a duty it does not have. In APP
+     * mode the columns go blank and the strip shows the degree circle they will
+     * carry once they are wired to the guest.
+     *
+     * Called HERE, after the claim and before the guest task exists, because
+     * display_margins_set() paints synchronously and requires the caller to be
+     * the only writer of the glass. The painter is suppressed by the claim, and
+     * the guest task that will blit does not exist yet, so that holds by
+     * construction rather than by luck -- and this is why the call is not
+     * deferred to the task.
+     */
+    display_margins_set(DISPLAY_MARGINS_APP);
+
     s_frames = 0;
     s_blits = 0;
     s_run = true;
@@ -342,8 +360,13 @@ void tama_stop(void)
     s_frame = NULL;
     s_rom = NULL;
 
-    /* Hand the screen back and let the painter rebuild the desktop: by now the
-     * glass holds the guest, not the cells the painter's record describes. */
+    /* Restore the margins FIRST, while the pixels are still claimed: the call
+     * paints synchronously and needs to be the only writer, which ownership
+     * guarantees and the released state does not. */
+    display_margins_set(DISPLAY_MARGINS_DESKTOP);
+
+    /* Then hand the screen back and let the painter rebuild the desktop: by now
+     * the glass holds the guest, not the cells the painter's record describes. */
     display_pixels_claim(false);
     display_repaint_all();
 }

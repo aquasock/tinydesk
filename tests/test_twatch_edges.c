@@ -46,6 +46,7 @@
 #include "td_test.h"
 
 #include "edges.h"
+#include "font8x16.h"
 
 /* ---- the measured facts, as numbers rather than as the port's macros ------ */
 #define GLASS_W     410
@@ -389,6 +390,106 @@ static void test_the_columns_mirror(void)
      * shape of the frame -- which is the part the hit test owns. */
 }
 
+/*
+ * THE LABELS THE MARGINS CARRY, in both modes.
+ *
+ * This is here because the APP-mode labels are the one part of the margin
+ * change that has logic rather than geometry: the degree circle is a UTF-8
+ * sequence written by hand ("\xc2\xb0"), and a mistyped escape fails in the
+ * quietest possible way -- utf8_cells() decodes it to some other code point,
+ * label_bit() finds no glyph, and the button is simply blank on the glass with
+ * nothing reporting an error. The glass is the only other place that would show
+ * it, and this test exists so that it does not have to.
+ *
+ * The decoder below is written from the UTF-8 definition rather than borrowed
+ * from display.c's, because a test that reuses the implementation it is testing
+ * checks nothing. Two independent decodings agreeing on 0x00B0 is the evidence;
+ * one decoding agreeing with itself is not.
+ */
+static int utf8_decode_first(const char *s, unsigned *cp)
+{
+    const unsigned char *p = (const unsigned char *)s;
+
+    if (!p[0])
+        return 0;
+    if (p[0] < 0x80)
+    {
+        *cp = p[0];
+        return 1;
+    }
+    if ((p[0] & 0xE0) == 0xC0)
+    {
+        if ((p[1] & 0xC0) != 0x80)
+            return -1;
+        *cp = ((unsigned)(p[0] & 0x1Fu) << 6) | (p[1] & 0x3Fu);
+        return 2;
+    }
+    return -1;
+}
+
+static void test_margin_labels(void)
+{
+    static const char *const desk_strip[BTN_N] = { "Tab", "Enter", "Ctrl+Q" };
+    static const char *const desk_left[COL_N] = { "F10", "Esc", "F6", "Super+D", "F11" };
+    unsigned cp = 0;
+    int i;
+
+    /* The desktop labels are unchanged, so restoring them on stop needs no new
+     * table and cannot drift from what shipped. */
+    for (i = 0; i < BTN_N; i++)
+        CHECK(strcmp(btn_label(i), desk_strip[i]) == 0);
+    for (i = 0; i < COL_N; i++)
+        CHECK(strcmp(left_label(i), desk_left[i]) == 0);
+
+    /* The right column is a reserved blank slot and then four arrows. Slot 0
+     * being empty is not a defect -- it is the reservation -- so the check is
+     * that 1..4 carry a label and 0 does not. Written this way after the first
+     * version asserted a non-empty label for every slot and failed on the
+     * reserved one, which is the test being wrong rather than the code. */
+    CHECK(right_label(0)[0] == '\0');
+    for (i = 1; i < COL_N; i++)
+        CHECK(right_label(i)[0] != '\0');
+
+    /* APP mode: every column label is empty and every strip label is the same
+     * one-code-point degree circle. Checked for every index, because the
+     * functions ignore their argument and a future one that does not would
+     * otherwise leave a button labelled while the rest went blank. */
+    for (i = 0; i < COL_N; i++)
+        CHECK(strcmp(blank_label(i), "") == 0);
+    for (i = 0; i < BTN_N; i++)
+    {
+        const char *lab = btn_label_app(i);
+
+        CHECK(utf8_decode_first(lab, &cp) == 2);   /* two bytes, one char */
+        CHECK_EQ(cp, 0x00B0);
+        CHECK(lab[2] == '\0');                    /* and nothing after it */
+    }
+
+    /* The font must actually have it, or the button paints blank and says
+     * nothing. This is the check that would have caught a wrong code point. */
+    {
+        const uint8_t *g = font8x16_glyph(0x00B0);
+        int ink = 0;
+
+        CHECK(g != NULL);
+        if (g)
+        {
+            for (int r = 0; r < 16; r++)
+                for (int b = 0; b < 8; b++)
+                    if (g[r] & (0x80 >> b))
+                        ink++;
+            CHECK(ink > 0);        /* a glyph that draws nothing is no glyph */
+        }
+    }
+
+    /* And it must fit the bar it is centred in. Upright, a label is one cell
+     * tall; the strip's usable height is its face less the corner radius at
+     * each end. A degree sign taller than that would be clipped by the very
+     * border the label painter draws under it. */
+    CHECK(16 <= (BTN_Y1 - BTN_Y0 + 1) - 2 * BTN_RADIUS);
+    CHECK(8 <= (BTN_X1 - BTN_X0 + 1) / BTN_N - BTN_SEP - 2 * BTN_RADIUS);
+}
+
 int main(void)
 {
     test_geometry_matches_the_glass();
@@ -396,6 +497,7 @@ int main(void)
     test_panel_coordinates();
     test_every_point_of_the_glass();
     test_the_columns_mirror();
+    test_margin_labels();
 
     return TD_TEST_RESULT();
 }
