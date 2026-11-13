@@ -55,6 +55,57 @@ void hid_mouse_attach(const char *name);
 void hid_mouse_detach(void);
 void hid_mouse_report(const hid_mouse_layout_t *layout, const uint8_t *r, size_t len);
 
+/* ------------------------------------------------------------- gamepads */
+
+/*
+ * A GAMEPAD IS NOT A MOUSE, and the difference is not the axes.
+ *
+ * A gamepad's report descriptor declares Generic Desktop X and Y for its left
+ * stick, which is exactly what hid_mouse_parse() looks for -- so an Xbox
+ * controller connects, delivers reports, and is claimed as a mouse. On this
+ * board that showed up as the desktop cursor jittering whenever the stick moved.
+ *
+ * What distinguishes them is the TOP-LEVEL COLLECTION: a gamepad declares
+ * Generic Desktop / Game Pad (0x05), a mouse declares / Mouse (0x02) and a
+ * keyboard / Keyboard (0x06). Measured on an Xbox Wireless Controller over BLE
+ * (2026-11-12): its collection is 0x05, and its report is ID 1, 16 bytes, with
+ * the hat switch at bit 96 and fifteen buttons at bit 104.
+ *
+ * THE BUTTON BITS ARE READ FROM THE DESCRIPTOR, not assumed: field offsets are
+ * accumulated exactly as the descriptor lays them out, so a controller that puts
+ * its buttons somewhere else still works, and the bit-to-button numbering stays
+ * whatever that controller declared.
+ */
+typedef struct
+{
+    bool ok, ids;
+    uint8_t id;            /* report ID (0: none)                      */
+    hid_field_t hat;       /* Generic Desktop Hat switch (0x39)        */
+    hid_field_t x, y;      /* left stick, for menus and pointer control */
+    hid_field_t button;    /* first button; `count` buttons from here  */
+    uint8_t count;
+} hid_gamepad_layout_t;
+
+/* Which buttons are down. Bits 0..14 are the descriptor's buttons 1..15. */
+typedef uint16_t hid_gamepad_mask_t;
+
+/* Fill `layout` from a report descriptor. False when the descriptor is not a
+ * gamepad -- which is the test a caller uses to stop one being taken for a
+ * mouse. */
+bool hid_gamepad_parse(hid_gamepad_layout_t *layout, const uint8_t *desc, size_t len);
+
+/* One input report, with its report ID first when the descriptor has IDs.
+ * Returns the button mask; 0 for a report that is not the gamepad's own. */
+hid_gamepad_mask_t hid_gamepad_report(const hid_gamepad_layout_t *layout,
+                                      const uint8_t *r, size_t len);
+
+/* The most recent mask, and the hat's direction (0..7 clockwise from up, or
+ * 0xFF for centred), for a caller that polls rather than being called back.
+ * Both are plain integers: they are written from the Bluetooth task and read
+ * from an emulator task, and an aligned int is atomic on this core. */
+hid_gamepad_mask_t hid_gamepad_state(void);
+uint8_t hid_gamepad_hat(void);
+
 /* The Mouse and Keyboard apps' settings (td_sysinfo_t.mouse, .keyboard), or
  * NULL before hid_input_init(). */
 const td_mouse_ops_t *hid_input_mouse_ops(void);

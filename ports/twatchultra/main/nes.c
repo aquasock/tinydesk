@@ -31,6 +31,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "tdsh.h"
+#include "hid_input.h"
 #include "touch.h"
 
 /* nofrendo's own headers. Included through the component's exported include
@@ -229,6 +230,54 @@ static int pad_from_frame(const touch_frame_t *f)
  */
 static volatile int s_pad;
 
+/*
+ * A REAL CONTROLLER BEATS THE MARGINS, and both are read.
+ *
+ * The margin buttons work and are the fallback, but a gamepad is what a game
+ * wants: a D-pad that is a D-pad, and enough buttons for START and SELECT.
+ *
+ * THE BIT NUMBERS ARE MEASURED, NOT ASSUMED. tests/xbox_btle.h holds the
+ * descriptor and the raw reports captured from the operator's Xbox Wireless
+ * Controller while each button was pressed in a stated order, and
+ * tests/test_gamepad.c pins what those reports decode to. What is known: the
+ * presses landed on button bits 0, 1, 3 and 4; the hat reports 1..8 clockwise
+ * from up; and two more buttons sit at bits 10 and 11.
+ *
+ * WHICH FACE BUTTON IS WHICH IS BY PRESS ORDER, so this mapping is only as good
+ * as that order: bits 0..3 are taken to be A, B, X and Y in the sequence the
+ * operator pressed them. If a game disagrees, the fix is this table and nothing
+ * else -- `nes pad` prints the live mask so the correction can be observed
+ * rather than guessed.
+ */
+#define GP_BIT_A      0
+#define GP_BIT_B      1
+#define GP_BIT_X      3
+#define GP_BIT_Y      4
+#define GP_BIT_VIEW   10
+#define GP_BIT_MENU   11
+
+static int pad_from_gamepad(void)
+{
+    hid_gamepad_mask_t m = hid_gamepad_state();
+    uint8_t hat = hid_gamepad_hat();
+    int pad = 0;
+
+    if (m & (1u << GP_BIT_A)) pad |= NES_PAD_A;
+    if (m & (1u << GP_BIT_B)) pad |= NES_PAD_B;
+    if (m & (1u << GP_BIT_VIEW)) pad |= NES_PAD_SELECT;
+    if (m & (1u << GP_BIT_MENU)) pad |= NES_PAD_START;
+
+    /* 0..7 clockwise from up, 0xFF for centred. Diagonals are deliberately not
+     * offered: a 4-bit hat switch cannot report one, so every other value is
+     * either a cardinal direction or centred. */
+    if (hat == 0) pad |= NES_PAD_UP;
+    else if (hat == 2) pad |= NES_PAD_RIGHT;
+    else if (hat == 4) pad |= NES_PAD_DOWN;
+    else if (hat == 6) pad |= NES_PAD_LEFT;
+
+    return pad;
+}
+
 static void nes_app_touch(void *user, const touch_frame_t *f)
 {
     (void)user;
@@ -264,7 +313,11 @@ static void nes_task(void *arg)
 
         /* The pad goes in BEFORE the frame is stepped, or a press is one frame
          * late -- 16 ms, which a player feels on a jump. */
-        input_update(0, s_pad);
+        /* A connected gamepad wins; the margins are the fallback. Both are
+         * plain integers, so reading them here is atomic. */
+        int pad = pad_from_gamepad();
+
+        input_update(0, pad ? pad : s_pad);
 
         int64_t t0 = esp_timer_get_time();
 
@@ -526,6 +579,55 @@ static int cmd_nes(tdsh_session_t *session, int argc, char **argv)
         return 0;
     }
 
+    if (argc >= 2 && strcmp(sub, "pad") == 0)
+    {
+        /*
+         * THE CONTROLLER'S LIVE STATE, TO THE CARD.
+         *
+         * A command that printed to the terminal asked the operator to press
+         * buttons DURING a three-second window that opened when the command was
+         * typed -- which cannot be coordinated, because the person has to read
+         * the instruction first. Two attempts produced zero captures that way.
+         * Writing to a file instead means the command can be started and the
+         * presses made whenever, and it is the same shape as `touchdump`, which
+         * settled the multi-touch question for the same reason.
+         *
+         * 30 seconds is long enough to press everything and short enough that
+         * the file cannot grow without bound.
+         */
+        FILE *pf = fopen("/sd/nespad.txt", "w");
+
+        if (!pf)
+        {
+            printf("no card\n");
+            return 1;
+        }
+
+        printf("sampling 30 s -> /sd/nespad.txt\n");
+
+        int last = -1;
+
+        for (int i = 0; i < 300; i++)
+        {
+            int gp = pad_from_gamepad();
+
+            if (gp != last)
+            {
+                fprintf(pf, "gamepad=0x%04x NES=0x%02x hat=%u margins=0x%02x\n",
+                        (unsigned)hid_gamepad_state(), (unsigned)gp,
+                        (unsigned)hid_gamepad_hat(), (unsigned)s_pad);
+                fflush(pf);
+                last = gp;
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+
+        fclose(pf);
+        printf("done\n");
+        return 0;
+    }
+
     if (argc >= 2 && strcmp(sub, "status") == 0)
     {
         printf("running=%d frames=%lu fps=%lu dropped=%lu\n",
@@ -560,7 +662,7 @@ static int cmd_nes(tdsh_session_t *session, int argc, char **argv)
 
 static const tdsh_command_t s_nes_cmd = {
     "nes",
-    "nes [start [rom] | stop | pause | status]",
+    "nes [start [rom] | stop | pause | status | pad]",
     "Run the NES emulator on the screen",
     cmd_nes,
     TDSH_CMD_INTERACTIVE,

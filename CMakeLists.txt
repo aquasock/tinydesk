@@ -437,6 +437,20 @@ if(TD_BUILD_TESTS)
     target_compile_options(test_tama_ui PRIVATE ${TD_WARNINGS})
     add_test(NAME test_tama_ui COMMAND test_tama_ui)
 
+    # The gamepad decoder, against a real controller's descriptor and reports.
+    # The file it tests needs ESP headers, so it is compiled with stub includes
+    # that provide only what it references -- which is the point: if the decoder
+    # grows a real ESP dependency, this build breaks first.
+    add_executable(test_gamepad tests/test_gamepad.c
+                   ports/esp_idf/app/hid_gamepad.c)
+    target_include_directories(test_gamepad PRIVATE
+                   ports/esp_idf/app tests tests/stub include)
+    target_compile_definitions(test_gamepad PRIVATE
+                   TD_HOST_TEST=1)
+    set_target_properties(test_gamepad PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+    target_compile_options(test_gamepad PRIVATE ${TD_WARNINGS} -Wno-unused-parameter)
+    add_test(NAME test_gamepad COMMAND test_gamepad)
+
     add_executable(test_trash tests/test_trash.c ports/common/td_fs_stdio.c)
     target_include_directories(test_trash PRIVATE ports/common)
     target_link_libraries(test_trash PRIVATE tinydesk_apps)

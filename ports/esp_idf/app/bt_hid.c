@@ -141,6 +141,8 @@ typedef struct
     uint8_t kbd_id;
     bool kbd_ids;
     hid_mouse_layout_t layout;
+    hid_gamepad_layout_t pad;
+    bool pad_ok;
     uint32_t reports;
     char last[TD_BT_MESSAGE_LEN + 32];
 } conn_t;
@@ -510,10 +512,27 @@ static void ready(conn_t *c)
         ble_gattc_write_no_rsp_flat(c->handle, c->proto_handle, &report_mode, 1);
     }
     c->kbd = keyboard_in_map(c);
-    c->mouse = hid_mouse_parse(&c->layout, c->map, c->map_len);
-    if (!c->kbd && !c->mouse)
+
+    /*
+     * THE GAMEPAD IS TRIED BEFORE THE MOUSE, AND THE ORDER IS THE FIX.
+     *
+     * hid_mouse_parse() accepts a gamepad's descriptor: a gamepad declares
+     * Generic Desktop X and Y for its left stick, which is exactly what the
+     * mouse parser looks for and all it looks for. So with the mouse asked
+     * first an Xbox controller connects, is claimed as a mouse, and moves the
+     * desktop cursor -- which is precisely what the operator saw, and the
+     * reason this ordering is load-bearing rather than stylistic.
+     *
+     * The gamepad parser tests the top-level collection (Generic Desktop /
+     * Game Pad 0x05, or / Joystick 0x04) and cannot be confused with a mouse
+     * (0x02) or a keyboard (0x06), so asking it first costs nothing.
+     */
+    c->pad_ok = hid_gamepad_parse(&c->pad, c->map, c->map_len);
+    c->mouse = !c->pad_ok && hid_mouse_parse(&c->layout, c->map, c->map_len);
+
+    if (!c->kbd && !c->mouse && !c->pad_ok)
     {
-        fail(c, "its reports are not a keyboard's or a mouse's", 0);
+        fail(c, "its reports are not a keyboard's, a gamepad's or a mouse's", 0);
         return;
     }
     char name[48];
@@ -522,6 +541,8 @@ static void ready(conn_t *c)
         hid_kbd_attach(name);
     if (c->mouse)
         hid_mouse_attach(name);
+    if (c->pad_ok)
+        snprintf(c->last, sizeof(c->last), "connected: gamepad");
     c->ready = true;
     c->state = "ready";
     s_busy = false;
@@ -568,6 +589,21 @@ static void input(conn_t *c, uint16_t attr, struct os_mbuf *om)
         else
             return;
         hid_kbd_report(k, 8);
+        return;
+    }
+    if (c->pad_ok)
+    {
+        /* With the report id prepended when the descriptor has one, exactly as
+         * the mouse path does: BLE carries the id in the attribute handle
+         * rather than in the payload, so bt_hid reconstructs it. */
+        if (c->pad.ids)
+        {
+            buf[0] = r->id;
+            (void)hid_gamepad_report(&c->pad, buf, (size_t)n + 1);
+        }
+        else
+            (void)hid_gamepad_report(&c->pad, buf + 1, n);
+
         return;
     }
     if (c->mouse)
