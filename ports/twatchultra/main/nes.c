@@ -132,6 +132,21 @@ static uint16_t s_pal_tx[256];
  * blit through a function pointer. */
 static volatile uint32_t s_us_blit_last;
 
+/*
+ * CUMULATIVE counters, and the last-second figures above are not enough.
+ *
+ * This cycle wasted a measurement on exactly that: the conversion was changed
+ * and the "last second" blit figure moved from 9,218 to 9,731 us, which reads as
+ * a 5 percent regression but is a one-second sample of a loop whose frame time
+ * wanders. A per-run average over ~900 frames is the number to compare, so the
+ * totals are kept as well as the sample.
+ */
+static volatile uint64_t s_blit_us_total;
+/* Push counters that predate the frame counter, so the first frame's average is
+ * not skewed by the margins being painted before nes_start() zeroed them. */
+static int64_t s_push_baseline_us;
+static volatile uint32_t s_blit_frames_total;
+
 static void build_palette(void)
 {
     const uint8_t *rgb = nes_palettes[0];   /* NES_PALETTE_NOFRENDO */
@@ -222,8 +237,39 @@ static void nes_fill_row(void *ctx, int row, int col, uint16_t *dst, int n)
     const uint8_t *src = NES_SCREEN_GETPTR(buf, col, row);
 
     /* s_pal_tx, not s_pal: the destination is the panel's transmit band, and the
-     * values are already in the order the wire wants. */
-    for (int x = 0; x < n; x++)
+     * values are already in the order the wire wants.
+     *
+     * FOUR SOURCE BYTES PER LOAD. The plain byte-at-a-time loop measured 5,105 us
+     * of a 25,196 us frame -- 20 cycles per pixel, which is far more than a table
+     * lookup and a store should cost, so the byte loads from the PSRAM frame
+     * buffer were the cost rather than the lookups. Reading a uint32 gives four
+     * indices per load and takes the source traffic down by four; the shifts and
+     * masks are register work.
+     *
+     * Alignment: NES_SCREEN_PITCH is 272, a multiple of 4, and `col` is 0 for
+     * every call this port makes, so a row start is 4-aligned whenever the buffer
+     * is -- which it is, being a heap allocation. The check is here anyway
+     * because a future caller with an odd column would otherwise fault on an
+     * unaligned read, and falling back to the byte loop for that case is cheaper
+     * than proving it can never happen. */
+    int x = 0;
+
+    if (((uintptr_t)src & 3) == 0)
+    {
+        const uint32_t *s32 = (const uint32_t *)src;
+
+        for (; x + 4 <= n; x += 4)
+        {
+            uint32_t v = s32[x >> 2];
+
+            dst[x + 0] = s_pal_tx[v & 0xFF];
+            dst[x + 1] = s_pal_tx[(v >> 8) & 0xFF];
+            dst[x + 2] = s_pal_tx[(v >> 16) & 0xFF];
+            dst[x + 3] = s_pal_tx[v >> 24];
+        }
+    }
+
+    for (; x < n; x++)
         dst[x] = s_pal_tx[src[x]];
 }
 
@@ -253,6 +299,8 @@ static void nes_blit(uint8_t *buf)
     }
 
     s_us_blit_last = (uint32_t)(esp_timer_get_time() - b0);
+    s_blit_us_total += s_us_blit_last;
+    s_blit_frames_total++;
 }
 
 /*
@@ -604,6 +652,16 @@ bool nes_start(const char *rom_path)
     s_frames = 0;
     s_dropped = 0;
     s_fps = 0;
+    display_push_stats_reset();
+    s_blit_us_total = 0;
+    s_blit_frames_total = 0;
+
+    {
+        int64_t w0 = 0, x0 = 0;
+
+        display_push_stats(&w0, &x0, NULL);
+        s_push_baseline_us = w0 + x0;
+    }
     s_pad = 0;
     s_paused = false;
     s_run = true;
@@ -766,6 +824,30 @@ static int cmd_nes(tdsh_session_t *session, int argc, char **argv)
             printf("rom=%s paused=%d\n", s_rom_path, s_paused ? 1 : 0);
 
         printf("vidbuf=%s\n", s_vidbuf_internal ? "INTERNAL" : "PSRAM");
+
+        /* Push breakdown, for deciding whether the blit's remaining 8 ms is the
+         * transfer or the window programming around it. */
+        {
+            int64_t w_us = 0, x_us = 0;
+            uint32_t pushes = 0;
+
+            display_push_stats(&w_us, &x_us, &pushes);
+            printf("push: bands=%lu window=%lldus xmit=%lldus\n",
+                   (unsigned long)pushes, (long long)w_us, (long long)x_us);
+
+            if (s_blit_frames_total)
+            {
+                int64_t push_us = w_us + x_us;
+                int64_t blit_avg = (int64_t)(s_blit_us_total / s_blit_frames_total);
+                int64_t push_avg = (int64_t)((push_us - s_push_baseline_us) /
+                                             (int64_t)s_blit_frames_total);
+
+                printf("per-frame: blit=%lldus convert=%lldus push=%lldus "
+                       "over %lu frames\n",
+                       (long long)blit_avg, (long long)(blit_avg - push_avg),
+                       (long long)push_avg, (unsigned long)s_blit_frames_total);
+            }
+        }
 
         return 0;
     }

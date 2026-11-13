@@ -221,6 +221,36 @@ static bool s_ovr_set[2][COL_N];
 static uint16_t s_tx[DISPLAY_W * BAND_ROWS];
 
 /*
+ * Where a push actually spends its time, so "the blit is push-bound" can be
+ * turned into numbers instead of a diagnosis.
+ *
+ * us_window  -- programming CASET/RASET, two single-line register writes per
+ *               band, each its own bus acquire/CS pulse/transmit.
+ * us_xmit    -- spi_device_polling_transmit over the pixel bytes.
+ * pushes     -- how many bands, to divide by.
+ *
+ * Reset by display_push_stats_reset() so a caller can measure one interval.
+ */
+static int64_t s_us_window, s_us_xmit;
+static uint32_t s_pushes;
+
+void display_push_stats_reset(void)
+{
+    s_us_window = s_us_xmit = 0;
+    s_pushes = 0;
+}
+
+void display_push_stats(int64_t *us_window, int64_t *us_xmit, uint32_t *pushes)
+{
+    if (us_window)
+        *us_window = s_us_window;
+    if (us_xmit)
+        *us_xmit = s_us_xmit;
+    if (pushes)
+        *pushes = s_pushes;
+}
+
+/*
  * The full xterm 256-colour palette, converted to RGB565 once at init.
  *
  * td_vterm stores COLOUR INDICES, not colours: 0-15 are the ANSI palette,
@@ -316,10 +346,14 @@ static void push_pixels_raw(int cx, int cy, int w, int h)
     bool first = true;
     esp_err_t err = ESP_OK;
 
+    int64_t t_w0 = esp_timer_get_time();
     set_window(cx, cy, w, h);
+    s_us_window += esp_timer_get_time() - t_w0;
+    s_pushes++;
 
     spi_device_acquire_bus(s_spi, portMAX_DELAY);
     gpio_set_level(LCD_CS, 0);
+    int64_t t_x0 = esp_timer_get_time();
 
     while (remaining)
     {
@@ -357,6 +391,7 @@ static void push_pixels_raw(int cx, int cy, int w, int h)
 
     gpio_set_level(LCD_CS, 1);
     spi_device_release_bus(s_spi);
+    s_us_xmit += esp_timer_get_time() - t_x0;
 }
 
 static const struct {

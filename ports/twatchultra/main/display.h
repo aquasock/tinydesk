@@ -120,6 +120,11 @@ typedef void (*display_row_fn)(void *ctx, int row, int col, uint16_t *dst, int n
 
 bool display_picture_rows(void *ctx, int x, int y, int w, int h, display_row_fn fn);
 
+/* Where pushes spend their time, for turning "the blit is push-bound" into
+ * numbers. Reset before a measurement, read after it. */
+void display_push_stats_reset(void);
+void display_push_stats(int64_t *us_window, int64_t *us_xmit, uint32_t *pushes);
+
 /* Byte-swap a pixel into the order the panel expects on the wire. */
 static inline uint16_t display_swap16(uint16_t v)
 {
