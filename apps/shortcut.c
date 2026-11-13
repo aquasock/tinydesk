@@ -109,7 +109,31 @@ void td_open_path(const char *path, bool is_dir)
             return;
         }
         const char *ts = strrchr(target, '/');
-        if (!td_is_shortcut(ts ? ts + 1 : target))   /* one step only: no loops */
+        const char *tname = ts ? ts + 1 : target;
+
+        /*
+         * A SHORTCUT MAY RUN A SCRIPT, and only a shortcut does.
+         *
+         * td_script_run() is reachable from here for anything with a Run command
+         * -- a shell script, Python source, .mpy or a .tdapp package -- so a Start
+         * menu entry or desktop icon can launch something that is not a document.
+         * Without this the only runnable targets were the compiled ones, and a
+         * shortcut to a Python source file opened it in the editor instead, which
+         * made a launcher entry impossible to write for any command the firmware
+         * exposes only through the shell.
+         *
+         * Deliberately NOT applied to the general case below: opening a `.py` from
+         * Files still opens the editor, because a file manager's job is to show a
+         * file and this branch's job is to start one. That distinction is why the
+         * check lives here rather than widening td_is_compiled_app().
+         *
+         * A `.tdsh` target reaches tdsh run, which needs a 32 KiB contiguous task
+         * stack this board has never had; that is a pre-existing limit and the
+         * script's own failure, not something this branch causes.
+         */
+        if (!td_is_shortcut(tname) && td_is_runnable(tname))
+            td_script_run(target);
+        else if (!td_is_shortcut(tname))              /* one step only: no loops */
             td_open_path(target, is_dir_path(target));
         return;
     }
