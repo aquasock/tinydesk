@@ -723,7 +723,35 @@ static uint16_t s_dpad_edge;   /* outline  -- the buttons' border */
 static uint16_t s_dpad_face;   /* interior -- the buttons' face   */
 static uint16_t s_dpad_ink;    /* arrows   -- the buttons' label  */
 
-#define PM_VOID  0x0000u   /* outside the cross: left as the background */
+/*
+ * THE BACKGROUND IS THE DESKTOP'S TEST GRID, not black.
+ *
+ * It is the same pattern `pattern 1` draws -- a line every 16 px, white on black
+ * -- so the empty framebuffer below the picture reads as graph paper rather than
+ * as a void, and the controls' alignment can be judged against it by eye. The
+ * increment is PM_GRID and the line is one pixel, exactly as display_test_pattern()
+ * draws it.
+ *
+ * The grid is generated per pixel rather than sampled from a tile because it is a
+ * modulo on two coordinates, and this runs once at start for 45,000 pixels.
+ */
+/* THE OLD GRID IS 16 PX, not the 5 or 10 the instruction guessed --
+ * display_test_pattern() case 1 uses `x % 16 == 0 || y % 16 == 0`, and it is the
+ * only grid in this port. 16 is kept so the background matches the pattern the
+ * `pattern 1` command draws.
+ *
+ * The line is a dark grey rather than the pattern's white. As a full-screen test
+ * pattern white is right; as a background behind controls it competes with them,
+ * and the controls are what the eye needs to find. 0x18C3 is RGB565(3,6,3) --
+ * the same faint grey-green cast as the button faces, so the grid reads as
+ * structure rather than as content. */
+#define PM_GRID      16
+#define PM_GRID_LINE 0x18C3u
+
+static inline uint16_t pm_grid(int x, int y)
+{
+    return (x % PM_GRID == 0 || y % PM_GRID == 0) ? PM_GRID_LINE : 0x0000u;
+}
 
 /*
  * THE EIGHT ARM TIPS ARE ROUNDED AND THE FOUR INNER CORNERS ARE SHARP.
@@ -905,40 +933,110 @@ static bool dpad_core(int x, int y)
  * beside the d-pad. `C` is already a margin button on the right. If these are
  * meant to be something else, the label table is the only thing to change.
  */
-/* THE CIRCLES MOVE DOWN WITH THE D-PAD BUT NOT LEFT WITH IT, which is the literal
- * reading of "move both down, and move the d-pad left". Their x is therefore
- * pinned to the value it had -- 224 -- rather than derived from the d-pad, so the
- * gap between the d-pad's right edge and the circles widens from 28 to 40 while
- * their right margin against the framebuffer stays at 28. */
+/* cos(45 degrees) in 16.16 fixed point, shared by both rotations -- the d-pad's
+ * clockwise one and the A/B labels' counter-clockwise one. Exactly representable
+ * and identical run to run, which matters because these shapes are rasterised
+ * once and any drift would show as a different edge. */
+#define PM_ROT_K     46341
+
+/*
+ * THE TWO CIRCLES ARE PLACED INDEPENDENTLY, in grid cells.
+ *
+ * They began as one column -- same x, y separated by PM_PAD_GAP -- which was
+ * right while they were a pair beside the d-pad. The operator now positions each
+ * one separately, and positions them by counting GRID SQUARES on the glass rather
+ * than in pixels, because the grid is the coordinate system a person can actually
+ * read off the watch. So each circle carries its own cell offset from the
+ * original column, and one cell is PM_GRID (16 px).
+ *
+ * The base is the pair's original position: x 224, A at the d-pad's top row --
+ * 260, which is the centred-and-nudged value -- and B one diameter plus one gap
+ * below that. Offsets are in cells and added to that base, so the
+ * numbers below read as "how far did it move on the grid" rather than as
+ * absolute pixels that have to be recomputed whenever anything else shifts.
+ *
+ * PM_PAD_X0/PM_PAD_Y0 are the BASE, in framebuffer coordinates. A and B are index
+ * 0 and 1 everywhere -- in the label table, in pad_inside(), in pad_cy() -- so the
+ * offset tables are indexed the same way and cannot get out of step.
+ */
 #define PM_PAD_D     68
-#define PM_PAD_X     224
-#define PM_PAD_Y0    (PM_DPAD_Y)                                    /* 240 */
-#define PM_PAD_Y1    (PM_PAD_Y0 + PM_PAD_D + PM_PAD_GAP)            /* 332 */
-#define PM_PAD_GAP   ((PM_DPAD_S - 2 * PM_PAD_D))                   /* 32  */
+#define PM_PAD_XBASE 224
+#define PM_PAD_YBASE (PM_DPAD_Y)                                      /* 260 */
+#define PM_PAD_GAP   ((PM_DPAD_S - 2 * PM_PAD_D))                     /* 32  */
+
+/* Cells. One cell is PM_GRID. Positive x is right, positive y is down. */
+#define PM_PAD_CELL   PM_GRID
+
+typedef struct { int cx, cy; } pad_off_t;
+
+static const pad_off_t s_pad_off[2] = {
+    /* A: 3 cells right, 2 down */
+    { .cx =  3, .cy = 2 },
+    /* B: 1 cell left, 1 down */
+    { .cx = -1, .cy = 1 },
+};
+
+/* Top-left of circle i, in framebuffer coordinates. B additionally starts one
+ * diameter plus one gap below A's base, which is what made them a column. */
+static int pad_x(int i) { return PM_PAD_XBASE + s_pad_off[i].cx * PM_PAD_CELL; }
+
+static int pad_y(int i)
+{
+    const int base = PM_PAD_YBASE + (i ? PM_PAD_D + PM_PAD_GAP : 0);
+
+    return base + s_pad_off[i].cy * PM_PAD_CELL;
+}
 
 static const uint16_t s_pad_label[2] = { 'A', 'B' };
 
-static int pad_cy(int i) { return (i ? PM_PAD_Y1 : PM_PAD_Y0) + PM_PAD_D / 2; }
-static int pad_cx(void)  { return PM_PAD_X + PM_PAD_D / 2; }
+static int pad_cy(int i) { return pad_y(i) + PM_PAD_D / 2; }
+static int pad_cx(int i) { return pad_x(i) + PM_PAD_D / 2; }
 
 /* Inside a circle of radius (D-1)/2, measured in half-pixels so the disc is
  * symmetric -- an even diameter has no centre pixel and an integer radius test
  * would put the bias on one side. */
 static bool pad_inside(int i, int x, int y)
 {
-    const int dx2 = 2 * (x - pad_cx());
+    const int dx2 = 2 * (x - pad_cx(i));
     const int dy2 = 2 * (y - pad_cy(i));
     const int rr = PM_PAD_D - 1;
 
     return dx2 * dx2 + dy2 * dy2 <= rr * rr;
 }
 
-/* The letter, at double the font's size like the d-pad arrows. */
+/*
+ * The letter, doubled like the d-pad arrows and ROTATED 45 DEGREES
+ * COUNTER-CLOCKWISE.
+ *
+ * Same inverse-transform trick as the d-pad, for the same reason: the glyph is
+ * sampled in its own unrotated frame, so the font needs no rotated copy and the
+ * doubling stays a clean 2x2 block sample. A point in screen space is mapped back
+ * into the glyph's frame and tested there.
+ *
+ * CCW is the opposite sense from the d-pad, which is what was asked for. In the
+ * unrotate below the sign of the shear is therefore flipped against
+ * dpad_unrotate()'s:
+ *
+ *     u = (gx - gy) * k        v = (gx + gy) * k
+ *
+ * and with the glyph centred on the entry before the map, that turns the letters
+ * anticlockwise so they read along the opposite diagonal from the d-pad's arms.
+ * They are the circles' own marks, not part of the d-pad, so the two rotations
+ * being opposite is a deliberate contrast rather than an inconsistency.
+ */
 static bool pad_label_ink(int i, int x, int y)
 {
-    const int cx = pad_cx(), cy = pad_cy(i);
-    const int gx = (x - cx) + PM_ARROW_W / 2;
-    const int gy = (y - cy) + PM_ARROW_H / 2;
+    const int cx = pad_cx(i), cy = pad_cy(i);
+
+    const int dx = x - cx;
+    const int dy = y - cy;
+
+    /* Back through the CCW rotation into glyph space. */
+    const int u = ((dx - dy) * PM_ROT_K) >> 16;
+    const int v = ((dx + dy) * PM_ROT_K) >> 16;
+
+    const int gx = u + PM_ARROW_W / 2;
+    const int gy = v + PM_ARROW_H / 2;
 
     if (gx < 0 || gy < 0 || gx >= PM_ARROW_W || gy >= PM_ARROW_H)
         return false;
@@ -998,7 +1096,6 @@ static bool pad_label_ink(int i, int x, int y)
  * cost is irrelevant and an exactly-representable integer keeps the rendering
  * identical run to run.
  */
-#define PM_ROT_K     46341            /* cos(45 deg) in 16.16 */
 #define PM_ROT_HALF  81               /* rotated bounding half-extent */
 
 static void dpad_unrotate(int x, int y, int *u, int *v)
@@ -1019,16 +1116,30 @@ static void dpad_unrotate(int x, int y, int *u, int *v)
 #define PM_ROT_X1   (PM_DPAD_CX + PM_ROT_HALF)                     /* 181 */
 #define PM_ROT_Y1   (PM_DPAD_CY + PM_ROT_HALF)                     /* 405 */
 
-/* The union of the rotated d-pad's box and the circles' box. The circles do not
- * rotate -- only the d-pad was asked for -- so their extent is unchanged. */
-#define PM_CTL_X  (PM_ROT_X0 < PM_PAD_X ? PM_ROT_X0 : PM_PAD_X)    /* 19  */
-#define PM_CTL_Y  (PM_ROT_Y0 < PM_PAD_Y0 ? PM_ROT_Y0 : PM_PAD_Y0)  /* 240 */
-#define PM_CTL_X1 (PM_ROT_X1 > (PM_PAD_X + PM_PAD_D - 1) ?         \
-                   PM_ROT_X1 : (PM_PAD_X + PM_PAD_D - 1))          /* 291 */
-#define PM_CTL_Y1 (PM_ROT_Y1 > (PM_PAD_Y1 + PM_PAD_D - 1) ?        \
-                   PM_ROT_Y1 : (PM_PAD_Y1 + PM_PAD_D - 1))          /* 405 */
-#define PM_CTL_W  (PM_CTL_X1 - PM_CTL_X + 1)                       /* 273 */
-#define PM_CTL_H  (PM_CTL_Y1 - PM_CTL_Y + 1)                       /* 166 */
+/* THE REGION IS THE WHOLE AREA BELOW THE PICTURE, not just the controls' bounding
+ * box, because the background is now the grid and a grid has to reach the edges
+ * it divides. Previously this was the union of the d-pad's rotated box and the
+ * circles' box, which would have painted a 273x166 patch of graph paper with
+ * black all round it -- a harder thing to read than either extreme.
+ *
+ * It spans the full framebuffer width and runs from the picture's bottom edge to
+ * the bottom of the glass, which is 41 rows past the framebuffer and is only
+ * reachable at all because this goes through display_panel_rows(). */
+/* FULL GLASS WIDTH, which is 45 px wider than the framebuffer on each side. The
+ * picture is a 320 px window inset 45 px into a 410 px panel, so a background
+ * that stops at the window stops 45 px short of the glass on both edges -- and
+ * the whole point of the grid is to be the surface everything sits on.
+ *
+ * In framebuffer terms that is x -45 .. 364: DISPLAY_ORIGIN_X is 45, so -45 maps
+ * to controller column 22, which is the glass's first visible column, and the
+ * region runs 410 columns from there.
+ *
+ * This is only possible because the push is display_panel_rows(); a
+ * framebuffer-coordinate push would have clipped at x 0 and 319. */
+#define PM_CTL_X  (-DISPLAY_ORIGIN_X)                              /* -45 */
+#define PM_CTL_Y  (PM_H * PM_SCALE)                                /* 192 */
+#define PM_CTL_W  DISPLAY_PANEL_W                                  /* 410 */
+#define PM_CTL_H  (PM_GLASS_BOT - PM_CTL_Y)                        /* 265 */
 
 static void pm_dpad_row(void *ctx, int row, int col, uint16_t *dst, int n)
 {
@@ -1041,13 +1152,15 @@ static void pm_dpad_row(void *ctx, int row, int col, uint16_t *dst, int n)
         const int x = col + i;
         const int y = row;
 
-        uint16_t c = PM_VOID;
-
-        /* --- the d-pad, rotated -------------------------------------------
-         * Region-local to framebuffer, then to the d-pad's centre, then back
-         * through the inverse rotation into the shape's own frame. */
+        /* Both shapes are tested in framebuffer coordinates, and the grid is
+         * drawn in those too, so the background lines up with the framebuffer's
+         * own origin rather than with the region's. */
         const int fx = x + PM_CTL_X;
         const int fy = y + PM_CTL_Y;
+
+        uint16_t c = pm_grid(fx, fy);
+
+        /* --- the d-pad, rotated ------------------------------------------- */
         int u, v;
         dpad_unrotate(fx - PM_DPAD_CX, fy - PM_DPAD_CY, &u, &v);
 
@@ -1062,29 +1175,21 @@ static void pm_dpad_row(void *ctx, int row, int col, uint16_t *dst, int n)
             if (c == s_dpad_face && dpad_arrow_ink(dx0, dy0))
                 c = s_dpad_ink;
         }
-
-        /* --- the two circles ----------------------------------------------
-         * Checked after the d-pad, but their regions do not overlap, so the
-         * order is only a tidiness. */
-        if (c == PM_VOID)
+        else
         {
+            /* --- the two circles -----------------------------------------
+             * Only tested where the d-pad is absent: they do not overlap, and
+             * skipping the test keeps the grid where neither shape is. */
             for (int b = 0; b < 2; b++)
             {
-                /* pad_inside() works in framebuffer coordinates, which fx and
-                 * fy already are. */
-                const int px = fx;
-                const int py = fy;
-
-                if (!pad_inside(b, px, py))
+                if (!pad_inside(b, fx, fy))
                     continue;
 
-                /* Same two-pixel border rule as everything else: a pixel is
-                 * border when the disc does not survive a 2 px erosion. */
                 bool core = true;
 
                 for (int ey = -PM_DPAD_LINE; ey <= PM_DPAD_LINE && core; ey++)
                     for (int ex = -PM_DPAD_LINE; ex <= PM_DPAD_LINE; ex++)
-                        if (!pad_inside(b, px + ex, py + ey))
+                        if (!pad_inside(b, fx + ex, fy + ey))
                         {
                             core = false;
                             break;
@@ -1092,7 +1197,7 @@ static void pm_dpad_row(void *ctx, int row, int col, uint16_t *dst, int n)
 
                 c = core ? s_dpad_face : s_dpad_edge;
 
-                if (c == s_dpad_face && pad_label_ink(b, px, py))
+                if (c == s_dpad_face && pad_label_ink(b, fx, fy))
                     c = s_dpad_ink;
 
                 break;

@@ -1593,8 +1593,17 @@ bool display_panel_rows(int cx, int cy, int w, int h, display_row_fn fn)
     int x1 = cx + w;
     int y1 = cy + h;
 
-    if (x1 > DISPLAY_PANEL_W)
-        x1 = DISPLAY_PANEL_W;
+    /* THE HORIZONTAL BOUND IS OFFSET, and getting it wrong here would have cut
+     * 22 columns off the right of the visible glass. The controller's RAM is 432
+     * columns wide but the glass starts at column PANEL_COL_OFFSET, so the last
+     * visible column is PANEL_COL_OFFSET + DISPLAY_PANEL_W - 1 = 431. Clipping at
+     * DISPLAY_PANEL_W alone would treat the glass's right edge as 410 and leave
+     * the strip from 411 to 431 unwritten -- invisible on a black picture and
+     * obvious the moment a background spans the full width. edges.h has the same
+     * expression as RIGHT_X1; this is deliberately the same arithmetic rather
+     * than a shared macro because edges.h includes display.h, not the reverse. */
+    if (x1 > PANEL_COL_OFFSET + DISPLAY_PANEL_W)
+        x1 = PANEL_COL_OFFSET + DISPLAY_PANEL_W;
     if (y1 > DISPLAY_PANEL_H)
         y1 = DISPLAY_PANEL_H;
     if (x0 >= x1 || y0 >= y1)
