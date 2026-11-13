@@ -215,6 +215,21 @@ static bool s_ovr_set[2][COL_N];
 static char s_ovr_btn[BTN_N][OVR_MAX];
 static bool s_ovr_btn_set[BTN_N];
 
+/*
+ * SLOTS WITH NO BUTTON GRAPHIC.
+ *
+ * A button is drawn as a rounded box with a border and a face, and a slot can
+ * opt out of that entirely: the painter then emits black and only the label is
+ * drawn, so the control reads as text on the glass rather than as a rendered
+ * button. Used for the controls whose graphic the app supplies itself -- the
+ * Pokemon Mini draws its own d-pad and A/B circles on the framebuffer, so a
+ * second drawn button above them would be two controls for one duty.
+ *
+ * Indexed [column][slot] with the same column numbering as the label overrides:
+ * 0 left, 1 right, 2 the bottom strip.
+ */
+static bool s_nochrome[3][COL_N];
+
 #define BAND_ROWS 16
 
 /*
@@ -1201,6 +1216,15 @@ static void paint_buttons(void)
                         if (x < g0 || x > g1)
                             continue;
 
+                        if (s_nochrome[2][s])
+                        {
+                            /* No box: the slot is the glass, and only the label
+                             * is drawn on it. */
+                            if (label_bit(&label[s], x, yy))
+                                c = label_fg();
+                            break;
+                        }
+
                         c = button_pixel(x, yy, g0, BTN_Y0, g1, BTN_Y1,
                                          bar_corners(s));
                         /* Gated on the fill, so a glyph pixel can never eat
@@ -1364,6 +1388,14 @@ static void paint_column(int x0, int x1, bool desk_right, label_rot_t rot,
                         if (yy < g0 || yy > g1)
                             continue;
 
+                        if (s_nochrome[desk_right ? 1 : 0][s])
+                        {
+                            /* No box; the label alone, on the glass. */
+                            if (label_bit(&label[s], x, yy))
+                                c = label_fg();
+                            break;
+                        }
+
                         c = button_pixel(x, yy, x0, g0, x1, g1,
                                          column_corners(s, desk_right));
                         /* Gated on the fill, so a glyph can never eat into the
@@ -1526,6 +1558,71 @@ void display_margin_label(int col, int index, const char *text)
 }
 
 /*
+ * Push a picture in PANEL coordinates, past the framebuffer's bottom edge.
+ *
+ * display_picture_rows() works in framebuffer coordinates and clips to the
+ * 320x416 rectangle, which is correct for a picture and wrong for furniture. The
+ * glass is 502 rows tall and the framebuffer stops at row 460, so the 41 rows
+ * below it are visible, are addressable, and already carry the bottom margin
+ * buttons -- but an app drawing through the framebuffer path cannot reach them.
+ * This is that path with the clip removed.
+ *
+ * Coordinates are the panel's own, the same space edges.h works in: x from
+ * PANEL_COL_OFFSET (22) and y from 0, both inclusive. A caller converting from
+ * framebuffer coordinates adds FB_X + PANEL_COL_OFFSET to x and FB_Y to y.
+ *
+ * The row callback gets `row` counted from the region's top, which is what makes
+ * it usable for a shape defined in framebuffer terms: the offset is applied here,
+ * once, rather than by every callback.
+ *
+ * Refuses unless the pixels are claimed, on the same reasoning as
+ * display_picture_rows(): the painter must not be racing this for the bus.
+ */
+bool display_panel_rows(int cx, int cy, int w, int h, display_row_fn fn)
+{
+    if (!s_fb || !fn || w <= 0 || h <= 0)
+        return false;
+    if (!s_pixel_owner)
+        return false;
+
+    /* Clipped to the panel rather than to the framebuffer. Anything off the glass
+     * is dropped, so a layout mistake shows as a missing edge instead of as
+     * writes into the controller's hidden RAM columns. */
+    int x0 = cx < 0 ? 0 : cx;
+    int y0 = cy < 0 ? 0 : cy;
+    int x1 = cx + w;
+    int y1 = cy + h;
+
+    if (x1 > DISPLAY_PANEL_W)
+        x1 = DISPLAY_PANEL_W;
+    if (y1 > DISPLAY_PANEL_H)
+        y1 = DISPLAY_PANEL_H;
+    if (x0 >= x1 || y0 >= y1)
+        return false;
+
+    const int dw = x1 - x0;
+    const int col = x0 - cx;
+
+    int band = (int)(sizeof(s_tx) / sizeof(s_tx[0])) / dw;
+    if (band > BAND_ROWS)
+        band = BAND_ROWS;
+    if (band < 1)
+        band = 1;
+
+    for (int yy = y0; yy < y1; yy += band)
+    {
+        int rows = (y1 - yy) > band ? band : (y1 - yy);
+
+        for (int r = 0; r < rows; r++)
+            fn(NULL, (yy + r) - cy, col, s_tx_app + (size_t)r * dw, dw);
+
+        push_pixels_raw_buf(x0, yy, dw, rows, s_tx_app);
+    }
+
+    return true;
+}
+
+/*
  * The margin buttons' own colours, so an app drawing on the framebuffer can
  * match them instead of writing the same three numbers again.
  *
@@ -1540,6 +1637,42 @@ void display_margin_colours(uint16_t *fill, uint16_t *edge, uint16_t *label)
     if (fill)  *fill  = COL_FILL;
     if (edge)  *edge  = COL_EDGE;
     if (label) *label = label_fg();
+}
+
+/*
+ * Remove or restore a slot's button graphic.
+ *
+ * `col` is 0 for the left column, 1 for the right, 2 for the bottom strip. With
+ * the graphic off the slot paints black and only its label appears, which is for
+ * an app that supplies its own control on the framebuffer and does not want two
+ * drawn buttons for one duty.
+ *
+ * Repaints the affected edge, because a chrome change is visible immediately and
+ * asking the paint task would drop it -- the same reason display_margin_label()
+ * repaints synchronously.
+ */
+void display_margin_chrome(int col, int index, bool on)
+{
+    if (!s_fb || col < 0 || col > 2 || index < 0 || index >= COL_N)
+        return;
+    if (col == 2 && index >= BTN_N)
+        return;
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+
+    s_nochrome[col][index] = !on;
+
+    if (s_margin_mode == DISPLAY_MARGINS_APP)
+    {
+        if (col == 2)
+            paint_buttons();
+        else if (col == 0)
+            paint_column(LEFT_X0, LEFT_X1, true, LABEL_CW, left_label_app, overrides_for(0));
+        else
+            paint_column(RIGHT_X0, RIGHT_X1, false, LABEL_CCW, right_label_app, overrides_for(1));
+    }
+
+    xSemaphoreGive(s_lock);
 }
 
 /*

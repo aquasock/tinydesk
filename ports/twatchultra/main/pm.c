@@ -649,14 +649,64 @@ static uint8_t *load_rom(const char *path, int *out_len)
  * the d-pad lives in the bottom-left corner and the space to its right is where
  * the A, B and C cluster belongs once it is drawn.
  */
-#define PM_DPAD_S    168
-#define PM_DPAD_ARM  (PM_DPAD_S / 3)
-#define PM_DPAD_Y    (PM_H * PM_SCALE +                                          \
-                      ((DISPLAY_H - PM_H * PM_SCALE) - PM_DPAD_S) / 2)        /* 220 */
-/* The margin the d-pad keeps from the left and bottom edges of the framebuffer,
- * derived rather than written so the two stay equal if the d-pad moves. */
-#define PM_DPAD_MARGIN (DISPLAY_H - (PM_DPAD_Y + PM_DPAD_S))                     /* 28  */
-#define PM_DPAD_X      PM_DPAD_MARGIN
+/* POSITION: CENTRED ON THE GLASS, NOT ON THE FRAMEBUFFER.
+ *
+ * These are two different rectangles and the difference is 41 rows. The
+ * framebuffer is 320x416 and stops at fb row 415, but the AMOLED's glass runs 41
+ * rows further down -- DISPLAY_PANEL_H 502 less the framebuffer's 45-row origin
+ * and its 416 height -- and that strip carries the bottom margin buttons, which
+ * is the visible proof it exists. An app cannot DRAW there; display_picture_rows()
+ * clips to the framebuffer. But it can be SEEN there, and the eye centres on what
+ * it can see.
+ *
+ * So the d-pad is centred in the band from the picture's bottom edge to the
+ * glass's bottom edge, not in the band from the picture to the framebuffer's last
+ * row. That puts 48 px above it and 49 px below, against a 1 px asymmetry that
+ * comes from the band being an odd 265 rows and cannot be removed at an integer
+ * position. Centring on the framebuffer instead would have left 16 px below
+ * inside the fb and then a further 41 px of visible glass, so the d-pad would
+ * have looked 57 px off-centre on the watch while reading as centred in the
+ * source.
+ *
+ * The horizontal inset stays 16, matching the picture's own PM_OX, so the d-pad
+ * lines up with the left edge of the game above it.
+ */
+#define PM_DPAD_S      168
+#define PM_DPAD_ARM    (PM_DPAD_S / 3)
+#define PM_DPAD_MLFT   16                                                 /* 16 */
+
+/* The glass's bottom edge expressed in framebuffer rows: one past the last
+ * visible row. Derived, so a panel or origin change moves it. */
+#define PM_GLASS_BOT   (DISPLAY_PANEL_H - DISPLAY_ORIGIN_Y)               /* 457 */
+
+/* The centring above puts the d-pad's 168 px box at y 240..407 and x 16..183.
+ * From there the operator nudges it down and left to open thumb room.
+ *
+ * THE BOUND IS THE PANEL, NOT THE FRAMEBUFFER. An earlier version of this
+ * comment computed the largest safe nudge as 10 px, because the rotated box needs
+ * 238 rows and the framebuffer has only 224 below the picture. That was correct
+ * about display_picture_rows() and wrong about what is visible: the framebuffer is
+ * a 320x416 window, the glass is 410x502, and the 41 rows below the window are
+ * addressable and visible -- the bottom margin buttons are already drawn there.
+ * Drawing through display_panel_rows() instead removes the artificial edge, which
+ * is what the operator asked for by pointing out the unused glass.
+ *
+ * So the real limits are the panel's own: y 0..501 and x 0..409 in panel
+ * coordinates. At a 20 px nudge the cluster's lowest row is framebuffer 427,
+ * which is panel 472, and the leftmost is framebuffer 6, which is panel 73 --
+ * both comfortably on the glass.
+ */
+#define PM_DPAD_NUDGE_DOWN  20
+#define PM_DPAD_NUDGE_LEFT  20
+
+#define PM_DPAD_Y      (PM_H * PM_SCALE +                                        \
+                        ((PM_GLASS_BOT - PM_H * PM_SCALE) - PM_DPAD_S) / 2 \
+                        + PM_DPAD_NUDGE_DOWN)                                /* 260 */
+#define PM_DPAD_X      (PM_DPAD_MLFT - PM_DPAD_NUDGE_LEFT)                /* -4 */
+
+/* Kept as a name for the circle layout below, which still measures its gap from
+ * the d-pad's old relationship rather than from the new margins. */
+#define PM_DPAD_MARGIN PM_DPAD_MLFT
 
 /*
  * COLOURS, TAKEN FROM THE MARGIN BUTTONS RATHER THAN CHOSEN HERE.
@@ -855,10 +905,15 @@ static bool dpad_core(int x, int y)
  * beside the d-pad. `C` is already a margin button on the right. If these are
  * meant to be something else, the label table is the only thing to change.
  */
+/* THE CIRCLES MOVE DOWN WITH THE D-PAD BUT NOT LEFT WITH IT, which is the literal
+ * reading of "move both down, and move the d-pad left". Their x is therefore
+ * pinned to the value it had -- 224 -- rather than derived from the d-pad, so the
+ * gap between the d-pad's right edge and the circles widens from 28 to 40 while
+ * their right margin against the framebuffer stays at 28. */
 #define PM_PAD_D     68
-#define PM_PAD_X     (PM_DPAD_X + PM_DPAD_S + PM_DPAD_MARGIN)      /* 224 */
-#define PM_PAD_Y0    (PM_DPAD_Y)                                    /* 220 */
-#define PM_PAD_Y1    (PM_PAD_Y0 + PM_PAD_D + PM_PAD_GAP)            /* 320 */
+#define PM_PAD_X     224
+#define PM_PAD_Y0    (PM_DPAD_Y)                                    /* 240 */
+#define PM_PAD_Y1    (PM_PAD_Y0 + PM_PAD_D + PM_PAD_GAP)            /* 332 */
 #define PM_PAD_GAP   ((PM_DPAD_S - 2 * PM_PAD_D))                   /* 32  */
 
 static const uint16_t s_pad_label[2] = { 'A', 'B' };
@@ -909,13 +964,71 @@ static bool pad_label_ink(int i, int x, int y)
  * 684 drawn and none on eight. The line is a little thicker where it steps
  * diagonally, which on a 168 px figure is not visible.
  */
+/*
+ * THE D-PAD IS ROTATED 45 DEGREES CLOCKWISE, and the whole thing rotates with it
+ * -- arms and arrows both.
+ *
+ * The implementation is an inverse transform rather than a rotated rasteriser:
+ * every pixel is mapped back into the unrotated frame and tested there, so
+ * dpad_inside() and the arrow sampler are unchanged and cannot drift apart from
+ * the shape. One rotation, one place.
+ *
+ * SCREEN -> SHAPE is the inverse of the rotation, which is why the sign looks
+ * backwards: a point in the upper-right of the screen is mapped to the TOP arm.
+ * With dx, dy measured from the d-pad's centre and k = cos45:
+ *
+ *     u = (dx + dy) * k        v = (dy - dx) * k
+ *
+ * and the result is tested at (u + S/2, v + S/2) in the shape's own 0..S frame.
+ *
+ * THE ARROWS ROTATE TOO, and they are the reason this is done as a transform of
+ * the input rather than as a dance of pre-rotated tables: the four glyphs are
+ * sampled in shape space, so they come out pointing into the rotated arms'
+ * directions without a second copy of the font or a rotated bitmap to maintain.
+ * At 45 degrees a 16x32 arrow is resampled on a diagonal, which is expected and
+ * is what "rotate the entire dpad" means.
+ *
+ * PM_ROT_HALF is the rotated shape's bounding half-extent: the cross's extremes
+ * are its arm tips, and the largest |u| among them is 84 * sqrt(2) / 1.5 =
+ * 79.2, plus one row for the 2 px border's outer edge. The region below is built
+ * from it, so the rotated d-pad cannot be clipped.
+ *
+ * Fixed point, not float: k is 46341 in 16.16, which is cos45 to within one
+ * part in 65536. The whole shape is rasterised once at start, so the arithmetic
+ * cost is irrelevant and an exactly-representable integer keeps the rendering
+ * identical run to run.
+ */
+#define PM_ROT_K     46341            /* cos(45 deg) in 16.16 */
+#define PM_ROT_HALF  81               /* rotated bounding half-extent */
+
+static void dpad_unrotate(int x, int y, int *u, int *v)
+{
+    /* x, y are relative to the d-pad's centre, in framebuffer pixels. */
+    *u = ((x + y) * PM_ROT_K) >> 16;
+    *v = ((y - x) * PM_ROT_K) >> 16;
+}
+
 /* The whole control cluster as one region: the d-pad plus the two circles to its
  * right. One push, not two, because they are adjacent, they never change, and two
  * windows would be two bus acquisitions and two transfers for one static image. */
-#define PM_CTL_X  PM_DPAD_X
-#define PM_CTL_Y  PM_DPAD_Y
-#define PM_CTL_W  (PM_PAD_X + PM_PAD_D - PM_DPAD_X)
-#define PM_CTL_H  PM_DPAD_S
+#define PM_DPAD_CX  (PM_DPAD_X + PM_DPAD_S / 2)                    /* 100 */
+#define PM_DPAD_CY  (PM_DPAD_Y + PM_DPAD_S / 2)                    /* 324 */
+
+#define PM_ROT_X0   (PM_DPAD_CX - PM_ROT_HALF)                     /* 19  */
+#define PM_ROT_Y0   (PM_DPAD_CY - PM_ROT_HALF)                     /* 243 */
+#define PM_ROT_X1   (PM_DPAD_CX + PM_ROT_HALF)                     /* 181 */
+#define PM_ROT_Y1   (PM_DPAD_CY + PM_ROT_HALF)                     /* 405 */
+
+/* The union of the rotated d-pad's box and the circles' box. The circles do not
+ * rotate -- only the d-pad was asked for -- so their extent is unchanged. */
+#define PM_CTL_X  (PM_ROT_X0 < PM_PAD_X ? PM_ROT_X0 : PM_PAD_X)    /* 19  */
+#define PM_CTL_Y  (PM_ROT_Y0 < PM_PAD_Y0 ? PM_ROT_Y0 : PM_PAD_Y0)  /* 240 */
+#define PM_CTL_X1 (PM_ROT_X1 > (PM_PAD_X + PM_PAD_D - 1) ?         \
+                   PM_ROT_X1 : (PM_PAD_X + PM_PAD_D - 1))          /* 291 */
+#define PM_CTL_Y1 (PM_ROT_Y1 > (PM_PAD_Y1 + PM_PAD_D - 1) ?        \
+                   PM_ROT_Y1 : (PM_PAD_Y1 + PM_PAD_D - 1))          /* 405 */
+#define PM_CTL_W  (PM_CTL_X1 - PM_CTL_X + 1)                       /* 273 */
+#define PM_CTL_H  (PM_CTL_Y1 - PM_CTL_Y + 1)                       /* 166 */
 
 static void pm_dpad_row(void *ctx, int row, int col, uint16_t *dst, int n)
 {
@@ -930,9 +1043,16 @@ static void pm_dpad_row(void *ctx, int row, int col, uint16_t *dst, int n)
 
         uint16_t c = PM_VOID;
 
-        /* --- the d-pad, offset from the region origin ---------------------- */
-        const int dx0 = x - (PM_DPAD_X - PM_CTL_X);
-        const int dy0 = y - (PM_DPAD_Y - PM_CTL_Y);
+        /* --- the d-pad, rotated -------------------------------------------
+         * Region-local to framebuffer, then to the d-pad's centre, then back
+         * through the inverse rotation into the shape's own frame. */
+        const int fx = x + PM_CTL_X;
+        const int fy = y + PM_CTL_Y;
+        int u, v;
+        dpad_unrotate(fx - PM_DPAD_CX, fy - PM_DPAD_CY, &u, &v);
+
+        const int dx0 = u + PM_DPAD_S / 2;
+        const int dy0 = v + PM_DPAD_S / 2;
 
         if (dpad_inside(dx0, dy0))
         {
@@ -950,11 +1070,10 @@ static void pm_dpad_row(void *ctx, int row, int col, uint16_t *dst, int n)
         {
             for (int b = 0; b < 2; b++)
             {
-                /* pad_inside() works in framebuffer coordinates -- its centre
-                 * comes from pad_cx()/pad_cy() -- so the region offset is ADDED
-                 * back here rather than subtracted. */
-                const int px = x + PM_CTL_X;
-                const int py = y + PM_CTL_Y;
+                /* pad_inside() works in framebuffer coordinates, which fx and
+                 * fy already are. */
+                const int px = fx;
+                const int py = fy;
 
                 if (!pad_inside(b, px, py))
                     continue;
@@ -1005,8 +1124,13 @@ static bool pm_draw_dpad(void)
     s_dpad_edge = display_swap16(edge);
     s_dpad_ink  = display_swap16(ink);
 
-    return display_picture_rows(NULL, PM_CTL_X, PM_CTL_Y,
-                                PM_CTL_W, PM_CTL_H, pm_dpad_row);
+    /* PANEL coordinates, not framebuffer ones, so the cluster can reach the
+     * bottom of the glass. display_picture_rows() would clip at fb row 415; the
+     * panel runs to 502 and the framebuffer's origin is 45, so this adds
+     * FB_Y and the panel's column offset exactly as the margin painters do. */
+    return display_panel_rows(PM_CTL_X + DISPLAY_ORIGIN_X + PANEL_COL_OFFSET,
+                              PM_CTL_Y + DISPLAY_ORIGIN_Y,
+                              PM_CTL_W, PM_CTL_H, pm_dpad_row);
 }
 
 /* --- the margin buttons ----------------------------------------------------
@@ -1038,9 +1162,42 @@ static bool pm_draw_dpad(void)
  * making them true. `SS` is the one that needs explaining: it is the
  * screenshot/save-state slot, and it is the name the operator asked for.
  */
-static const char *const PM_LEFT[COL_N]  = { "SS", "Save", "Load", "Pause", "Reset" };
-static const char *const PM_RIGHT[COL_N] = { "Hold", "Sound", "Speed", "", "C" };
-static const char *const PM_BOTTOM[BTN_N] = { "Shake", "A", "B" };
+/* THE SEVEN BARE SLOTS CARRY NO TEXT EITHER.
+ *
+ * They have no box and no label: Pause, Reset, Shake, A, B, C and the reserved
+ * slot are simply black glass. Their duties are drawn on the framebuffer instead
+ * -- the d-pad and the A and B circles -- so a legend beside them would be a
+ * second name for a control the player can already see.
+ *
+ * The six that keep a label keep their box too, so a slot is either a drawn
+ * button with its name or nothing at all, and the two never mix. */
+/* A SINGLE SPACE, NOT AN EMPTY STRING, and that is not a trick.
+ * display_margin_label() treats "" as "clear the override so the shared table
+ * applies again", which would restore the Tamagotchi's words -- "Sound",
+ * "Reset", the degree circle -- on exactly the slots meant to be blank. A space
+ * is a real label that happens to be invisible, so the override sticks and
+ * nothing is drawn. */
+#define PM_BLANK " "
+
+static const char *const PM_LEFT[COL_N]  = { "SS", "Save", "Load", PM_BLANK, PM_BLANK };
+static const char *const PM_RIGHT[COL_N] = { "Hold", "Sound", "Speed", PM_BLANK, PM_BLANK };
+static const char *const PM_BOTTOM[BTN_N] = { PM_BLANK, PM_BLANK, PM_BLANK };
+
+/*
+ * WHICH SLOTS ARE BARE GLASS rather than drawn buttons.
+ *
+ * The controls the app supplies itself -- the d-pad and the A and B circles on
+ * the framebuffer -- must not also appear as drawn buttons in the margins, or
+ * the glass carries two controls for one duty. So Pause and Reset on the left,
+ * all three bottom bars, and the blank slot with C on the right lose their box
+ * and keep only their label; SS, Save, Load, Hold, Sound and Speed keep theirs.
+ *
+ * Expressed as three masks in the label tables' index order, so reading them
+ * beside the tables above shows exactly which slots are affected.
+ */
+static const bool PM_BARE_LEFT[COL_N]  = { false, false, false, true,  true  };
+static const bool PM_BARE_RIGHT[COL_N] = { false, false, false, true,  true  };
+static const bool PM_BARE_BOTTOM[BTN_N] = { true, true, true };
 
 /* Store the overrides. Safe to call before the app owns the glass: the setters
  * record the label and simply skip the repaint, so the single paint that
@@ -1055,6 +1212,17 @@ static void pm_label_margins(void)
 
     for (int i = 0; i < BTN_N; i++)
         display_margin_btn_label(i, PM_BOTTOM[i]);
+
+    /* Chrome after labels, so the one repaint each setter does already carries
+     * the right text. */
+    for (int i = 0; i < COL_N; i++)
+    {
+        display_margin_chrome(0, i, !PM_BARE_LEFT[i]);
+        display_margin_chrome(1, i, !PM_BARE_RIGHT[i]);
+    }
+
+    for (int i = 0; i < BTN_N; i++)
+        display_margin_chrome(2, i, !PM_BARE_BOTTOM[i]);
 }
 
 /* Clearing every slot hands the next app the shared defaults back. Without this
@@ -1069,6 +1237,16 @@ static void pm_unlabel_margins(void)
 
     for (int i = 0; i < BTN_N; i++)
         display_margin_btn_label(i, "");
+
+    /* Restore every box, or the next app inherits bare slots. */
+    for (int i = 0; i < COL_N; i++)
+    {
+        display_margin_chrome(0, i, true);
+        display_margin_chrome(1, i, true);
+    }
+
+    for (int i = 0; i < BTN_N; i++)
+        display_margin_chrome(2, i, true);
 }
 
 bool pmini_start(const char *rom_path)

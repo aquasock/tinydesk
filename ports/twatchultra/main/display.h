@@ -228,6 +228,30 @@ void display_margin_btn_label(int index, const char *text);
 void display_margin_colours(uint16_t *fill, uint16_t *edge, uint16_t *label);
 
 /*
+ * Remove or restore a slot's button graphic. col is 0 left, 1 right, 2 bottom
+ * strip. With on == false the slot paints black and only its label appears.
+ * Same sole-writer requirement as display_margins_set().
+ */
+void display_margin_chrome(int col, int index, bool on);
+
+/*
+ * Push a picture in PANEL coordinates, without the framebuffer's clip.
+ *
+ * display_picture_rows() stops at the 320x416 framebuffer; the glass is 502 rows
+ * tall and the 41 rows below it are visible and addressable -- that strip already
+ * carries the bottom margin buttons. This is the same row-callback push with the
+ * clip moved to the panel's own bounds, for an app drawing furniture that should
+ * reach the edge of the glass.
+ *
+ * cx, cy are panel coordinates: x from PANEL_COL_OFFSET, y from 0. From
+ * framebuffer coordinates, add FB_X + PANEL_COL_OFFSET to x and FB_Y to y. The
+ * callback's `row` is counted from the region's top.
+ *
+ * Requires display_pixels_claim(true).
+ */
+bool display_panel_rows(int cx, int cy, int w, int h, display_row_fn fn);
+
+/*
  * Compare the framebuffer against the cell grid, and the grid against what the
  * painter believes it has drawn.
  *
