@@ -209,6 +209,17 @@ display_margins_t display_margins_get(void);
 void display_margin_label(int col, int index, const char *text);
 
 /*
+ * Relabel one bottom-strip bar while an app owns the screen, and repaint the
+ * strip. index is 0..2, left to right; an empty label restores the edges.h
+ * default. Same sole-writer requirement as display_margins_set().
+ *
+ * Separate from display_margin_label() because the strip has its own table in
+ * edges.h (the Tamagotchi's), which an app cannot reach through the column
+ * overrides.
+ */
+void display_margin_btn_label(int index, const char *text);
+
+/*
  * Compare the framebuffer against the cell grid, and the grid against what the
  * painter believes it has drawn.
  *

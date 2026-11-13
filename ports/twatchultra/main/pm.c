@@ -609,6 +609,68 @@ static uint8_t *load_rom(const char *path, int *out_len)
     return buf;
 }
 
+/* --- the margin buttons ----------------------------------------------------
+ *
+ * WHAT THE GLASS SAYS WHILE A POKEMON MINI IS RUNNING.
+ *
+ * The layout is the operator's, and it follows the console's own control set
+ * rather than the desktop's keys:
+ *
+ *   left column,  top to bottom   SS, Save, Load, Pause, Reset
+ *   bottom strip, left to right   Shake, A, B
+ *   right column, top to bottom   Hold, Sound, Speed, (blank), C
+ *
+ * The blank right-column slot is deliberate and is not a mistake: four of the
+ * five right-hand slots are taken and the fifth is where a later control goes,
+ * so leaving it visibly empty keeps the button positions stable when it arrives.
+ *
+ * THE LABELS ARE APPLIED AS OVERRIDES, NOT BY EDITING edges.h. Those tables are
+ * the Tamagotchi's and are pinned against its action table by
+ * tests/test_tama_ui.c; adding a second app's names to them would either break
+ * that test or force it to know about two apps. `display_margin_label()` and
+ * `display_margin_btn_label()` exist for exactly this and fall back to the
+ * shared default when a slot is cleared.
+ *
+ * NO BUTTON DOES ANYTHING YET. This cycle is the labels only; the actions are
+ * the next one. That is worth stating in the source because edges.h's rule is
+ * that a label must not claim a job the button is not doing -- so these are
+ * currently a statement of intent, and the first thing the next cycle owes is
+ * making them true. `SS` is the one that needs explaining: it is the
+ * screenshot/save-state slot, and it is the name the operator asked for.
+ */
+static const char *const PM_LEFT[COL_N]  = { "SS", "Save", "Load", "Pause", "Reset" };
+static const char *const PM_RIGHT[COL_N] = { "Hold", "Sound", "Speed", "", "C" };
+static const char *const PM_BOTTOM[BTN_N] = { "Shake", "A", "B" };
+
+/* Store the overrides. Safe to call before the app owns the glass: the setters
+ * record the label and simply skip the repaint, so the single paint that
+ * display_margins_set() then does is the one that shows all twelve at once. */
+static void pm_label_margins(void)
+{
+    for (int i = 0; i < COL_N; i++)
+    {
+        display_margin_label(0, i, PM_LEFT[i]);
+        display_margin_label(1, i, PM_RIGHT[i]);
+    }
+
+    for (int i = 0; i < BTN_N; i++)
+        display_margin_btn_label(i, PM_BOTTOM[i]);
+}
+
+/* Clearing every slot hands the next app the shared defaults back. Without this
+ * the Tamagotchi would inherit "Shake A B" on the strip. */
+static void pm_unlabel_margins(void)
+{
+    for (int i = 0; i < COL_N; i++)
+    {
+        display_margin_label(0, i, "");
+        display_margin_label(1, i, "");
+    }
+
+    for (int i = 0; i < BTN_N; i++)
+        display_margin_btn_label(i, "");
+}
+
 bool pmini_start(const char *rom_path)
 {
     if (s_run)
@@ -683,6 +745,9 @@ bool pmini_start(const char *rom_path)
      * the emulator running against a framebuffer it does not own. */
     display_pixels_claim(true);
     display_fill(0x0000);
+
+    /* Labels first, then the single paint that shows them. */
+    pm_label_margins();
     display_margins_set(DISPLAY_MARGINS_APP);
 
     s_frame = xSemaphoreCreateCounting(PM_TICK_BACKLOG, 0);
@@ -905,6 +970,7 @@ void pmini_stop(void)
     /* Order matters and follows nes_stop(): the margins are repainted while the
      * framebuffer is still owned, and ownership is released last, so the painter
      * never comes back to a desktop whose margins are still in app mode. */
+    pm_unlabel_margins();
     display_margins_set(DISPLAY_MARGINS_DESKTOP);
     display_pixels_claim(false);
 }

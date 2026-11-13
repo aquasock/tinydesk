@@ -202,6 +202,19 @@ static display_margins_t s_margin_mode;
 static char s_ovr[2][COL_N][OVR_MAX];
 static bool s_ovr_set[2][COL_N];
 
+/*
+ * The bottom strip's overrides, on the same principle as the columns'.
+ *
+ * It exists separately because the strip has its own table -- `btn_label_app()`
+ * in edges.h, which is the Tamagotchi's and returns the same glyph for all three
+ * bars. A second app that wants its three bars named differently cannot express
+ * that through the column overrides, so the strip gets its own small array here
+ * rather than a table per app in edges.h, which would have made every new app
+ * edit the shared header and the test that pins it.
+ */
+static char s_ovr_btn[BTN_N][OVR_MAX];
+static bool s_ovr_btn_set[BTN_N];
+
 #define BAND_ROWS 16
 
 /*
@@ -1149,7 +1162,9 @@ static void paint_buttons(void)
         int g0 = s == 0 ? BTN_X0 : btn_slot_x(s) + BTN_SEP;
         int g1 = btn_slot_x(s + 1) - 1;
 
-        label_place(label_at(s), g0 + BTN_RADIUS, g1 - BTN_RADIUS,
+        const char *text = s_ovr_btn_set[s] ? s_ovr_btn[s] : label_at(s);
+
+        label_place(text, g0 + BTN_RADIUS, g1 - BTN_RADIUS,
                     BTN_Y0 + BTN_RADIUS, BTN_Y1 - BTN_RADIUS, LABEL_UPRIGHT, &label[s]);
     }
 
@@ -1419,7 +1434,13 @@ static void paint_margins(void)
     paint_buttons();
     paint_column(LEFT_X0, LEFT_X1, true, LABEL_CW,
                  app ? left_label_app : left_label, overrides_for(0));
-    paint_column(RIGHT_X0, RIGHT_X1, false, LABEL_UPRIGHT,
+    /* CCW, not upright: the right column stands on end the same way the left
+     * one does, and the two read as a mirror pair -- the left reads downward
+     * from the top (CW), the right reads upward from the bottom (CCW). Both are
+     * then legible to someone looking at the watch held the same way, which
+     * upright text was not: it read correctly only when the watch was turned 90
+     * degrees, which is not how it is held. */
+    paint_column(RIGHT_X0, RIGHT_X1, false, LABEL_CCW,
                  app ? right_label_app : right_label, overrides_for(1));
 }
 
@@ -1499,7 +1520,44 @@ void display_margin_label(int col, int index, const char *text)
     if (col == 0)
         paint_column(LEFT_X0, LEFT_X1, true, LABEL_CW, left_label_app, overrides_for(0));
     else
-        paint_column(RIGHT_X0, RIGHT_X1, false, LABEL_UPRIGHT, right_label_app, overrides_for(1));
+        paint_column(RIGHT_X0, RIGHT_X1, false, LABEL_CCW, right_label_app, overrides_for(1));
+
+    xSemaphoreGive(s_lock);
+}
+
+/*
+ * Relabel one bottom-strip bar, and repaint the strip.
+ *
+ * The strip is repainted whole rather than per bar: it is one window, one bus
+ * acquisition and one transfer, so painting one bar in isolation would cost the
+ * same as painting three and would break the single-window rule the painter
+ * relies on.
+ *
+ * Same rules as display_margin_label(): the caller must already own the pixels,
+ * `index` is 0..BTN_N-1, and an empty string restores the edges.h default.
+ */
+void display_margin_btn_label(int index, const char *text)
+{
+    if (!s_fb || index < 0 || index >= BTN_N)
+        return;
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+
+    if (text && *text)
+    {
+        strncpy(s_ovr_btn[index], text, OVR_MAX - 1);
+        s_ovr_btn[index][OVR_MAX - 1] = '\0';
+        s_ovr_btn_set[index] = true;
+    }
+    else
+    {
+        s_ovr_btn[index][0] = '\0';
+        s_ovr_btn_set[index] = false;
+    }
+
+    /* Only meaningful in APP mode; a desktop strip belongs to the painter. */
+    if (s_margin_mode == DISPLAY_MARGINS_APP)
+        paint_buttons();
 
     xSemaphoreGive(s_lock);
 }
