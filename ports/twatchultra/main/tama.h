@@ -43,7 +43,13 @@ void tama_stop(void);
 
 bool tama_running(void);
 
-/* Registers the `tama` shell command with TinyDesk Shell. */
+/* Registers the `tama` shell command with TinyDesk Shell, and offers the margin
+ * buttons to the emulator. Both are one call because both are "make this app
+ * reachable" and there is no ordering in which one is useful without the
+ * other. */
 bool tama_register_command(void);
+
+/* How many of the strip's three bars map to the guest, left to right. */
+#define TAMA_BTN_N 3
 
 #endif /* TAMA_H */

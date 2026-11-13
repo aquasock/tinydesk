@@ -151,6 +151,15 @@ static i2c_master_dev_handle_t s_dev;
 static touch_input_fn s_input;
 static bool s_down;              /* pointer button down: only in pass-through */
 static bool s_pressed;           /* the controller is reporting a press */
+
+/* The application's own buttons, and which one is currently held. Kept here
+ * rather than in the app because the release is synthesised from this driver's
+ * own idle timer: the part emits no release event, so only the code that
+ * notices the reports stopping can say when a button came up. */
+static touch_app_button_fn s_app_btn;
+static void *s_app_btn_user;
+static edge_region_t s_app_region = EDGE_NONE;
+static int s_app_index = -1;
 static int s_last_x = -1, s_last_y = -1;
 
 /* When the last press report arrived. RELEASE_MS is measured against this and
@@ -505,6 +514,19 @@ static void release_if_idle(void)
         return;
     if (esp_timer_get_time() - s_last_press_us < (int64_t)RELEASE_MS * 1000)
         return;
+
+    /* Release whatever the app took, before the pointer path. A button that the
+     * handler accepted is a button the handler must be told has come up, and
+     * the pet's own input is edge-triggered: leaving it latched down would hold
+     * the guest's button for ever. */
+    if (s_app_index >= 0)
+    {
+        if (s_app_btn)
+            s_app_btn(s_app_btn_user, s_app_region, s_app_index, false);
+        s_app_index = -1;
+        s_app_region = EDGE_NONE;
+    }
+
     if (s_down)
     {
         int col, row;
@@ -689,12 +711,33 @@ static void poll_task(void *arg)
                 s_pressed = true;
                 if (owned)
                 {
-                    /* Inert, and logged once per press so the suppression is
-                     * visible rather than merely believed. No haptic either:
-                     * a buzz with no action says something happened when
-                     * nothing did, which is the rule edge_press() already
-                     * follows for the reserved slot. */
-                    ESP_LOGI(TAG, "e%d i%d off", (int)hit.region, hit.index);
+                    /*
+                     * Offer it to whoever owns the pixels. The handler decides
+                     * which of the thirteen it wants, so this file does not
+                     * learn any application's controls -- and one that returns
+                     * false (the columns today, a different app tomorrow) is
+                     * logged as inert rather than silently swallowed.
+                     *
+                     * The buzz follows the accepted press and only that, the
+                     * rule edge_press() already applies to the reserved slot:
+                     * feedback for an action, never for a refusal.
+                     */
+                    if (s_app_btn && s_app_btn(s_app_btn_user, hit.region, hit.index, true))
+                    {
+                        s_app_region = hit.region;
+                        s_app_index = hit.index;
+                        /* Logged, and short for the 40-column viewer: an
+                         * accepted press writes `app`, a declined one `off`, so
+                         * "the button is wired" is a fact in the log ring rather
+                         * than something inferred from a pet that happened to
+                         * blink. */
+                        ESP_LOGI(TAG, "e%d i%d app", (int)hit.region, hit.index);
+                        haptic_tap();
+                    }
+                    else
+                    {
+                        ESP_LOGI(TAG, "e%d i%d off", (int)hit.region, hit.index);
+                    }
                 }
                 else if (!app)
                 {
@@ -706,8 +749,14 @@ static void poll_task(void *arg)
              * margins included -- on those the glass is its, and a game that
              * draws its own controls near the edge needs the whole surface.
              * On the desktop nothing here runs: the framebuffer is not a touch
-             * surface, and the margins were already handled above. */
-            if (!app)
+             * surface, and the margins were already handled above.
+             *
+             * A CLAIMED framebuffer is not this path, even when a window
+             * manager window also says it owns the screen: an app that claimed
+             * the pixels has been offered the margins as buttons and expects
+             * them as buttons, and sending it pointer reports as well would be
+             * two answers to one press. */
+            if (!app || owned)
                 continue;
 
             {
@@ -737,6 +786,12 @@ static void poll_task(void *arg)
             }
         }
     }
+}
+
+void touch_set_app_buttons(touch_app_button_fn fn, void *user)
+{
+    s_app_btn = fn;
+    s_app_btn_user = user;
 }
 
 bool touch_init(touch_input_fn input)

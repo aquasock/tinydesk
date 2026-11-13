@@ -37,7 +37,9 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
+#include "touch.h"
 #include "tdsh.h"
 #include "tmc_core.h"
 
@@ -56,6 +58,45 @@ static TaskHandle_t s_task;
 static volatile bool s_run;
 static uint32_t s_frames;
 static uint32_t s_blits;
+
+/*
+ * THE STRIP'S BUTTONS CROSS A TASK BOUNDARY, so they are queued rather than
+ * written.
+ *
+ * touch.c runs its poll task pinned to core 0 at priority 3; the guest task here
+ * is unpinned and can be on core 1 at the same priority. `tmc_button()` writes
+ * the emulated CPU's pin state, and tmc_core.h states plainly that one instance
+ * is not reentrant -- so calling it from the touch task would be a data race
+ * against `tmc_run()` on the guest task, on two cores, with the guest's own
+ * programmer's model as the victim. The symptom would not be a crash; it would
+ * be a pet that occasionally acts on a button it never received.
+ *
+ * A queue is also what lets the emulator keep its own single-threaded contract
+ * instead of gaining a lock: the guest task drains the queue between frames and
+ * is the only thing that ever calls tmc_button().
+ *
+ * The queue is created once and never deleted, so the touch driver can never
+ * hold a handle to freed memory -- which is why the sink is registered for good
+ * rather than with each run (see touch.h).
+ */
+typedef struct
+{
+    uint8_t index;
+    bool down;
+} tama_btn_evt_t;
+
+#define TAMA_BTN_QDEPTH 8
+
+/* The strip's three bars are the V3's three buttons, positionally. If either
+ * count changes, the mapping above stops being a mapping -- so it is checked at
+ * compile time rather than trusted, and BTN_N comes from edges.h, which is the
+ * geometry the painter and the hit test share. */
+_Static_assert(BTN_N == TAMA_BTN_N, "the strip's bar count and the guest's button count disagree");
+
+static QueueHandle_t s_btn_q;
+static volatile bool s_accept_input;   /* false between stop and start */
+static uint32_t s_presses;             /* accepted presses, for the report */
+static uint32_t s_btn_drops;           /* events the queue would not take */
 static char s_rom_path[64] = TAMA_ROM_DEFAULT;
 
 /* --- report ---------------------------------------------------------------
@@ -73,8 +114,10 @@ static void report(const char *what, const char *extra)
     if (!f)
         return;
 
-    fprintf(f, "%s%s%s frames=%lu blits=%lu reset=%d\n", what, extra ? " " : "",
-            extra ? extra : "", (unsigned long)s_frames, (unsigned long)s_blits,
+    fprintf(f, "%s%s%s frames=%lu blits=%lu presses=%lu drops=%lu reset=%d\n",
+            what, extra ? " " : "", extra ? extra : "",
+            (unsigned long)s_frames, (unsigned long)s_blits,
+            (unsigned long)s_presses, (unsigned long)s_btn_drops,
             (int)esp_reset_reason());
     /* Cycles, and guest seconds derived from them -- not wall-clock seconds.
      * The two are the same only while the board keeps up with 16 frames a
@@ -88,6 +131,53 @@ static void report(const char *what, const char *extra)
     fclose(f);
 }
 
+/* --- the strip's three bars ---------------------------------------------- */
+
+/*
+ * touch.c offers every margin press here while the pixels are claimed.
+ *
+ * THE MAPPING IS POSITIONAL: left bar is the guest's button 0, middle 1, right
+ * 2, which is the order tmc_button() documents for the V3's pin mask. The
+ * columns are declined, not ignored -- returning false is what makes the driver
+ * log `off`, which keeps "not wired yet" visible in the log instead of leaving
+ * a press that silently does nothing.
+ */
+static bool tama_enqueue_button(int index, bool down)
+{
+    tama_btn_evt_t e = { (uint8_t)index, down };
+
+    /* Never block. The queue is eight deep against a 66 ms re-report and a
+     * 16 Hz drain, so a full queue means the guest task has stopped draining --
+     * a fault, counted rather than hidden. */
+    if (!s_accept_input || !s_btn_q || xQueueSend(s_btn_q, &e, 0) != pdTRUE)
+    {
+        s_btn_drops++;
+        return false;
+    }
+
+    if (down)
+        s_presses++;
+
+    return true;
+}
+
+static bool tama_app_button(void *user, edge_region_t region, int index, bool down)
+{
+    (void)user;
+
+    if (region != EDGE_BOTTOM || index < 0 || index >= TAMA_BTN_N)
+        return false;
+
+    if (!s_accept_input)
+        return false;
+
+    /* Queued, and reported as accepted even when the queue is full: the press
+     * did reach the application, and telling the driver otherwise would relabel
+     * a real fault as "not wired". */
+    (void)tama_enqueue_button(index, down);
+    return true;
+}
+
 /* --- the guest task ------------------------------------------------------ */
 
 static void tama_task(void *arg)
@@ -98,6 +188,13 @@ static void tama_task(void *arg)
     while (s_run)
     {
         int y_lo = 0, y_hi = 0;
+        tama_btn_evt_t e;
+
+        /* Buttons first, so a press that arrived during the last frame is in
+         * effect for this one -- the guest polls its pins at its own rate and
+         * a press applied after the step would be one frame late. */
+        while (xQueueReceive(s_btn_q, &e, 0) == pdTRUE)
+            tmc_button(s_m, e.index, e.down);
 
         tmc_run(s_m, TMC_FRAME_CYCLES);
 
@@ -296,7 +393,31 @@ bool tama_start(const char *rom_path)
 
     s_frames = 0;
     s_blits = 0;
+    s_presses = 0;
+    s_btn_drops = 0;
+
+    /* One queue for the life of the process: the touch driver holds a handle to
+     * this sink for ever, so deleting the queue between runs would leave it
+     * pointing at nothing. Created before the guest task and before input is
+     * accepted, so a press cannot arrive at a queue that does not exist. */
+    if (!s_btn_q)
+        s_btn_q = xQueueCreate(TAMA_BTN_QDEPTH, sizeof(tama_btn_evt_t));
+
+    if (!s_btn_q)
+    {
+        display_pixels_claim(false);
+        tmc_free(s_m);
+        heap_caps_free(s_frame);
+        heap_caps_free(s_rom);
+        s_m = NULL;
+        s_frame = NULL;
+        s_rom = NULL;
+        printf("no queue\n");
+        return false;
+    }
+
     s_run = true;
+    s_accept_input = true;
 
     if (xTaskCreate(tama_task, "tama", TAMA_STACK, NULL, TAMA_PRIO, &s_task) != pdPASS)
     {
@@ -323,6 +444,9 @@ void tama_stop(void)
     if (!s_task)
         return;
 
+    /* Stop accepting button presses FIRST: the sink writes to a queue the guest
+     * task drains, and the guest task is about to stop existing. */
+    s_accept_input = false;
     s_run = false;
 
     /* Wait for the guest task to leave tmc_run() and delete itself before
@@ -428,7 +552,18 @@ static int cmd_tama(tdsh_session_t *session, int argc, char **argv)
             printf("button is 0, 1 or 2\n");
             return 1;
         }
-        tmc_button(s_m, idx, strcmp(sub, "press") == 0);
+        /* THROUGH THE QUEUE, not straight at the machine. The shell runs on
+         * another task from the guest, and tmc_button() writes emulated pin
+         * state that tmc_run() is reading; tmc_core.h says one instance is not
+         * reentrant. This path had the race from Phase 4 until the strip's
+         * buttons made it worth removing -- and taking the same road as a real
+         * press means `tama press` exercises the queue rather than bypassing
+         * it. */
+        if (!tama_enqueue_button(idx, strcmp(sub, "press") == 0))
+        {
+            printf("not queued\n");
+            return 1;
+        }
         printf("%s %d\n", sub, idx);
         return 0;
     }
@@ -482,5 +617,11 @@ static const tdsh_command_t s_tama_cmd = {
 
 bool tama_register_command(void)
 {
+    /* Registered for the life of the process, not per run: see touch.h. The
+     * handler declines everything while the emulator is not running, which is
+     * the same behaviour as being unregistered, without a window in which the
+     * driver holds a pointer to something that has gone away. */
+    touch_set_app_buttons(tama_app_button, NULL);
+
     return tdsh_register_command(&s_tama_cmd) == 0;
 }
