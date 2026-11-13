@@ -235,6 +235,14 @@ void display_margin_colours(uint16_t *fill, uint16_t *edge, uint16_t *label);
 void display_margin_chrome(int col, int index, bool on);
 
 /*
+ * How many column slots this app draws, out of COL_N. The buttons keep their
+ * shared geometry and the column below the last one is painted black, so an app
+ * can claim the space under them for its own controls. Defaults to COL_N; pass
+ * COL_N to restore.
+ */
+void display_margin_column_slots(int n);
+
+/*
  * Push a picture in PANEL coordinates, without the framebuffer's clip.
  *
  * display_picture_rows() stops at the 320x416 framebuffer; the glass is 502 rows

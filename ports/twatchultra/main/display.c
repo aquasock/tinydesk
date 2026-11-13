@@ -230,6 +230,25 @@ static bool s_ovr_btn_set[BTN_N];
  */
 static bool s_nochrome[3][COL_N];
 
+/*
+ * HOW MANY SLOTS THE COLUMNS DRAW WHILE AN APP OWNS THE SCREEN.
+ *
+ * COL_N is the desktop's count and the Tamagotchi's, and both need all five. An
+ * app that only wants three needs the columns to stop after three rather than to
+ * be re-divided into three taller ones -- the operator's words were that
+ * everything below the third button belongs to the app's own controls, which only
+ * means anything if the third button keeps its size and the bar ends under it.
+ *
+ * So this is a COUNT, not a height. Slot geometry stays exactly col_slot_y()'s,
+ * the buttons keep the size every other screen gives them, and the bar simply
+ * stops. Anything below the last slot is painted black, so the desktop's labels
+ * cannot survive underneath on a mode change.
+ *
+ * The bottom strip is not covered by this; an app that wants no bar there marks
+ * all three bare, which PM_BARE_BOTTOM already does.
+ */
+static int s_col_n = COL_N;
+
 #define BAND_ROWS 16
 
 /*
@@ -1328,6 +1347,27 @@ static void paint_column(int x0, int x1, bool desk_right, label_rot_t rot,
     const int wx = x0 - 1;
     const int wy = COL_Y0 - 1;
     const int width = x1 - wx + 1;                  /* 46 */
+
+    /* How many slots this column draws. An app may draw fewer than the desktop
+     * does; the buttons keep their geometry. */
+    const int n_slots = (s_margin_mode == DISPLAY_MARGINS_APP) ? s_col_n : COL_N;
+
+    /*
+     * THE WINDOW STILL RUNS THE FULL COLUMN HEIGHT, even when fewer slots are
+     * drawn, and that is deliberate rather than left over.
+     *
+     * The slots below the last one must be painted black, because the desktop
+     * painted five of them at boot and leaving the window short would let its
+     * labels survive underneath -- which is exactly what happened when this was
+     * limited to the drawn slots: F11 and Super+D reappeared in the two spare
+     * slots, half-covered by the app's black background.
+     *
+     * An earlier note here claimed a full-height window also clipped the app's A
+     * button. That was wrong, and the order of operations is the proof: this
+     * painter runs before the app draws its controls, so anything it writes is
+     * painted over a moment later. The A clipping the operator saw came from the
+     * push band's own right edge, not from this window.
+     */
     const int height = COL_Y1 - wy + 1;             /* 417 */
     const int band = (int)(sizeof(s_tx) / sizeof(s_tx[0])) / width;
     label_pos_t label[COL_N];
@@ -1344,7 +1384,7 @@ static void paint_column(int x0, int x1, bool desk_right, label_rot_t rot,
      * horizontally because a label is centred in an 83-row slot and the rounded
      * corners only reach ten rows in from each end, so no glyph can land in one
      * however wide it is; button_pixel() would clip it if it ever could. */
-    for (int s = 0; s < COL_N; s++)
+    for (int s = 0; s < n_slots; s++)
     {
         int g0 = s == 0 ? COL_Y0 : col_slot_y(s) + BTN_SEP;
         int g1 = col_slot_y(s + 1) - 1;
@@ -1380,7 +1420,7 @@ static void paint_column(int x0, int x1, bool desk_right, label_rot_t rot,
                      * belongs to no button, which is what leaves the gap. The
                      * fill starts two rows into every slot but the first, and
                      * ends one row before the next slot begins. */
-                    for (int s = 0; s < COL_N; s++)
+                    for (int s = 0; s < n_slots; s++)
                     {
                         int g0 = s == 0 ? COL_Y0 : col_slot_y(s) + BTN_SEP;
                         int g1 = col_slot_y(s + 1) - 1;
@@ -1646,6 +1686,28 @@ void display_margin_colours(uint16_t *fill, uint16_t *edge, uint16_t *label)
     if (fill)  *fill  = COL_FILL;
     if (edge)  *edge  = COL_EDGE;
     if (label) *label = label_fg();
+}
+
+/*
+ * Set how many column slots an app draws. Defaults to COL_N; pass COL_N to
+ * restore. Repaints both columns, because the visible change is immediate and
+ * routing it through the paint task would drop it exactly when it is wanted.
+ */
+void display_margin_column_slots(int n)
+{
+    if (!s_fb || n < 0 || n > COL_N || n == s_col_n)
+        return;
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_col_n = n;
+
+    if (s_margin_mode == DISPLAY_MARGINS_APP)
+    {
+        paint_column(LEFT_X0, LEFT_X1, true, LABEL_CW, left_label_app, overrides_for(0));
+        paint_column(RIGHT_X0, RIGHT_X1, false, LABEL_CCW, right_label_app, overrides_for(1));
+    }
+
+    xSemaphoreGive(s_lock);
 }
 
 /*

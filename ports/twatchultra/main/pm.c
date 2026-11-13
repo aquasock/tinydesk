@@ -724,33 +724,39 @@ static uint16_t s_dpad_face;   /* interior -- the buttons' face   */
 static uint16_t s_dpad_ink;    /* arrows   -- the buttons' label  */
 
 /*
- * THE BACKGROUND IS THE DESKTOP'S TEST GRID, not black.
+ * THE BACKGROUND IS BLACK, and the grid is kept behind a switch.
  *
- * It is the same pattern `pattern 1` draws -- a line every 16 px, white on black
- * -- so the empty framebuffer below the picture reads as graph paper rather than
- * as a void, and the controls' alignment can be judged against it by eye. The
- * increment is PM_GRID and the line is one pixel, exactly as display_test_pattern()
- * draws it.
+ * The grid was drawn as a diagnostic -- a line every 16 px, matching what
+ * `pattern 1` puts on the glass -- so the controls' alignment could be judged by
+ * eye against a known scale. It has served that purpose: three rounds of
+ * positioning were specified in grid cells rather than pixels precisely because
+ * the grid made them countable off the watch.
  *
- * The grid is generated per pixel rather than sampled from a tile because it is a
- * modulo on two coordinates, and this runs once at start for 45,000 pixels.
+ * The operator now wants the controls seen against their normal background, so
+ * PM_BG selects black. PM_GRID_ON is the switch rather than a comment, because
+ * the grid will be wanted again the next time something is positioned by eye and
+ * a deleted block would be written a third time.
+ *
+ * PM_GRID stays 16 because that is the increment `pattern 1` uses, and it is what
+ * "one cell" has meant throughout this layout's history -- the cell offsets in
+ * s_pad_off[] are still measured in it, so the grid's increment and the layout's
+ * unit must not drift apart even while the lines are invisible.
  */
-/* THE OLD GRID IS 16 PX, not the 5 or 10 the instruction guessed --
- * display_test_pattern() case 1 uses `x % 16 == 0 || y % 16 == 0`, and it is the
- * only grid in this port. 16 is kept so the background matches the pattern the
- * `pattern 1` command draws.
- *
- * The line is a dark grey rather than the pattern's white. As a full-screen test
- * pattern white is right; as a background behind controls it competes with them,
- * and the controls are what the eye needs to find. 0x18C3 is RGB565(3,6,3) --
- * the same faint grey-green cast as the button faces, so the grid reads as
- * structure rather than as content. */
 #define PM_GRID      16
 #define PM_GRID_LINE 0x18C3u
+#define PM_GRID_ON   0
+
+#define PM_BG        0x0000u
 
 static inline uint16_t pm_grid(int x, int y)
 {
-    return (x % PM_GRID == 0 || y % PM_GRID == 0) ? PM_GRID_LINE : 0x0000u;
+#if PM_GRID_ON
+    return (x % PM_GRID == 0 || y % PM_GRID == 0) ? PM_GRID_LINE : PM_BG;
+#else
+    (void)x;
+    (void)y;
+    return PM_BG;
+#endif
 }
 
 /*
@@ -959,30 +965,71 @@ static bool dpad_core(int x, int y)
  * 0 and 1 everywhere -- in the label table, in pad_inside(), in pad_cy() -- so the
  * offset tables are indexed the same way and cannot get out of step.
  */
-#define PM_PAD_D     68
+#define PM_PAD_D0    68                       /* the diameter both started at */
+#define PM_PAD_D     84                       /* grown by one cell           */
 #define PM_PAD_XBASE 224
 #define PM_PAD_YBASE (PM_DPAD_Y)                                      /* 260 */
-#define PM_PAD_GAP   ((PM_DPAD_S - 2 * PM_PAD_D))                     /* 32  */
+#define PM_PAD_GAP   ((PM_DPAD_S - 2 * PM_PAD_D0))                    /* 32  */
 
 /* Cells. One cell is PM_GRID. Positive x is right, positive y is down. */
 #define PM_PAD_CELL   PM_GRID
 
 typedef struct { int cx, cy; } pad_off_t;
 
+/*
+ * PLACEMENT AND SIZE ARE PER CIRCLE, and the diameter is now independent of the
+ * font. Both circles grew by one cell -- 68 to 84 -- while the labels stay at the
+ * d-pad arrows' doubled 16x32, because the instruction was to resize the circles
+ * and explicitly not the text.
+ *
+ * OFF SETS ARE FROM THE BASE COLUMN, NOT FROM EACH OTHER, so either circle can be
+ * moved without disturbing the other. A shared an x offset with B for one cycle,
+ * when the operator wanted them on one vertical axis; the two values are separate
+ * now that A can be placed independently.
+ *
+ * HORIZONTAL HEADROOM: THE RIGHT COLUMN IS THE WALL, NOT THE SCREEN. The push
+ * above the column bottom is framebuffer-wide -- panel 67..386 -- because the
+ * column occupies 387..431, so a circle that reaches past fb column 319 is simply
+ * not drawn there and the black under it shows as a rectangular notch. Measured
+ * against that wall, with the circle 84 px wide from a base of x 224:
+ *
+ *   xoff 0 -> panel 291..374   clipped 0 px
+ *   xoff 1 -> panel 307..390   clipped 4 px
+ *   xoff 2 -> panel 323..406   clipped 20 px
+ *   xoff 3 -> panel 339..422   clipped 36 px
+ *
+ * xoff 3 was tried on the operator's instruction and produced a 36 px notch in A's
+ * upper-right, which is what this value used to be. 1 is the compromise: one cell
+ * right as asked, with a 4 px cut that reads as a slightly flat edge rather than a
+ * step. Only 0 is exactly clean.
+ *
+ * Shrinking the circle does not fix this -- at 68 px, xoff 2 still clips 4 px and
+ * xoff 3 still clips 20 -- because the wall is a column boundary and not a size
+ * limit. The vertical direction has more room: B's bottom is 443 against a glass
+ * bottom of 456.
+ */
+#define PM_PAD_A_XOFF   1                     /* 1 cell right of the base */
+#define PM_PAD_B_XOFF  (-2)   /* 2 cells left of the base */
+#define PM_PAD_A_YOFF   1                     /* cells below the base row */
+#define PM_PAD_B_YOFF   0                     /* up one from where it was */
+
 static const pad_off_t s_pad_off[2] = {
-    /* A: 3 cells right, 2 down */
-    { .cx =  3, .cy = 2 },
-    /* B: 1 cell left, 1 down */
-    { .cx = -1, .cy = 1 },
+    /* A: base column, 1 cell down */
+    { .cx = PM_PAD_A_XOFF, .cy = PM_PAD_A_YOFF },
+    /* B: base column, on the base row -- up one cell from where it was */
+    { .cx = PM_PAD_B_XOFF, .cy = PM_PAD_B_YOFF },
 };
 
-/* Top-left of circle i, in framebuffer coordinates. B additionally starts one
- * diameter plus one gap below A's base, which is what made them a column. */
+/* Top-left of circle i, in framebuffer coordinates. B starts one OLD diameter plus
+ * one gap below A's base, which is the column the pair was built as; the offsets
+ * then move each from there. Using the original 68 and not the new 84 matters:
+ * the base row is a fixed reference, so growing a circle does not silently shift
+ * the other one. */
 static int pad_x(int i) { return PM_PAD_XBASE + s_pad_off[i].cx * PM_PAD_CELL; }
 
 static int pad_y(int i)
 {
-    const int base = PM_PAD_YBASE + (i ? PM_PAD_D + PM_PAD_GAP : 0);
+    const int base = PM_PAD_YBASE + (i ? PM_PAD_D0 + PM_PAD_GAP : 0);
 
     return base + s_pad_off[i].cy * PM_PAD_CELL;
 }
@@ -1005,38 +1052,21 @@ static bool pad_inside(int i, int x, int y)
 }
 
 /*
- * The letter, doubled like the d-pad arrows and ROTATED 45 DEGREES
- * COUNTER-CLOCKWISE.
+ * The letter, doubled like the d-pad arrows and UPRIGHT.
  *
- * Same inverse-transform trick as the d-pad, for the same reason: the glyph is
- * sampled in its own unrotated frame, so the font needs no rotated copy and the
- * doubling stays a clean 2x2 block sample. A point in screen space is mapped back
- * into the glyph's frame and tested there.
- *
- * CCW is the opposite sense from the d-pad, which is what was asked for. In the
- * unrotate below the sign of the shear is therefore flipped against
- * dpad_unrotate()'s:
- *
- *     u = (gx - gy) * k        v = (gx + gy) * k
- *
- * and with the glyph centred on the entry before the map, that turns the letters
- * anticlockwise so they read along the opposite diagonal from the d-pad's arms.
- * They are the circles' own marks, not part of the d-pad, so the two rotations
- * being opposite is a deliberate contrast rather than an inconsistency.
+ * It was rotated 45 degrees counter-clockwise for one cycle and the operator
+ * asked for it back at 0. Upright is also the better answer for a glyph this
+ * small: a 16x32 bitmap resampled onto a diagonal staircases badly, and at 84 px
+ * the circle has room to hold it square. The d-pad's arrows stay rotated because
+ * they are part of a rotated shape; these two are marks on their own circles and
+ * do not have to agree with it.
  */
 static bool pad_label_ink(int i, int x, int y)
 {
     const int cx = pad_cx(i), cy = pad_cy(i);
 
-    const int dx = x - cx;
-    const int dy = y - cy;
-
-    /* Back through the CCW rotation into glyph space. */
-    const int u = ((dx - dy) * PM_ROT_K) >> 16;
-    const int v = ((dx + dy) * PM_ROT_K) >> 16;
-
-    const int gx = u + PM_ARROW_W / 2;
-    const int gy = v + PM_ARROW_H / 2;
+    const int gx = (x - cx) + PM_ARROW_W / 2;
+    const int gy = (y - cy) + PM_ARROW_H / 2;
 
     if (gx < 0 || gy < 0 || gx >= PM_ARROW_W || gy >= PM_ARROW_H)
         return false;
@@ -1125,21 +1155,57 @@ static void dpad_unrotate(int x, int y, int *u, int *v)
  * It spans the full framebuffer width and runs from the picture's bottom edge to
  * the bottom of the glass, which is 41 rows past the framebuffer and is only
  * reachable at all because this goes through display_panel_rows(). */
-/* FULL GLASS WIDTH, which is 45 px wider than the framebuffer on each side. The
- * picture is a 320 px window inset 45 px into a 410 px panel, so a background
- * that stops at the window stops 45 px short of the glass on both edges -- and
- * the whole point of the grid is to be the surface everything sits on.
+/*
+ * THE PUSH IS TWO ZONES, NOT ONE RECTANGLE, and that is what the column resize
+ * bought.
  *
- * In framebuffer terms that is x -45 .. 364: DISPLAY_ORIGIN_X is 45, so -45 maps
- * to controller column 22, which is the glass's first visible column, and the
- * region runs 410 columns from there.
+ * Above the columns' last button the only safe width is the framebuffer's: the
+ * side bars occupy panel 22..66 and 387..431, and a full-width rectangle there
+ * erases them -- which it did, cutting the third button in half.
  *
- * This is only possible because the push is display_panel_rows(); a
- * framebuffer-coordinate push would have clipped at x 0 and 319. */
-#define PM_CTL_X  (-DISPLAY_ORIGIN_X)                              /* -45 */
-#define PM_CTL_Y  (PM_H * PM_SCALE)                                /* 192 */
-#define PM_CTL_W  DISPLAY_PANEL_W                                  /* 410 */
-#define PM_CTL_H  (PM_GLASS_BOT - PM_CTL_Y)                        /* 265 */
+ * Below their last button the whole glass is free, because this app draws only
+ * three slots per column. That space is where the d-pad and the action buttons
+ * live, and an earlier version could not use it: the region was one rectangle at
+ * the framebuffer's width, so anything to the right of panel 386 was clipped
+ * whatever the glass had room for. That is what made "move A a few cells right"
+ * look impossible.
+ *
+ * So: an upper band at framebuffer width, and a lower band at full glass width
+ * from the column bottom down.
+ */
+/*
+ * WHERE THE BAND BEING DRAWN STARTS, in framebuffer coordinates.
+ *
+ * BOTH axes, and the y one is not decoration. The push is two bands with
+ * different origins, and the callback's `row` is counted from the region's own
+ * top -- so a band that starts at fb y 294 has to be told that, or every shape is
+ * offset by the difference. The first version passed only x and added the fixed
+ * PM_CTL_Y for y, which drew the lower band 102 rows too low: the d-pad was cut
+ * in half by the bottom of the glass, B fell off it entirely, and A clipped. All
+ * three symptoms, one missing offset.
+ */
+static int s_row_x0;
+static int s_row_y0;
+
+#define PM_COL_SLOTS  3
+
+/* Bottom row of the last drawn column slot, in framebuffer coordinates. Derived
+ * from the same formula edges.h uses, so it follows a slot-count change. */
+#define PM_COL_BOT    (COL_Y0 + (PM_COL_SLOTS * (COL_Y1 - COL_Y0 + 1)) / COL_N - 1)
+
+#define PM_CTL_Y      (PM_H * PM_SCALE)                                /* 192 */
+#define PM_CTL_Y1     (PM_PAD_YBASE + PM_PAD_D0 + PM_PAD_GAP +                     \
+                       PM_PAD_B_YOFF * PM_PAD_CELL + PM_PAD_D)         /* 443 */
+
+/* Upper band: framebuffer width, from the picture down to the column bottom. */
+#define PM_UP_X       0
+#define PM_UP_W       DISPLAY_W                                    /* 320 */
+#define PM_UP_H       (PM_COL_BOT - PM_CTL_Y + 1)                  /* 102 */
+
+/* Lower band: full glass width, from just below the column bottom. */
+#define PM_LO_X       (-DISPLAY_ORIGIN_X)                          /* -45 */
+#define PM_LO_W       DISPLAY_PANEL_W                              /* 410 */
+#define PM_LO_H       (PM_CTL_Y1 - (PM_COL_BOT + 1) + 1)           /* 150 */
 
 static void pm_dpad_row(void *ctx, int row, int col, uint16_t *dst, int n)
 {
@@ -1155,8 +1221,8 @@ static void pm_dpad_row(void *ctx, int row, int col, uint16_t *dst, int n)
         /* Both shapes are tested in framebuffer coordinates, and the grid is
          * drawn in those too, so the background lines up with the framebuffer's
          * own origin rather than with the region's. */
-        const int fx = x + PM_CTL_X;
-        const int fy = y + PM_CTL_Y;
+        const int fx = x + s_row_x0;
+        const int fy = y + s_row_y0;
 
         uint16_t c = pm_grid(fx, fy);
 
@@ -1229,13 +1295,27 @@ static bool pm_draw_dpad(void)
     s_dpad_edge = display_swap16(edge);
     s_dpad_ink  = display_swap16(ink);
 
-    /* PANEL coordinates, not framebuffer ones, so the cluster can reach the
-     * bottom of the glass. display_picture_rows() would clip at fb row 415; the
-     * panel runs to 502 and the framebuffer's origin is 45, so this adds
-     * FB_Y and the panel's column offset exactly as the margin painters do. */
-    return display_panel_rows(PM_CTL_X + DISPLAY_ORIGIN_X + PANEL_COL_OFFSET,
-                              PM_CTL_Y + DISPLAY_ORIGIN_Y,
-                              PM_CTL_W, PM_CTL_H, pm_dpad_row);
+    /*
+     * Two pushes. `x_origin` reaches the row callback through the ctx pointer,
+     * because the callback needs to know which framebuffer column it is drawing
+     * and the two bands start at different ones: the upper at fb 0, the lower at
+     * fb -45, since the lower band spans the whole glass.
+     */
+    bool ok = true;
+
+    s_row_x0 = PM_UP_X;
+    s_row_y0 = PM_CTL_Y;
+    ok = display_panel_rows(PM_UP_X + DISPLAY_ORIGIN_X + PANEL_COL_OFFSET,
+                            PM_CTL_Y + DISPLAY_ORIGIN_Y,
+                            PM_UP_W, PM_UP_H, pm_dpad_row) && ok;
+
+    s_row_x0 = PM_LO_X;
+    s_row_y0 = PM_COL_BOT + 1;
+    ok = display_panel_rows(PM_LO_X + DISPLAY_ORIGIN_X + PANEL_COL_OFFSET,
+                            PM_COL_BOT + 1 + DISPLAY_ORIGIN_Y,
+                            PM_LO_W, PM_LO_H, pm_dpad_row) && ok;
+
+    return ok;
 }
 
 /* --- the margin buttons ----------------------------------------------------
@@ -1343,6 +1423,9 @@ static void pm_unlabel_margins(void)
     for (int i = 0; i < BTN_N; i++)
         display_margin_btn_label(i, "");
 
+    /* The next app gets the desktop's five back. */
+    display_margin_column_slots(COL_N);
+
     /* Restore every box, or the next app inherits bare slots. */
     for (int i = 0; i < COL_N; i++)
     {
@@ -1428,6 +1511,11 @@ bool pmini_start(const char *rom_path)
      * the emulator running against a framebuffer it does not own. */
     display_pixels_claim(true);
     display_fill(0x0000);
+
+    /* Three slots per column, not five: this app's own d-pad and action buttons
+     * own everything below the third button, and the columns must stop there for
+     * that claim to mean anything. Set before the margins are painted. */
+    display_margin_column_slots(3);
 
     /* Labels first, then the single paint that shows them. */
     pm_label_margins();
@@ -1763,9 +1851,9 @@ static int cmd_pm(tdsh_session_t *session, int argc, char **argv)
         }
 
         const bool ok = pm_draw_dpad();
-        printf("pm dpad %s -- %dx%d at (%d,%d)\n",
-               ok ? "drawn" : "PUSH REFUSED", PM_CTL_W, PM_CTL_H,
-               PM_CTL_X, PM_CTL_Y);
+        printf("pm dpad %s -- band y%d..%d fb-width, y%d..%d full glass\n",
+               ok ? "drawn" : "PUSH REFUSED",
+               PM_CTL_Y, PM_COL_BOT, PM_COL_BOT + 1, PM_CTL_Y1);
 
         if (!ran)
         {
