@@ -166,12 +166,45 @@ static inline const char *left_label(int i)
  * into code points and the font has the glyph at 0x00B0. It is one character
  * wide in the 41 px strip, so it fits without the rotation the columns need.
  */
-static inline const char *blank_label(int i)
+/*
+ * The labels an app's own controls carry, in the same index order as the
+ * desktop's -- which is what lets display.c swap one table for the other without
+ * knowing anything about either.
+ *
+ * THESE MUST MATCH tama_ui.c's action table. A label here with no action there is
+ * a button that does nothing; an action there with no label here is a button
+ * nobody can find. tests/test_tama_ui.c walks both and fails when they disagree,
+ * because that is the only version of this rule that survives a later edit.
+ *
+ * The arm slot keeps the desktop's reserved position and gets a word for the
+ * first time: it is held, not pressed, so `Hold` says what to do with it.
+ */
+static inline const char *left_label_app(int i)
 {
-    (void)i;
-    return "";
+    static const char *const labels[COL_N] = {
+        "Pause", "Save", "Load", "Speed", "Sound",
+    };
+
+    return i >= 0 && i < COL_N ? labels[i] : "";
 }
 
+static inline const char *right_label_app(int i)
+{
+    static const char *const labels[COL_N] = {
+        "Hold",                 /* the arm: held for a gated button */
+        "Shot",
+        "",                     /* blank: nothing assigned yet          */
+        "",
+        "Reset",
+    };
+
+    return i >= 0 && i < COL_N ? labels[i] : "";
+}
+
+/* The bottom strip still carries the pet's three buttons, and its label is still
+ * a placeholder: there is no short word for the V3's three buttons that fits
+ * 41 px. U+00B0 is written as UTF-8 by hand because the label machinery decodes
+ * UTF-8 into code points and the font has the glyph there. */
 static inline const char *btn_label_app(int i)
 {
     (void)i;

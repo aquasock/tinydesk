@@ -450,12 +450,20 @@ static void test_margin_labels(void)
     for (i = 1; i < COL_N; i++)
         CHECK(right_label(i)[0] != '\0');
 
-    /* APP mode: every column label is empty and every strip label is the same
-     * one-code-point degree circle. Checked for every index, because the
-     * functions ignore their argument and a future one that does not would
-     * otherwise leave a button labelled while the rest went blank. */
+    /* APP mode: the columns carry the app's own control names, and the strip
+     * still shows the degree circle placeholder. The label/action pairing is
+     * checked in test_tama_ui; what is checked here is that every app label fits
+     * the row a column button offers, because a label that overruns its border
+     * is a rendering fault this file is the right place to catch. */
     for (i = 0; i < COL_N; i++)
-        CHECK(strcmp(blank_label(i), "") == 0);
+    {
+        CHECK(left_label_app(i) != NULL);
+        CHECK(right_label_app(i) != NULL);
+        /* Seven characters is the ceiling: a slot is 81-83 rows and a glyph is
+         * 8 px wide stood on end, inside the corner radius. */
+        CHECK(strlen(left_label_app(i)) <= 7);
+        CHECK(strlen(right_label_app(i)) <= 7);
+    }
     for (i = 0; i < BTN_N; i++)
     {
         const char *lab = btn_label_app(i);

@@ -149,6 +149,25 @@ uint32_t splb32_bank(const splb32 *c);
 /* Audio: current output level per channel, -1..+1, and an emit counter. */
 double splb32_audio_level(const splb32 *c, int channel);
 unsigned long splb32_audio_emits(const splb32 *c);
+
+/*
+ * Is either channel making a sound right now?
+ *
+ * THE QUESTION A FRONT END ACTUALLY ASKS, and the reason it is not "did the
+ * emit counter change". That counter increments on every square-wave toggle --
+ * `toggle()` runs on each driver timer overflow while the envelope is non-zero --
+ * so a single held tone raises it thousands of times a second. A front end that
+ * treats a rising counter as "a sound happened" therefore plays a sound
+ * continuously for as long as one tone lasts, which is exactly what the watch
+ * did: a BEL that never stopped and only went quiet while the emulator was
+ * paused.
+ *
+ * The waveform is a clock, not a signal. What a caller wants to know is the
+ * envelope: whether the machine is currently trying to make noise. This answers
+ * that, and a caller detects the rising EDGE of it -- silence to not-silence --
+ * to get one event per sound rather than one per cycle.
+ */
+int splb32_audio_active(const splb32 *c);
 void splb32_dbg_ports(splb32 *c, uint8_t *pdir, uint8_t *pattr, uint8_t *platch);
 void     splb32_clear_coverage(splb32 *c);
 

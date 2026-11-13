@@ -1338,6 +1338,21 @@ double splb32_audio_level(const splb32 *c, int channel)
 
 unsigned long splb32_audio_emits(const splb32 *c) { return c->sound.emits; }
 
+int splb32_audio_active(const splb32 *c)
+{
+    /* The envelope is what a tone holds while it is playing; the level is what a
+     * PWM write leaves behind. Either being non-zero means the machine is
+     * currently driving its speaker, which is the state a front end needs and
+     * which the emit counter cannot express. */
+    for (int ch = 0; ch < 2; ch++)
+    {
+        if (c->sound.envelope[ch] != 0.0 || c->sound.last[ch] != 0.0)
+            return 1;
+    }
+
+    return 0;
+}
+
 void splb32_dbg_ports(splb32 *c, uint8_t *pdir, uint8_t *pattr, uint8_t *platch)
 {
     for (int i = 0; i < 4; i++) { pdir[i]=c->pdir[i]; pattr[i]=c->pattr[i]; platch[i]=c->platch[i]; }

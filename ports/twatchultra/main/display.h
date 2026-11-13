@@ -160,6 +160,16 @@ void display_margins_set(display_margins_t mode);
 display_margins_t display_margins_get(void);
 
 /*
+ * Relabel one column button while an app owns the screen, and repaint that
+ * column. col is 0 (left) or 1 (right); an empty label restores the default from
+ * edges.h.
+ *
+ * For the toggles whose meaning changes: Pause/Resume, the current Speed, Sound
+ * on or off. Same sole-writer requirement as display_margins_set().
+ */
+void display_margin_label(int col, int index, const char *text);
+
+/*
  * Compare the framebuffer against the cell grid, and the grid against what the
  * painter believes it has drawn.
  *

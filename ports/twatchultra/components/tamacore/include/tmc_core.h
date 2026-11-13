@@ -113,6 +113,23 @@ bool tmc_eeprom_load(tmc *m, const uint8_t *in, size_t len);
  * says whether the machine is progressing. */
 uint64_t tmc_cycles(const tmc *m);
 
+/*
+ * Is the guest making a sound right now?
+ *
+ * A front end detects the rising edge of this -- silence to not-silence -- and
+ * gets one event per sound. That is the only shape that works, and the previous
+ * one did not: this used to expose splb32_audio_emits(), a counter that
+ * increments on every square-wave toggle, and a caller comparing it against its
+ * last reading saw thousands of "events" a second for as long as one tone
+ * lasted. On the watch that played a beep back to back, continuously, and it
+ * stopped only while the emulator was paused -- because pausing stops stepping
+ * the guest and therefore stops the waveform.
+ *
+ * The waveform is a clock. The envelope is the signal. See
+ * splb32_audio_active() for the other half of this argument.
+ */
+int tmc_audio_active(const tmc *m);
+
 /* The guest's 512-byte display RAM, for a caller that wants to draw the frame
  * itself rather than through tmc_frame() -- the dirty-row check does exactly
  * that, so it can build a full-repaint reference to compare against. */

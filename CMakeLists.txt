@@ -427,6 +427,16 @@ if(TD_BUILD_TESTS)
     target_compile_options(test_twatch_edges PRIVATE ${TD_WARNINGS})
     add_test(NAME test_twatch_edges COMMAND test_twatch_edges)
 
+    # The Tamagotchi's margin buttons, including the hold-to-arm interlock on
+    # Save/Load/Reset. Pure arithmetic over a small set, so the orders a human
+    # tester never tries -- arm pressed then released, then the destructive
+    # button -- can be walked exhaustively at a desk.
+    add_executable(test_tama_ui tests/test_tama_ui.c ports/twatchultra/main/tama_ui.c)
+    target_include_directories(test_tama_ui PRIVATE ports/twatchultra/main)
+    set_target_properties(test_tama_ui PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+    target_compile_options(test_tama_ui PRIVATE ${TD_WARNINGS})
+    add_test(NAME test_tama_ui COMMAND test_tama_ui)
+
     add_executable(test_trash tests/test_trash.c ports/common/td_fs_stdio.c)
     target_include_directories(test_trash PRIVATE ports/common)
     target_link_libraries(test_trash PRIVATE tinydesk_apps)

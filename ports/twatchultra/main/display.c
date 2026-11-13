@@ -184,6 +184,24 @@ static display_reply_fn s_reply;
  * currently owns the glass. */
 static display_margins_t s_margin_mode;
 
+/*
+ * Per-button label overrides, and why they exist.
+ *
+ * Three of the app's buttons are not fixed words: Pause becomes Resume, Speed
+ * reads its current rate, Sound reads whether it is on. A static label on a
+ * toggle is the label/duty lie this port has now removed twice -- a button
+ * reading "Pause" that resumes is worse than an unlabelled one, because it is
+ * confidently wrong.
+ *
+ * The override is a whole label rather than a suffix, so the table in edges.h
+ * remains the default and nothing has to concatenate at paint time. An unset
+ * slot falls through to that default, which is what makes clearing an override a
+ * matter of writing an empty string.
+ */
+#define OVR_MAX 12
+static char s_ovr[2][COL_N][OVR_MAX];
+static bool s_ovr_set[2][COL_N];
+
 #define BAND_ROWS 16
 
 /*
@@ -1134,7 +1152,8 @@ static corners_t column_corners(int s, bool desk_right)
 /* One column, at controller x0..x1. desk_right says which side the desktop is
  * on, which is the only thing that differs between the two. */
 static void paint_column(int x0, int x1, bool desk_right, label_rot_t rot,
-                         const char *(*label_at)(int))
+                         const char *(*label_at)(int),
+                         const char *const *ovr)
 {
     /* One sacrificial row and column: exactly one pixel is lost at the top-left
      * of a window (docs/panel-geometry.md, "The first row and column are
@@ -1168,7 +1187,10 @@ static void paint_column(int x0, int x1, bool desk_right, label_rot_t rot,
         int g0 = s == 0 ? COL_Y0 : col_slot_y(s) + BTN_SEP;
         int g1 = col_slot_y(s + 1) - 1;
 
-        label_place(label_at(s), x0 + BTN_BORDER, x1 - BTN_BORDER,
+        /* An override wins over the table for that one slot. */
+        const char *text = (ovr && ovr[s]) ? ovr[s] : label_at(s);
+
+        label_place(text, x0 + BTN_BORDER, x1 - BTN_BORDER,
                     g0 + BTN_RADIUS, g1 - BTN_RADIUS, rot, &label[s]);
     }
 
@@ -1234,15 +1256,48 @@ static void paint_column(int x0, int x1, bool desk_right, label_rot_t rot,
  * The one place that decides what the margins say, so display_init() and
  * display_margins_set() cannot disagree about the order or the arguments --
  * which is the same reason the geometry lives in one header. */
+/* The override pointers for one column, or NULL when no slot is overridden.
+ *
+ * THE OBVIOUS VERSION OF THIS WAS WRONG AND CRASHED THE BOARD. It cast
+ * `s_ovr[col]` -- a char[COL_N][OVR_MAX] -- to `const char **` and returned it.
+ * A pointer array and a 2-D char array are not the same layout: the compiler
+ * reads element i of a `const char *const *` at offset i * sizeof(pointer),
+ * while the rows of the char array are OVR_MAX apart. So ovr[1] read eight bytes
+ * out of the middle of row 0, painted a button from that garbage pointer, and
+ * the watch reset. On the glass it presented as `tama do speed` rebooting the
+ * board.
+ *
+ * So the pointers are built into a real array first. It is static because
+ * paint_column() reads it only for the duration of the call it is an argument
+ * to, and because two columns are never painted concurrently -- one writer of
+ * the glass, which is the rule everything in this file already depends on.
+ */
+static const char *s_ovr_ptr[2][COL_N];
+
+static const char *const *overrides_for(int col)
+{
+    bool any = false;
+
+    for (int i = 0; i < COL_N; i++)
+    {
+        s_ovr_ptr[col][i] = s_ovr_set[col][i] ? s_ovr[col][i] : NULL;
+
+        if (s_ovr_set[col][i])
+            any = true;
+    }
+
+    return any ? s_ovr_ptr[col] : NULL;
+}
+
 static void paint_margins(void)
 {
-    const char *(*col_label)(int) = (s_margin_mode == DISPLAY_MARGINS_APP) ? blank_label
-                                                                          : left_label;
+    bool app = (s_margin_mode == DISPLAY_MARGINS_APP);
 
     paint_buttons();
-    paint_column(LEFT_X0, LEFT_X1, true, LABEL_CW, col_label);
+    paint_column(LEFT_X0, LEFT_X1, true, LABEL_CW,
+                 app ? left_label_app : left_label, overrides_for(0));
     paint_column(RIGHT_X0, RIGHT_X1, false, LABEL_UPRIGHT,
-                 (s_margin_mode == DISPLAY_MARGINS_APP) ? blank_label : right_label);
+                 app ? right_label_app : right_label, overrides_for(1));
 }
 
 /*
@@ -1277,6 +1332,53 @@ void display_margins_set(display_margins_t mode)
 display_margins_t display_margins_get(void)
 {
     return s_margin_mode;
+}
+
+/*
+ * Relabel one column button, and repaint that column.
+ *
+ * For the three toggles whose meaning changes while an app runs: Pause becomes
+ * Resume, Speed shows the rate it will select next, Sound shows whether it is
+ * on. Same sole-writer rule as display_margins_set() -- the caller must have
+ * claimed the pixels -- and the same reason it repaints synchronously rather
+ * than asking the paint task, which is suppressed while an app owns the glass.
+ *
+ * `col` is 0 for the left column and 1 for the right. An empty label clears the
+ * override and the edges.h table applies again.
+ */
+void display_margin_label(int col, int index, const char *text)
+{
+    if (!s_fb || col < 0 || col > 1 || index < 0 || index >= COL_N)
+        return;
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+
+    if (text && *text)
+    {
+        strncpy(s_ovr[col][index], text, OVR_MAX - 1);
+        s_ovr[col][index][OVR_MAX - 1] = '\0';
+        s_ovr_set[col][index] = true;
+    }
+    else
+    {
+        s_ovr[col][index][0] = '\0';
+        s_ovr_set[col][index] = false;
+    }
+
+    /* Only the app's own column has overrides, and only in APP mode; repainting
+     * a desktop column here would fight the painter's record of it. */
+    if (s_margin_mode != DISPLAY_MARGINS_APP)
+    {
+        xSemaphoreGive(s_lock);
+        return;
+    }
+
+    if (col == 0)
+        paint_column(LEFT_X0, LEFT_X1, true, LABEL_CW, left_label_app, overrides_for(0));
+    else
+        paint_column(RIGHT_X0, RIGHT_X1, false, LABEL_UPRIGHT, right_label_app, overrides_for(1));
+
+    xSemaphoreGive(s_lock);
 }
 
 static void paint_task(void *arg)

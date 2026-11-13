@@ -479,3 +479,8 @@ const uint8_t *tmc_dpram(const tmc *m)
 {
     return m ? splb32_dpram(m->cpu) : NULL;
 }
+
+int tmc_audio_active(const tmc *m)
+{
+    return m ? splb32_audio_active(m->cpu) : 0;
+}

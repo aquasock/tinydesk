@@ -457,6 +457,9 @@ bool link_init(void)
     if (!tama_register_command())
         ESP_LOGW(TAG, "tama command did not register");
 
+    if (!touch_register_command())
+        ESP_LOGW(TAG, "touchdump command did not register");
+
     charge_report(NULL);
 
     /* The battery's NTC input, if one is fitted. Read and logged only: this

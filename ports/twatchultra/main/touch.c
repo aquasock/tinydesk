@@ -75,6 +75,7 @@
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
 #include "esp_attr.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -84,6 +85,7 @@
 #include "haptic.h"
 #include "tinydesk/td_wm.h"
 #include "power.h"
+#include "tdsh.h"
 #include "tdsh_board.h"
 #include "tinydesk/td_vterm.h"
 
@@ -156,10 +158,26 @@ static bool s_pressed;           /* the controller is reporting a press */
  * rather than in the app because the release is synthesised from this driver's
  * own idle timer: the part emits no release event, so only the code that
  * notices the reports stopping can say when a button came up. */
-static touch_app_button_fn s_app_btn;
-static void *s_app_btn_user;
-static edge_region_t s_app_region = EDGE_NONE;
-static int s_app_index = -1;
+/*
+ * Raw-block capture, for the multi-touch question.
+ *
+ * The buffer is a PSRAM heap allocation rather than a static array: 512 blocks
+ * of 16 bytes is 8 KB, and internal DRAM on this board idles near 66 KB free
+ * with tdsh's SSH server wanting 65,536 of it (EMU-018). A diagnostic that
+ * costs the board a peripheral is not a diagnostic.
+ *
+ * Written by the poll task, read by the shell task once the flag is cleared --
+ * one writer, which is why there is no lock. The reader waits a poll period
+ * after clearing the flag so a capture already in flight finishes first.
+ */
+static uint8_t (*s_dump_buf)[REPORT_LEN];
+static volatile int s_dump_n;
+static volatile int s_dump_cap;
+static volatile bool s_dumping;
+
+static touch_app_touch_fn s_app_touch;
+static void *s_app_touch_user;
+static bool s_app_active;        /* the app currently has points down */
 static int s_last_x = -1, s_last_y = -1;
 
 /* When the last press report arrived. RELEASE_MS is measured against this and
@@ -515,16 +533,22 @@ static void release_if_idle(void)
     if (esp_timer_get_time() - s_last_press_us < (int64_t)RELEASE_MS * 1000)
         return;
 
-    /* Release whatever the app took, before the pointer path. A button that the
-     * handler accepted is a button the handler must be told has come up, and
-     * the pet's own input is edge-triggered: leaving it latched down would hold
-     * the guest's button for ever. */
-    if (s_app_index >= 0)
+    /* Tell the app the glass is clear. One empty frame ends a chord, a hold and
+     * a stray press alike, because the frame is state and "nothing down" is a
+     * state. Only sent when something was actually reported first, so an idle
+     * panel does not wake the app every 250 ms. */
+    if (s_app_active)
     {
-        if (s_app_btn)
-            s_app_btn(s_app_btn_user, s_app_region, s_app_index, false);
-        s_app_index = -1;
-        s_app_region = EDGE_NONE;
+        touch_frame_t empty;
+
+        memset(&empty, 0, sizeof(empty));
+        empty.p[0].region = EDGE_NONE;
+        empty.p[1].region = EDGE_NONE;
+
+        s_app_active = false;
+
+        if (s_app_touch)
+            s_app_touch(s_app_touch_user, &empty);
     }
 
     if (s_down)
@@ -621,6 +645,37 @@ static void poll_task(void *arg)
         wr(REPORT_ADDR, ACK_BYTE);
 
         s_reads++;
+
+        /*
+         * Capture before any interpretation, so what lands in the file is what
+         * the controller said rather than what this driver understood.
+         *
+         * IDLE BLOCKS ARE NOT STORED, and that is a correction rather than an
+         * optimisation. The buffer is 512 blocks, and with a finger down the
+         * poll runs at ACTIVE_MS so 512 blocks is TEN SECONDS -- which silently
+         * truncated a thirty-second capture at block 512, after which the file
+         * simply stopped while the command still reported success. That cost
+         * three captures and, worse, produced a file that looked complete: the
+         * gesture in progress at the cutoff was recorded up to its last
+         * recorded block and no further, so the release looked absent rather
+         * than missing. Storing only real reports makes the depth a count of
+         * EVENTS, which is what the buffer is for.
+         */
+        if (s_dumping && s_dump_n < s_dump_cap)
+        {
+            bool idle = true;
+
+            for (int k = 0; k < REPORT_LEN; k++)
+                if (b[k] != 0xFF)
+                    idle = false;
+
+            if (!idle)
+            {
+                memcpy(s_dump_buf[s_dump_n], b, REPORT_LEN);
+                s_dump_n++;
+            }
+        }
+
         if (s_logged_blocks < 3)
         {
             log_block("blk", b);
@@ -654,8 +709,29 @@ static void poll_task(void *arg)
         {
             int fingers = b[5] & 0x7F;
 
+            /*
+             * EXACT 0x06, NOT (b[0] & 0x0F) == 0x06, and that is a fix with a
+             * measured fault behind it.
+             *
+             * When a two-finger chord is broken by lifting the FIRST finger,
+             * this controller promotes the survivor into the primary slot: its
+             * coordinates move to bytes 1..3 and its event code becomes 0x16.
+             * Masking the low nibble makes 0x16 look exactly like 0x06, so the
+             * stray finger left on the glass after a chord was accepted as a
+             * fresh press at its own position -- which means releasing the arm
+             * could fire whatever button the other finger was resting on, with
+             * the interlock already satisfied and gone. That is precisely the
+             * accidental Reset the arm exists to prevent.
+             *
+             * The capture that proves it (blocks 558..784 of the 2026-11-12
+             * lift-order dump) is preserved at
+             * ~/twatch-backup/touch-captures/touch7.txt on the development
+             * machine and summarised in TCH-012.
+             *
+             * 0x16 is therefore "a point is present but it is not a new
+             * primary press", and the driver treats it as no press at all. */
             press = b[6] == ACK_BYTE && fingers > 0 &&
-                    fingers <= MAX_FINGERS && (b[0] & 0x0F) == EVENT_DOWN;
+                    fingers <= MAX_FINGERS && b[0] == EVENT_DOWN;
         }
 
         /* Log the FIRST report of a touch and nothing while it is held.
@@ -686,6 +762,7 @@ static void poll_task(void *arg)
             int y = (b[2] << 4) | (b[3] & 0x0F);
             edge_hit_t hit;
             bool app = td_wm_app_owns_screen();
+            bool edge = !s_pressed;
 
             s_last_press_us = esp_timer_get_time();
 
@@ -702,48 +779,76 @@ static void poll_task(void *arg)
              * it is already the contract the painter honours. */
             bool owned = display_pixels_claimed();
 
-            /* The action fires once per touch, on the first report, not once
-             * per report: the controller re-reports the same finger about
-             * every 66 ms while it is held, which would be a hundred presses a
-             * second on a held Tab. */
-            if (!s_pressed)
+            s_pressed = true;
+
+            /*
+             * A dump must not also ACT. The margins send keys and the
+             * framebuffer is a pointer, so a capture taken while the operator
+             * touches the glass would otherwise type Enter into the shell, open
+             * the Start menu, or close the window that is about to print the
+             * result -- and the buttons being characterised are exactly the ones
+             * that do it.
+             */
+            if (s_dumping)
+                continue;
+
+            /*
+             * A CONSUMER THAT OWNS THE PIXELS GETS STATE, NOT EVENTS.
+             *
+             * Reported on every block, not only on the first, because the
+             * question a chord asks -- "is the arm still held" -- has to be
+             * answerable at the moment the action arrives, and an edge-only
+             * callback cannot answer it. The buzz fires on the report where the
+             * set of points CHANGES, which is the transition a finger feels.
+             */
+            if (owned)
             {
-                s_pressed = true;
-                if (owned)
+                touch_frame_t f;
+
+                memset(&f, 0, sizeof(f));
+                f.p[0].region = EDGE_NONE;
+                f.p[1].region = EDGE_NONE;
+                f.n = 1;
+                f.p[0].region = hit.region;
+                f.p[0].index = hit.index;
+
+                /* The second point, at bytes 8..10 with its event code at byte 7
+                 * and its validity marker at byte 12. Same 12-bit encoding as
+                 * the first: x = (hi1 << 4) | (lo >> 4), y = (hi2 << 4) | (lo &
+                 * 0x0F). Read only when the count says a second point exists,
+                 * and only when its own validity marker is present -- a block
+                 * claiming two fingers but carrying one valid point would
+                 * otherwise decode 0xFF-filled bytes into a position on the
+                 * glass and invent a button press at it. */
+                if ((b[5] & 0x7F) == 2 && b[12] == ACK_BYTE && b[7] != 0xFF)
                 {
-                    /*
-                     * Offer it to whoever owns the pixels. The handler decides
-                     * which of the thirteen it wants, so this file does not
-                     * learn any application's controls -- and one that returns
-                     * false (the columns today, a different app tomorrow) is
-                     * logged as inert rather than silently swallowed.
-                     *
-                     * The buzz follows the accepted press and only that, the
-                     * rule edge_press() already applies to the reserved slot:
-                     * feedback for an action, never for a refusal.
-                     */
-                    if (s_app_btn && s_app_btn(s_app_btn_user, hit.region, hit.index, true))
-                    {
-                        s_app_region = hit.region;
-                        s_app_index = hit.index;
-                        /* Logged, and short for the 40-column viewer: an
-                         * accepted press writes `app`, a declined one `off`, so
-                         * "the button is wired" is a fact in the log ring rather
-                         * than something inferred from a pet that happened to
-                         * blink. */
-                        ESP_LOGI(TAG, "e%d i%d app", (int)hit.region, hit.index);
-                        haptic_tap();
-                    }
-                    else
-                    {
-                        ESP_LOGI(TAG, "e%d i%d off", (int)hit.region, hit.index);
-                    }
+                    int x2 = (b[8] << 4) | (b[10] >> 4);
+                    int y2 = (b[9] << 4) | (b[10] & 0x0F);
+                    edge_hit_t hit2;
+
+                    edges_hit(x2, y2, &hit2);
+
+                    f.p[1].region = hit2.region;
+                    f.p[1].index = hit2.index;
+                    f.n = 2;
                 }
-                else if (!app)
+
+                s_app_active = true;
+
+                if (s_app_touch)
+                    s_app_touch(s_app_touch_user, &f);
+
+                if (edge)
                 {
-                    edge_press(&hit, y);
+                    ESP_LOGI(TAG, "e%d i%d n%d", (int)hit.region, hit.index, f.n);
+                    haptic_tap();
                 }
+
+                continue;      /* no keys, and no pointer: the app has it */
             }
+
+            if (!app && edge)
+                edge_press(&hit, y);
 
             /* An application that owns the screen gets the panel as a pointer,
              * margins included -- on those the glass is its, and a game that
@@ -788,10 +893,112 @@ static void poll_task(void *arg)
     }
 }
 
-void touch_set_app_buttons(touch_app_button_fn fn, void *user)
+void touch_set_app_touch(touch_app_touch_fn fn, void *user)
 {
-    s_app_btn = fn;
-    s_app_btn_user = user;
+    s_app_touch = fn;
+    s_app_touch_user = user;
+    s_app_active = false;
+}
+
+/* --- the raw-block dump -------------------------------------------------- */
+
+#define TOUCH_DUMP_BLOCKS 2048
+
+int touch_dump(int seconds)
+{
+    if (seconds <= 0)
+        seconds = 5;
+
+    if (!s_dump_buf)
+    {
+        s_dump_buf = heap_caps_malloc((size_t)TOUCH_DUMP_BLOCKS * REPORT_LEN,
+                                      MALLOC_CAP_SPIRAM);
+
+        if (!s_dump_buf)
+            return -1;
+    }
+
+    s_dump_cap = TOUCH_DUMP_BLOCKS;
+    s_dump_n = 0;
+    s_dumping = true;
+
+    vTaskDelay(pdMS_TO_TICKS(seconds * 1000));
+
+    s_dumping = false;
+
+    /* Let a read already in flight finish: the poll task may be between the
+     * memcpy and its own bookkeeping, and reading the count too early would
+     * report one block fewer than the file has. */
+    vTaskDelay(pdMS_TO_TICKS(ACTIVE_MS * 2));
+
+    int n = s_dump_n;
+    int kept = 0;
+
+    FILE *f = fopen("/sd/touch.txt", "w");
+
+    if (!f)
+        return -1;
+
+    /* An idle read returns fifteen 0xFF bytes -- MEASURED, and worth stating
+     * because it is not what the driver's own comments assume: the "nothing
+     * there" case was documented as 0x00 or 0xAB, and it is neither. Idle
+     * blocks are excluded at capture time (see the poll loop), so everything
+     * here is a real report.
+     *
+     * What is written is the raw fifteen bytes, contiguous hex so a line fits
+     * the Log Viewer's width, in the order the controller sent them -- no
+     * decoding, because the decoding is the thing being measured. */
+    for (int i = 0; i < n; i++)
+    {
+        const uint8_t *b = s_dump_buf[i];
+
+        fprintf(f, "%03d ", kept++);
+        for (int k = 0; k < REPORT_LEN; k++)
+            fprintf(f, "%02x", b[k]);
+        fprintf(f, " n%d%s\n", b[5] & 0x7F, b[6] == ACK_BYTE ? " ok" : "");
+    }
+
+    fclose(f);
+    return kept;
+}
+
+static int cmd_touchdump(tdsh_session_t *session, int argc, char **argv)
+{
+    (void)session;
+
+    int secs = argc >= 2 ? atoi(argv[1]) : 5;
+
+    if (secs <= 0 || secs > 30)
+    {
+        printf("seconds 1..30\n");
+        return 1;
+    }
+
+    printf("capturing %d s -- touch the glass now\n", secs);
+
+    int n = touch_dump(secs);
+
+    if (n < 0)
+    {
+        printf("no card or no memory\n");
+        return 1;
+    }
+
+    printf("%d blocks -> /sd/touch.txt\n", n);
+    return 0;
+}
+
+static const tdsh_command_t s_touchdump_cmd = {
+    "touchdump",
+    "touchdump [seconds]",
+    "Capture raw touch report blocks to /sd/touch.txt",
+    cmd_touchdump,
+    TDSH_CMD_INTERACTIVE,
+};
+
+bool touch_register_command(void)
+{
+    return tdsh_register_command(&s_touchdump_cmd) == 0;
 }
 
 bool touch_init(touch_input_fn input)
