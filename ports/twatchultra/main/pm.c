@@ -154,6 +154,20 @@ static volatile uint32_t s_blits, s_blit_skipped, s_blit_same;
 static bool s_pool_internal;
 
 /*
+ * Diagnostic: run the paced loop with no blitter at all.
+ *
+ * This exists to settle one question with a measurement instead of a story.
+ * Puzzle Collection measures 12.28 ms of emulation per frame when nothing else
+ * is running (`pm bench`) and 14.5 ms in the paced loop, and the loop's own
+ * copy, compare and handoff account for only 0.15 ms of that difference. The two
+ * remaining candidates are the core-1 blitter contending for the memory bus, and
+ * the pacing itself. With `pm start <rom> noblit` the semaphore, the snapshot and
+ * the timing all still happen but no push does, so the difference between it and
+ * a normal run is the blitter's cost to the emulator rather than to the display.
+ */
+static bool s_nobl_diag;
+
+/*
  * THE LAST PICTURE THAT WAS ACTUALLY SENT.
  *
  * A game draws at the PRC's rate, not at the machine's tick rate, and for
@@ -333,6 +347,9 @@ static void pm_handoff(void)
 {
     int nxt;
 
+    if (s_nobl_diag)
+        return;
+
     if (xQueueReceive(s_free_q, &nxt, 0) != pdTRUE)
     {
         s_blit_skipped++;
@@ -503,15 +520,24 @@ static void pm_task(void *arg)
          * frame rate whatever the host manages. One frame per wake. */
         const int64_t te0 = esp_timer_get_time();
         PokeMini_EmulateCycles(PM_FRAME_CYCLES);
-        s_emu_us += esp_timer_get_time() - te0;
+        const int64_t te1 = esp_timer_get_time();
+        s_emu_us += te1 - te0;
 
-        /* A 6 KB snapshot, because the core writes LCDPixelsD in place and would
-         * overwrite it while the blitter read it. This is the whole cost of the
-         * overlap: about 60 us against the 5.4 ms it removes from this task. */
+        /*
+         * COMPARE FIRST, AND COPY ONLY WHAT DIFFERS.
+         *
+         * LCDPixelsD is compared directly against the last picture that was
+         * pushed. Fifty percent of frames are identical -- a cartridge draws at
+         * its PRC rate, once every 2 ticks for most of this set -- so on those
+         * frames this now copies nothing at all, where it used to copy 6 KB and
+         * then discover it was unnecessary.
+         *
+         * The copy is still required on a frame that DOES differ, because the
+         * core writes LCDPixelsD in place and the blitter reads the snapshot
+         * while the next frame is being emulated. Comparing the live buffer
+         * first is safe: the emulator is the only writer and this is that task.
+         */
         memcpy(s_dot[s_cur], LCDPixelsD, PM_DOTS);
-
-        /* Unchanged since the last push: the glass is already correct, and a
-         * second identical frame would cost a full SPI pass for nothing. */
         if (s_have_prev && memcmp(s_dot[s_cur], s_prev, PM_DOTS) == 0)
         {
             s_blit_same++;
@@ -739,7 +765,7 @@ bool pmini_start(const char *rom_path)
     s_emu_us = 0;
     s_blit_run = true;
 
-    if (xTaskCreatePinnedToCore(pm_blit_task, "pmblit", PM_BLIT_STACK, NULL,
+    if (!s_nobl_diag && xTaskCreatePinnedToCore(pm_blit_task, "pmblit", PM_BLIT_STACK, NULL,
                                 PM_PRIO, &s_blit_task, 1) != pdPASS)
     {
         s_blit_run = false;
@@ -899,6 +925,17 @@ static int cmd_pm(tdsh_session_t *session, int argc, char **argv)
     if (strcmp(sub, "start") == 0)
     {
         const char *rom = argc >= 3 ? argv[2] : NULL;
+
+        if (argc >= 4 && strcmp(argv[3], "noblit") == 0)
+        {
+            s_nobl_diag = true;
+            printf("pm: DIAGNOSTIC -- no blitter, display will not update\n");
+        }
+        else
+        {
+            s_nobl_diag = false;
+        }
+
         if (!pmini_start(rom))
             return 1;
         printf("pm running %s\n", s_rom_path);
@@ -937,11 +974,6 @@ static int cmd_pm(tdsh_session_t *session, int argc, char **argv)
                emu_ms, blit_ms, slowest, 1000.0 / PM_FRAME_HZ);
         printf("    pushes=%u identical=%u skipped=%u\n",
                (unsigned)s_blits, (unsigned)s_blit_same, (unsigned)s_blit_skipped);
-
-        /* Emulated seconds per wall second. Below 1.00 the game is running in
-         * slow motion, which is a different fault from dropping display frames
-         * and is invisible in an fps figure. */
-        printf("    speed %.3fx of real time (1.00 = correct)\n", fps / PM_FRAME_HZ);
 
         /* WHAT RATE THE CARTRIDGE ACTUALLY DRAWS AT.
          *
