@@ -221,6 +221,19 @@ static bool s_ovr_set[2][COL_N];
 static uint16_t s_tx[DISPLAY_W * BAND_ROWS];
 
 /*
+ * A SECOND transmit band, used only by display_picture_rows().
+ *
+ * The blit runs on its own task while the desktop can still repaint a margin
+ * label on another core -- a Pause/Resume toggle in the NES UI does exactly that
+ * mid-game. Both would otherwise fill s_tx and then push it, so a relabel could
+ * overwrite a band the blitter was about to send, which appears on the glass as
+ * a strip of margin colours across the game. Two buffers cost 10,240 bytes of
+ * internal DRAM against 143,275 free and remove the race by construction rather
+ * than by a lock the reader has to remember to take.
+ */
+static uint16_t s_tx_app[DISPLAY_W * BAND_ROWS];
+
+/*
  * Where a push actually spends its time, so "the blit is push-bound" can be
  * turned into numbers instead of a diagnosis.
  *
@@ -294,6 +307,37 @@ static inline uint16_t swap16(uint16_t v)
     return (uint16_t)((v >> 8) | (v << 8));
 }
 
+/* A register write with the SPI bus ALREADY HELD by the caller.
+ *
+ * Split out of reg_write() so that a window programming and the pixel transfer
+ * that fills it can happen inside ONE bus acquisition. That atomicity is what
+ * makes two tasks able to push at once: CASET and RASET are device state, not
+ * per-transaction state, so if a second pusher could program its window between
+ * another's window write and its pixel stream, the pixels would land in the
+ * wrong rectangle. Before this, the window was written before the bus was
+ * acquired, which was safe only while there was exactly one pusher.
+ *
+ * CS is still pulsed per register write, matching LilyGoDispQSPI::writeCommand()
+ * -- the panel latches on CS, and holding CS low across both registers changes
+ * what it sees.
+ */
+static void reg_write_bus(uint8_t reg, const uint8_t *data, size_t len)
+{
+    spi_transaction_t t = { 0 };
+    t.flags = SPI_TRANS_MULTILINE_CMD | SPI_TRANS_MULTILINE_ADDR;
+    t.cmd = CMD_WRITE;
+    t.addr = (uint64_t)reg << 8;
+    t.tx_buffer = len ? data : NULL;
+    t.length = 8 * len;
+
+    gpio_set_level(LCD_CS, 0);
+    esp_err_t err = spi_device_polling_transmit(s_spi, &t);
+    gpio_set_level(LCD_CS, 1);
+
+    if (err != ESP_OK)
+        ESP_LOGE(TAG, "reg 0x%02X failed: %s", reg, esp_err_to_name(err));
+}
+
 /* A register write, exactly as LilyGoDispQSPI::writeCommand(). */
 static void reg_write(uint8_t reg, const uint8_t *data, size_t len)
 {
@@ -315,15 +359,16 @@ static void reg_write(uint8_t reg, const uint8_t *data, size_t len)
         ESP_LOGE(TAG, "reg 0x%02X failed: %s", reg, esp_err_to_name(err));
 }
 
-static void set_window(int x, int y, int w, int h)
+/* Program CASET/RASET. Requires the bus to be held by the caller. */
+static void set_window_bus(int x, int y, int w, int h)
 {
     uint8_t cas[4] = { (uint8_t)((x >> 8) & 0xFF), (uint8_t)(x & 0xFF),
                        (uint8_t)(((x + w - 1) >> 8) & 0xFF), (uint8_t)((x + w - 1) & 0xFF) };
     uint8_t ras[4] = { (uint8_t)((y >> 8) & 0xFF), (uint8_t)(y & 0xFF),
                        (uint8_t)(((y + h - 1) >> 8) & 0xFF), (uint8_t)((y + h - 1) & 0xFF) };
 
-    reg_write(0x2A, cas, 4);
-    reg_write(0x2B, ras, 4);
+    reg_write_bus(0x2A, cas, 4);
+    reg_write_bus(0x2B, ras, 4);
 }
 
 /* Push w*h pixels from s_tx at RAW controller coordinates, byte-swapped and
@@ -331,6 +376,7 @@ static void set_window(int x, int y, int w, int h)
  * offsets; this one is for the areas outside the framebuffer, where those
  * offsets do not apply. */
 static void push_pixels_raw(int cx, int cy, int w, int h);
+static void push_pixels_buf(int x, int y, int w, int h, uint16_t *buf);
 
 /* Push w*h byte-swapped pixels from s_tx, CS held across the whole stream. */
 static void push_pixels(int x, int y, int w, int h)
@@ -338,21 +384,53 @@ static void push_pixels(int x, int y, int w, int h)
     push_pixels_raw(x + FB_X + PANEL_COL_OFFSET, y + FB_Y, w, h);
 }
 
-static void push_pixels_raw(int cx, int cy, int w, int h)
+static void push_pixels_raw_buf(int cx, int cy, int w, int h, uint16_t *buf)
 {
     size_t npix = (size_t)w * h;
-    uint16_t *p = s_tx;
+    uint16_t *p = buf;
     size_t remaining = npix;
     bool first = true;
     esp_err_t err = ESP_OK;
 
+    /*
+     * WINDOW AND PIXELS UNDER ONE BUS HOLD.
+     *
+     * CASET/RASET live in the panel and persist across transactions, so the
+     * window a pixel stream fills has to be the window this pusher programmed.
+     * Acquiring per-band and programming inside that acquisition makes each band
+     * atomic, which is what allows the app blit to run on one core while the
+     * desktop repaints margins on the other: their bands interleave, and each
+     * band still lands where it was aimed.
+     *
+     * Asserting CS low across the window write and the stream is deliberate.
+     * Two separate CS pulses -- the old behaviour -- would let a second pusher's
+     * window write land between this one's window and its pixels even with the
+     * bus held, because the panel latches on CS.
+     */
+    spi_device_acquire_bus(s_spi, portMAX_DELAY);
+
     int64_t t_w0 = esp_timer_get_time();
-    set_window(cx, cy, w, h);
+    uint8_t cas[4] = { (uint8_t)((cx >> 8) & 0xFF), (uint8_t)(cx & 0xFF),
+                       (uint8_t)(((cx + w - 1) >> 8) & 0xFF), (uint8_t)((cx + w - 1) & 0xFF) };
+    uint8_t ras[4] = { (uint8_t)((cy >> 8) & 0xFF), (uint8_t)(cy & 0xFF),
+                       (uint8_t)(((cy + h - 1) >> 8) & 0xFF), (uint8_t)((cy + h - 1) & 0xFF) };
+
+    gpio_set_level(LCD_CS, 0);
+    reg_write_bus(0x2A, cas, 4);
+    reg_write_bus(0x2B, ras, 4);
     s_us_window += esp_timer_get_time() - t_w0;
     s_pushes++;
 
-    spi_device_acquire_bus(s_spi, portMAX_DELAY);
+    /* CS HAS TO GO LOW AGAIN HERE, and the fault this fixes is worth recording.
+     * reg_write_bus() asserts CS around each register write and leaves it HIGH
+     * when it returns, so without this line the pixel stream below went out with
+     * chip select de-asserted: the SPI transmitted every byte, the timing
+     * accounted for every microsecond, `nes status` reported a healthy frame rate
+     * and a full set of blits, and the panel ignored all of it. The glass was
+     * black. Nothing in the counters could see it, because from the driver's side
+     * the transfer succeeded -- the only evidence was looking at the screen. */
     gpio_set_level(LCD_CS, 0);
+
     int64_t t_x0 = esp_timer_get_time();
 
     while (remaining)
@@ -392,6 +470,16 @@ static void push_pixels_raw(int cx, int cy, int w, int h)
     gpio_set_level(LCD_CS, 1);
     spi_device_release_bus(s_spi);
     s_us_xmit += esp_timer_get_time() - t_x0;
+}
+
+static void push_pixels_raw(int cx, int cy, int w, int h)
+{
+    push_pixels_raw_buf(cx, cy, w, h, s_tx);
+}
+
+static void push_pixels_buf(int x, int y, int w, int h, uint16_t *buf)
+{
+    push_pixels_raw_buf(x + FB_X + PANEL_COL_OFFSET, y + FB_Y, w, h, buf);
 }
 
 static const struct {
@@ -591,8 +679,8 @@ static void panel_fill(uint16_t colour)
             uint16_t *pp = s_tx;
             bool first = true;
 
-            set_window(x + PANEL_COL_OFFSET, y, w, h);
             spi_device_acquire_bus(s_spi, portMAX_DELAY);
+            set_window_bus(x + PANEL_COL_OFFSET, y, w, h);
             gpio_set_level(LCD_CS, 0);
 
             while (remaining)
@@ -1067,8 +1155,8 @@ static void paint_buttons(void)
 
     /* The window is the whole strip; every transfer below continues it, so CS
      * stays low and the panel sees one window rather than one per band. */
-    set_window(wx, BTN_Y0, width, BTN_Y1 - BTN_Y0 + 1);
     spi_device_acquire_bus(s_spi, portMAX_DELAY);
+    set_window_bus(wx, BTN_Y0, width, BTN_Y1 - BTN_Y0 + 1);
     gpio_set_level(LCD_CS, 0);
 
     while (y <= BTN_Y1)
@@ -1230,8 +1318,8 @@ static void paint_column(int x0, int x1, bool desk_right, label_rot_t rot,
     }
 
     /* The window is the whole column; every transfer below continues it. */
-    set_window(wx, wy, width, height);
     spi_device_acquire_bus(s_spi, portMAX_DELAY);
+    set_window_bus(wx, wy, width, height);
     gpio_set_level(LCD_CS, 0);
 
     while (y < wy + height)
@@ -1813,9 +1901,9 @@ bool display_picture_rows(void *ctx, int x, int y, int w, int h, display_row_fn 
         int rows = (y1 - yy) > band ? band : (y1 - yy);
 
         for (int r = 0; r < rows; r++)
-            fn(ctx, (yy + r) - y, col, s_tx + (size_t)r * dw, dw);
+            fn(ctx, (yy + r) - y, col, s_tx_app + (size_t)r * dw, dw);
 
-        push_pixels(x0, yy, dw, rows);
+        push_pixels_buf(x0, yy, dw, rows, s_tx_app);
     }
 
     return true;

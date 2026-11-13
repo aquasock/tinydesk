@@ -44,6 +44,11 @@ static const char *TAG = "nes";
 /* --- state ---------------------------------------------------------------- */
 
 #define NES_STACK       8192
+/* The blit task needs less: it converts and pushes, and its deepest call is the
+ * row callback. It gets its own constant rather than sharing, because a stack
+ * sized for the 6502 interpreter would be 8 KB of internal DRAM held for a task
+ * that only ever runs the palette loop. */
+#define NES_BLIT_STACK  4096
 #define NES_PRIO        3
 /* The NES runs at 60.0988 Hz on NTSC. Pacing to the core's own refresh rate
  * rather than to a round 60 keeps audio pitch and game speed right -- the
@@ -74,11 +79,46 @@ static nes_t *s_nes;
  * the SPI push and not by reading the buffer. */
 #define NES_VIDBUF_STATIC 0
 
-static uint8_t *s_vidbuf;          /* 272x240 palette indices        */
-/* Which pool the frame buffer actually came from: true for internal DRAM, false
- * for PSRAM. Reported by `nes status`, because the two produce very different
- * frame times and a measurement is worthless if it does not say which it had. */
+/*
+ * THREE FRAME BUFFERS, SO THE BLIT CAN RUN WHILE THE NEXT FRAME IS EMULATED.
+ *
+ * The emulator and the blit used to run one after the other on one task: 15,242 us
+ * of interpreter and PPU, then 8,409 us of conversion and SPI. Nothing about
+ * either half is wasteful -- the SPI runs at 1.10x its arithmetic floor and the
+ * conversion reads four source bytes per lookup -- so the only thing left to win
+ * was running them at the same time, and both core 1 and the QSPI peripheral
+ * were idle for 8 of every 23 ms.
+ *
+ * Three buffers, not two, because with two the renderer would have to wait for
+ * the blitter to finish before starting the next frame, and there would be
+ * nothing to overlap. Three lets the blitter hold one while the renderer fills
+ * another and the third is free, so a slow blit costs latency rather than
+ * throughput.
+ *
+ * The handoff uses two queues rather than flags: `s_free_q` holds the indices of
+ * buffers nobody is using, `s_filled_q` the ones waiting to be pushed. That
+ * ordering is the whole safety argument -- a buffer is only handed to the
+ * blitter after a free one has been taken for the renderer, so the renderer can
+ * never be writing the buffer the blitter is reading, even if it fails to get a
+ * free one and has to skip a frame.
+ */
+#define NES_VBUF_N 3
+
+static uint8_t *s_vb[NES_VBUF_N];   /* PSRAM, 272x240 palette indices each */
+/* Which pool the buffers actually came from: true for internal DRAM, false for
+ * PSRAM. Reported by `nes status`, because the two produce very different frame
+ * times and a measurement is worthless if it does not say which it had. */
 static bool s_vidbuf_internal;
+
+static QueueHandle_t s_free_q;      /* indices: available to render          */
+static QueueHandle_t s_filled_q;    /* indices: rendered, waiting to be sent */
+static TaskHandle_t s_blit_task;
+static volatile bool s_blit_run;
+
+/* Counters for the handoff itself. A skip means the blitter was still busy when
+ * the renderer finished a frame -- the pool ran dry, which on the glass is a
+ * repeated frame rather than a delay. Visible rather than inferred. */
+static volatile uint32_t s_blit_done, s_blit_skipped;
 static TaskHandle_t s_task;
 static volatile bool s_run;
 static volatile bool s_paused;
@@ -188,11 +228,13 @@ static void build_palette(void)
  */
 static void vidbuf_release(void)
 {
-#if !NES_VIDBUF_STATIC
-    if (s_vidbuf)
-        heap_caps_free(s_vidbuf);
-#endif
-    s_vidbuf = NULL;
+    for (int i = 0; i < NES_VBUF_N; i++)
+    {
+        if (s_vb[i])
+            heap_caps_free(s_vb[i]);
+
+        s_vb[i] = NULL;
+    }
 }
 
 /* --- the blit ------------------------------------------------------------- */
@@ -273,17 +315,17 @@ static void nes_fill_row(void *ctx, int row, int col, uint16_t *dst, int n)
         dst[x] = s_pal_tx[src[x]];
 }
 
-static void nes_blit(uint8_t *buf)
+/* Convert one rendered frame into the transmit band and push it.
+ *
+ * This runs on the blit task, on core 1, while the emulator is already working
+ * on the next frame. Everything it touches is either its own (s_tx_app inside
+ * the display driver) or a buffer this task currently owns. */
+static void blit_one(const uint8_t *buf)
 {
-    if (!buf)
-        return;
-
     int64_t b0 = esp_timer_get_time();
 
-    /* `buf` is the pointer the core was given, so it is the context the row
-     * callback reads rather than the file-scope copy: if those two ever
-     * disagreed, the picture would come from the wrong place and neither
-     * counter would notice. */
+    /* `buf` is the buffer the pool handed over, so it is the context the row
+     * callback reads. */
     if (!display_picture_rows((void *)buf, NES_OX, NES_OY,
                               NES_SCREEN_WIDTH, NES_SCREEN_HEIGHT, nes_fill_row))
     {
@@ -301,6 +343,87 @@ static void nes_blit(uint8_t *buf)
     s_us_blit_last = (uint32_t)(esp_timer_get_time() - b0);
     s_blit_us_total += s_us_blit_last;
     s_blit_frames_total++;
+}
+
+/*
+ * The blit task: core 1, one job -- take a finished frame and send it.
+ *
+ * It never touches the emulator's state. The only shared things are the two
+ * queues and the buffers themselves, and ownership moves through them.
+ */
+static void nes_blit_task(void *arg)
+{
+    (void)arg;
+
+    while (s_blit_run)
+    {
+        int idx;
+
+        if (xQueueReceive(s_filled_q, &idx, pdMS_TO_TICKS(50)) != pdTRUE)
+            continue;
+
+        blit_one(s_vb[idx]);
+        s_blit_done++;
+
+        /* The renderer may be waiting for a buffer; give this one back even if
+         * the loop is about to end, so a stop cannot strand it. */
+        xQueueSend(s_free_q, &idx, 0);
+    }
+
+    s_blit_task = NULL;
+    vTaskDelete(NULL);
+}
+
+/* Which pool index a pointer belongs to, or -1. */
+static int vb_index(const void *p)
+{
+    for (int i = 0; i < NES_VBUF_N; i++)
+        if (s_vb[i] == p)
+            return i;
+
+    return -1;
+}
+
+/*
+ * The blit callback, called by the core at the end of every emulated frame on
+ * the emulator task.
+ *
+ * It does no drawing. It hands the finished frame to the blit task and swaps the
+ * renderer onto a free buffer, which is O(1) work and is what makes the overlap
+ * possible: the emulator returns to the 6502 immediately instead of waiting 8.4
+ * ms for the SPI.
+ *
+ * THE ORDER OF THESE TWO STEPS IS THE CORRECTNESS ARGUMENT. A free buffer is
+ * taken BEFORE the finished one is published, so if the pool is dry the frame is
+ * not queued and the renderer keeps writing the buffer it already has. Done the
+ * other way round, a dry pool would publish a buffer and then keep rendering
+ * into it, and the blitter would push a half-written frame -- tearing that
+ * appears only under load and would look like a panel fault.
+ */
+static void nes_blit(uint8_t *buf)
+{
+    int cur = vb_index(buf);
+    int nxt;
+
+    if (cur < 0)
+        return;
+
+    if (xQueueReceive(s_free_q, &nxt, 0) != pdTRUE)
+    {
+        /* No free buffer: the blitter is still busy. Skip the handoff and carry
+         * on rendering into `cur`, which is still ours. */
+        s_blit_skipped++;
+        return;
+    }
+
+    if (xQueueSend(s_filled_q, &cur, 0) != pdTRUE)
+    {
+        s_blit_skipped++;
+        xQueueSend(s_free_q, &nxt, 0);
+        return;
+    }
+
+    nes_setvidbuf(s_vb[nxt]);
 }
 
 /*
@@ -537,73 +660,48 @@ bool nes_start(const char *rom_path)
     }
 
     /*
-     * THE FRAME BUFFER: INTERNAL RAM IF IT FITS, PSRAM OTHERWISE. 272x240 is
-     * 65,280 bytes, and it is touched twice per pixel per frame -- the PPU writes
-     * it, the blit reads it -- so which pool it lives in decides the cost of both
-     * halves of the frame, not just one.
+     * THE FRAME BUFFERS, FROM PSRAM -- all three of them.
      *
-     * It was PSRAM unconditionally, and the reason was sound at the time: 4,148
-     * bytes of static .bss once starved tdsh's SSH server of its 65,536-byte
-     * floor (EMU-018), so a fixed 65 KB array in internal DRAM was clearly
-     * unaffordable. Two things have changed since. Free internal now reads
-     * 143,275 bytes when the radio is never initialised, and this allocation is
-     * made at `nes` start rather than at boot -- so it is a heap request that is
-     * returned on stop, not a permanent claim, which is the same refcount
-     * discipline the Tamagotchi's frame buffer follows.
+     * 272x240 is 65,280 bytes each, so the pool is 195,840 bytes. They are
+     * touched twice per pixel per frame -- the PPU writes a buffer, the blitter
+     * reads one -- so internal DRAM would be the faster home, and it was tried
+     * on 2026-11-12: a single static internal buffer measured 45 fps against 42,
+     * saving 577 us of an 8,409 us blit, because the blit is dominated by the SPI
+     * push and not by reading the buffer. Three of them would be 195,840 bytes,
+     * which this board does not have to spare and does not need to spend for
+     * 577 us. So the experiment is not carried forward here: it is measured,
+     * recorded in NES-003, and incompatible with the pool by size.
      *
-     * It is a REQUEST, NOT AN ASSUMPTION. Internal DRAM is fragmented by the
-     * time an app runs, so a 65,280-byte contiguous block may simply not exist
-     * however much total free is reported -- and the answer is a property of the
-     * running system, not something that can be read off a size report. So the
-     * result is recorded in s_vidbuf_internal and reported by `nes status`, and
-     * the same firmware works either way. A silent fallback would leave the next
-     * measurement quoting a number for a pool it was not using.
-     *
-     * Set AFTER loading, always: nes_loadfile() calls nes_reset(), which nulls
-     * vidbuf, so a buffer installed beforehand is silently discarded and the PPU
-     * renders nothing while the emulator reports a healthy frame rate. That cost
-     * two benchmark runs on the host (NES-001).
+     * Allocated at `nes` start and returned on stop, never at boot. That is the
+     * refcount discipline the Tamagotchi's frame buffer follows, and it is what
+     * keeps 195 KB from being a permanent claim on a board whose scarcest
+     * resource is memory (EMU-018).
      */
     const size_t vidbytes = (size_t)NES_SCREEN_PITCH * NES_SCREEN_HEIGHT;
 
-#if NES_VIDBUF_STATIC
-    /* THE EXPERIMENT: a fixed array in internal DRAM, which bypasses the heap
-     * entirely and therefore its fragmentation. Nothing below asks for memory,
-     * so nothing can fall back.
-     *
-     * It exists because the heap route cannot work on this board: a running
-     * desktop leaves internal DRAM with 143,275 bytes free but only a 49,152-byte
-     * largest block, and vidbuf needs 65,280 contiguous. Measured, not assumed --
-     * `nes status` reported `vidbuf=PSRAM` with the internal attempt in place.
-     *
-     * WHAT IT COSTS, and this is why it is a switch and not the default: the
-     * array is claimed at boot by the linker, so it is gone whether or not the
-     * emulator is running. With the radio initialised that takes internal free
-     * from 102,615 to about 37,000, below the 65,536 tdsh's SSH server demands,
-     * so SSH would stop starting. That is EMU-018's lesson being paid again by
-     * the other route -- the memory has to come from somewhere.
-     */
-    static uint8_t s_vidbuf_static[(size_t)NES_SCREEN_PITCH * NES_SCREEN_HEIGHT];
-    s_vidbuf = s_vidbuf_static;
-    s_vidbuf_internal = true;
-#else
-    s_vidbuf = (uint8_t *)heap_caps_malloc(vidbytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    s_vidbuf_internal = (s_vidbuf != NULL);
-
-    if (!s_vidbuf)
-        s_vidbuf = (uint8_t *)heap_caps_malloc(vidbytes, MALLOC_CAP_SPIRAM);
-
-    if (!s_vidbuf)
+    for (int i = 0; i < NES_VBUF_N; i++)
     {
-        printf("no memory for the frame buffer\n");
-        return false;
-    }
-#endif
+        s_vb[i] = (uint8_t *)heap_caps_malloc(vidbytes, MALLOC_CAP_SPIRAM);
 
-    printf("vidbuf %u bytes in %s (internal free=%u largest=%u)\n",
-           (unsigned)vidbytes, s_vidbuf_internal ? "INTERNAL" : "PSRAM",
-           (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        if (!s_vb[i])
+        {
+            printf("no memory for %d frame buffers\n", NES_VBUF_N);
+
+            for (int j = 0; j < i; j++)
+                heap_caps_free(s_vb[j]);
+
+            for (int j = 0; j < NES_VBUF_N; j++)
+                s_vb[j] = NULL;
+
+            return false;
+        }
+    }
+
+    s_vidbuf_internal = false;
+
+    printf("vidbuf %u x %d = %u bytes, PSRAM (internal free=%u)\n",
+           (unsigned)vidbytes, NES_VBUF_N, (unsigned)(vidbytes * NES_VBUF_N),
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
     s_nes->vidbuf = NULL;   /* in case a previous run left it set */
 
@@ -611,12 +709,13 @@ bool nes_start(const char *rom_path)
     {
         printf("unable to load %s (unsupported mapper?)\n", s_rom_path);
         vidbuf_release();
-        s_vidbuf = NULL;
         return false;
     }
 
-    /* AFTER the load, per the note above. */
-    nes_setvidbuf(s_vidbuf);
+    /* AFTER the load, per the note above: nos_loadfile() calls nes_reset(), which
+     * nulls vidbuf, so a buffer installed beforehand is silently discarded and
+     * the PPU renders nothing while the emulator reports a healthy frame rate. */
+    nes_setvidbuf(s_vb[0]);
 
     build_palette();
 
@@ -628,7 +727,6 @@ bool nes_start(const char *rom_path)
     {
         display_pixels_claim(false);
         vidbuf_release();
-        s_vidbuf = NULL;
         printf("no framebuffer\n");
         return false;
     }
@@ -665,21 +763,67 @@ bool nes_start(const char *rom_path)
     s_pad = 0;
     s_paused = false;
     s_run = true;
+    s_blit_done = s_blit_skipped = 0;
 
-    if (xTaskCreate(nes_task, "nes", NES_STACK, NULL, NES_PRIO, &s_task) != pdPASS)
+    /* The pool. Two queues rather than flags: ownership of a buffer moves by
+     * being popped and pushed, so there is no state two cores can disagree
+     * about. Buffer 0 is the renderer's to start with, so 1 and 2 are free. */
+    s_free_q = xQueueCreate(NES_VBUF_N, sizeof(int));
+    s_filled_q = xQueueCreate(NES_VBUF_N, sizeof(int));
+
+    if (!s_free_q || !s_filled_q)
+    {
+        printf("no queue\n");
+        goto fail_queues;
+    }
+
+    for (int i = 1; i < NES_VBUF_N; i++)
+        xQueueSend(s_free_q, &i, 0);
+
+    s_blit_run = true;
+
+    if (xTaskCreatePinnedToCore(nes_blit_task, "nesblit", NES_BLIT_STACK, NULL,
+                                NES_PRIO, &s_blit_task, 1) != pdPASS)
+    {
+        s_blit_run = false;
+        printf("no blit task\n");
+        goto fail_queues;
+    }
+
+    /* Core 0 explicitly, so the two really are on different cores rather than
+     * both landing wherever the scheduler felt like it. */
+    if (xTaskCreatePinnedToCore(nes_task, "nes", NES_STACK, NULL,
+                                NES_PRIO, &s_task, 0) != pdPASS)
     {
         s_run = false;
         s_task = NULL;
+        s_blit_run = false;
+
+        for (int i = 0; i < 100 && s_blit_task; i++)
+            vTaskDelay(pdMS_TO_TICKS(10));
+
         display_margins_set(DISPLAY_MARGINS_DESKTOP);
         display_pixels_claim(false);
-        vidbuf_release();
-        s_vidbuf = NULL;
         printf("no task\n");
-        return false;
+        goto fail_queues;
     }
 
     ESP_LOGI(TAG, "running %s", s_rom_path);
     return true;
+
+fail_queues:
+    if (s_free_q)
+    {
+        vQueueDelete(s_free_q);
+        s_free_q = NULL;
+    }
+    if (s_filled_q)
+    {
+        vQueueDelete(s_filled_q);
+        s_filled_q = NULL;
+    }
+    vidbuf_release();
+    return false;
 }
 
 void nes_stop(void)
@@ -698,11 +842,34 @@ void nes_stop(void)
         return;
     }
 
+    /* The blit task before anything it touches. It exits within one queue
+     * timeout (50 ms) once s_blit_run is clear, and it returns its buffer before
+     * doing so. Waiting for it here, rather than assuming it noticed, is what
+     * stops a stop from racing a push into a display that is being released
+     * underneath it. */
+    s_blit_run = false;
+
+    for (int i = 0; i < 100 && s_blit_task; i++)
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+    if (s_blit_task)
+        ESP_LOGE(TAG, "blit task did not stop; not freeing");
+
+    if (s_free_q)
+    {
+        vQueueDelete(s_free_q);
+        s_free_q = NULL;
+    }
+    if (s_filled_q)
+    {
+        vQueueDelete(s_filled_q);
+        s_filled_q = NULL;
+    }
+
     nes_shutdown();
     s_nes = NULL;
 
     vidbuf_release();
-    s_vidbuf = NULL;
 
     /* The converted-frame buffer is gone with the old blit: there is nothing to
      * keep between runs because there is nothing to convert into. That returns
@@ -823,7 +990,9 @@ static int cmd_nes(tdsh_session_t *session, int argc, char **argv)
         if (s_nes)
             printf("rom=%s paused=%d\n", s_rom_path, s_paused ? 1 : 0);
 
-        printf("vidbuf=%s\n", s_vidbuf_internal ? "INTERNAL" : "PSRAM");
+        printf("vidbuf=%s blits=%lu skipped=%lu\n",
+               s_vidbuf_internal ? "INTERNAL" : "PSRAM",
+               (unsigned long)s_blit_done, (unsigned long)s_blit_skipped);
 
         /* Push breakdown, for deciding whether the blit's remaining 8 ms is the
          * transfer or the window programming around it. */
