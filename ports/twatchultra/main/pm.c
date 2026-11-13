@@ -173,10 +173,32 @@ static bool s_pool_internal;
 static uint8_t *s_prev;
 static bool s_have_prev;
 
-/* Two colours, and both are byte-order palindromic (0xFFFF, 0x0000), so no swap
- * is needed per pixel. The panel wants high byte first and these are symmetric. */
-#define PM_ON   0xFFFFu
-#define PM_OFF  0x0000u
+/*
+ * A LIT DOT IS DARK, WHICH IS THE OPPOSITE OF WHAT THE FIRST VERSION DID.
+ *
+ * The Pokemon Mini's panel is a monochrome LCD: what a game calls a set pixel is
+ * a dark dot on a pale background, not a bright dot on black. PokeMini's
+ * LCDPixelsD holds one byte per dot with non-zero meaning "this dot is lit", and
+ * the reference front end renders exactly that -- pmgui.c maps a non-zero dot to
+ * 0xFF16161A, near black, against 0xFFC8C8BE for an unlit one.
+ *
+ * This port mapped non-zero to white and shipped an inverted picture. The fault
+ * was invisible in every counter: the frame rate, the speed ratio, the push count
+ * and the identical-frame skip were all correct, because they do not care what a
+ * pixel means. It took the operator putting the watch beside the desktop
+ * emulator, on the same screen of the same cartridge, to see it.
+ *
+ * NOTE THIS IS NOT THE HARDWARE'S OWN INVERSION. MinxLCD has InvAllPix and
+ * SetAllPix registers that a game can set, and MinxLCD_Render() applies them into
+ * LCDPixelsD before this code ever sees it. So the polarity here is fixed and
+ * absolute: nothing a cartridge does should change it.
+ *
+ * Both values are byte-order palindromic (0xFFFF, 0x0000), so no per-pixel swap
+ * is needed -- the panel wants high byte first and these read the same either
+ * way.
+ */
+#define PM_DOT_LIT    0x0000u   /* a set dot is dark */
+#define PM_DOT_UNLIT  0xFFFFu   /* clear is pale */
 
 /* --- the frame, as bytes for the panel ------------------------------------- */
 
@@ -230,7 +252,7 @@ static void pm_expand_row(const uint8_t *dots, int sy)
 
     for (int x = 0; x < PM_W; x++)
     {
-        const uint16_t v = src[x] ? PM_ON : PM_OFF;
+        const uint16_t v = src[x] ? PM_DOT_LIT : PM_DOT_UNLIT;
         uint16_t *d = &s_xrow[x * PM_SCALE];
 
         for (int k = 0; k < PM_SCALE; k++)
@@ -247,7 +269,7 @@ static void pm_fill_row(void *ctx, int row, int col, uint16_t *dst, int n)
     if (sy >= PM_H || col < 0)
     {
         for (int i = 0; i < n; i++)
-            dst[i] = PM_OFF;
+            dst[i] = PM_DOT_UNLIT;
         return;
     }
 
