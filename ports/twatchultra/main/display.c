@@ -231,6 +231,25 @@ static bool s_ovr_btn_set[BTN_N];
 static bool s_nochrome[3][COL_N];
 
 /*
+ * A VERTICAL NUDGE ON ONE SLOT'S LABEL, in pixels, positive is down.
+ *
+ * The label is centred in its button, and centring is right for a word whose
+ * height is close to the face's. It is wrong for the short words at the top of
+ * each column: "Exit" is four characters and "Hold" four, so both stand on end
+ * in a 61-row face with more slack above than the eye wants, and they read as
+ * sitting high. Rather than a second centring rule per slot -- which would be
+ * one more thing to keep true for every app -- a slot can be nudged by a pixel
+ * count, so the operator tunes what he sees without moving anything else.
+ *
+ * Indexed [column][slot] like s_nochrome, and both columns are nudged by the
+ * same amount for each of their top slots, so the two columns stay level with
+ * each other. Rotated labels are nudged along the glass, not along their own
+ * reading direction: dy moves the whole word down the screen, which for a
+ * label reading upward means toward its first character.
+ */
+static int s_lab_dy[2][COL_N];
+
+/*
  * HOW MANY SLOTS THE COLUMNS DRAW WHILE AN APP OWNS THE SCREEN.
  *
  * COL_N is the desktop's count and the Tamagotchi's, and both need all five. An
@@ -1394,6 +1413,20 @@ static void paint_column(int x0, int x1, bool desk_right, label_rot_t rot,
 
         label_place(text, x0 + BTN_BORDER, x1 - BTN_BORDER,
                     g0 + BTN_RADIUS, g1 - BTN_RADIUS, rot, &label[s]);
+
+        /* Then the slot's nudge, clamped inside the face: label_place() already
+         * guarantees the word fits, so a nudge large enough to push it out is a
+         * caller error and the clamp keeps it on the button rather than
+         * spilling into the separator. */
+        const int dy = s_lab_dy[desk_right ? 0 : 1][s];
+
+        if (dy)
+        {
+            const int top = g0 + BTN_RADIUS;
+            const int y = label[s].y + dy;
+
+            label[s].y = y < top ? top : y;
+        }
     }
 
     /* The window is the whole column; every transfer below continues it. */
@@ -1738,6 +1771,37 @@ void display_margin_chrome(int col, int index, bool on)
         if (col == 2)
             paint_buttons();
         else if (col == 0)
+            paint_column(LEFT_X0, LEFT_X1, true, LABEL_CW, left_label_app, overrides_for(0));
+        else
+            paint_column(RIGHT_X0, RIGHT_X1, false, LABEL_CCW, right_label_app, overrides_for(1));
+    }
+
+    xSemaphoreGive(s_lock);
+}
+
+/*
+ * Nudge one column slot's label vertically, and repaint that column.
+ *
+ * `dy` is in pixels and positive is down the glass. 0 restores the centred
+ * position, which is the default for every slot.
+ *
+ * Repaints synchronously for the same reason the other margin setters do: a
+ * label moved by a pixel is visible immediately, and asking the paint task to do
+ * it would drop the request while the app owns the screen. Same rule as
+ * display_margin_label(): call only as the sole writer of the glass.
+ */
+void display_margin_label_dy(int col, int index, int dy)
+{
+    if (!s_fb || (col != 0 && col != 1) || index < 0 || index >= COL_N)
+        return;
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+
+    s_lab_dy[col][index] = dy;
+
+    if (s_margin_mode == DISPLAY_MARGINS_APP)
+    {
+        if (col == 0)
             paint_column(LEFT_X0, LEFT_X1, true, LABEL_CW, left_label_app, overrides_for(0));
         else
             paint_column(RIGHT_X0, RIGHT_X1, false, LABEL_CCW, right_label_app, overrides_for(1));

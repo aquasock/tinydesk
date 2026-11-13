@@ -209,6 +209,17 @@ display_margins_t display_margins_get(void);
 void display_margin_label(int col, int index, const char *text);
 
 /*
+ * Nudge one column slot's label vertically by `dy` pixels, positive is down the
+ * glass; 0 restores the centred position. For a short word at the top of a
+ * column, whose centring leaves more slack above than the eye wants.
+ *
+ * Same sole-writer rule as display_margin_label(), and the same column numbering
+ * (0 left, 1 right). The bottom strip has no nudge: its bars are laid out
+ * horizontally and centred, which is the case centring is right for.
+ */
+void display_margin_label_dy(int col, int index, int dy);
+
+/*
  * Relabel one bottom-strip bar while an app owns the screen, and repaint the
  * strip. index is 0..2, left to right; an empty label restores the edges.h
  * default. Same sole-writer requirement as display_margins_set().

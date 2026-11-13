@@ -974,7 +974,7 @@ static bool dpad_core(int x, int y)
 /* Cells. One cell is PM_GRID. Positive x is right, positive y is down. */
 #define PM_PAD_CELL   PM_GRID
 
-typedef struct { int cx, cy; } pad_off_t;
+typedef struct { int cx, cy; int dx; } pad_off_t;
 
 /*
  * PLACEMENT AND SIZE ARE PER CIRCLE, and the diameter is now independent of the
@@ -1007,25 +1007,49 @@ typedef struct { int cx, cy; } pad_off_t;
  * xoff 3 still clips 20 -- because the wall is a column boundary and not a size
  * limit. The vertical direction has more room: B's bottom is 443 against a glass
  * bottom of 456.
+ *
+ * A'S HEIGHT IS NOT FREE, AND MOVING IT UP COSTS RIGHT EDGE. The wall at fb 319
+ * only applies ABOVE the column bottom (fb 293); below it the lower band is full
+ * glass width. So how much of A the wall can bite depends on how many of A's rows
+ * are in the upper band, and those rows are the narrow ones near the top of the
+ * circle. At yoff 1 (A's top at 276) the widest row still inside the upper band
+ * reaches fb 316 and nothing is cut at all. At yoff 0 the top 34 rows are in the
+ * upper band and the widest of them -- the last, at fb 293 -- reaches fb 323, so
+ * 4 px down that whole side is bare glass. Moving A up therefore trades finger
+ * room for a taller flat edge; it is one cell at a time because the evidence is
+ * the operator's eyes on the glass, not a counter.
  */
 #define PM_PAD_A_XOFF   1                     /* 1 cell right of the base */
+#define PM_PAD_A_XNUDGE (PM_PAD_CELL / -2)    /* then half a cell back left */
 #define PM_PAD_B_XOFF  (-2)   /* 2 cells left of the base */
-#define PM_PAD_A_YOFF   1                     /* cells below the base row */
+#define PM_PAD_A_YOFF   0   /* on the base row: top level with the d-pad top */
 #define PM_PAD_B_YOFF   0                     /* up one from where it was */
 
 static const pad_off_t s_pad_off[2] = {
-    /* A: base column, 1 cell down */
-    { .cx = PM_PAD_A_XOFF, .cy = PM_PAD_A_YOFF },
+    /* A: base column, on the base row, half a cell back towards the d-pad */
+    { .cx = PM_PAD_A_XOFF, .cy = PM_PAD_A_YOFF, .dx = PM_PAD_A_XNUDGE },
     /* B: base column, on the base row -- up one cell from where it was */
-    { .cx = PM_PAD_B_XOFF, .cy = PM_PAD_B_YOFF },
+    { .cx = PM_PAD_B_XOFF, .cy = PM_PAD_B_YOFF, .dx = 0 },
 };
 
 /* Top-left of circle i, in framebuffer coordinates. B starts one OLD diameter plus
  * one gap below A's base, which is the column the pair was built as; the offsets
  * then move each from there. Using the original 68 and not the new 84 matters:
  * the base row is a fixed reference, so growing a circle does not silently shift
- * the other one. */
-static int pad_x(int i) { return PM_PAD_XBASE + s_pad_off[i].cx * PM_PAD_CELL; }
+ * the other one.
+ *
+ * `dx` IS THE HALF-CELL CHANNEL. Cells alone cannot express a half-cell step, and
+ * the operator wanted one: A needed to come back towards the d-pad by 8 px, not
+ * 16. Rather than re-basing the whole table on 8 px units -- which would have
+ * turned B's -2 into -4 and made every reading in the comments wrong -- the cell
+ * count keeps its meaning and the leftover pixels go in dx. It is also the escape
+ * hatch for any future sub-cell nudge, and 0 for everything that lands on the
+ * grid.
+ */
+static int pad_x(int i)
+{
+    return PM_PAD_XBASE + s_pad_off[i].cx * PM_PAD_CELL + s_pad_off[i].dx;
+}
 
 static int pad_y(int i)
 {
@@ -1325,13 +1349,22 @@ static bool pm_draw_dpad(void)
  * The layout is the operator's, and it follows the console's own control set
  * rather than the desktop's keys:
  *
- *   left column,  top to bottom   SS, Save, Load, Pause, Reset
- *   bottom strip, left to right   Shake, A, B
- *   right column, top to bottom   Hold, Sound, Speed, (blank), C
+ *   left column,  top to bottom   Exit, Save, Load
+ *   right column, top to bottom   Hold, Sound, C
+ *   bottom strip, left to right   (blank) -- the d-pad and A/B are drawn on
+ *                                 the framebuffer and need no legend
  *
- * The blank right-column slot is deliberate and is not a mistake: four of the
- * five right-hand slots are taken and the fifth is where a later control goes,
- * so leaving it visibly empty keeps the button positions stable when it arrives.
+ * THREE SLOTS PER COLUMN, not five: nothing is drawn below the third, and the
+ * space from there down belongs to the d-pad and the A/B circles.
+ *
+ * THE TWO NAMES THAT CHANGED ARE THE CONSOLE'S, NOT THE DESKTOP'S. The top-left
+ * slot was `SS` (the screenshot/save-state slot of the operator's first
+ * sketch) and is now `Exit`, which is what leaving the emulator has to be
+ * called. The third right-hand slot was `Speed` -- a desktop key -- and is now
+ * `C`, so the column reads Hold/Sound/C beside the A and B circles and names
+ * the console's three buttons instead of a host-side convenience. `C` keeps its
+ * box: unlike Pause and Reset it has no drawn control of its own to stand in
+ * for it.
  *
  * THE LABELS ARE APPLIED AS OVERRIDES, NOT BY EDITING edges.h. Those tables are
  * the Tamagotchi's and are pinned against its action table by
@@ -1344,8 +1377,7 @@ static bool pm_draw_dpad(void)
  * the next one. That is worth stating in the source because edges.h's rule is
  * that a label must not claim a job the button is not doing -- so these are
  * currently a statement of intent, and the first thing the next cycle owes is
- * making them true. `SS` is the one that needs explaining: it is the
- * screenshot/save-state slot, and it is the name the operator asked for.
+ * making them true.
  */
 /* THE SEVEN BARE SLOTS CARRY NO TEXT EITHER.
  *
@@ -1364,8 +1396,8 @@ static bool pm_draw_dpad(void)
  * nothing is drawn. */
 #define PM_BLANK " "
 
-static const char *const PM_LEFT[COL_N]  = { "SS", "Save", "Load", PM_BLANK, PM_BLANK };
-static const char *const PM_RIGHT[COL_N] = { "Hold", "Sound", "Speed", PM_BLANK, PM_BLANK };
+static const char *const PM_LEFT[COL_N]  = { "Exit", "Save", "Load", PM_BLANK, PM_BLANK };
+static const char *const PM_RIGHT[COL_N] = { "Hold", "Sound", "C", PM_BLANK, PM_BLANK };
 static const char *const PM_BOTTOM[BTN_N] = { PM_BLANK, PM_BLANK, PM_BLANK };
 
 /*
@@ -1375,7 +1407,7 @@ static const char *const PM_BOTTOM[BTN_N] = { PM_BLANK, PM_BLANK, PM_BLANK };
  * the framebuffer -- must not also appear as drawn buttons in the margins, or
  * the glass carries two controls for one duty. So Pause and Reset on the left,
  * all three bottom bars, and the blank slot with C on the right lose their box
- * and keep only their label; SS, Save, Load, Hold, Sound and Speed keep theirs.
+ * and keep only their label; Exit, Save, Load, Hold, Sound and C keep theirs.
  *
  * Expressed as three masks in the label tables' index order, so reading them
  * beside the tables above shows exactly which slots are affected.
@@ -1383,6 +1415,10 @@ static const char *const PM_BOTTOM[BTN_N] = { PM_BLANK, PM_BLANK, PM_BLANK };
 static const bool PM_BARE_LEFT[COL_N]  = { false, false, false, true,  true  };
 static const bool PM_BARE_RIGHT[COL_N] = { false, false, false, true,  true  };
 static const bool PM_BARE_BOTTOM[BTN_N] = { true, true, true };
+
+/* One character width of the 8x16 label font, down the glass. See where it is
+ * applied: the top slot of each column, Exit and Hold. */
+#define PM_TOP_DY  8
 
 /* Store the overrides. Safe to call before the app owns the glass: the setters
  * record the label and simply skip the repaint, so the single paint that
@@ -1408,6 +1444,17 @@ static void pm_label_margins(void)
 
     for (int i = 0; i < BTN_N; i++)
         display_margin_chrome(2, i, !PM_BARE_BOTTOM[i]);
+
+    /* THE SHORT TOP WORDS SIT LOW ON PURPOSE.
+     *
+     * "Exit" and "Hold" are four characters stood on end in a 61-row face, and
+     * centring leaves the eye reading them as high in the button -- the operator's
+     * words were that both should "render a bit lower". One character width is
+     * 8 px, the width of the 8x16 label font, and it is a nudge rather than a new
+     * alignment rule: display_margin_label_dy() adds to the centred position and
+     * clamps inside the face, so this cannot grow into a layout of its own. */
+    display_margin_label_dy(0, 0, PM_TOP_DY);
+    display_margin_label_dy(1, 0, PM_TOP_DY);
 }
 
 /* Clearing every slot hands the next app the shared defaults back. Without this
