@@ -38,6 +38,7 @@
 #include "gps.h"
 #include "nfc.h"
 #include "sound.h"
+#include "nes.h"
 #include "tama.h"
 #include "hal_mux.h"
 #include "tinydesk/td_picture.h"
@@ -456,6 +457,9 @@ bool link_init(void)
 
     if (!tama_register_command())
         ESP_LOGW(TAG, "tama command did not register");
+
+    if (!nes_register_command())
+        ESP_LOGW(TAG, "nes command did not register");
 
     if (!touch_register_command())
         ESP_LOGW(TAG, "touchdump command did not register");

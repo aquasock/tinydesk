@@ -45,6 +45,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -195,17 +196,43 @@ bool sound_init(void)
 
 void sound_beep(void)
 {
-    /* Stereo frames: two samples each, so twice the buffer the mono version
-     * needed for the same tone length. */
-    static int16_t buf[2 * BEEP_MS * SOUND_RATE_HZ / 1000];
+    /*
+     * PSRAM, NOT .bss, AND THAT IS A CORRECTION RATHER THAN A PREFERENCE.
+     *
+     * This was a 16,000-byte static array in internal DRAM, held for the whole
+     * life of the firmware to be used for 250 ms at a time. Internal DRAM is
+     * this board's scarcest resource -- tdsh's SSH server refuses to start below
+     * 65,536 bytes free -- and adding the NES component's 4 KB of .bss pushed it
+     * under that floor: `ssh start` began reporting "insufficient internal RAM
+     * (60143 bytes free)". That is EMU-018 happening a second time, in a
+     * peripheral with nothing to do with the change that caused it.
+     *
+     * So the buffer moves to the heap, where 16 KB lands in PSRAM and is released
+     * on the way out. PSRAM latency does not matter here: the buffer is filled
+     * once and handed to I2S, which DMAs it and buffers it -- nobody reads it back
+     * per-sample from the CPU.
+     *
+     * Allocated per call rather than kept, because a beep is a rare event on a
+     * watch and holding 16 KB of PSRAM permanently to avoid a malloc on each one
+     * is the wrong trade. A failed allocation falls back to the internal-DRAM
+     * behaviour of returning quietly, which is what a beep already does when
+     * there is no speaker.
+     */
     const int frames = BEEP_MS * SOUND_RATE_HZ / 1000;
-    const size_t want = sizeof(buf);
+    const size_t want = (size_t)frames * 2 * sizeof(int16_t);
     size_t written = 0;
     esp_err_t err;
+    int16_t *buf = (int16_t *)heap_caps_malloc(want, MALLOC_CAP_SPIRAM);
 
     if (!s_tx)
     {
         ESP_LOGW(TAG, "beep: no channel");
+        return;
+    }
+
+    if (!buf)
+    {
+        ESP_LOGW(TAG, "beep: no psram for %u bytes", (unsigned)want);
         return;
     }
 
@@ -224,6 +251,8 @@ void sound_beep(void)
      * attempts ended up. Short, for the Log Viewer's 40 columns. */
     ESP_LOGI(TAG, "beep %u/%u %s", (unsigned)written, (unsigned)want,
              err == ESP_OK ? "ok" : esp_err_to_name(err));
+
+    heap_caps_free(buf);
 }
 
 /* ------------------------------------------------------------ wav playback */

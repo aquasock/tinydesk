@@ -177,6 +177,8 @@ static volatile bool s_dumping;
 
 static touch_app_touch_fn s_app_touch;
 static void *s_app_touch_user;
+
+static void deliver_app_touch(const touch_frame_t *f);
 static bool s_app_active;        /* the app currently has points down */
 static int s_last_x = -1, s_last_y = -1;
 
@@ -547,8 +549,7 @@ static void release_if_idle(void)
 
         s_app_active = false;
 
-        if (s_app_touch)
-            s_app_touch(s_app_touch_user, &empty);
+        deliver_app_touch(&empty);
     }
 
     if (s_down)
@@ -835,8 +836,7 @@ static void poll_task(void *arg)
 
                 s_app_active = true;
 
-                if (s_app_touch)
-                    s_app_touch(s_app_touch_user, &f);
+                deliver_app_touch(&f);
 
                 if (edge)
                 {
@@ -893,11 +893,48 @@ static void poll_task(void *arg)
     }
 }
 
+#define APP_TOUCH_MAX 4
+static touch_app_touch_fn s_app_touch_extra[APP_TOUCH_MAX];
+static void *s_app_touch_extra_user[APP_TOUCH_MAX];
+
 void touch_set_app_touch(touch_app_touch_fn fn, void *user)
 {
     s_app_touch = fn;
     s_app_touch_user = user;
     s_app_active = false;
+}
+
+bool touch_add_app_touch(touch_app_touch_fn fn, void *user)
+{
+    if (!fn)
+        return false;
+
+    for (int i = 0; i < APP_TOUCH_MAX; i++)
+    {
+        if (s_app_touch_extra[i] == fn)
+            return true;                    /* already registered */
+
+        if (!s_app_touch_extra[i])
+        {
+            s_app_touch_extra[i] = fn;
+            s_app_touch_extra_user[i] = user;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/* Every registered consumer, in registration order. Only the one that owns the
+ * screen acts; the others check their own running state and return. */
+static void deliver_app_touch(const touch_frame_t *f)
+{
+    if (s_app_touch)
+        s_app_touch(s_app_touch_user, f);
+
+    for (int i = 0; i < APP_TOUCH_MAX; i++)
+        if (s_app_touch_extra[i])
+            s_app_touch_extra[i](s_app_touch_extra_user[i], f);
 }
 
 /* --- the raw-block dump -------------------------------------------------- */

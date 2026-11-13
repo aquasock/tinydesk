@@ -1074,7 +1074,8 @@ bool tama_register_command(void)
      * handler declines everything while the emulator is not running, which is
      * the same behaviour as being unregistered, without a window in which the
      * driver holds a pointer to something that has gone away. */
-    touch_set_app_touch(tama_app_touch, NULL);
+    if (!touch_add_app_touch(tama_app_touch, NULL))
+        ESP_LOGW(TAG, "touch consumer table full");
 
     return tdsh_register_command(&s_tama_cmd) == 0;
 }

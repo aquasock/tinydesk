@@ -5,11 +5,11 @@
 include("${CMAKE_CURRENT_LIST_DIR}/../../esp_idf/app/app.cmake")
 
 idf_component_register(
-    SRCS "link_twatch.c" "display.c" "touch.c" "pusher.c" "pwrkey.c" "charge.c" "nfc.c" "nfc_scan.cpp" "gps.c" "nmea.c" "ts_convert.c" "power.c" "rtc.c" "haptic.c" "sound.c" "wav.c" "font8x16.c" "tama.c" "tama_ui.c" ${TD_ESP_APP_SRCS}
+    SRCS "link_twatch.c" "display.c" "touch.c" "pusher.c" "pwrkey.c" "charge.c" "nfc.c" "nfc_scan.cpp" "gps.c" "nmea.c" "ts_convert.c" "power.c" "rtc.c" "haptic.c" "sound.c" "wav.c" "font8x16.c" "tama.c" "tama_ui.c" "nes.c" ${TD_ESP_APP_SRCS}
     EMBED_TXTFILES "${TD_BOARD_BUILTIN_CONF}"
     INCLUDE_DIRS "." "${TD_ESP_APP_DIR}"
     LDFRAGMENTS "extram.lf"
-    REQUIRES ${TD_ESP_APP_REQUIRES} st25r3916 tamacore esp_driver_spi esp_driver_i2c esp_driver_gpio
+    REQUIRES ${TD_ESP_APP_REQUIRES} st25r3916 tamacore nofrendo esp_driver_spi esp_driver_i2c esp_driver_gpio
              esp_driver_i2s esp_driver_uart esp_driver_usb_serial_jtag
 )
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Wextra -Werror)

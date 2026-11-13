@@ -66,6 +66,23 @@ bool touch_init(touch_input_fn input);
 void touch_set_app_touch(touch_app_touch_fn fn, void *user);
 
 /*
+ * ADD a consumer rather than replacing the one before it.
+ *
+ * There are now two apps that draw pixels -- the Tamagotchi and the NES -- and
+ * each needs the margins while it owns the screen. Only one can own it at a time,
+ * so both receivers are called and each decides for itself whether the frame is
+ * meant for it. That is why the two "set" functions above still exist (a single
+ * consumer is the simpler contract) and why this one is separate: replacing on
+ * registration meant the app that registered LAST silently disabled the other,
+ * which is a fault that would only appear once somebody launched the older app
+ * second.
+ *
+ * Returns false when the table is full. The limit is small and deliberate: a
+ * handful of screen-owning apps, not a general subscription mechanism.
+ */
+bool touch_add_app_touch(touch_app_touch_fn fn, void *user);
+
+/*
  * Capture raw report blocks for `seconds` and write them to /sd/touch.txt.
  *
  * A diagnostic, and it exists because multi-touch is UNMEASURED. The driver

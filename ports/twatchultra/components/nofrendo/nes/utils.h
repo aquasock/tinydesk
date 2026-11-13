@@ -7,7 +7,21 @@
 #else
 #include <stdio.h>
 #define LOG_PRINTF(level, x...) printf(x)
+/*
+ * IRAM_ATTR IS DEFINED ONLY WHEN NOTHING ELSE HAS, and this is the single line
+ * of upstream that this port had to change -- recorded here rather than left as
+ * a silent local edit.
+ *
+ * Upstream defines it as nothing, because on a bare build there is no such
+ * attribute. ESP-IDF defines it in `esp_attr.h` to place a function in IRAM, and
+ * the core's `utils.h` is included AFTER that header through nes.c, so the
+ * unconditional definition is a redefinition -- which `-Werror` turns into a
+ * build failure. Guarding it keeps upstream's intent (an empty macro when
+ * nothing defines it) and lets the platform's real definition win when it does.
+ */
+#ifndef IRAM_ATTR
 #define IRAM_ATTR
+#endif
 #define CRC32(a, b, c) (0)
 #endif
 
