@@ -35,6 +35,7 @@
 #include <string.h>
 
 #include "display.h"
+#include "font8x16.h"
 #include "edges.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -609,6 +610,405 @@ static uint8_t *load_rom(const char *path, int *out_len)
     return buf;
 }
 
+/* --- the d-pad, drawn into the rows the picture does not use -----------------
+ *
+ * The picture is 288x192 and top-aligned, which leaves 224 rows of framebuffer
+ * below it. That is where the d-pad goes: the Pokemon Mini has one and the
+ * watch has no hardware equivalent, so it has to exist on the glass for the
+ * console to be playable at all.
+ *
+ * DRAWN ONCE, NOT PER FRAME. Nothing about it changes while a cartridge runs, so
+ * it is pushed once at start rather than with every frame; the picture is 55,296
+ * pixels a frame and adding a static 28,224 would have cost about half again in
+ * SPI traffic for an image that never moves. That is why this is a separate
+ * picture push and not part of the blit callback.
+ *
+ * SINGLE-PIXEL WHITE OUTLINE, as asked for, so the shape can be judged and
+ * adjusted before anything depends on it. It is deliberately not filled: a solid
+ * cross would be a large white block on a black screen and would hide the
+ * boundary mistakes that a line drawing makes obvious.
+ *
+ * THE SHAPE IS A UNION OF TWO BARS with its twelve corners rounded, and the
+ * outline falls out of that rather than from hand-placed segments: a pixel is
+ * drawn when it is inside the rounded cross and at least one of its four
+ * neighbours is not. Every edge comes from that one rule, so the outline cannot
+ * disagree with itself at a corner.
+ *
+ * Geometry is a square of PM_DPAD_S with arms one third of it, vertically
+ * centred in the leftover rows and inset from the LEFT by the same amount as it
+ * is inset from the bottom. A 56-pixel arm is comfortably above the ~40 px a
+ * touch target wants.
+ *
+ * THE LEFT INSET IS DERIVED FROM THE BOTTOM ONE rather than written as 28. That
+ * is the operator's instruction -- the margin to the left edge should match the
+ * margin to the bottom edge -- and deriving it means the two stay matched if the
+ * d-pad is ever resized or the picture's height changes. Written as a literal it
+ * would silently stop being true the first time either moved.
+ *
+ * The cost is a large empty margin on the right, 124 px, which is intentional:
+ * the d-pad lives in the bottom-left corner and the space to its right is where
+ * the A, B and C cluster belongs once it is drawn.
+ */
+#define PM_DPAD_S    168
+#define PM_DPAD_ARM  (PM_DPAD_S / 3)
+#define PM_DPAD_Y    (PM_H * PM_SCALE +                                          \
+                      ((DISPLAY_H - PM_H * PM_SCALE) - PM_DPAD_S) / 2)        /* 220 */
+/* The margin the d-pad keeps from the left and bottom edges of the framebuffer,
+ * derived rather than written so the two stay equal if the d-pad moves. */
+#define PM_DPAD_MARGIN (DISPLAY_H - (PM_DPAD_Y + PM_DPAD_S))                     /* 28  */
+#define PM_DPAD_X      PM_DPAD_MARGIN
+
+/*
+ * COLOURS, TAKEN FROM THE MARGIN BUTTONS RATHER THAN CHOSEN HERE.
+ *
+ * The d-pad is furniture on the same glass as the twelve margin buttons, so it
+ * uses their palette: violet border, dark grey face, green arrows. The values are
+ * read from display_margin_colours() at draw time instead of being written as
+ * constants, so tuning the buttons moves the d-pad with them.
+ *
+ * All three are byte-order palindromic once byte-swapped by hand below, which is
+ * why the swap is done once per push rather than per pixel.
+ */
+static uint16_t s_dpad_edge;   /* outline  -- the buttons' border */
+static uint16_t s_dpad_face;   /* interior -- the buttons' face   */
+static uint16_t s_dpad_ink;    /* arrows   -- the buttons' label  */
+
+#define PM_VOID  0x0000u   /* outside the cross: left as the background */
+
+/*
+ * THE EIGHT ARM TIPS ARE ROUNDED AND THE FOUR INNER CORNERS ARE SHARP.
+ *
+ * That asymmetry is deliberate rather than unfinished. Rounding the inner
+ * corners was tried three ways and none of them looked right on the glass: an
+ * arc centred on the corner and added bulges into the notch; centred in the void
+ * and subtracted is tangent and removes almost nothing; centred on the corner
+ * and subtracted is the true mirror of a tip but eats three quarters of its disc
+ * from the reflex angle, so at any radius that reads well on the tips the inner
+ * corners look over-rounded. The operator's call was to leave them sharp, which
+ * is also the conventional d-pad shape -- the tips are what a thumb meets and
+ * the inner corners are where the eye wants a clean right angle.
+ *
+ * A TIP is rounded by putting an arc's centre r inside the material on both axes
+ * and cutting away everything in the r-by-r corner square that falls outside it.
+ *
+ * The table is what makes a wrong direction one entry rather than a wrong
+ * triangle in one corner, and it is the same table the inner corners will need
+ * if they are ever revisited. The direction fields point INTO the material.
+ *
+ * At r = 5 on a 168 px shape the effect is deliberately small: it takes the hard
+ * corner off without changing the silhouette.
+ */
+#define PM_DPAD_R 5
+
+typedef struct { int x, y, dx, dy; } dpad_corner_t;
+
+/* Arm tips. Four arms, two corners each. Cut: outside the arc. */
+static const dpad_corner_t s_tip[] = {
+    { 0,                    PM_DPAD_ARM,         +1, +1 },
+    { 0,                    2 * PM_DPAD_ARM - 1, +1, -1 },
+    { PM_DPAD_S - 1,        PM_DPAD_ARM,         -1, +1 },
+    { PM_DPAD_S - 1,        2 * PM_DPAD_ARM - 1, -1, -1 },
+    { PM_DPAD_ARM,          0,                   +1, +1 },
+    { 2 * PM_DPAD_ARM - 1,  0,                   -1, +1 },
+    { PM_DPAD_ARM,          PM_DPAD_S - 1,       +1, -1 },
+    { 2 * PM_DPAD_ARM - 1,  PM_DPAD_S - 1,       -1, -1 },
+};
+
+/* Is this point inside the sharp cross, before rounding? */
+static bool dpad_cross(int x, int y)
+{
+    if (x < 0 || y < 0 || x >= PM_DPAD_S || y >= PM_DPAD_S)
+        return false;
+
+    /* Horizontal bar spans the full width of the two middle thirds; vertical bar
+     * spans the full height of the two middle thirds. Their union is the cross. */
+    return (y >= PM_DPAD_ARM && y < 2 * PM_DPAD_ARM) ||
+           (x >= PM_DPAD_ARM && x < 2 * PM_DPAD_ARM);
+}
+
+static int dpad_lo(int c, int d) { return d > 0 ? c : c - PM_DPAD_R; }
+static int dpad_hi(int c, int d) { return d > 0 ? c + PM_DPAD_R : c; }
+
+static bool dpad_inside(int x, int y)
+{
+    bool in = dpad_cross(x, y);
+
+    for (size_t i = 0; i < sizeof(s_tip) / sizeof(s_tip[0]); i++)
+    {
+        const dpad_corner_t *c = &s_tip[i];
+
+        if (x < dpad_lo(c->x, c->dx) || x > dpad_hi(c->x, c->dx) ||
+            y < dpad_lo(c->y, c->dy) || y > dpad_hi(c->y, c->dy))
+            continue;
+
+        const int ox = c->x + c->dx * PM_DPAD_R;
+        const int oy = c->y + c->dy * PM_DPAD_R;
+        const int dx = x - ox, dy = y - oy;
+
+        if (dx * dx + dy * dy > PM_DPAD_R * PM_DPAD_R)
+            in = false;
+    }
+
+    return in;
+}
+
+/*
+ * THE FOUR ARROWS, at double size and placed in the arms.
+ *
+ * These are the same four characters the desktop's right column uses -- U+2190,
+ * U+2191, U+2192, U+2193, taken from the same 8x16 font -- so the watch's d-pad
+ * and its margin arrows read as one piece of furniture rather than two. Each is
+ * doubled to 16x32 by sampling every source pixel as a 2x2 block, which is the
+ * only scale that keeps an 8x16 glyph legible without inventing pixels: a
+ * non-integer scale would drop or double stems unevenly and a stem is one pixel
+ * wide at this size.
+ *
+ * Positions are centred in each arm, computed from PM_DPAD_ARM so they follow the
+ * arms if the d-pad is ever resized. The arms are PM_DPAD_ARM wide and this glyph
+ * is 32 tall at double size, which leaves 12 px of arm either side -- comfortably
+ * clear of the outline even with the 5 px corner rounding taking a bite.
+ */
+#define PM_ARROW_W 16
+#define PM_ARROW_H 32
+
+typedef struct { uint16_t cp; int x, y; } dpad_arrow_t;
+
+/* Arm centres. The arms are the OUTER thirds -- [0, A) and [2A, S) -- so their
+ * centres are A/2 and 5A/2, not A/2 and 3A/2. Using 3A/2 puts the glyph in the
+ * middle square instead of the arm, which is what the first version did: Up and
+ * Left landed correctly and Down and Right drew on top of each other in the
+ * centre. Both are computed from PM_DPAD_ARM so they follow the arms if the
+ * d-pad is resized. */
+#define PM_ARM_NEAR  (PM_DPAD_ARM / 2)
+#define PM_ARM_FAR   (5 * PM_DPAD_ARM / 2)
+
+static const dpad_arrow_t s_arrow[] = {
+    /* up */    { 0x2191, (PM_DPAD_S - PM_ARROW_W) / 2,        PM_ARM_NEAR - PM_ARROW_H / 2 },
+    /* down */  { 0x2193, (PM_DPAD_S - PM_ARROW_W) / 2,        PM_ARM_FAR  - PM_ARROW_H / 2 },
+    /* left */  { 0x2190, PM_ARM_NEAR - PM_ARROW_W / 2,        (PM_DPAD_S - PM_ARROW_H) / 2 },
+    /* right */ { 0x2192, PM_ARM_FAR  - PM_ARROW_W / 2,        (PM_DPAD_S - PM_ARROW_H) / 2 },
+};
+
+/* Is (x, y) ink in one of the arrows, in d-pad local coordinates? */
+static bool dpad_arrow_ink(int x, int y)
+{
+    for (size_t i = 0; i < sizeof(s_arrow) / sizeof(s_arrow[0]); i++)
+    {
+        const dpad_arrow_t *a = &s_arrow[i];
+        const int gx = x - a->x, gy = y - a->y;
+
+        if (gx < 0 || gy < 0 || gx >= PM_ARROW_W || gy >= PM_ARROW_H)
+            continue;
+
+        const uint8_t *rows = font8x16_glyph(a->cp);
+        if (!rows)
+            continue;
+
+        /* Doubling: every source pixel becomes a 2x2 block. */
+        const uint8_t bits = rows[gy / 2];
+
+        if (bits & (0x80 >> (gx / 2)))
+            return true;
+    }
+
+    return false;
+}
+
+/*
+ * THE OUTLINE IS TWO PIXELS, THE SAME AS THE MARGIN BUTTONS.
+ *
+ * `display.c` builds a button's border as the shape minus a copy of itself inset
+ * by BTN_BORDER, and BTN_BORDER is 2. The same construction is used here rather
+ * than a thicker one-pixel test, so the d-pad's edge has the same weight as the
+ * twelve buttons around it: the outline is every inside pixel whose 5x5
+ * neighbourhood is not entirely inside, which is a Chebyshev erosion by 2.
+ *
+ * A one-pixel test repeated twice would have been the obvious alternative and is
+ * not the same thing -- it thickens diagonals unevenly and leaves a notch at each
+ * of the rounded tips, which is exactly where the eye goes.
+ */
+#define PM_DPAD_LINE 2
+
+static bool dpad_core(int x, int y)
+{
+    for (int dy = -PM_DPAD_LINE; dy <= PM_DPAD_LINE; dy++)
+        for (int dx = -PM_DPAD_LINE; dx <= PM_DPAD_LINE; dx++)
+            if (!dpad_inside(x + dx, y + dy))
+                return false;
+
+    return true;
+}
+
+/* --- the two round action buttons -------------------------------------------
+ *
+ * Right of the d-pad, stacked vertically, sized to fill what is left with the
+ * same 28 px margin the d-pad keeps from the edges. The width is what binds: the
+ * gap between the d-pad's right edge and the framebuffer's right margin is 124 px,
+ * so a 28 px margin on each side leaves 68 for a circle, and 68 is the diameter.
+ *
+ * Vertically the pair occupies the d-pad's own band, 220..388. Two 68 px circles
+ * leave 32 px between them, which is wider than the outer margins -- unavoidable
+ * at this diameter, and it reads as two buttons rather than as a column.
+ *
+ * THEY CARRY A AND B, which is an assumption worth stating: the labels were not
+ * specified, and A and B are the two action buttons the console's own layout puts
+ * beside the d-pad. `C` is already a margin button on the right. If these are
+ * meant to be something else, the label table is the only thing to change.
+ */
+#define PM_PAD_D     68
+#define PM_PAD_X     (PM_DPAD_X + PM_DPAD_S + PM_DPAD_MARGIN)      /* 224 */
+#define PM_PAD_Y0    (PM_DPAD_Y)                                    /* 220 */
+#define PM_PAD_Y1    (PM_PAD_Y0 + PM_PAD_D + PM_PAD_GAP)            /* 320 */
+#define PM_PAD_GAP   ((PM_DPAD_S - 2 * PM_PAD_D))                   /* 32  */
+
+static const uint16_t s_pad_label[2] = { 'A', 'B' };
+
+static int pad_cy(int i) { return (i ? PM_PAD_Y1 : PM_PAD_Y0) + PM_PAD_D / 2; }
+static int pad_cx(void)  { return PM_PAD_X + PM_PAD_D / 2; }
+
+/* Inside a circle of radius (D-1)/2, measured in half-pixels so the disc is
+ * symmetric -- an even diameter has no centre pixel and an integer radius test
+ * would put the bias on one side. */
+static bool pad_inside(int i, int x, int y)
+{
+    const int dx2 = 2 * (x - pad_cx());
+    const int dy2 = 2 * (y - pad_cy(i));
+    const int rr = PM_PAD_D - 1;
+
+    return dx2 * dx2 + dy2 * dy2 <= rr * rr;
+}
+
+/* The letter, at double the font's size like the d-pad arrows. */
+static bool pad_label_ink(int i, int x, int y)
+{
+    const int cx = pad_cx(), cy = pad_cy(i);
+    const int gx = (x - cx) + PM_ARROW_W / 2;
+    const int gy = (y - cy) + PM_ARROW_H / 2;
+
+    if (gx < 0 || gy < 0 || gx >= PM_ARROW_W || gy >= PM_ARROW_H)
+        return false;
+
+    const uint8_t *rows = font8x16_glyph(s_pad_label[i]);
+    if (!rows)
+        return false;
+
+    return (rows[gy / 2] & (0x80 >> (gx / 2))) != 0;
+}
+
+/*
+ * One destination row of the d-pad. A pixel is on the outline when it is inside
+ * the rounded cross and at least one of its neighbours is not.
+ *
+ * EIGHT NEIGHBOURS, NOT FOUR, and the reason is the inner corners. An arc that
+ * merely grazes an edge -- which is exactly what a fillet tangent to two edges
+ * does -- leaves one pixel of the material edge removed and the pixel beyond it
+ * drawn, with nothing drawn beside it. On the four-neighbour rule that is an
+ * isolated white speck floating next to the outline: eight of them, two at each
+ * inner corner. Counting the diagonals merges each speck into the arc it belongs
+ * to. Measured on the shape: 640 pixels drawn and 8 specks on four neighbours,
+ * 684 drawn and none on eight. The line is a little thicker where it steps
+ * diagonally, which on a 168 px figure is not visible.
+ */
+/* The whole control cluster as one region: the d-pad plus the two circles to its
+ * right. One push, not two, because they are adjacent, they never change, and two
+ * windows would be two bus acquisitions and two transfers for one static image. */
+#define PM_CTL_X  PM_DPAD_X
+#define PM_CTL_Y  PM_DPAD_Y
+#define PM_CTL_W  (PM_PAD_X + PM_PAD_D - PM_DPAD_X)
+#define PM_CTL_H  PM_DPAD_S
+
+static void pm_dpad_row(void *ctx, int row, int col, uint16_t *dst, int n)
+{
+    (void)ctx;
+
+    for (int i = 0; i < n; i++)
+    {
+        /* Region-local, because that is what the row callback is given: `col`
+         * starts at the region's left edge, not the framebuffer's. */
+        const int x = col + i;
+        const int y = row;
+
+        uint16_t c = PM_VOID;
+
+        /* --- the d-pad, offset from the region origin ---------------------- */
+        const int dx0 = x - (PM_DPAD_X - PM_CTL_X);
+        const int dy0 = y - (PM_DPAD_Y - PM_CTL_Y);
+
+        if (dpad_inside(dx0, dy0))
+        {
+            /* Two-pixel outline: inside the shape but not inside its erosion. */
+            c = dpad_core(dx0, dy0) ? s_dpad_face : s_dpad_edge;
+
+            if (c == s_dpad_face && dpad_arrow_ink(dx0, dy0))
+                c = s_dpad_ink;
+        }
+
+        /* --- the two circles ----------------------------------------------
+         * Checked after the d-pad, but their regions do not overlap, so the
+         * order is only a tidiness. */
+        if (c == PM_VOID)
+        {
+            for (int b = 0; b < 2; b++)
+            {
+                /* pad_inside() works in framebuffer coordinates -- its centre
+                 * comes from pad_cx()/pad_cy() -- so the region offset is ADDED
+                 * back here rather than subtracted. */
+                const int px = x + PM_CTL_X;
+                const int py = y + PM_CTL_Y;
+
+                if (!pad_inside(b, px, py))
+                    continue;
+
+                /* Same two-pixel border rule as everything else: a pixel is
+                 * border when the disc does not survive a 2 px erosion. */
+                bool core = true;
+
+                for (int ey = -PM_DPAD_LINE; ey <= PM_DPAD_LINE && core; ey++)
+                    for (int ex = -PM_DPAD_LINE; ex <= PM_DPAD_LINE; ex++)
+                        if (!pad_inside(b, px + ex, py + ey))
+                        {
+                            core = false;
+                            break;
+                        }
+
+                c = core ? s_dpad_face : s_dpad_edge;
+
+                if (c == s_dpad_face && pad_label_ink(b, px, py))
+                    c = s_dpad_ink;
+
+                break;
+            }
+        }
+
+        dst[i] = c;
+    }
+}
+
+/* Push the d-pad. Safe to call more than once -- it overwrites the same region --
+ * which is what makes `pm dpad` useful for adjusting the shape without a
+ * restart. Requires the pixels to be claimed. */
+static bool pm_draw_dpad(void)
+{
+    if (!display_pixels_claimed())
+        return false;
+
+    /* Fetched per draw, not cached at init: display_margin_colours() reads the
+     * terminal palette, which is populated during display_init() and could move
+     * if that ever gains themes. */
+    uint16_t fill, edge, ink;
+    display_margin_colours(&fill, &edge, &ink);
+
+    /* The panel wants each 16-bit pixel high byte first, and this port's other
+     * picture paths hand over pre-swapped values. The margin painters build their
+     * own through display_swap16(); these three are swapped here, once. */
+    s_dpad_face = display_swap16(fill);
+    s_dpad_edge = display_swap16(edge);
+    s_dpad_ink  = display_swap16(ink);
+
+    return display_picture_rows(NULL, PM_CTL_X, PM_CTL_Y,
+                                PM_CTL_W, PM_CTL_H, pm_dpad_row);
+}
+
 /* --- the margin buttons ----------------------------------------------------
  *
  * WHAT THE GLASS SAYS WHILE A POKEMON MINI IS RUNNING.
@@ -749,6 +1149,10 @@ bool pmini_start(const char *rom_path)
     /* Labels first, then the single paint that shows them. */
     pm_label_margins();
     display_margins_set(DISPLAY_MARGINS_APP);
+
+    /* Once. Nothing else is writing yet -- the blitter task does not exist. */
+    if (!pm_draw_dpad())
+        ESP_LOGW(TAG, "d-pad push refused");
 
     s_frame = xSemaphoreCreateCounting(PM_TICK_BACKLOG, 0);
     if (!s_frame)
@@ -1060,6 +1464,35 @@ static int cmd_pm(tdsh_session_t *session, int argc, char **argv)
         return 0;
     }
 
+    if (strcmp(sub, "dpad") == 0)
+    {
+        /* Redraw the d-pad in place. Safe while a cartridge runs: it overwrites
+         * only its own region, and the display layer holds the bus per band and
+         * programs each window inside that hold, so two pushers interleave
+         * without either landing in the wrong rectangle. */
+        const bool ran = s_run;
+
+        if (!ran)
+        {
+            display_pixels_claim(true);
+            display_fill(0x0000);
+            display_margins_set(DISPLAY_MARGINS_APP);
+        }
+
+        const bool ok = pm_draw_dpad();
+        printf("pm dpad %s -- %dx%d at (%d,%d)\n",
+               ok ? "drawn" : "PUSH REFUSED", PM_CTL_W, PM_CTL_H,
+               PM_CTL_X, PM_CTL_Y);
+
+        if (!ran)
+        {
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            display_margins_set(DISPLAY_MARGINS_DESKTOP);
+            display_pixels_claim(false);
+        }
+        return ok ? 0 : 1;
+    }
+
     if (strcmp(sub, "pattern") == 0)
     {
         /* Nothing here touches the emulator: this draws a 1-pixel border and an
@@ -1163,13 +1596,13 @@ static int cmd_pm(tdsh_session_t *session, int argc, char **argv)
         return 0;
     }
 
-    printf("usage: pm start [rom] | pm stop | pm status | pm pattern | pm bench [rom] [frames]\n");
+    printf("usage: pm start [rom] | pm stop | pm status | pm dpad | pm pattern | pm bench [rom] [frames]\n");
     return 2;
 }
 
 static const tdsh_command_t s_pm_cmd = {
     "pm",
-    "pm start [rom] | pm stop | pm status | pm pattern | pm bench [rom] [frames]",
+    "pm start [rom] | pm stop | pm status | pm dpad | pm pattern | pm bench [rom] [frames]",
     "Run a Pokemon Mini cartridge on the screen",
     cmd_pm,
     TDSH_CMD_INTERACTIVE,

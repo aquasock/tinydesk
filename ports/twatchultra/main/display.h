@@ -220,6 +220,14 @@ void display_margin_label(int col, int index, const char *text);
 void display_margin_btn_label(int index, const char *text);
 
 /*
+ * The colours the margin buttons are painted with: face, border and label.
+ * Any pointer may be NULL. For an app drawing its own controls on the
+ * framebuffer, so its furniture matches the margins rather than approximating
+ * them.
+ */
+void display_margin_colours(uint16_t *fill, uint16_t *edge, uint16_t *label);
+
+/*
  * Compare the framebuffer against the cell grid, and the grid against what the
  * painter believes it has drawn.
  *

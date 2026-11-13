@@ -1526,6 +1526,23 @@ void display_margin_label(int col, int index, const char *text)
 }
 
 /*
+ * The margin buttons' own colours, so an app drawing on the framebuffer can
+ * match them instead of writing the same three numbers again.
+ *
+ * A COPY OF THE SAME CONSTANTS, not a parallel palette: these are the values
+ * paint_buttons() and paint_column() use, so a change to the buttons moves the
+ * app's furniture with them. Writing 0x58CB into pm.c would have worked today
+ * and silently diverged the first time the border was tuned -- the same drift
+ * edges.h exists to prevent for geometry.
+ */
+void display_margin_colours(uint16_t *fill, uint16_t *edge, uint16_t *label)
+{
+    if (fill)  *fill  = COL_FILL;
+    if (edge)  *edge  = COL_EDGE;
+    if (label) *label = label_fg();
+}
+
+/*
  * Relabel one bottom-strip bar, and repaint the strip.
  *
  * The strip is repainted whole rather than per bar: it is one window, one bus
