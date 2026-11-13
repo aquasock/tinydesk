@@ -1554,6 +1554,46 @@ bool display_picture_rgb(void *user, int x, int y, const uint16_t *pixels, int w
 }
 
 /*
+ * Paint the whole framebuffer one colour, in one go.
+ *
+ * This exists for the difference between an app that draws a PICTURE and one
+ * that owns the SCREEN. A blit only writes the rectangle it is given, so
+ * everything the desktop painter left in the framebuffer around that rectangle
+ * stays there -- and the moment ownership is claimed, the painter stops, so
+ * nothing will ever overwrite it. On the glass that reads as an app floating on
+ * top of the console it was launched from: the pet is drawn correctly and the
+ * shell's text is still legible around it. Clearing the framebuffer is the
+ * missing half of taking the screen.
+ *
+ * WHAT IT DOES NOT TOUCH, deliberately: the glass outside the framebuffer. The
+ * three button bars and the two key columns live in the panel's margins, in
+ * controller coordinates, and are painted once by paint_buttons() and
+ * paint_column() at init rather than by the cell painter. So they cost nothing
+ * here and survive a full-screen app -- which is the intended behaviour: the
+ * margins are the watch's controls, not the desktop's, and an app that covers
+ * the desktop should not also disable them.
+ *
+ * Same locking as display_picture_rgb(): the lock covers the framebuffer write
+ * and is released before flush_rect(), which uses s_tx and the SPI bus. Safe
+ * only for a caller that has already claimed the pixels, because with
+ * ownership set the painter takes its notification and returns without touching
+ * s_tx (DSP-001, DSP-005).
+ */
+bool display_fill(uint16_t colour)
+{
+    if (!s_fb)
+        return false;
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (size_t i = 0; i < (size_t)DISPLAY_W * DISPLAY_H; i++)
+        s_fb[i] = colour;
+    xSemaphoreGive(s_lock);
+
+    flush_rect(0, 0, DISPLAY_W, DISPLAY_H);
+    return true;
+}
+
+/*
  * Test patterns, so the blit can be checked on its own.
  *
  * A bitmap that arrives wrong is indistinguishable from a bitmap that was wrong

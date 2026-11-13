@@ -108,6 +108,24 @@ void display_pixels_claim(bool on);
 bool display_pixels_claimed(void);
 
 /*
+ * Paint the whole framebuffer one colour and push it.
+ *
+ * The other half of claiming the screen. A blit only writes the rectangle it is
+ * given, so whatever the desktop painter left in the framebuffer outside it
+ * stays -- and once ownership is claimed, nothing will ever overwrite it. On
+ * the glass that is the app sitting on top of the console it was launched
+ * from, with the shell's text still legible around the picture.
+ *
+ * The glass margins are untouched: the button bars and key columns live outside
+ * the framebuffer in controller coordinates and are painted once at init, so
+ * the watch's own controls keep working while an app owns the screen.
+ *
+ * Call ONLY after display_pixels_claim(true) -- the painter must not be using
+ * s_tx when this flushes (DSP-001, DSP-005).
+ */
+bool display_fill(uint16_t colour);
+
+/*
  * Compare the framebuffer against the cell grid, and the grid against what the
  * painter believes it has drawn.
  *

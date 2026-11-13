@@ -246,6 +246,36 @@ bool tama_start(const char *rom_path)
      * believes are on the glass and the console bleeds through the pet. */
     display_pixels_claim(true);
 
+    /*
+     * THEN CLEAR THE FRAMEBUFFER, because claiming the screen is not the same
+     * as owning what is on it.
+     *
+     * The blit below only writes the 300x308 rectangle the emulator draws into.
+     * Everything the painter had already put in the rest of the 320x416
+     * framebuffer -- the shell's text, the window frame -- stays exactly where
+     * it was, and once ownership is claimed nothing will ever overwrite it. So
+     * without this the pet appears on top of the console it was launched from,
+     * which is what the operator saw.
+     *
+     * Black rather than the emulator's bezel colour by coincidence: both are
+     * 0x0000, so the frame blends into the screen and only the LCD's lit dots
+     * show. The glass margins are not touched -- the buttons live outside the
+     * framebuffer and are painted by display_init() -- so the watch's controls
+     * keep working while the guest has the screen.
+     */
+    if (!display_fill(0x0000))
+    {
+        display_pixels_claim(false);
+        tmc_free(s_m);
+        heap_caps_free(s_frame);
+        heap_caps_free(s_rom);
+        s_m = NULL;
+        s_frame = NULL;
+        s_rom = NULL;
+        printf("no framebuffer\n");
+        return false;
+    }
+
     s_frames = 0;
     s_blits = 0;
     s_run = true;
