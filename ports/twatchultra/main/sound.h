@@ -16,6 +16,8 @@
 #define TWATCH_SOUND_H
 
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 
 /*
  * Raise the amplifier's rail and start an I2S output; false when the rail or
@@ -65,5 +67,29 @@ void sound_stop(void);
 
 /* True while a file is playing. */
 bool sound_is_playing(void);
+
+/*
+ * A continuous PCM stream, for an app that synthesises audio as it runs.
+ *
+ * Unlike sound_play_wav() these never block the caller and never touch the
+ * filesystem, so they are safe to call from a frame loop with a millisecond of
+ * slack. `rate` must be the generator's own output rate or the pitch is wrong.
+ *
+ * sound_stream_write() takes MONO samples and duplicates them to both slots;
+ * it returns how many frames were accepted and silently drops the remainder
+ * when the DMA ring is full. Dropping is deliberate: the alternative is
+ * blocking the caller for the drain time, which for one video frame of audio is
+ * 13.9 ms and would cost more than every other optimisation in this port put
+ * together. The frame loop should carry on and let the tick go missing.
+ *
+ * sound_stream_open() returns false when there is no amplifier, so an app can
+ * treat audio as best-effort and keep drawing either way.
+ */
+bool sound_stream_open(int rate);
+size_t sound_stream_write(const int16_t *mono, int frames);
+void sound_stream_close(void);
+
+/* Frames dropped since the stream opened, for a status line. */
+uint32_t sound_stream_dropped(void);
 
 #endif

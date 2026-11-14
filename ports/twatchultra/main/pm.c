@@ -43,6 +43,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "sound.h"
 #include "tdsh.h"
 #include "touch.h"
 
@@ -82,6 +83,48 @@ extern unsigned long g_exec_count;
 /* A double, because every use of it is in a rate or a percentage. */
 #define PM_FRAME_HZ       ((double)PM_CLOCK_HZ / PM_FRAME_CYCLES) /* 71.97 */
 #define PM_FRAME_US       (((int64_t)PM_FRAME_CYCLES * 1000000) / PM_CLOCK_HZ)  /* 13,894 */
+
+/* Samples one frame needs at the core's own output rate, which MinxAudio.h
+ * fixes at MINX_AUDIOFREQ 44100. The product overflows 32 bits on the way, so
+ * the cast is load-bearing: 44100 * 55575 is 2,450,857,500. 612.7 truncates to
+ * 612, and that fractional remainder is what `pm sbench` deliberately does not
+ * model -- it prices synthesis, not clock discipline. */
+#define PM_AUDIO_HZ         44100
+#define PM_SAMPLES_PER_FRAME \
+    ((int)(((int64_t)PM_AUDIO_HZ * PM_FRAME_CYCLES) / PM_CLOCK_HZ))
+
+/* More sub-slices than this and the frame budget is spent on slicing rather
+ * than on sound; the ceiling exists so a mistyped argument cannot thrash the
+ * core with one timer read per instruction. */
+#define PM_SBENCH_MAX_SLICES 64
+
+/* The generator's output for one frame, in internal RAM.
+ *
+ * SHARED BY `pm sbench` AND THE LIVE LOOP, which is safe because sbench refuses
+ * to run while the emulator is running: the two are never alive together. It is
+ * here rather than in PSRAM because it is written and read once per sub-slice on
+ * the emulator's own core, and 1.2 KB is cheap next to the 512 KB cartridge
+ * already saturating PSRAM.
+ *
+ * Sized for a whole frame, which is the largest single chunk any slice count can
+ * ask for. */
+static int16_t s_pcm[PM_SAMPLES_PER_FRAME + 1];   /* the +1 is the 613th */
+
+/* How many sub-slices a frame is emulated in. Each slice samples the console's
+ * timer registers once and turns that one reading into `chunk` samples, so this
+ * is the pitch resolution: one slice quantises every note change to a whole
+ * frame (13.9 ms), sixteen brings it to 0.87 ms.
+ *
+ * MEASURED ON THE WATCH (pm sbench, pinball, 200 frames):
+ *
+ *   N=1   12.209 ms/frame total, 0.188 synthesis
+ *   N=4   12.175 ms/frame total, 0.130 synthesis
+ *   N=16  12.314 ms/frame total, 0.251 synthesis
+ *
+ * against a 13.893 ms budget, so sixteen slices cost about 0.4 ms and leave
+ * 1.6 ms of headroom. The fidelity is therefore nearly free and there is no
+ * reason to start low; this is tunable by ear after that. */
+#define PM_AUDIO_SLICES 16
 
 #define PM_W              96
 #define PM_H              64
@@ -149,6 +192,13 @@ static uint8_t *s_dot[PM_VBUF_N];
 static QueueHandle_t s_free_q;      /* indices: available to render */
 static QueueHandle_t s_filled_q;    /* indices: rendered, waiting to be sent */
 static TaskHandle_t s_blit_task;
+
+/* True when the amplifier came up and the frame loop should synthesise. Best
+ * effort by design: a watch with no working speaker still runs the emulator. */
+static bool s_audio;
+
+/* Sample-carry for the fractional frame rate. See where it is used. */
+static int64_t s_aud_acc;
 static volatile bool s_blit_run;
 static int s_cur;                   /* the buffer the emulator is writing */
 static volatile uint32_t s_blits, s_blit_skipped, s_blit_same;
@@ -519,8 +569,83 @@ static void pm_task(void *arg)
 
         /* Fixed cycle slices, so emulated time advances at the machine's own
          * frame rate whatever the host manages. One frame per wake. */
+        /* ONE FRAME, IN SLICES, WITH THE CONSOLE'S OWN AUDIO ALONGSIDE IT.
+         *
+         * The slice boundaries are computed by fraction rather than as
+         * PM_FRAME_CYCLES / N, because 55,575 does not divide by sixteen: the
+         * truncating form would run 55,568 cycles and lose seven per frame,
+         * which is a slow drift rather than a rounding detail. The same applies
+         * to the sample count, where 612 / 16 truncates to 38 and would emit 608
+         * samples a frame -- a flat four-sample-per-frame shortfall that shows up
+         * as a pitch that sags the longer the game runs.
+         *
+         * Synthesis is interleaved rather than done once at the end of the frame
+         * because MinxAudio_GetSamplesS16() reads the timer registers once per
+         * call: one call a frame quantises every note change to 13.9 ms. */
         const int64_t te0 = esp_timer_get_time();
-        PokeMini_EmulateCycles(PM_FRAME_CYCLES);
+
+        /* HOW MANY SAMPLES THIS FRAME OWES, CARRIED EXACTLY.
+         *
+         * One frame is 612.7 samples at 44.1 kHz and the frame rate is not a
+         * divisor of the sample rate, so a fixed 612 loses 0.7 samples a frame.
+         * That is 50 samples a second -- a silent shortfall, not a rounding
+         * detail -- and the 93 ms DMA ring hides it for about eighty seconds
+         * before the first underrun clicks. Left unfixed it presents as "the
+         * sound goes wrong after a minute or two", which is about the worst
+         * possible shape for a bug that is really a two-line integer problem.
+         *
+         * The accumulator is in cycle units so it never drifts: the numerator is
+         * exact and the remainder carries to the next frame, giving 613, 612,
+         * 613... averaging exactly 612.7.
+         */
+        int n_samples;
+
+        if (s_audio)
+        {
+            s_aud_acc += (int64_t)PM_AUDIO_HZ * PM_FRAME_CYCLES;
+            n_samples = (int)(s_aud_acc / PM_CLOCK_HZ);
+            s_aud_acc -= (int64_t)n_samples * PM_CLOCK_HZ;
+        }
+        else
+        {
+            n_samples = PM_SAMPLES_PER_FRAME;
+        }
+
+        for (int sl = 0; sl < PM_AUDIO_SLICES; sl++)
+        {
+            const int cyc0 = (int)(((int64_t)PM_FRAME_CYCLES * sl) / PM_AUDIO_SLICES);
+            const int cyc1 = (int)(((int64_t)PM_FRAME_CYCLES * (sl + 1)) / PM_AUDIO_SLICES);
+
+            PokeMini_EmulateCycles(cyc1 - cyc0);
+
+            /* Synthesise into the frame's buffer at this slice's offset, but do
+             * NOT hand it to I2S yet. See the single write after the loop. */
+            if (s_audio)
+            {
+                const int s0 = (n_samples * sl) / PM_AUDIO_SLICES;
+                const int s1 = (n_samples * (sl + 1)) / PM_AUDIO_SLICES;
+
+                MinxAudio_GetSamplesS16(s_pcm + s0, s1 - s0);
+            }
+        }
+
+        /* ONE WRITE PER FRAME, NOT ONE PER SLICE.
+         *
+         * This was sixteen writes a frame and cost 1.4 ms -- measured, not
+         * guessed: emu read 13.7 ms running against 12.3 ms in `pm sbench`,
+         * which synthesised the same samples but called no I2S at all. The
+         * driver takes a lock and inspects the DMA on every call, so sixteen a
+         * frame is sixteen times that overhead for no benefit: the ring does not
+         * care whether samples arrive in one lump or sixteen.
+         *
+         * Slicing still matters for PITCH -- each GetSamplesS16() samples the
+         * timer registers once, so the slices are what keep a note change from
+         * being quantised to a whole frame. That is synthesis-side and is
+         * unaffected by when the buffer is flushed.
+         */
+        if (s_audio)
+            sound_stream_write(s_pcm, n_samples);
+
         const int64_t te1 = esp_timer_get_time();
         s_emu_us += te1 - te0;
 
@@ -1554,6 +1679,31 @@ bool pmini_start(const char *rom_path)
 
     PokeMini_Reset(0);
 
+    /*
+     * AUDIO, BEFORE THE FRAME LOOP EXISTS.
+     *
+     * ChangeEngine() is mandatory and easy to miss: nothing in the core calls it,
+     * so SoundEngine stays MINX_AUDIO_DISABLED and MinxAudio_GetSamplesS16()
+     * hands back zeros without doing any work. That failure is silent in both
+     * senses -- no sound, and no cost -- which is exactly the kind of thing that
+     * reads as "audio is cheap" when it is really "audio is off".
+     *
+     * GENERATED, not EMULATED. The EMULATED and DIRECT engines set
+     * RequireSoundSync, which makes Hardware.c call MinxAudio_Sync() from inside
+     * the instruction loop, and that path runs MinxAudio_GetEmulated() once PER
+     * SAMPLE -- two integer divisions the LX7 has no instruction for. GENERATED
+     * calls it once per chunk and leaves the instruction loop untouched.
+     *
+     * Volume is deliberately NOT set here: the cartridge writes 0x71 itself and
+     * that write path (Hardware.c) is live regardless of the engine.
+     */
+    s_aud_acc = 0;
+    s_audio = sound_stream_open(PM_AUDIO_HZ);
+    if (s_audio)
+        MinxAudio_ChangeEngine(MINX_AUDIO_GENERATED);
+    else
+        printf("pm: no audio (amplifier did not come up)\n");
+
     /* The screen, claimed before the first push. A failed claim must not leave
      * the emulator running against a framebuffer it does not own. */
     display_pixels_claim(true);
@@ -1714,6 +1864,12 @@ fail:
     }
     if (s_prev) { heap_caps_free(s_prev); s_prev = NULL; }
     if (s_frame) { vSemaphoreDelete(s_frame); s_frame = NULL; }
+    if (s_audio)
+    {
+        sound_stream_close();
+        MinxAudio_ChangeEngine(MINX_AUDIO_DISABLED);
+        s_audio = false;
+    }
     display_pixels_claim(false);
     PokeMini_Destroy();
     heap_caps_free(s_rom);
@@ -1744,6 +1900,17 @@ void pmini_stop(void)
 
     if (s_task)
         ESP_LOGE(TAG, "emulator task did not stop");
+
+    /* After the task, so nothing can write to the stream while it is being
+     * taken away. Both halves are needed: closing the stream restores the
+     * beep's rate, and clearing the engine stops the core making samples that
+     * nobody will read. */
+    if (s_audio)
+    {
+        sound_stream_close();
+        MinxAudio_ChangeEngine(MINX_AUDIO_DISABLED);
+        s_audio = false;
+    }
 
     /*
      * THE BLITTER GOES NEXT, BEFORE THE POOL IT READS.
@@ -1863,6 +2030,17 @@ static int cmd_pm(tdsh_session_t *session, int argc, char **argv)
         printf("    pushes=%u identical=%u skipped=%u\n",
                (unsigned)s_blits, (unsigned)s_blit_same, (unsigned)s_blit_skipped);
 
+        /* Audio is best-effort, so it reports its own state rather than being
+         * inferred from "the game should be making noise". `dropped` is the
+         * number of samples the DMA ring refused: a few is inaudible, a count
+         * that climbs with frames means the producer is outrunning the output
+         * rate and the ring is the wrong shape. */
+        if (s_audio)
+            printf("    audio %d Hz, %u drops\n", PM_AUDIO_HZ,
+                   (unsigned)sound_stream_dropped());
+        else
+            printf("    audio off\n");
+
         /* WHAT RATE THE CARTRIDGE ACTUALLY DRAWS AT.
          *
          * The 71.97 Hz counter is the machine's tick, not the picture rate. The
@@ -1879,6 +2057,63 @@ static int cmd_pm(tdsh_session_t *session, int argc, char **argv)
                " = %.1f Hz\n",
                (unsigned)PMR_PRC_RATE, (unsigned)match, divisor,
                (double)PM_FRAME_HZ / divisor);
+        return 0;
+    }
+
+    /* pm audio [on|off] -- A/B the audio cost with everything else running.
+     *
+     * This exists because the first estimate of what audio costs was wrong by
+     * 5x in the wrong direction: `pm sbench` priced synthesis at 0.25 ms, the
+     * live loop read 1.3 ms higher, and the difference was assumed to be the
+     * sixteen I2S writes a frame. Batching them into one saved 0.1 ms, which
+     * disproved that. Without a toggle the only way to find the real number is
+     * to build two firmwares, and that cannot separate "audio" from any other
+     * difference between the builds.
+     */
+    if (strcmp(sub, "audio") == 0)
+    {
+        if (argc < 3)
+        {
+            printf("pm: audio %s\n", s_audio ? "on" : "off");
+            return 0;
+        }
+
+        if (!s_run)
+        {
+            printf("pm: audio is set by pm start, and the emulator is not running\n");
+            printf("pm: (the engine has to be selected before the frame loop exists)\n");
+            return 1;
+        }
+
+        if (strcmp(argv[2], "off") == 0)
+        {
+            s_audio = false;
+            MinxAudio_ChangeEngine(MINX_AUDIO_DISABLED);
+            sound_stream_close();
+            printf("pm: audio off\n");
+        }
+        else if (strcmp(argv[2], "on") == 0)
+        {
+            s_aud_acc = 0;
+            s_audio = sound_stream_open(PM_AUDIO_HZ);
+            if (s_audio)
+                MinxAudio_ChangeEngine(MINX_AUDIO_GENERATED);
+            printf("pm: audio %s\n", s_audio ? "on" : "could not open");
+        }
+        else
+        {
+            printf("pm: audio [on|off]\n");
+            return 2;
+        }
+
+        /* Counters restart so the next `pm status` describes one condition
+         * rather than a blend of two. */
+        s_frames = 0;
+        s_misses = 0;
+        s_emu_us = 0;
+        s_blit_us = 0;
+        s_blits = 0;
+        s_started_us = esp_timer_get_time();
         return 0;
     }
 
@@ -2014,13 +2249,198 @@ static int cmd_pm(tdsh_session_t *session, int argc, char **argv)
         return 0;
     }
 
-    printf("usage: pm start [rom] | pm stop | pm status | pm dpad | pm pattern | pm bench [rom] [frames]\n");
+    /*
+     * pm sbench [rom] [frames] [N] -- what audio synthesis would cost.
+     *
+     * THE QUESTION. Audio is off, and turning it on has to fit inside the
+     * frame budget. The vendored core offers two ways to make samples and they
+     * are not close in price:
+     *
+     *   MINX_AUDIO_EMULATED / _DIRECT  MinxAudio_Sync() runs from inside the
+     *   instruction loop and calls MinxAudio_GetEmulated() PER SAMPLE. That
+     *   function does two integer divisions and this core has no divide
+     *   instruction, so it is the expensive one.
+     *
+     *   MINX_AUDIO_GENERATED  MinxAudio_GenerateEmulatedS16() calls
+     *   GetEmulated() ONCE for the whole chunk and then runs the sample loop on
+     *   a multiply-add-compare. It also leaves RequireSoundSync at 0, so the
+     *   instruction loop pays nothing.
+     *
+     * This measures the second one, and measures it three ways so the answer
+     * separates into the parts that can be acted on independently:
+     *
+     *   emu only        the frame with no slicing and no sound -- the baseline
+     *   sliced          the same frame split into N EmulateCycles() calls, with
+     *                   no synthesis. Isolates what the sub-frames cost.
+     *   sliced+synth    both. What the shipping loop would pay.
+     *   synth only      synthesis with no emulation. Isolates the samples.
+     *
+     * N matters because a bulk chunk samples the timer registers once, so one
+     * call per frame quantises every note change to 13.9 ms. More sub-slices
+     * means finer pitch and more synthesis calls, and this exists to price
+     * that trade rather than guess at it.
+     *
+     * NOTHING HERE TOUCHES I2S. The samples are written to a scratch buffer and
+     * thrown away, so this is the cost of making audio and not of delivering
+     * it -- delivery is a separate problem, and the one likely to matter more.
+     */
+    if (strcmp(sub, "sbench") == 0)
+    {
+        if (s_run)
+        {
+            printf("pm: stop the emulator first\n");
+            return 1;
+        }
+
+        const char *path = argc >= 3 ? argv[2] : PM_ROM_DEFAULT;
+        int n = argc >= 4 ? atoi(argv[3]) : 400;
+        int slices = argc >= 5 ? atoi(argv[4]) : 1;
+
+        if (slices < 1) slices = 1;
+        if (slices > PM_SBENCH_MAX_SLICES) slices = PM_SBENCH_MAX_SLICES;
+        if (n < 1) n = 1;
+
+        int len = 0;
+        uint8_t *rom = load_rom(path, &len);
+        if (!rom)
+            return 1;
+
+        if (!PokeMini_Create(0, 0))
+        {
+            heap_caps_free(rom);
+            printf("pm: PokeMini_Create failed\n");
+            return 1;
+        }
+        if (PokeMini_LoadBIOSFile(PM_BIOS_DEFAULT) <= 0 || PokeMini_FreeBIOS)
+        {
+            printf("pm: no retail BIOS at %s -- refusing to measure\n", PM_BIOS_DEFAULT);
+            PokeMini_Destroy();
+            heap_caps_free(rom);
+            return 1;
+        }
+
+        snprintf(s_bios, sizeof(s_bios), "retail");
+        PokeMini_SetMINMem(rom, len);
+
+        /* The bulk engine is selected explicitly: nothing in the core calls
+         * MinxAudio_ChangeEngine(), so it would otherwise stay DISABLED and
+         * MinxAudio_GetSamplesS16() would hand back zeros without doing any
+         * work -- a measurement that costs nothing because it does nothing. */
+        MinxAudio_ChangeEngine(MINX_AUDIO_GENERATED);
+
+        PokeMini_Reset(0);
+
+        /* VOLUME IS SET AFTER THE RESET, and the first version of this got it
+         * backwards: MinxAudio_Reset() memsets the whole TMinxAudio, so writing
+         * Volume before PokeMini_Reset() writes it into a struct that is about
+         * to be cleared. The symptom was a checksum of exactly zero. */
+        MinxAudio.Volume = MINX_AUDIO_MAX_VOL;
+        MinxAudio.PWMMul = 2;
+
+        PokeMini_EmulateCycles(PM_FRAME_CYCLES * 8);
+
+        /* What the generator itself sees, sampled once at the end. A frequency
+         * of zero means the cartridge is not playing at this point in its boot,
+         * so silence here is a fact about the game state and not about the
+         * arithmetic -- and the timing is still valid either way, because the
+         * per-sample work runs whether the sample is loud or zero. */
+        int gen_freq = 0, gen_pulse = 0;
+        MinxAudio_GetEmulated(&gen_freq, &gen_pulse);
+
+        const int chunk = PM_SAMPLES_PER_FRAME / slices;
+        int64_t t_emu = 0, t_slice = 0, t_slice_synth = 0, t_synth = 0;
+        int nz_synth = 0, nz_alone = 0;
+
+        /* 1. The frame, whole and silent. */
+        for (int i = 0; i < n; i++)
+        {
+            const int64_t t0 = esp_timer_get_time();
+            PokeMini_EmulateCycles(PM_FRAME_CYCLES);
+            t_emu += esp_timer_get_time() - t0;
+        }
+
+        /* 2. The same frame in N sub-slices, still silent. */
+        PokeMini_Reset(0);
+        PokeMini_EmulateCycles(PM_FRAME_CYCLES * 8);
+        for (int i = 0; i < n; i++)
+        {
+            const int64_t t0 = esp_timer_get_time();
+            for (int s = 0; s < slices; s++)
+                PokeMini_EmulateCycles(PM_FRAME_CYCLES / slices);
+            t_slice += esp_timer_get_time() - t0;
+        }
+
+        /* 3. Sliced and synthesised -- the shipping shape. */
+        PokeMini_Reset(0);
+        MinxAudio.Volume = MINX_AUDIO_MAX_VOL;
+        MinxAudio.PWMMul = 2;
+        PokeMini_EmulateCycles(PM_FRAME_CYCLES * 8);
+        for (int i = 0; i < n; i++)
+        {
+            const int64_t t0 = esp_timer_get_time();
+            for (int s = 0; s < slices; s++)
+            {
+                PokeMini_EmulateCycles(PM_FRAME_CYCLES / slices);
+                MinxAudio_GetSamplesS16(s_pcm, chunk);
+                for (int k = 0; k < chunk; k++)
+                    if (s_pcm[k]) nz_synth++;
+            }
+            t_slice_synth += esp_timer_get_time() - t0;
+        }
+
+        /* 4. Synthesis alone, the same number of samples and calls. */
+        for (int i = 0; i < n; i++)
+        {
+            const int64_t t0 = esp_timer_get_time();
+            for (int s = 0; s < slices; s++)
+            {
+                MinxAudio_GetSamplesS16(s_pcm, chunk);
+                for (int k = 0; k < chunk; k++)
+                    if (s_pcm[k]) nz_alone++;
+            }
+            t_synth += esp_timer_get_time() - t0;
+        }
+
+        /* THE DIVISOR IS (n * 1000), NOT (1000 / n). The timers are in
+         * microseconds and the answer wanted is milliseconds per frame, so it
+         * is us / n / 1000. The first version multiplied by 1000/n and reported
+         * eleven million milliseconds per frame, which is a thousand times the
+         * wall clock of the whole run and should have been impossible on sight. */
+        const double per = 1.0 / ((double)n * 1000.0);
+        const double total_ms = (double)t_slice_synth * per;
+
+        printf("pm sbench %s, bios %s, N=%d\n", path, s_bios, slices);
+        printf("    %d frames, %d samples/frame in %d chunk(s) of %d\n",
+               n, PM_SAMPLES_PER_FRAME, slices, chunk);
+        printf("    generator sees %d Hz, pulse %d\n", gen_freq, gen_pulse);
+        printf("    emu only            %7.3f ms/frame\n", (double)t_emu * per);
+        printf("    sliced              %7.3f ms/frame   (+%.3f slicing)\n",
+               (double)t_slice * per,
+               ((double)t_slice - (double)t_emu) * per);
+        printf("    sliced+synthesised  %7.3f ms/frame\n", total_ms);
+        printf("      synthesis         %7.3f ms/frame   <- the audio cost\n",
+               ((double)t_slice_synth - (double)t_slice) * per);
+        printf("    synthesis alone     %7.3f ms/frame   (no emulation)\n",
+               (double)t_synth * per);
+        printf("    budget %.3f ms -> %s, headroom %+.3f ms (%d/%d samples non-zero)\n",
+               (double)PM_FRAME_US / 1000.0,
+               total_ms < (double)PM_FRAME_US / 1000.0 ? "FITS" : "OVER",
+               (double)PM_FRAME_US / 1000.0 - total_ms,
+               nz_synth, n * slices * chunk);
+
+        MinxAudio_ChangeEngine(MINX_AUDIO_DISABLED);
+        PokeMini_Destroy();
+        heap_caps_free(rom);
+        return 0;
+    }
+
+    printf("usage: pm start [rom] | pm stop | pm status | pm dpad | pm pattern | pm bench [rom] [frames] | pm sbench [rom] [frames] [N]\n");
     return 2;
 }
 
 static const tdsh_command_t s_pm_cmd = {
     "pm",
-    "pm start [rom] | pm stop | pm status | pm dpad | pm pattern | pm bench [rom] [frames]",
+    "pm start [rom] | pm stop | pm status | pm dpad | pm pattern | pm bench [rom] [frames] | pm sbench [rom] [frames] [N]",
     "Run a Pokemon Mini cartridge on the screen",
     cmd_pm,
     TDSH_CMD_INTERACTIVE,

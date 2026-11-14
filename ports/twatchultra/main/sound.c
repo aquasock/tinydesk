@@ -525,6 +525,122 @@ bool sound_play_wav(const char *path)
     return true;
 }
 
+/* ------------------------------------------------------- live sample stream */
+
+/*
+ * A continuous PCM source, for an app that generates audio as it runs rather
+ * than playing a file.
+ *
+ * WHY THIS IS NOT sound_play_wav(). That one owns a task, reads from the
+ * filesystem and may block for the length of a track. This one never blocks the
+ * caller and never reads a file: it exists for an emulator frame loop that has
+ * about a millisecond of slack and cannot afford to wait for anything.
+ *
+ * THE WHOLE DESIGN IS THE ZERO TIMEOUT. i2s_channel_write() blocks until the
+ * DMA takes the samples, and the DMA only drains at the output rate: 613
+ * samples at 44.1 kHz is 13.9 ms of real time. Called from the frame loop that
+ * would be a stall longer than the entire frame budget, every frame, which is
+ * the single worst thing audio could do to this port. So the write timeout is 0
+ * and a full ring means the samples are DROPPED. A dropped sample is a tick; a
+ * stalled frame is a visible stutter, and the trade is not close.
+ *
+ * The ring is why dropping is rare rather than constant: sound_init() already
+ * builds four DMA buffers of 1024 frames, which at 44.1 kHz is 93 ms of audio
+ * queued ahead. A frame loop producing 13.9 ms per frame fills that in about
+ * six frames, so in steady state each write finds room.
+ *
+ * MONO IN, STEREO OUT. The generator produces one channel and the amplifier
+ * averages (L+R)/2, so a sample written to one slot is half amplitude. The
+ * caller's buffer is duplicated into both slots here rather than in the
+ * emulator, because the emulator's per-frame budget is the scarce thing.
+ */
+
+#define STREAM_FRAMES 1024        /* > one frame's 613, so a chunk always fits */
+
+static int16_t *s_stream;         /* PSRAM: touched once per frame, not per sample */
+static bool s_stream_open;
+static volatile uint32_t s_stream_drops;
+
+bool sound_stream_open(int rate)
+{
+    if (!s_tried && !sound_init())
+        return false;
+    if (!s_tx)
+        return false;
+
+    /* The rate comes from the generator, not from a constant: MinxAudio.h fixes
+     * its output at MINX_AUDIOFREQ 44100 and a mismatch here is a pitch shift of
+     * however wrong the ratio is, which sounds like a tuning fault rather than a
+     * configuration one. */
+    if (!set_std((uint32_t)rate, true))
+        return false;
+
+    if (!s_stream)
+    {
+        s_stream = (int16_t *)heap_caps_malloc(STREAM_FRAMES * 2 * sizeof(int16_t),
+                                               MALLOC_CAP_SPIRAM);
+        if (!s_stream)
+            return false;
+    }
+
+    s_stream_drops = 0;
+    s_stream_open = true;
+    return true;
+}
+
+/* Write `frames` mono samples. Returns how many were accepted; the rest were
+ * dropped because the ring was full. Never blocks. */
+size_t sound_stream_write(const int16_t *mono, int frames)
+{
+    if (!s_stream_open || !s_tx || !s_stream || frames <= 0)
+        return 0;
+
+    if (frames > STREAM_FRAMES)
+        frames = STREAM_FRAMES;
+
+    for (int i = 0; i < frames; i++)
+    {
+        s_stream[2 * i] = mono[i];
+        s_stream[2 * i + 1] = mono[i];
+    }
+
+    const size_t want = (size_t)frames * 2 * sizeof(int16_t);
+    size_t wrote = 0;
+
+    /* Timeout 0 by design -- see the note above. ESP_ERR_TIMEOUT here is the
+     * normal full-ring case and not a failure. */
+    i2s_channel_write(s_tx, s_stream, want, &wrote, 0);
+
+    const size_t got = wrote / (2 * sizeof(int16_t));
+
+    if (got < (size_t)frames)
+        s_stream_drops += (uint32_t)((size_t)frames - got);
+
+    return got;
+}
+
+void sound_stream_close(void)
+{
+    if (!s_stream_open)
+        return;
+
+    s_stream_open = false;
+
+    /* Back to the beep's own rate, or the next BEL is pitched wrong. */
+    set_std(SOUND_RATE_HZ, false);
+
+    if (s_stream)
+    {
+        heap_caps_free(s_stream);
+        s_stream = NULL;
+    }
+}
+
+uint32_t sound_stream_dropped(void)
+{
+    return s_stream_drops;
+}
+
 /* The terminal's BEL. The user pointer exists because the vterm's callbacks all
  * carry one; the beep does not need it. */
 void sound_bell(void *user)
