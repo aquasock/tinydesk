@@ -24,6 +24,7 @@
 
 #include "display.h"
 #include "edges.h"
+#include "gamepad.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -893,6 +894,113 @@ static void nes_task(void *arg)
 
 /* --- start / stop --------------------------------------------------------- */
 
+/*
+ * THE ON-GLASS CONTROLS, AND WHY THEY SIT WHERE THEY DO.
+ *
+ * The picture owns rows 0..239 from the top-align in entry 89, so the controls
+ * have rows 240 to the bottom of the glass -- 217 rows, being 457 minus 240,
+ * where 457 is DISPLAY_PANEL_H less the framebuffer's 45-row origin. The shapes
+ * are the Pokemon Mini's own, at its own sizes, because the operator asked for
+ * that furniture rather than a second design: a 168 px d-pad and two 84 px
+ * circles. They fit without shrinking, and the arithmetic that shows it is worth
+ * keeping because it is the whole reason no compromise was made.
+ *
+ * Vertically the d-pad is centred in the band, (217 - 168) / 2 = 24, so it runs
+ * 264..431. Its ROTATED bounding box is smaller than its 168 px frame -- the
+ * rotated half-extent is 84 * sqrt(2) / 1.5 plus a row for the border, 81 -- so
+ * what is actually painted spans fb 267..429 vertically and 35..197
+ * horizontally. Every pixel of it is inside the framebuffer.
+ *
+ * The circles stack at 84 each with the Pokemon Mini's 32 px gap, 200 rows, so
+ * they start at 240 + (217 - 200) / 2 = 248 and end at 447: nine rows clear of
+ * the glass. Their base column is x 224, which is the Pokemon Mini's own value;
+ * the d-pad's right edge is 199, so the nearest circle keeps 25 px of gap and the
+ * far edge lands at 308 with 11 px to the wall at 319.
+ *
+ * KEEPING EVERYTHING INSIDE THE FRAMEBUFFER IS A DELIBERATE SIMPLIFICATION and it
+ * has a cost that must be paid at the sides rather than in the middle: the upper
+ * band of the push is framebuffer-wide because the side columns occupy the glass
+ * outside it. Nothing here reaches past fb 319, so that band clips nothing.
+ */
+#define NES_GLASS_BOT   (DISPLAY_PANEL_H - DISPLAY_ORIGIN_Y)              /* 457 */
+#define NES_CTL_Y       (NES_SCREEN_HEIGHT)                              /* 240 */
+#define NES_CTL_BAND    (NES_GLASS_BOT - NES_CTL_Y)                      /* 217 */
+
+#define NES_DPAD_S      168
+#define NES_DPAD_X      NES_OX                                           /* 32  */
+#define NES_DPAD_Y      (NES_CTL_Y + (NES_CTL_BAND - NES_DPAD_S) / 2)    /* 264 */
+
+#define NES_PAD_D       84
+#define NES_PAD_GAP     32
+#define NES_PAD_X       224
+#define NES_PAD_Y       (NES_CTL_Y + (NES_CTL_BAND - (2 * NES_PAD_D + NES_PAD_GAP)) / 2)
+
+#define NES_COL_SLOTS   3
+
+/* Bottom row of the last drawn column slot. Derived the way edges.h derives its
+ * own slots, so a change to COL_N moves this rather than leaving it stale. */
+#define NES_COL_BOT     (COL_Y0 + (NES_COL_SLOTS * (COL_Y1 - COL_Y0 + 1)) / COL_N - 1)
+
+static const gamepad_t s_gp = {
+    .cx = NES_DPAD_X + NES_DPAD_S / 2,
+    .cy = NES_DPAD_Y + NES_DPAD_S / 2,
+    .size = NES_DPAD_S,
+    /* Rotated 45 degrees clockwise, matching the Pokemon Mini. cos(45) in 16.16
+     * fixed point: exactly representable, so the shape is identical run to run. */
+    .rot_k = 46341,
+    .line = 2,          /* the margin buttons' own border weight */
+    .tip_r = 5,
+
+    .pad_cx = { NES_PAD_X + NES_PAD_D / 2, NES_PAD_X + NES_PAD_D / 2 },
+    .pad_cy = { NES_PAD_Y + NES_PAD_D / 2,
+                NES_PAD_Y + NES_PAD_D + NES_PAD_GAP + NES_PAD_D / 2 },
+    .pad_d = { NES_PAD_D, NES_PAD_D },
+    .pad_label = { 'A', 'B' },
+
+    .bg = 0x0000,
+    .grid = 0,          /* black, as the Pokemon Mini settled on */
+};
+
+/*
+ * Two pushes, not one rectangle, for the reason pm.c records at length: above the
+ * side columns' last button the only safe width is the framebuffer's, because the
+ * columns occupy the glass outside it and a full-width rectangle there cuts the
+ * third button in half. Below their last button the whole glass is free.
+ *
+ * The region's origin has to travel with the push, since each band starts at a
+ * different framebuffer column and a missing y offset once drew every shape 102
+ * rows too low.
+ */
+static bool nes_draw_controls(void)
+{
+    if (!display_pixels_claimed())
+        return false;
+
+    /* Read at draw time rather than cached, so the controls cannot drift from the
+     * twelve margin buttons they sit beside. Swapped once here: the panel wants
+     * each 16-bit pixel high byte first. */
+    uint16_t fill, edge, ink;
+    display_margin_colours(&fill, &edge, &ink);
+
+    const uint16_t face = display_swap16(fill);
+    const uint16_t e = display_swap16(edge);
+    const uint16_t i = display_swap16(ink);
+
+    gamepad_t g = s_gp;
+    g.bg = 0x0000;
+    g.grid_line = 0;
+
+    bool ok = true;
+
+    ok = gamepad_paint(&g, 0, NES_CTL_Y, DISPLAY_W,
+                       NES_COL_BOT - NES_CTL_Y + 1, face, e, i) && ok;
+
+    ok = gamepad_paint(&g, -DISPLAY_ORIGIN_X, NES_COL_BOT + 1, DISPLAY_PANEL_W,
+                       NES_GLASS_BOT - (NES_COL_BOT + 1), face, e, i) && ok;
+
+    return ok;
+}
+
 bool nes_start(const char *rom_path)
 {
     if (s_task)
@@ -993,20 +1101,49 @@ bool nes_start(const char *rom_path)
     }
 
     display_margins_set(DISPLAY_MARGINS_APP);
+    display_margin_column_slots(NES_COL_SLOTS);
 
-    /* The labels, in the app's own terms. The bottom strip is the NES pad rather
-     * than the pet's three buttons, and the right column is its D-pad. */
+    /*
+     * THE LABELS NOW DESCRIBE WHAT IS ON THE GLASS, WHICH CHANGED BECAUSE THE
+     * CONTROLS ARE DRAWN.
+     *
+     * The bottom strip used to read B, A, Start and the right column Left, Right,
+     * Up, Down -- because the margins WERE the pad. A drawn d-pad and drawn A and
+     * B circles take both jobs, so those legends are now describing a second set
+     * of the same buttons, and PM's answer is the one that reads correctly: the
+     * strip goes blank and the columns carry only what has no drawn equivalent.
+     *
+     * A BLANK IS A SINGLE SPACE, NOT NULL. `display_margin_label()` treats a NULL
+     * or empty string as "clear the override and fall back to the shared table",
+     * so the two NULLs that used to be here restored the OTHER app's words on
+     * slots this app meant to leave empty -- the same fault entry 77 chased on the
+     * Pokemon Mini, where the desktop's labels survived in the spare slots and the
+     * operator read one as "Supe". A space is a real label that renders as
+     * nothing, which is what a bare slot actually is.
+     *
+     * The strip is blanked through the same override channel, because `edges.h`
+     * hands every bottom bar the same degree glyph and this app does not want it.
+     */
     display_margin_label(0, 0, "Pause");
     display_margin_label(0, 1, "Reset");
     display_margin_label(0, 2, "Save");
-    display_margin_label(0, 3, NULL);
-    display_margin_label(0, 4, NULL);
+    display_margin_label(0, 3, " ");
+    display_margin_label(0, 4, " ");
 
-    display_margin_label(1, 0, "Hold");
-    display_margin_label(1, 1, "Left");
-    display_margin_label(1, 2, "Right");
-    display_margin_label(1, 3, "Up");
-    display_margin_label(1, 4, "Down");
+    display_margin_label(1, 0, "Start");
+    display_margin_label(1, 1, "Select");
+    display_margin_label(1, 2, " ");
+    display_margin_label(1, 3, " ");
+    display_margin_label(1, 4, " ");
+
+    for (int i = 0; i < BTN_N; i++)
+        display_margin_btn_label(i, " ");
+
+    /* The controls last, so they land on a cleared framebuffer rather than under
+     * whatever the console left there. Failure is logged rather than fatal: a
+     * refusal here means ownership was lost, and the emulator should still start. */
+    if (!nes_draw_controls())
+        ESP_LOGW(TAG, "controls not drawn -- push refused?");
 
     s_frames = 0;
     s_dropped = 0;
