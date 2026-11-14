@@ -25,6 +25,7 @@
 #include "link.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "display.h"
@@ -291,6 +292,97 @@ static const tdsh_command_t s_dcheck_cmd = {
     TDSH_CMD_INTERACTIVE,
 };
 
+
+/* --- vbus: is the USB port delivering power? -------------------------------
+ *
+ * THE QUESTION THIS EXISTS TO ANSWER, AND WHY IT COMES FIRST.
+ *
+ * A bus-powered USB-C headphone DAC takes its 5 V from its host. If this
+ * watch's USB-C port is wired as a device only -- which the board notes suggest,
+ * since the port appears under "taken by the board" with nothing said about
+ * sourcing -- then a DAC plugged into it is dead on arrival, and no amount of
+ * USB host stack changes that. VBUS is therefore the first thing to establish,
+ * and it needs no USB host driver, no USB PHY handover and no console
+ * switching: the PMU already measures it, and reading a register cannot break
+ * anything.
+ *
+ * `vbus 40` samples the AXP2101 every 250 ms for 40 s into /sd/vbus.log. THE
+ * FILE IS THE RECORD AND THE SCREEN IS NOT, because the operator unplugs the
+ * watch from the PC partway through and the console goes with it. Registers
+ * 0x00..0x02 are the PMU's own status words (VBUS presence among them) and
+ * 0x34/0x35 are battery millivolts, logged as a self-check: if the battery
+ * reads about 4,170 mV then the I2C path is sound and anything the status
+ * words say can be believed.
+ *
+ * Registers 0x15/0x16 are logged raw because this port has never read them and
+ * their meaning on the AXP2101 is not asserted here -- if one of them turns out
+ * to be VBUS millivolts, the log will show it rising when a source appears.
+ */
+static int cmd_vbus(tdsh_session_t *session, int argc, char **argv)
+{
+    (void)session;
+
+    int secs = argc >= 2 ? atoi(argv[1]) : 40;
+
+    if (secs < 1)
+        secs = 1;
+    if (secs > 300)
+        secs = 300;
+
+    FILE *f = fopen("/sd/vbus.log", "w");
+
+    if (!f)
+    {
+        printf("vbus: cannot open /sd/vbus.log\n");
+        return 1;
+    }
+    fprintf(f, "t,st0,st1,st2,vh,vl,bat_mv\n");
+    fclose(f);
+
+    printf("vbus: sampling %d s -> /sd/vbus.log\n", secs);
+    printf("vbus: unplug from the PC now, then plug the DAC in\n");
+
+    for (int i = 0; i < secs * 4; i++)
+    {
+        uint8_t s0 = 0, s1 = 0, s2 = 0, vh = 0, vl = 0, bh = 0, bl = 0;
+
+        board_pmu_read(0x00, &s0);
+        board_pmu_read(0x01, &s1);
+        board_pmu_read(0x02, &s2);
+        board_pmu_read(0x15, &vh);
+        board_pmu_read(0x16, &vl);
+        board_pmu_read(0x34, &bh);
+        board_pmu_read(0x35, &bl);
+
+        const unsigned bat = (unsigned)(((bh & 0x3F) << 8) | bl);
+
+        f = fopen("/sd/vbus.log", "a");
+        if (f)
+        {
+            fprintf(f, "%d,%u,%u,%u,%u,%u,%u\n", i, (unsigned)s0, (unsigned)s1,
+                    (unsigned)s2, (unsigned)vh, (unsigned)vl, bat);
+            fclose(f);
+        }
+
+        if ((i & 3) == 0)
+            printf("vbus %3ds st0=%02X st1=%02X st2=%02X bat=%umV\n",
+                   i / 4, (unsigned)s0, (unsigned)s1, (unsigned)s2, bat);
+
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+
+    printf("vbus: done -- replug the PC and read /sd/vbus.log\n");
+    return 0;
+}
+
+static const tdsh_command_t s_vbus_cmd = {
+    "vbus",
+    "vbus [seconds]",
+    "Sample AXP2101 VBUS/status into /sd/vbus.log",
+    cmd_vbus,
+    TDSH_CMD_INTERACTIVE,
+};
+
 static const tdsh_command_t s_pattern_cmd = {
     "pattern",
     "pattern [0|1|2|off|stats]",
@@ -447,6 +539,9 @@ bool link_init(void)
 
     if (!gps_register_command())
         ESP_LOGW(TAG, "gps command did not register");
+
+    if (tdsh_register_command(&s_vbus_cmd) != 0)
+        ESP_LOGW(TAG, "vbus command did not register");
 
     if (tdsh_register_command(&s_pattern_cmd) != 0)
         ESP_LOGW(TAG, "pattern command did not register");

@@ -750,6 +750,75 @@ static void ui_task(void *arg)
 
       /* Keep ROM / early-boot output off the USB port, which belongs to the
  * desktop (see sdkconfig.defaults). */
+
+/*
+ * The SSH server at boot, when the board asks for it.
+ *
+ * WHY THIS IS NOT A STARTUP SCRIPT. tdsh runs ~/.tdshrc.tdsh from
+ * tdsh_espidf_init(), which happens BEFORE the Wi-Fi driver is initialised --
+ * so "ssh start" there fails with "no network interface is connected" and
+ * "wificonnect" fails because the driver does not exist yet. Both were measured
+ * on the watch. A shell script also has no sleep and no loop, so it cannot wait
+ * for the link to come up.
+ *
+ * WHY A TASK RATHER THAN A POLL. telnet_poll() runs once per pass of the
+ * console read loop, which only iterates when a byte arrives -- fine for a
+ * service that is started by hand, useless for one that must come up on its
+ * own. This task polls the network policy instead, starts the server once, and
+ * exits, so it costs nothing after boot.
+ *
+ * GATED BY NVS, like Telnet: the key "ssh" in the "tinydesk" namespace, unset
+ * by default, so this changes nothing on a board that has not asked for it.
+ * The server itself still refuses to start unless the root password has been
+ * changed (tdsh_remote_access_ready()), which is the existing safety rule and
+ * is not bypassed here.
+ */
+#define SSH_BOOT_WAIT_MS   1000
+#define SSH_BOOT_TRIES     60
+
+static void ssh_boot_task(void *arg)
+{
+    (void)arg;
+
+    /* Up to a minute for Wi-Fi. A board with no saved network never gets here
+     * at all, and one whose network is slow gets the full window. */
+    for (int i = 0; i < SSH_BOOT_TRIES; i++)
+    {
+        if (tdsh_network_is_online())
+        {
+            int rc = tdsh_ssh_set_running(true);
+            ESP_LOGI("ssh-boot", "server %s", rc == 0 ? "started" : "refused");
+            vTaskDelete(NULL);
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(SSH_BOOT_WAIT_MS));
+    }
+
+    ESP_LOGW("ssh-boot", "no network after %d s; not starting", SSH_BOOT_TRIES);
+    vTaskDelete(NULL);
+}
+
+static void ssh_boot_start(void)
+{
+    /* A BOARD SETTING, not an NVS key: this is the same kind of thing as
+     * usb.host and bt.enable, it lives in the same file the operator already
+     * edits, and "board set ssh.autostart 1" is how it is turned on. Unset
+     * means off, so no other board changes behaviour. */
+    const char *v = tdsh_board_get("ssh.autostart");
+
+    if (!v || (v[0] != '1' && v[0] != 'y' && v[0] != 'Y'))
+        return;
+    if (!tdsh_remote_access_ready())
+    {
+        ESP_LOGW("ssh-boot", "root password not changed; not starting");
+        return;
+    }
+
+    if (xTaskCreate(ssh_boot_task, "sshboot", 3072, NULL, 4, NULL) != pdPASS)
+        ESP_LOGW("ssh-boot", "no task");
+}
+
+
 static void quiet_usb_port(void)
 {
     esp_rom_install_channel_putc(2, NULL);   /* ROM printf: not on USB... */
@@ -864,4 +933,5 @@ void app_main(void)
     if (esp_timer_create(&ok, &s_ok_timer) == ESP_OK)
         esp_timer_start_once(s_ok_timer, 30 * 1000000LL);
     telnet_start();   /* remote desktop on port 23 (TinyDesk Shell login) */
+    ssh_boot_start(); /* the SSH server, if the board is configured for it */
 }
