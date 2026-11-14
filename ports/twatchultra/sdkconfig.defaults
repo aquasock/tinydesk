@@ -39,7 +39,13 @@ CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_QUAD=y
 CONFIG_SPIRAM_TYPE_AUTO=y
-CONFIG_SPIRAM_SPEED_80M=y
+# FLASH MUST MATCH. esp32s3/mspi_timing_tuning_configs.h asserts it:
+# "FLASH and PSRAM Mode configuration are not supported" -- the two module
+# clocks are checked against each other at compile time, so PSRAM at 120 MHz
+# with flash at 80 does not build. The flash here is a Winbond W25Q128JV,
+# JEDEC EF 40 18, which is rated to 133 MHz, so 120 is inside spec.
+CONFIG_SPIRAM_SPEED_120M=y
+CONFIG_ESPTOOLPY_FLASHFREQ_120M=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
@@ -171,32 +177,37 @@ CONFIG_FATFS_API_ENCODING_UTF_8=y
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 
 # --- Caches ----------------------------------------------------------------
-# 16 KB instruction cache, the default, and it is a DELIBERATE REVERT.
+# 32 KB instruction cache, and this one was reverted once before it was earned.
 #
-# The case for 32 KB was real and measured: the 6502 interpreter is 21,175 bytes
-# and runs from flash, so a 16 KB I-cache cannot hold it and the loop evicts
-# itself. Doubling it took the NES interpreter from 14,420 to 12,389 us/frame,
-# which is where the audio headroom came from.
+# THE CASE FOR IT. The 6502 interpreter is 21,175 bytes of code and lives at
+# 0x42112754, which is IROM -- it runs in place from flash. A 16 KB instruction
+# cache cannot hold it, so the hottest function in the emulator evicted itself
+# on every pass and the whole inner loop ran at flash speed.
 #
-# IT COSTS 16,384 BYTES OF INTERNAL RAM, AND THAT IS MORE THAN THE BOARD HAS TO
-# SPARE. Internal free went 76,599 -> 59,531, which is below the 65,536 that
-# tdsh's SSH server refuses to start below -- and SSH is how this port is
-# developed now that the USB console is wanted free. Measured both ways on
-# 2026-11-13: at 32 KB `ssh start` reports "insufficient internal RAM (24007
-# bytes free; need at least 65536)", at 16 KB the server starts and answers
-# SSH-2.0-wolfSSHv1.5.0 on port 22.
+# WHY IT WAS REVERTED. It costs 16,384 bytes of internal RAM, and on
+# 2026-11-13 that was the exact amount that put the board below the 65,536 tdsh's
+# SSH server refuses to start under. Measured both ways at the time: 32 KB gave
+# 59,531 free and `ssh start` reported "insufficient internal RAM", 16 KB gave
+# 76,599 and the server answered SSH-2.0-wolfSSHv1.5.0 on port 22.
 #
-# So the trade is 2,031 us of NES interpreter against a working network shell,
-# and the shell wins: the NES still holds 60 fps either way, while without SSH
-# the only way onto the board is the USB console, which is the same port a USB
-# headset would need.
+# WHY IT IS BACK. The RAM was recovered elsewhere rather than conceded: the two
+# diagnostic buffers (pm pattern's 6,144 and nes convbench's 8,192) moved off
+# static storage, which is worth 15,176 bytes measured. With that done the
+# interpreter fits inside both the RAM budget and the SSH floor -- 69,611 free
+# with the cache at 32 KB, server starting, and a full ECDSA key exchange
+# completing against it.
 #
-# Revisit if internal RAM is ever recovered elsewhere -- 21,175 bytes of
-# interpreter against a 16 KB cache is a genuine mismatch and the 32 KB setting
-# is the right one the moment it fits.
-# CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB is not set
-CONFIG_ESP32S3_INSTRUCTION_CACHE_16KB=y
-CONFIG_ESP32S3_INSTRUCTION_CACHE_SIZE=0x4000
+# MEASURED, 2026-11-13, Zelda, `nes start <rom> noblit`:
+#     80 MHz PSRAM, 16 KB cache   13,374 us/frame
+#    120 MHz PSRAM, 16 KB cache   12,138 us/frame
+#    120 MHz PSRAM, 32 KB cache   11,311 us/frame
+# The cache is worth 2,031 us at 80 MHz flash but only 827 at 120, which is the
+# same effect measured twice: the cache exists to avoid fetching code from
+# flash, and a 50 percent faster flash makes each miss cheaper to avoid. Neither
+# number is wrong; the second is the one that applies to this configuration.
+CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
+# CONFIG_ESP32S3_INSTRUCTION_CACHE_16KB is not set
+CONFIG_ESP32S3_INSTRUCTION_CACHE_SIZE=0x8000
 
 # --- Flash mode ------------------------------------------------------------
 # Quad I/O, not the DIO default.
