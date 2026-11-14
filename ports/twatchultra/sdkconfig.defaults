@@ -133,3 +133,25 @@ CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM=16
 CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FATFS_MAX_LFN=255
 CONFIG_FATFS_API_ENCODING_UTF_8=y
+
+# --- Optimisation ----------------------------------------------------------
+# -O2, NOT -Og. Every emulator number this port recorded for its first months
+# was measured with CONFIG_COMPILER_OPTIMIZATION_DEBUG, which is ESP-IDF's
+# default and is chosen to make a debugger useful rather than to make an
+# emulator keep up. Nothing marked it as a decision, so it went unnoticed.
+#
+# Switching to -O2 on 2026-11-13 took the Pokemon Mini core from 81.6 to 117.9
+# fps unpaced, cut emulation per frame from 13.5 to 9.6 ms, and raised the
+# frame-budget headroom from 0.4 to 4.3 ms. The NES, which had been parked at 51
+# fps, holds 60. The image is also 13 KB smaller.
+#
+# SAME RULE AS THE FAT SETTINGS ABOVE: this lives here, not only in sdkconfig,
+# because sdkconfig is gitignored and a clean checkout would silently rebuild at
+# -Og and lose all of it. An existing sdkconfig must be deleted for a change
+# here to take effect.
+#
+# ONE COST, and it is why ports/twatchultra/CMakeLists.txt demotes
+# -Werror=format-truncation: above -Og, GCC inlines far enough to see the
+# destination size of two snprintf() calls in tdsh's prompt builders and fails
+# the build on a truncation that cannot actually corrupt anything.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y

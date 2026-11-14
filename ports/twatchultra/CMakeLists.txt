@@ -54,6 +54,32 @@ else()
     set(PROJECT_VER "0.4.0")
 endif()
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+
+#
+# ONE DIAGNOSTIC IS DEMOTED FOR THE WHOLE BUILD, AND ONLY BECAUSE OF -O2.
+#
+# The firmware is built at -O2 (CONFIG_COMPILER_OPTIMIZATION_PERF). Above -Og,
+# GCC inlines far enough to see the destination size of two snprintf() calls in
+# tdsh's prompt builders, and -Werror=all then turns -Wformat-truncation into a
+# build failure. Neither site is a memory-safety fault: snprintf() bounds the
+# write by construction, so the worst case is a truncated prompt, which is
+# cosmetic and visible on the glass.
+#
+# IT IS SET HERE RATHER THAN IN THE COMPONENT because tdsh is a submodule pinned
+# to upstream (tinydesk-project/tinydesk-shell), and this fork publishes to
+# aquasock only. Editing the submodule would either make the build depend on a
+# commit nobody else can fetch, or require pushing to a repository this project
+# must not push to. The parent is also where the -O2 decision lives, so the
+# exception belongs beside it.
+#
+# SCOPE AND COST: this is build-wide, so a genuine truncation anywhere would be
+# demoted to a warning rather than an error. It still prints -- it is invisible
+# in the build log only if nobody reads it -- and the alternative, raising those
+# prompt buffers to a theoretical 603 bytes each, spends internal RAM that this
+# board does not have.
+#
+idf_build_set_property(COMPILE_OPTIONS "-Wno-error=format-truncation" APPEND)
+
 project(tinydesk)
 
 # No terminal-size polling (TD_SIZE_POLL_MS=0, see main/project_include.cmake).
