@@ -22,19 +22,32 @@
 
 /* Where the picture lands on the panel.
  *
- * 1x, letterboxed, centred. The NES is 256x240 in a 320x416 framebuffer, so this
- * is 46 percent of the panel with black bars around it -- and it is the only
- * option that is PIXEL-PERFECT, because any scale between 1x and 2x on a 256-wide
- * image either drops or doubles columns unevenly. A sprite that is two pixels
- * wide in one place and three in another reads as a rendering bug to a player,
- * which is why integer scaling is the right default and why upscaling is a
- * separate decision rather than an obvious improvement.
+ * 1x, TOP-ALIGNED. The NES is 256x240 in a 320x416 framebuffer, so this is 46
+ * percent of the panel with black bars around it -- and it is the only option
+ * that is PIXEL-PERFECT, because any scale between 1x and 2x on a 256-wide image
+ * either drops or doubles columns unevenly. A sprite that is two pixels wide in
+ * one place and three in another reads as a rendering bug to a player, which is
+ * why integer scaling is the right default and why upscaling is a separate
+ * decision rather than an obvious improvement.
+ *
+ * THE PICTURE SITS AT ROW 0, and it was centred at row 88 until it was not.
+ * The reason is the same one pm.h records for the Pokemon Mini: the eye tracks
+ * the top of a small screen, and a 240-row picture floating between two equal
+ * bands of dead space reads as badly framed. Centring also splits the space
+ * that is left into two unusable halves, where top-aligning gives the whole
+ * 176 rows below the picture to the controls that belong there -- the same
+ * trade the Pokemon Mini made when its picture moved to row 0 and its d-pad
+ * took the room underneath.
+ *
+ * THIS ONLY CHANGES WHAT IS VISIBLE, NOT WHAT IS ACCEPTABLE. The 45-degree
+ * chamfers on the glass cut the corners, so a picture pushed up cannot lose an
+ * edge: row 0 of the framebuffer is panel row 45, well inside the chamfer.
  *
  * ODD OFFSETS WOULD COST, and do not here: (320-256)/2 is 32, a multiple of the
  * 4-byte SPI alignment, so a row copy stays aligned. A board with an odd margin
  * would be slower for no visible benefit. */
 #define NES_OX ((320 - 256) / 2)
-#define NES_OY ((416 - 240) / 2)
+#define NES_OY 0
 
 /*
  * Start the emulator from `rom_path`, or NES_ROM_DEFAULT when NULL.
