@@ -256,6 +256,82 @@ static const int16_t *s_aud_buf;/* the APU's own output buffer, once found */
 static int16_t s_pcm[NES_AUD_MAX];
 
 /*
+ * STALL INSTRUMENTATION, AND WHY `dropped` COULD NOT ANSWER THIS.
+ *
+ * Reported by ear, twice, as "a maybe one-second bursty underrun region in the
+ * startup music", while every counter read clean: 61 fps, skipped=0, and
+ * `sound_stream_write()` never short so /sd/nes_audio.log stayed empty. The
+ * samples were being handed over and accepted; the sound still gapped.
+ *
+ * `dropped` looked like it correlated and does not mean what its name says. In
+ * the behind-branch below, `next = now` REBASES the deadline, so a stall of one
+ * second increments `dropped` by exactly one -- the same increment as a 17 ms
+ * overrun. It reports that a stall happened, never how long it lasted, and a
+ * duration is the only thing that distinguishes a glitch from a starved ring.
+ *
+ * So this measures the wall time between consecutive loop iterations. A healthy
+ * iteration is 16,667 us whether it sleeps or spins; anything past the threshold
+ * is a lost interval, and while the loop is lost nothing is produced, so the
+ * DMA ring -- four descriptors of 1023 frames, 92 ms at 44,172 Hz, with
+ * auto_clear_after_cb padding with zeros -- runs dry and is refilled with
+ * silence. That is what a sub-second dropout sounds like.
+ *
+ * The duration is the point. It separates the two candidates that produce the
+ * same silence: a stall of a few hundred ms that starves the ring (fix the
+ * stall), against a gap with no stall logged at all (the ring is draining
+ * faster than it is being filled, so the fault is the clock).
+ *
+ * NO I/O IN THE FRAME LOOP, AND THAT IS THE THIRD CORRECTION THIS MEASUREMENT
+ * NEEDED. The first version appended each event to /sd/nes_stall.log from
+ * inside the loop. Writing the SD card takes milliseconds and this task is
+ * pinned to the core that owns the card, so every logged event delayed the
+ * next frame, which produced another event, which wrote again -- a positive
+ * feedback loop wearing the fault's clothes. The arithmetic gave it away: 144
+ * `gap` lines and 56 `late` lines is exactly the 200-line cap, the log stopped
+ * dead, and the run went back to 60 fps the moment the writes ceased. So the
+ * 144 stalls are the instrument measuring itself, not a board fault.
+ *
+ * Events now go into a RAM ring and are dumped on demand by `nes stalls`. The
+ * frame loop touches no filesystem at all, which is also why the audio path's
+ * own drop log was left where it is: it fires only on a refused write, and a
+ * refused write is already a fault worth recording.
+ *
+ * `emu_us` is carried beside each gap because a slow frame and an unscheduled
+ * frame look identical from the outside and want opposite fixes: if emulation
+ * itself took the extra time the fault is contention, and if it did not the
+ * task was not running.
+ */
+#define NES_STALL_US     20000        /* over one frame period; below this is pacing jitter */
+#define NES_STALL_RING   128          /* events kept in RAM; no cap on counting */
+
+static uint32_t s_stalls;             /* intervals lost, for `nes status` */
+static uint32_t s_aud_zero;           /* writes that accepted NOTHING */
+static int64_t  s_gap_max;            /* worst interval since start */
+
+/* A ring, not a file: the loop must not block on the SD card. */
+typedef struct
+{
+    uint32_t frame;
+    int32_t  gap_us;      /* wall time between iterations */
+    int32_t  emu_us;      /* what the emulator itself took in that iteration */
+    uint8_t  late;        /* 1 = from the behind-branch, 0 = interval */
+} stall_rec_t;
+
+static stall_rec_t s_stall_ring[NES_STALL_RING];
+static uint32_t s_stall_head;         /* total recorded, ring index = head % N */
+
+static void stall_note(uint8_t late, int64_t gap_us, int64_t emu_us)
+{
+    stall_rec_t *r = &s_stall_ring[s_stall_head % NES_STALL_RING];
+
+    r->frame  = s_frames;
+    r->gap_us = (int32_t)(gap_us > 0x7FFFFFFF ? 0x7FFFFFFF : gap_us);
+    r->emu_us = (int32_t)(emu_us > 0x7FFFFFFF ? 0x7FFFFFFF : emu_us);
+    r->late   = late;
+    s_stall_head++;
+}
+
+/*
  * CUMULATIVE counters, and the last-second figures above are not enough.
  *
  * This cycle wasted a measurement on exactly that: the conversion was changed
@@ -646,9 +722,29 @@ static void nes_task(void *arg)
     int64_t fps_deadline = next + 1000000;
     uint32_t fps_frames = 0;
     uint32_t acc_emu = 0, acc_blit = 0;
+    int64_t iter_prev = 0;
+    int64_t iter_prev_emu = 0;   /* emulation time of the previous iteration */
 
     while (s_run)
     {
+        /* HOW LONG WAS THE LOOP GONE? Measured at the top of the iteration, so
+         * it spans the emulation, the audio write, the pacing delay and any
+         * time the task was never scheduled at all -- which is the case a frame
+         * duration cannot see and this one can. */
+        {
+            const int64_t iter_now = esp_timer_get_time();
+            const int64_t gap = iter_prev ? (iter_now - iter_prev) : 0;
+
+            if (gap > s_gap_max)
+                s_gap_max = gap;
+
+            if (gap > NES_STALL_US)
+            {
+                s_stalls++;
+                stall_note(0, gap, iter_prev_emu);
+            }
+            iter_prev = iter_now;
+        }
         if (s_paused)
         {
             /* Nothing stepped, nothing drawn, but the loop stays alive so a
@@ -673,6 +769,11 @@ static void nes_task(void *arg)
 
         nes_emulate(true);
 
+        /* What the emulator itself took, carried to the next iteration so a
+         * logged gap can say whether the time went into emulation or the task
+         * simply was not running. */
+        iter_prev_emu = esp_timer_get_time() - t0;
+
         /* Synthesise this frame's samples and hand them to the DAC. The write
          * never blocks -- see sound_stream_write(): a full ring drops samples
          * rather than stalling the frame loop, which matters here because the
@@ -694,7 +795,21 @@ static void nes_task(void *arg)
                     s_pcm[i] = s_aud_buf[i];
 
             const uint32_t before = sound_stream_dropped();
-            sound_stream_write(s_pcm, n);
+            const size_t took = sound_stream_write(s_pcm, n);
+
+            /* A WRITE THAT ACCEPTED NOTHING is the other way sound vanishes and
+             * it leaves no trace in `drops`: that counter is written only when
+             * SOME samples were refused. Zero accepted is a hard boundary -- the
+             * ring was full at the instant of the call -- so it is counted
+             * separately and named in the same log. */
+            if (took == 0)
+            {
+                s_aud_zero++;
+
+                /* Recorded in the RAM ring like every other event. This was a
+                 * second fopen() in the loop and is gone for the same reason. */
+                stall_note(2, 0, iter_prev_emu);
+            }
 
             /* WHEN, not how many. A total says the ring refused something; the
              * frame number says whether that was a startup transient or a
@@ -740,7 +855,21 @@ static void nes_task(void *arg)
              * a burst moves the game further ahead of the wall clock, not less,
              * and the visible result is a stutter followed by a speed-up. */
             if (now - next > (int64_t)NES_FRAME_US)
+            {
                 s_dropped++;
+
+                /* EVERY ONE OF THESE IS RECORDED, whatever its size.
+                 *
+                 * `next` has already been advanced by one frame period above, so
+                 * this branch means the iteration overran by MORE than a frame --
+                 * about 33 ms. The interval log above fires at 20 ms, which left
+                 * the 33-to-50 ms band counted in `dropped` and absent from the
+                 * record, and that is exactly the band an earlier run fell into:
+                 * the counter moved twice while the file gained one entry. A
+                 * count with no durations beside it is what made the first two
+                 * hypotheses unfalsifiable. */
+                stall_note(1, now - next, spent);
+            }
 
             next = now;
         }
@@ -882,6 +1011,10 @@ bool nes_start(const char *rom_path)
     s_frames = 0;
     s_dropped = 0;
     s_fps = 0;
+    s_stalls = 0;
+    s_stall_head = 0;
+    s_aud_zero = 0;
+    s_gap_max = 0;
     display_push_stats_reset();
     s_blit_us_total = 0;
     s_blit_frames_total = 0;
@@ -913,6 +1046,14 @@ bool nes_start(const char *rom_path)
 
     {
         FILE *f = fopen("/sd/nes_audio.log", "w");
+        if (f)
+            fclose(f);
+    }
+
+    /* Removed on each start: the ring is in RAM and starts empty, but the old
+     * file may still be on the card and stale evidence is worse than none. */
+    {
+        FILE *f = fopen("/sd/nes_stall.log", "w");
         if (f)
             fclose(f);
     }
@@ -1166,6 +1307,29 @@ static int cmd_nes(tdsh_session_t *session, int argc, char **argv)
         return 0;
     }
 
+    if (argc >= 2 && strcmp(sub, "stalls") == 0)
+    {
+        /* Dump the RAM ring. Nothing is written to the card, on the reasoning
+         * recorded above the ring: the loop must not touch the filesystem, and
+         * this read happens on the shell's own task long after the event. */
+        const uint32_t n = s_stall_head < NES_STALL_RING ? s_stall_head : NES_STALL_RING;
+
+        printf("recorded=%lu kept=%lu maxgap=%lldus\n",
+               (unsigned long)s_stall_head, (unsigned long)n,
+               (long long)s_gap_max);
+
+        for (uint32_t i = 0; i < n; i++)
+        {
+            const stall_rec_t *r = &s_stall_ring[i];
+            const char *kind = r->late == 1 ? "late" : r->late == 2 ? "aud0" : "gap";
+
+            printf("f%lu %s gap=%ld emu=%ld\n",
+                   (unsigned long)r->frame, kind,
+                   (long)r->gap_us, (long)r->emu_us);
+        }
+        return 0;
+    }
+
     if (argc >= 2 && strcmp(sub, "status") == 0)
     {
         printf("running=%d frames=%lu fps=%lu dropped=%lu\n",
@@ -1188,6 +1352,13 @@ static int cmd_nes(tdsh_session_t *session, int argc, char **argv)
                    (unsigned long)sound_stream_dropped());
         else
             printf("audio off\n");
+
+        /* Stall evidence, which `dropped` cannot express: a COUNT of lost
+         * intervals, the number of writes that accepted nothing, and the worst
+         * interval seen. The log carries the durations. */
+        printf("stalls=%lu aud0=%lu maxgap=%lldus\n",
+               (unsigned long)s_stalls, (unsigned long)s_aud_zero,
+               (long long)s_gap_max);
 
         printf("vidbuf=%s%s blits=%lu skipped=%lu\n",
                s_vidbuf_internal ? "INTERNAL" : "PSRAM",
