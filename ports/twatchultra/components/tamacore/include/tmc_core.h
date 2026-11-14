@@ -119,6 +119,25 @@ uint64_t tmc_run(tmc *m, uint64_t cycles);
  */
 int tmc_frame(tmc *m, int *y_lo, int *y_hi);
 
+/*
+ * Redraw the WHOLE frame from the guest's DPRAM, regardless of what changed.
+ *
+ * `tmc_frame()` regenerates only the rows it reports, which is right for pushing
+ * but leaves the rest of `frame` holding whatever was there when those rows were
+ * last drawn. That is fine while every push is preceded by a regeneration of the
+ * same range -- and it is exactly what makes a stale-dot fault hard to see: the
+ * pushed pixels always agree with a fresh render, so the frame buffer cannot be
+ * blamed, and the question of whether the GUEST still holds those dots lit is
+ * unanswerable from outside.
+ *
+ * This regenerates everything, so a caller that pushes the full window afterwards
+ * has a frame that is provably a pure function of the current DPRAM. If artefacts
+ * survive that, they are in the guest's own dot data; if they vanish, they were in
+ * the incremental path.
+ */
+void tmc_redraw(tmc *m);
+
+
 /* Press or release a button. `index` 0..2 is the V3's three buttons, matching
  * the order its pin mask uses (0x01, 0x02, 0x04 on port 0). */
 void tmc_button(tmc *m, int index, bool down);

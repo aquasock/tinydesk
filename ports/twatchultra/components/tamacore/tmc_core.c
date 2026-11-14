@@ -450,6 +450,20 @@ int tmc_frame(tmc *m, int *y_lo, int *y_hi)
     return rows;
 }
 
+void tmc_redraw(tmc *m)
+{
+    if (!m)
+        return;
+
+    draw_rows(m->frame, splb32_dpram(m->cpu), 0, TMC_FRAME_H, true);
+
+    /* The shadow must follow, or the next tmc_frame() would compare the guest
+     * against a copy of itself from before this redraw and report no change for
+     * every dot this call just corrected. */
+    memcpy(m->dpram_shadow, splb32_dpram(m->cpu), DPRAM_BYTES);
+    m->shadow_valid = true;
+}
+
 void tmc_button(tmc *m, int index, bool down)
 {
     static const uint8_t bit[3] = { 0x01, 0x02, 0x04 };

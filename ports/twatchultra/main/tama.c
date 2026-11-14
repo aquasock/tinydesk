@@ -62,6 +62,78 @@ static uint32_t s_frames;
 static uint32_t s_blits;
 
 /*
+ * A WHOLE-FRAME REDRAW, ASKED FOR BY THE SHELL AND DONE BY THE GUEST TASK.
+ *
+ * The frame buffer is written only by the guest task, so a redraw requested from
+ * the shell has to be a flag rather than an action -- doing it in place would be
+ * a second writer on a buffer the guest is mid-render into, which is DSP-005
+ * arriving through a different door.
+ *
+ * It exists because the incremental path could not otherwise be separated from
+ * the guest's own state. Every push is preceded by a regeneration of exactly the
+ * rows pushed, so the pixels on the glass always agree with a fresh render and the
+ * frame buffer can never be blamed from outside. A full redraw makes the frame a
+ * pure function of the current DPRAM for one frame, which is the one observation
+ * that tells a stale incremental push apart from dots the guest still has lit.
+ */
+static volatile bool s_full_redraw;
+
+/* Draw a red box around every band pushed, for tracking down stale pixels. Set by
+ * `tama mark on`, read by the guest task. */
+static volatile bool s_mark_dirty;
+
+/* How many boxes have been drawn, so "the marker never fired" and "the marker
+ * fired and the panel did not draw it" are distinguishable from the shell. */
+static uint32_t s_marks;
+
+/*
+ * LOG EVERY BAND'S ROW RANGE to /sd/tamaband.txt.
+ *
+ * The marker answers "was this row inside a pushed band" for one frame, by eye,
+ * which is enough to see that a leftover sits outside a box but not to say whether
+ * the row was pushed at ANY point before it went stale. A log of lo/hi per push
+ * does: if the leftover row never appears between any lo and hi, the dirty tables
+ * are not attributing that dot to a row, and the fault is settled without another
+ * round trip.
+ *
+ * Bounded, because a 16 Hz guest over a long run would fill the card; 500 lines is
+ * over half a minute of every single frame changing, which is more than any
+ * diagnosis needs.
+ */
+#define BAND_LOG_MAX 500
+
+static volatile bool s_log_bands;
+static uint32_t s_band_lines;
+
+/*
+ * HOW MANY EXTRA ROWS TO PUSH ON EACH SIDE OF A DIRTY BAND.
+ *
+ * THE FIX FOR THE LEFTOVER-PIXEL TRAILS. The frame buffer is provably correct --
+ * draw_rows() regenerates the whole band it is given, from the guest's DPRAM,
+ * immediately before the push -- so a stale pixel on the glass means the panel did
+ * not draw every row it was sent. Band heights here are 35, 41 and 47, and
+ * flush_rect() caps one transaction at 17 rows across this width, so a 47-row band
+ * is three separate transactions.
+ *
+ * Widening the band means any row the transfer dropped is rewritten by the next
+ * band that touches it. Measured on the glass: at 0 the operator saw thin
+ * horizontal trails behind a moving tama, one every time it moved; at 8 the trails
+ * are gone. 8 is a dot row plus its gap -- one full cell of slack each side --
+ * which is the smallest value here that has a physical meaning rather than being a
+ * number tuned until the symptom stopped.
+ *
+ * The cost is transfer time only, and it is small: a 47-row band becomes 63 of a
+ * 308-row frame, and bands are pushed at the guest's own 16 Hz rather than per
+ * frame.
+ *
+ * `tama pad N` changes it at runtime, so the value can be A/B'd on the glass
+ * without a flash. 0 restores the unpatched behaviour and is the reproduction.
+ */
+#define TAMA_PAD_DEFAULT 8
+
+static int s_pad_rows = TAMA_PAD_DEFAULT;
+
+/*
  * THE STRIP'S BUTTONS CROSS A TASK BOUNDARY, so they are queued rather than
  * written.
  *
@@ -551,6 +623,71 @@ static void apply_action(tama_act_t act)
 
 /* --- the guest task ------------------------------------------------------ */
 
+/*
+ * DRAW A RED BOX AROUND THE REGION JUST PUSHED, at the operator's suggestion.
+ *
+ * The question this answers cannot be answered by reading code: a leftover dot
+ * either lies INSIDE the band that was repainted, or OUTSIDE it. Inside means the
+ * band was pushed and the dot survived the push, so the fault is downstream of the
+ * dirty tracking. Outside means the rows were never marked dirty at all, so the
+ * fault is the dirty-row tables failing to attribute a change to a row.
+ *
+ * Marking the band is the only way to see that difference on the glass, because
+ * the frame buffer is regenerated just before every push and therefore always
+ * agrees with what was sent -- the frame cannot be blamed from outside, and the
+ * band boundary is not otherwise visible.
+ *
+ * The box is drawn AFTER the push, straight onto the panel, so it never enters
+ * the emulator's frame buffer and cannot be mistaken for guest content.
+ *
+ * THE EDGES ARE THICK, AND THAT IS NOT A STYLE CHOICE. LCD-002 is a verified
+ * record in this project: the CO5300 does not honour a window one pixel wide or
+ * one pixel tall, and every call returns success while nothing appears. The first
+ * version of this function drew four 1 px rules and was invisible on the glass for
+ * exactly that reason -- which cost a round trip, and is the same class of silent
+ * failure the record was written to prevent. At 3 px the transfer is a real window
+ * and the panel draws it.
+ *
+ * Marks accumulate, which is deliberate -- a dot that went stale several frames
+ * ago can be checked against the boxes drawn since.
+ */
+#define MARK_RED   0xF800u      /* RGB565 red */
+#define MARK_THICK 3            /* >1: see LCD-002, a 1 px window is not drawn */
+
+static void mark_dirty(int y0, int y1)
+{
+    static uint16_t row[TMC_FRAME_W * MARK_THICK];
+    static uint16_t col[MARK_THICK];
+
+    if (y1 - y0 < MARK_THICK)
+        return;
+
+    s_marks++;
+
+    for (int i = 0; i < TMC_FRAME_W * MARK_THICK; i++)
+        row[i] = MARK_RED;
+
+    /* Top and bottom edges, MARK_THICK rows each. */
+    display_picture_rgb(NULL, TAMA_OX, y0, row, TMC_FRAME_W, MARK_THICK);
+    display_picture_rgb(NULL, TAMA_OX, y1 - MARK_THICK, row,
+                        TMC_FRAME_W, MARK_THICK);
+
+    /* Left and right edges, in strips short enough to stay inside each edge's
+     * own colour band, since both are the same red. */
+    for (int i = 0; i < MARK_THICK; i++)
+        col[i] = MARK_RED;
+
+    const int h = y1 - y0 - 2 * MARK_THICK;
+
+    if (h > 0)
+    {
+        display_picture_rgb(NULL, TAMA_OX, y0 + MARK_THICK, col,
+                            MARK_THICK, h);
+        display_picture_rgb(NULL, TAMA_OX + TMC_FRAME_W - MARK_THICK,
+                            y0 + MARK_THICK, col, MARK_THICK, h);
+    }
+}
+
 static void tama_task(void *arg)
 {
     (void)arg;
@@ -621,12 +758,57 @@ static void tama_task(void *arg)
 
         /* Dirty rows only. An icon flip is one band; a blank frame is nothing
          * at all and costs no SPI traffic. */
-        if (tmc_frame(s_m, &y_lo, &y_hi) > 0)
+        if (s_full_redraw)
         {
-            display_picture_rgb(NULL, TAMA_OX, TAMA_OY + y_lo,
-                                s_frame + (size_t)y_lo * TMC_FRAME_W,
-                                TMC_FRAME_W, y_hi - y_lo);
+            s_full_redraw = false;
+
+            tmc_redraw(s_m);
+            display_picture_rgb(NULL, TAMA_OX, TAMA_OY, s_frame,
+                                TMC_FRAME_W, TMC_FRAME_H);
             s_blits++;
+        }
+        else if (tmc_frame(s_m, &y_lo, &y_hi) > 0)
+        {
+            /*
+             * Widen the band by s_pad_rows on each side before pushing.
+             *
+             * The frame buffer already holds correct pixels for these extra rows --
+             * draw_rows() regenerates the whole band it is asked for, and the rest of
+             * s_frame was written by earlier pushes from the same truth -- so this
+             * costs nothing but transfer time and cannot introduce wrong pixels.
+             *
+             * Clamped to the frame, because a band at row 0 or at the last row would
+             * otherwise push outside it.
+             */
+            int lo = y_lo - s_pad_rows;
+            int hi = y_hi + s_pad_rows;
+
+            if (lo < 0)
+                lo = 0;
+            if (hi > TMC_FRAME_H)
+                hi = TMC_FRAME_H;
+
+            display_picture_rgb(NULL, TAMA_OX, TAMA_OY + lo,
+                                s_frame + (size_t)lo * TMC_FRAME_W,
+                                TMC_FRAME_W, hi - lo);
+            s_blits++;
+
+            if (s_mark_dirty)
+                mark_dirty(TAMA_OY + lo, TAMA_OY + hi);
+
+            if (s_log_bands && s_band_lines < BAND_LOG_MAX)
+            {
+                FILE *bf = fopen("/sd/tamaband.txt", "a");
+
+                if (bf)
+                {
+                    fprintf(bf, "f=%lu lo=%d hi=%d h=%d\n",
+                            (unsigned long)s_frames, lo, hi, hi - lo);
+                    fclose(bf);
+                    s_band_lines++;
+                }
+            }
+
         }
         s_frames++;
 
@@ -814,8 +996,10 @@ bool tama_start(const char *rom_path)
 
     s_frames = 0;
     s_blits = 0;
+    s_marks = 0;
     s_presses = 0;
     s_btn_drops = 0;
+    s_full_redraw = false;
 
     /* The app's controls start from their defaults on every run. The label
      * refresh must come after display_margins_set() above, because that call
@@ -969,8 +1153,10 @@ static int cmd_tama(tdsh_session_t *session, int argc, char **argv)
 
     if (argc >= 2 && strcmp(sub, "status") == 0)
     {
-        printf("running=%d frames=%lu blits=%lu\n", tama_running() ? 1 : 0,
-               (unsigned long)s_frames, (unsigned long)s_blits);
+        printf("running=%d frames=%lu blits=%lu marks=%lu mark=%d\n",
+               tama_running() ? 1 : 0,
+               (unsigned long)s_frames, (unsigned long)s_blits,
+               (unsigned long)s_marks, s_mark_dirty ? 1 : 0);
         if (tama_running())
         {
             /* The snapshot, not tmc_cycles(s_m): Load and Reset free the
@@ -1015,6 +1201,103 @@ static int cmd_tama(tdsh_session_t *session, int argc, char **argv)
             return 1;
         }
         printf("%s %d\n", sub, idx);
+        return 0;
+    }
+
+    if (argc >= 2 && strcmp(sub, "pad") == 0)
+    {
+        /* `tama pad N`. Widens every pushed band by N rows on each side, so a row
+         * the panel dropped at a band edge is rewritten by the next band. 0
+         * restores the unpatched behaviour, which makes this an A/B on the glass. */
+        if (argc < 3)
+        {
+            printf("pad=%d\n", s_pad_rows);
+            return 0;
+        }
+
+        int n = atoi(argv[2]);
+
+        if (n < 0 || n > 64)
+        {
+            printf("pad 0..64\n");
+            return 1;
+        }
+
+        s_pad_rows = n;
+        printf("pad %d\n", s_pad_rows);
+        return 0;
+    }
+
+    if (argc >= 2 && strcmp(sub, "bands") == 0)
+    {
+        /* `tama bands on|off` logs every pushed band's row range to
+         * /sd/tamaband.txt, so a row that never appears in any range is provably
+         * never marked dirty rather than merely seen outside one box. */
+        const char *arg = argc >= 3 ? argv[2] : NULL;
+
+        if (!arg || strcmp(arg, "on") == 0)
+        {
+            FILE *bf = fopen("/sd/tamaband.txt", "w");
+            if (bf)
+                fclose(bf);
+
+            s_band_lines = 0;
+            s_log_bands = true;
+            printf("bands on -> /sd/tamaband.txt\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "off") == 0)
+        {
+            s_log_bands = false;
+            printf("bands off, %lu lines\n", (unsigned long)s_band_lines);
+            return 0;
+        }
+
+        printf("bands on|off\n");
+        return 1;
+    }
+
+    if (argc >= 2 && strcmp(sub, "mark") == 0)
+    {
+        /* `tama mark on|off`. A diagnostic for the stale-pixel fault: with it on,
+         * every band the guest pushes gets a red box drawn round it afterwards, so
+         * a leftover dot can be classified as inside a repainted band or outside
+         * one at a glance. */
+        const char *arg = argc >= 3 ? argv[2] : NULL;
+
+        if (!arg || strcmp(arg, "on") == 0)
+        {
+            s_mark_dirty = true;
+            printf("mark on\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "off") == 0)
+        {
+            s_mark_dirty = false;
+            printf("mark off\n");
+            return 0;
+        }
+
+        printf("mark on|off\n");
+        return 1;
+    }
+
+    if (argc >= 2 && strcmp(sub, "redraw") == 0)
+    {
+        /* Regenerate the whole frame and push it, on the guest task.
+         *
+         * A diagnostic that doubles as a recovery: if a stale dot survives this,
+         * it is in the guest's DPRAM and no amount of redrawing will move it. */
+        if (!tama_running())
+        {
+            printf("not running\n");
+            return 1;
+        }
+
+        s_full_redraw = true;
+        printf("full redraw queued\n");
         return 0;
     }
 
@@ -1074,7 +1357,7 @@ static int cmd_tama(tdsh_session_t *session, int argc, char **argv)
 
 static const tdsh_command_t s_tama_cmd = {
     "tama",
-    "tama [start [rom] | stop | status | press|release N | save]",
+    "tama [start [rom] | stop | status | press|release N | save | redraw | mark on|off | bands on|off | pad N]",
     "Run the Tamagotchi V3 emulator on the screen",
     cmd_tama,
     TDSH_CMD_INTERACTIVE,
