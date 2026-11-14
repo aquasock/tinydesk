@@ -37,6 +37,7 @@
 /* nofrendo's own headers. Included through the component's exported include
  * path, which is why the component lists "." and "nes" in INCLUDE_DIRS. */
 #include "nes/nes.h"
+#include "nes/apu.h"
 #include "palettes.h"
 
 static const char *TAG = "nes";
@@ -1053,6 +1054,58 @@ static int cmd_nes(tdsh_session_t *session, int argc, char **argv)
     const char *rom = NULL;
 
     /*
+     * nes abench [frames] -- what audio would cost.
+     *
+     * THE QUESTION THIS ANSWERS BEFORE ANY AUDIO IS WRITTEN. The APU is already
+     * initialised (nes_init passes 44100 and stereo) and its channel state
+     * already advances, so the register side is inside the measured interpreter
+     * cost. What is NOT paid is apu_process(), which synthesises five channels
+     * per sample -- and nothing in this port calls it, so the whole of audio is
+     * that function plus an I2S write.
+     *
+     * Guessing at it would be the same mistake as the -Og discovery: the number
+     * is either small enough to add without touching anything else, or large
+     * enough that the frame budget has to be found first, and the two lead to
+     * completely different plans. So it is timed.
+     *
+     * Runs the real apu_process over a real APU state after a few hundred
+     * emulated frames, so the channels are producing signal rather than sitting
+     * at their reset values.
+     */
+    if (strcmp(sub, "abench") == 0)
+    {
+        const int rounds = argc >= 3 ? atoi(argv[2]) : 200;
+
+        if (rounds < 1)
+            return 2;
+        if (!s_nes)
+        {
+            printf("abench: start a ROM first (the APU needs a machine)\n");
+            return 1;
+        }
+
+        /* 44,100 / 60.0988 = 733.7, so 733 whole samples a frame. */
+        const int spf = 734;
+        static int16_t pcm[734 * 2];
+
+        int64_t t0 = esp_timer_get_time();
+        for (int i = 0; i < rounds; i++)
+            apu_process((short *)pcm, (size_t)spf, true);
+        const int64_t us = esp_timer_get_time() - t0;
+
+        int64_t sum = 0;
+        for (int i = 0; i < spf * 2; i++)
+            sum += pcm[i];
+
+        printf("nes abench %d frames x %d stereo samples\n", rounds, spf);
+        printf("    apu_process %lld us total, %.3f ms/frame\n",
+               (long long)us, (double)us / rounds / 1000.0);
+        printf("    %.2f us/sample, checksum %lld\n",
+               (double)us / ((double)rounds * spf), (long long)sum);
+        return 0;
+    }
+
+    /*
      * nes convbench [frames] -- how much of the conversion is memory.
      *
      * THE QUESTION. Conversion is 60 percent of the blit (5,826 us of 9,728)
@@ -1182,7 +1235,7 @@ static int cmd_nes(tdsh_session_t *session, int argc, char **argv)
 
 static const tdsh_command_t s_nes_cmd = {
     "nes",
-    "nes [start [rom] [noblit] | stop | pause | status | pad | convbench]",
+    "nes [start [rom] [noblit] | stop | pause | status | pad | convbench | abench]",
     "Run the NES emulator on the screen",
     cmd_nes,
     TDSH_CMD_INTERACTIVE,

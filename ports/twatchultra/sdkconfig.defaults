@@ -155,3 +155,50 @@ CONFIG_FATFS_API_ENCODING_UTF_8=y
 # destination size of two snprintf() calls in tdsh's prompt builders and fails
 # the build on a truncation that cannot actually corrupt anything.
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# --- Caches ----------------------------------------------------------------
+# 32 KB instruction cache, not the 16 KB default.
+#
+# The 6502 interpreter -- the single hottest function in the NES emulator -- is
+# 21,175 bytes of code, and it runs in place from flash (IROM at 0x4211xxxx).
+# With a 16 KB I-cache it cannot fit, so it evicted itself on every pass and the
+# whole inner loop of the emulator ran at flash speed.
+#
+# MEASURED 2026-11-13, Zelda, interpreter only (`nes start <rom> noblit`):
+#     16 KB   14,420 us/frame
+#     32 KB   12,389 us/frame      -2,031 us, -14.1%
+# and with the blitter running the frame went from ~16,000 to 13,557 us, taking
+# the headroom against the 16,667 us budget from about 700 us to 3,110 us.
+#
+# It also made the blit cheaper (9,774 -> 8,069 us) because the row callback's
+# own code is in flash too.
+#
+# COST: 16 KB of internal RAM. Free internal went 115,107 -> 90,503 bytes, still
+# well clear of the 65,536 tdsh's SSH server refuses to start below. Growing the
+# DATA cache to 64 KB was considered and rejected for exactly that reason: it
+# would leave about 58 KB and stop SSH working.
+CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
+CONFIG_ESP32S3_INSTRUCTION_CACHE_SIZE=0x8000
+
+# --- Flash mode ------------------------------------------------------------
+# Quad I/O, not the DIO default.
+#
+# The board's flash is a Winbond W25Q128JV (JEDEC EF 40 18), which is a quad
+# part, so this is supported rather than hoped for. Note the ESPTOOLPY_FLASHMODE
+# *string* stays "dio" even when this is set -- ESP-IDF flashes in DIO and the
+# bootloader upgrades itself to quad during initialisation -- so reading the
+# string back is not a way to check whether this took effect. Comparing
+# bootloader.bin against a DIO build is.
+#
+# MEASURED 2026-11-13, Zelda, interpreter only (`nes start <rom> noblit`):
+#     DIO   12,389 us/frame
+#     QIO   12,122 us/frame      -267 us
+# and with the blitter running, 13,557 -> 12,114 us/frame. That second gain is
+# larger than the first and is the interesting part: at DIO the blit cost the
+# interpreter about 1.2 ms of contention, and at QIO the two nearly stop
+# interfering.
+#
+# COST: none in RAM. This is the only cache/bus lever that was free -- growing
+# the data cache to 64 KB would have taken internal RAM below the 65,536 bytes
+# tdsh's SSH server refuses to start below.
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
