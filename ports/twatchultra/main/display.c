@@ -311,12 +311,22 @@ static uint16_t s_tx_app[DISPLAY_W * BAND_ROWS];
  * Reset by display_push_stats_reset() so a caller can measure one interval.
  */
 static int64_t s_us_window, s_us_xmit;
+
+/* Time spent inside the caller's row callback by display_picture_rows(), which
+ * is the picture conversion for an app that has one. See display_convert_us(). */
+static int64_t s_us_convert;
 static uint32_t s_pushes;
 
 void display_push_stats_reset(void)
 {
     s_us_window = s_us_xmit = 0;
     s_pushes = 0;
+    s_us_convert = 0;
+}
+
+int64_t display_convert_us(void)
+{
+    return s_us_convert;
 }
 
 void display_push_stats(int64_t *us_window, int64_t *us_xmit, uint32_t *pushes)
@@ -2243,8 +2253,20 @@ bool display_picture_rows(void *ctx, int x, int y, int w, int h, display_row_fn 
     {
         int rows = (y1 - yy) > band ? band : (y1 - yy);
 
+        /* WHAT THE CALLBACK COSTS, MEASURED WHERE IT RUNS.
+         *
+         * `per-frame: convert=` in nes status was derived as blit minus push, and
+         * that subtraction is only valid if nothing else happens between the two
+         * -- which is exactly the kind of assumption that was already wrong once
+         * this cycle. Two timer reads per band is fifteen pairs a frame, which is
+         * noise, so the conversion can just be timed directly instead of
+         * inferred. */
+        const int64_t c0 = esp_timer_get_time();
+
         for (int r = 0; r < rows; r++)
             fn(ctx, (yy + r) - y, col, s_tx_app + (size_t)r * dw, dw);
+
+        s_us_convert += esp_timer_get_time() - c0;
 
         push_pixels_buf(x0, yy, dw, rows, s_tx_app);
     }

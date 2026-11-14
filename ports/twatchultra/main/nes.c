@@ -173,6 +173,22 @@ static uint16_t s_pal_tx[256];
 static volatile uint32_t s_us_blit_last;
 
 /*
+ * THE CONTENTION DIAGNOSTIC. `nes start <rom> noblit` runs the emulator with no
+ * blit task at all.
+ *
+ * The question it answers is whether the blitter is costing the interpreter
+ * anything. The blit runs on core 1 and is therefore overlapped, so its own
+ * duration should not appear in the frame time -- but both cores read PSRAM, and
+ * the frame buffer, the paletted source and the converted band all live there.
+ * If suppressing the blit makes the INTERPRETER faster, the blit is stealing
+ * memory bandwidth even though it never shares a core; if the interpreter is
+ * unchanged, the blit is free and optimising it is pointless.
+ *
+ * Same shape and same reason as `pm start <rom> noblit` in pm.c.
+ */
+static bool s_nobl_diag;
+
+/*
  * CUMULATIVE counters, and the last-second figures above are not enough.
  *
  * This cycle wasted a measurement on exactly that: the conversion was changed
@@ -406,6 +422,11 @@ static void nes_blit(uint8_t *buf)
     int nxt;
 
     if (cur < 0)
+        return;
+
+    /* No blitter to hand to. Returning keeps `cur`, so the renderer carries on
+     * into the same buffer and the measurement is of the interpreter alone. */
+    if (s_nobl_diag)
         return;
 
     if (xQueueReceive(s_free_q, &nxt, 0) != pdTRUE)
@@ -782,7 +803,7 @@ bool nes_start(const char *rom_path)
 
     s_blit_run = true;
 
-    if (xTaskCreatePinnedToCore(nes_blit_task, "nesblit", NES_BLIT_STACK, NULL,
+    if (!s_nobl_diag && xTaskCreatePinnedToCore(nes_blit_task, "nesblit", NES_BLIT_STACK, NULL,
                                 NES_PRIO, &s_blit_task, 1) != pdPASS)
     {
         s_blit_run = false;
@@ -990,8 +1011,9 @@ static int cmd_nes(tdsh_session_t *session, int argc, char **argv)
         if (s_nes)
             printf("rom=%s paused=%d\n", s_rom_path, s_paused ? 1 : 0);
 
-        printf("vidbuf=%s blits=%lu skipped=%lu\n",
+        printf("vidbuf=%s%s blits=%lu skipped=%lu\n",
                s_vidbuf_internal ? "INTERNAL" : "PSRAM",
+               s_nobl_diag ? " noblit" : "",
                (unsigned long)s_blit_done, (unsigned long)s_blit_skipped);
 
         /* Push breakdown, for deciding whether the blit's remaining 8 ms is the
@@ -1008,13 +1030,20 @@ static int cmd_nes(tdsh_session_t *session, int argc, char **argv)
             {
                 int64_t push_us = w_us + x_us;
                 int64_t blit_avg = (int64_t)(s_blit_us_total / s_blit_frames_total);
+                int64_t conv_avg = (int64_t)(display_convert_us() /
+                                             (int64_t)s_blit_frames_total);
                 int64_t push_avg = (int64_t)((push_us - s_push_baseline_us) /
                                              (int64_t)s_blit_frames_total);
 
+                /* `convert` here is MEASURED, from display_convert_us(); the
+                 * subtraction that used to stand in for it is kept beside it so
+                 * the two can be compared and the difference noticed rather than
+                 * explained away. */
                 printf("per-frame: blit=%lldus convert=%lldus push=%lldus "
-                       "over %lu frames\n",
-                       (long long)blit_avg, (long long)(blit_avg - push_avg),
-                       (long long)push_avg, (unsigned long)s_blit_frames_total);
+                       "(subtract=%lldus) over %lu frames\n",
+                       (long long)blit_avg, (long long)conv_avg,
+                       (long long)push_avg, (long long)(blit_avg - push_avg),
+                       (unsigned long)s_blit_frames_total);
             }
         }
 
@@ -1023,8 +1052,123 @@ static int cmd_nes(tdsh_session_t *session, int argc, char **argv)
 
     const char *rom = NULL;
 
+    /*
+     * nes convbench [frames] -- how much of the conversion is memory.
+     *
+     * THE QUESTION. Conversion is 60 percent of the blit (5,826 us of 9,728)
+     * and the source buffer lives in PSRAM. Two explanations fit that number:
+     * the loop is doing too many instructions, or it is waiting on external
+     * memory. They call for opposite fixes, and a guess already went wrong once
+     * this cycle -- a software-prefetch rewrite measured 6,897 us against the
+     * 5,826 it replaced, so the prefetch was adding work rather than hiding
+     * latency.
+     *
+     * This runs the SAME row callback over the same number of pixels twice,
+     * once from the PSRAM frame buffer and once from an internal-RAM copy. If
+     * internal is much faster the cost is memory and the fix is about traffic;
+     * if the two are close the cost is instruction throughput and no amount of
+     * buffering will help.
+     *
+     * It needs the palette built, so it calls build_palette() itself and works
+     * whether or not the emulator is running.
+     */
+    if (strcmp(sub, "convbench") == 0)
+    {
+        const int rounds = argc >= 3 ? atoi(argv[2]) : 100;
+
+        if (rounds < 1)
+            return 2;
+
+        build_palette();
+
+        /*
+         * THE INTERNAL BUFFER IS SIZED TO WHAT WILL ACTUALLY ALLOCATE. A full
+         * frame is 65,280 bytes; 106,895 was free when this was written and the
+         * allocation still failed, because free bytes are not contiguous bytes.
+         * Both passes therefore run over however many rows fit, which keeps the
+         * comparison honest -- it is the same work either way, which is the only
+         * property the measurement needs.
+         */
+        int rows = NES_SCREEN_HEIGHT;
+        uint8_t *isrc = NULL;
+
+        while (rows >= 16 && !isrc)
+        {
+            isrc = (uint8_t *)heap_caps_malloc((size_t)rows * NES_SCREEN_PITCH,
+                                               MALLOC_CAP_INTERNAL);
+            if (!isrc)
+                rows >>= 1;
+        }
+
+        if (!isrc)
+        {
+            printf("convbench: no internal buffer even at 16 rows\n");
+            return 1;
+        }
+
+        const size_t bytes = (size_t)rows * NES_SCREEN_PITCH;
+        uint8_t *psrc = (uint8_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+
+        if (!psrc)
+        {
+            printf("convbench: no psram buffer\n");
+            heap_caps_free(isrc);
+            return 1;
+        }
+
+        for (size_t i = 0; i < bytes; i++)
+        {
+            psrc[i] = (uint8_t)(i * 7);
+            isrc[i] = (uint8_t)(i * 7);
+        }
+
+        /* A band-sized destination, so the stores are not all landing in the
+         * same 512 bytes where the cache would flatter them. */
+        static uint16_t band[16 * NES_SCREEN_WIDTH];
+
+        /* Warm both so the first pass is not paying for cold cache lines that
+         * the second never sees. */
+        for (int y = 0; y < rows; y++)
+        {
+            nes_fill_row(psrc, y, 0, band, NES_SCREEN_WIDTH);
+            nes_fill_row(isrc, y, 0, band, NES_SCREEN_WIDTH);
+        }
+
+        int64_t t0 = esp_timer_get_time();
+        for (int r = 0; r < rounds; r++)
+            for (int y = 0; y < rows; y++)
+                nes_fill_row(psrc, y, 0, band, NES_SCREEN_WIDTH);
+        const int64_t psram_us = esp_timer_get_time() - t0;
+
+        t0 = esp_timer_get_time();
+        for (int r = 0; r < rounds; r++)
+            for (int y = 0; y < rows; y++)
+                nes_fill_row(isrc, y, 0, band, NES_SCREEN_WIDTH);
+        const int64_t int_us = esp_timer_get_time() - t0;
+
+        const double px = (double)rounds * rows * NES_SCREEN_WIDTH;
+
+        printf("convbench %d rounds x %d rows, %u bytes source\n", rounds, rows, (unsigned)bytes);
+        printf("    psram  %lld us  %.3f ms/frame  %.2f cycles/px\n",
+               (long long)psram_us, (double)psram_us / rounds / 1000.0,
+               (double)psram_us * 240.0 / px);
+        printf("    inter  %lld us  %.3f ms/frame  %.2f cycles/px\n",
+               (long long)int_us, (double)int_us / rounds / 1000.0,
+               (double)int_us * 240.0 / px);
+        printf("    memory is %s (%.1f%% of the psram case)\n",
+               int_us * 2 < psram_us ? "MOST of the cost" : "not the dominant cost",
+               100.0 * (double)(psram_us - int_us) / (double)(psram_us ? psram_us : 1));
+
+        heap_caps_free(psrc);
+        heap_caps_free(isrc);
+        return 0;
+    }
+
     if (argc >= 2 && strcmp(sub, "start") == 0)
+    {
         rom = argc >= 3 ? argv[2] : NULL;
+        s_nobl_diag = (argc >= 4 && strcmp(argv[3], "noblit") == 0);
+    }
     else if (sub[0] == '/')
         rom = sub;
 
@@ -1038,7 +1182,7 @@ static int cmd_nes(tdsh_session_t *session, int argc, char **argv)
 
 static const tdsh_command_t s_nes_cmd = {
     "nes",
-    "nes [start [rom] | stop | pause | status | pad]",
+    "nes [start [rom] [noblit] | stop | pause | status | pad | convbench]",
     "Run the NES emulator on the screen",
     cmd_nes,
     TDSH_CMD_INTERACTIVE,
