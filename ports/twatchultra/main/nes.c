@@ -908,14 +908,15 @@ static void nes_task(void *arg)
  * Vertically the d-pad is centred in the band, (217 - 168) / 2 = 24, so it runs
  * 264..431. Its ROTATED bounding box is smaller than its 168 px frame -- the
  * rotated half-extent is 84 * sqrt(2) / 1.5 plus a row for the border, 81 -- so
- * what is actually painted spans fb 267..429 vertically and 35..197
+ * what is actually painted spans fb 267..429 vertically and 19..181
  * horizontally. Every pixel of it is inside the framebuffer.
  *
  * The circles stack at 84 each with the Pokemon Mini's 32 px gap, 200 rows, so
  * they start at 240 + (217 - 200) / 2 = 248 and end at 447: nine rows clear of
  * the glass. Their base column is x 224, which is the Pokemon Mini's own value;
- * the d-pad's right edge is 199, so the nearest circle keeps 25 px of gap and the
- * far edge lands at 308 with 11 px to the wall at 319.
+ * with the d-pad now at the 16 px control margin its painted right edge is 181,
+ * so the nearest circle keeps 43 px and the far edge lands at 308 with 11 px to
+ * the wall at 319.
  *
  * KEEPING EVERYTHING INSIDE THE FRAMEBUFFER IS A DELIBERATE SIMPLIFICATION and it
  * has a cost that must be paid at the sides rather than in the middle: the upper
@@ -927,13 +928,112 @@ static void nes_task(void *arg)
 #define NES_CTL_BAND    (NES_GLASS_BOT - NES_CTL_Y)                      /* 217 */
 
 #define NES_DPAD_S      168
-#define NES_DPAD_X      NES_OX                                           /* 32  */
+/*
+ * WHERE THE D-PAD SITS HORIZONTALLY, AND THE TWO WRONG ANSWERS IT TOOK TO GET HERE.
+ *
+ * The first version used `NES_OX`, on the reasoning that the d-pad should line up
+ * with the left edge of the game above it. That rule is real but it is pm.h's, and
+ * there it works by coincidence: the Pokemon Mini's picture is 288 wide in a 320
+ * framebuffer, so its inset is 16, and its control margin is also 16 -- the two
+ * numbers were never distinguishable. The NES picture is 256 wide, so its inset is
+ * 32 while the control margin is not, and reusing the picture's value put the
+ * d-pad a cell right of the same furniture on the other emulator. A picture's
+ * inset follows from that picture's width; a control's margin is a property of the
+ * glass. They agreed once, by accident.
+ *
+ * The second version used the 16 px control margin, which was still an answer to
+ * the wrong question -- a margin is where a shape starts, and what the operator
+ * asked for is where a specific EDGE of it lands. So the position is now derived
+ * from the target edge itself.
+ *
+ * The target is the side buttons' own right edge: the left column's `LEFT_X1`,
+ * which in framebuffer coordinates is LEFT_X1 - PANEL_COL_OFFSET -
+ * DISPLAY_ORIGIN_X = -1. Note the -1: it is one column LEFT of the framebuffer's
+ * origin, because the side columns live in the glass outside fb 0..319.
+ *
+ * THE RASTERISED SHAPE DOES NOT REACH ITS BOUNDING BOX. The rotated half-extent is
+ * 81, but the arms are only a third of the frame wide, so the box's corners are
+ * empty and the real leftmost pixel sits further in. Rasterising the actual shape
+ * at a top-left of x 0 puts that pixel at x 8 -- a property of a 168 px cross at 45
+ * degrees with a 5 px tip radius, and it moves if any of those do. Hence
+ * -1 - 8 = -9, which puts the painted tip exactly on the column's axis.
+ *
+ * At -9 the painted extent is fb -1..151 by 272..424: inside the framebuffer
+ * horizontally, and entirely below the side columns vertically, since their last
+ * slot ends at fb 248. So every pixel lands in the lower push band, where the full
+ * glass width is available and nothing clips.
+ */
+#define NES_DPAD_TIP_INSET  8
+#define NES_COL_EDGE        (LEFT_X1 - PANEL_COL_OFFSET - DISPLAY_ORIGIN_X)  /* -1 */
+#define NES_DPAD_X          (NES_COL_EDGE - NES_DPAD_TIP_INSET)              /* -9 */
 #define NES_DPAD_Y      (NES_CTL_Y + (NES_CTL_BAND - NES_DPAD_S) / 2)    /* 264 */
 
 #define NES_PAD_D       84
 #define NES_PAD_GAP     32
-#define NES_PAD_X       224
+#define NES_PAD_CELL    16      /* one grid cell, as the operator counts them */
+
+/*
+ * THE CIRCLES ARE PLACED INDEPENDENTLY, IN CELLS, FROM A SHARED BASE COLUMN.
+ *
+ * The operator positions these by counting squares on the glass rather than in
+ * pixels, exactly as on the Pokemon Mini, so the offsets are cell counts from one
+ * base and the pixels are derived. Offsets are separate per circle rather than
+ * relative to each other, so either can move without dragging the other.
+ *
+ * The values land where PM's own final layout lands: B at fb 192 is PM's exact B
+ * column, and A at 240 is PM's A column without its 8 px half-cell nudge back.
+ *
+ * A CLIPS 4 PX IN THE UPPER BAND AND THAT IS ACCEPTED, NOT OVERLOOKED. The push is
+ * two bands, and the boundary is the side columns' last slot at fb 293. A occupies
+ * fb 248..331, so its top 46 rows are in the upper band, which is framebuffer-wide
+ * because the columns own the glass outside fb 0..319. Its widest row there spans
+ * fb 241..323, so 4 px of its upper-right is not drawn. pm.c measured and recorded
+ * the identical 4 px cut when the same circle took the same offset, and the
+ * operator chose it then over the alternatives: at xoff 2 it is 20 px and at xoff 3
+ * it is 36 px, while xoff 0 is the only exactly clean value. It reads as a
+ * slightly flat edge rather than a step. Moving the circle up would make it worse
+ * and down would make it better, but the vertical position is already accepted.
+ */
+#define NES_PAD_XBASE   224
+#define NES_PAD_A_CELL  1       /* one cell right of the base */
+#define NES_PAD_B_CELL  (-1)    /* one cell left of the base */
+
+/*
+ * VERTICAL AND PIXEL OFFSETS ARE PER CIRCLE TOO.
+ *
+ * A needed half a cell down, which a cell count cannot express, and then 4 px
+ * left, which is a third of a cell. Rather than re-basing the grid on 4 or 8 px --
+ * which would have turned every cell number in these comments into a lie -- the
+ * cell count keeps its meaning and the leftovers ride in separate terms. It is the
+ * same escape hatch pm.c uses with `dx` on its circle table, and 0 for anything
+ * that lands on the grid.
+ *
+ * A'S 4 PX LEFT NUDGE ALSO CLEARS ITS UPPER-BAND CLIP, which was the only reason
+ * that cut was ever worth mentioning: at x 236 its widest upper-band row reaches
+ * fb 319.2 against the wall at 319, so the flat edge is 0.2 px and invisible,
+ * where at 240 it was 4.1 px. The nudge was asked for as a placement, and this is
+ * a second dividend rather than the purpose.
+ *
+ * B lands at fb 208..291, entirely below the band split, so the framebuffer-width
+ * restriction does not apply to it at all -- the lower band spans the whole glass.
+ * Its bottom is fb 447 against a glass bottom of 456.
+ */
+#define NES_PAD_A_HALF  1       /* half a cell down */
+#define NES_PAD_B_HALF  0
+
+#define NES_PAD_A_XNUDGE (-4)   /* px, left */
+#define NES_PAD_B_XNUDGE 0
+
+#define NES_PAD_A_X     (NES_PAD_XBASE + NES_PAD_A_CELL * NES_PAD_CELL +     \
+                         NES_PAD_A_XNUDGE)                                   /* 236 */
+#define NES_PAD_B_X     (NES_PAD_XBASE + NES_PAD_B_CELL * NES_PAD_CELL +     \
+                         NES_PAD_B_XNUDGE)                                   /* 208 */
+
 #define NES_PAD_Y       (NES_CTL_Y + (NES_CTL_BAND - (2 * NES_PAD_D + NES_PAD_GAP)) / 2)
+
+#define NES_PAD_A_Y     (NES_PAD_Y + NES_PAD_A_HALF * (NES_PAD_CELL / 2))    /* 256 */
+#define NES_PAD_B_Y     (NES_PAD_Y + NES_PAD_D + NES_PAD_GAP +                \
+                         NES_PAD_B_HALF * (NES_PAD_CELL / 2))                /* 364 */
 
 #define NES_COL_SLOTS   3
 
@@ -951,9 +1051,8 @@ static const gamepad_t s_gp = {
     .line = 2,          /* the margin buttons' own border weight */
     .tip_r = 5,
 
-    .pad_cx = { NES_PAD_X + NES_PAD_D / 2, NES_PAD_X + NES_PAD_D / 2 },
-    .pad_cy = { NES_PAD_Y + NES_PAD_D / 2,
-                NES_PAD_Y + NES_PAD_D + NES_PAD_GAP + NES_PAD_D / 2 },
+    .pad_cx = { NES_PAD_A_X + NES_PAD_D / 2, NES_PAD_B_X + NES_PAD_D / 2 },
+    .pad_cy = { NES_PAD_A_Y + NES_PAD_D / 2, NES_PAD_B_Y + NES_PAD_D / 2 },
     .pad_d = { NES_PAD_D, NES_PAD_D },
     .pad_label = { 'A', 'B' },
 
