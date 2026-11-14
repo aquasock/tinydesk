@@ -2158,9 +2158,27 @@ static int cmd_pm(tdsh_session_t *session, int argc, char **argv)
             return 1;
         }
 
-        /* A static buffer: the pattern is drawn once, from this task, with no
-         * emulator running, so it does not need the pool. */
-        static uint8_t dots[PM_DOTS];
+        /* PSRAM, NOT A STATIC, because this is a diagnostic that runs a handful
+         * of times in a firmware's life and a static held 6,144 bytes of
+         * internal DRAM for the entire uptime. Measured: internal RAM is this
+         * board's scarce resource (it gates the SSH server at 65,536 free)
+         * while PSRAM reads 7,630 of 8,192 KB free -- 93 percent idle.
+         *
+         * Safe here in a way it would not be for a picture pushed every frame:
+         * the buffer is filled once, handed to blit_one(), and never touched
+         * again. One PSRAM burst for a screen that then sleeps six seconds is
+         * not a cost worth accounting for.
+         *
+         * Freed before the single return, and the only earlier exit is the
+         * allocation failing -- which cannot leak what was never allocated. */
+        uint8_t *dots = (uint8_t *)heap_caps_malloc(PM_DOTS, MALLOC_CAP_SPIRAM);
+
+        if (!dots)
+        {
+            printf("pm: pattern needs %d bytes of PSRAM\n", PM_DOTS);
+            return 1;
+        }
+
         pm_pattern_dots(dots);
 
         display_pixels_claim(true);
@@ -2178,6 +2196,7 @@ static int cmd_pm(tdsh_session_t *session, int argc, char **argv)
 
         display_margins_set(DISPLAY_MARGINS_DESKTOP);
         display_pixels_claim(false);
+        heap_caps_free(dots);
         return ok ? 0 : 1;
     }
 

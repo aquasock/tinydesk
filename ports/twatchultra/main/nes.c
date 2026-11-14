@@ -1176,8 +1176,30 @@ static int cmd_nes(tdsh_session_t *session, int argc, char **argv)
         }
 
         /* A band-sized destination, so the stores are not all landing in the
-         * same 512 bytes where the cache would flatter them. */
-        static uint16_t band[16 * NES_SCREEN_WIDTH];
+         * same 512 bytes where the cache would flatter them.
+         *
+         * HEAP, INTERNAL, AND DELIBERATELY NOT PSRAM. This buffer stands in for
+         * the real transmit band (s_tx_app in display.c), which is internal
+         * because SPI DMA reads it every frame. Moving this one to PSRAM would
+         * make the benchmark measure writes to a different memory than the
+         * shipping path uses, and the number it reports would stop describing
+         * the thing it exists to describe.
+         *
+         * What it may not do is stay a static: that held 8,192 bytes of internal
+         * DRAM for the whole uptime on behalf of a command run a few times ever.
+         * Heap-freed-internal gets both properties -- same memory as production,
+         * none of the cost when the tool is not running. */
+        uint16_t *band = (uint16_t *)heap_caps_malloc(16 * NES_SCREEN_WIDTH * sizeof(uint16_t),
+                                                      MALLOC_CAP_INTERNAL);
+
+        if (!band)
+        {
+            printf("convbench: no internal band buffer (%u bytes)\n",
+                   (unsigned)(16 * NES_SCREEN_WIDTH * sizeof(uint16_t)));
+            heap_caps_free(psrc);
+            heap_caps_free(isrc);
+            return 1;
+        }
 
         /* Warm both so the first pass is not paying for cold cache lines that
          * the second never sees. */
@@ -1214,6 +1236,7 @@ static int cmd_nes(tdsh_session_t *session, int argc, char **argv)
 
         heap_caps_free(psrc);
         heap_caps_free(isrc);
+        heap_caps_free(band);
         return 0;
     }
 
