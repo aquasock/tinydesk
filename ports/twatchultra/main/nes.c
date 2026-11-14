@@ -602,18 +602,33 @@ static void nes_blit(uint8_t *buf)
 /* --- input ---------------------------------------------------------------- */
 
 /*
- * The margin buttons, as an NES pad.
+ * The control geometry and the struct that describes it live in the start/stop
+ * section further down, beside the painter that draws them, because the painter
+ * was written first. The hit test needs the same struct, so it is reached through
+ * this one declaration rather than by moving 160 lines of constants up the file
+ * for the compiler's benefit.
+ */
+static int nes_controls_hit(int panel_x, int panel_y);
+
+/*
+ * The margin buttons and the drawn controls, as one NES pad.
  *
- * The layout follows the Tamagotchi's: the three bottom bars are the NES's three
- * most-reached-for buttons and the right column's arrows are the D-pad, which
- * leaves the left column for the emulator's own controls (pause, reset, save).
+ * TWO SOURCES, AND THE ORDER MATTERS FOR NOTHING BUT CLARITY: a point is either
+ * inside the framebuffer, where the drawn d-pad and circles are, or on a margin,
+ * which `edges_hit()` has already classified. A framebuffer point comes back from
+ * `edges_hit()` as EDGE_NONE with index -1, so the two tests cannot both match and
+ * neither shadows the other.
  *
- *   strip 0 -> B      strip 1 -> A     strip 2 -> START
- *   right 1 -> LEFT   right 2 -> RIGHT right 3 -> UP    right 4 -> DOWN
+ * THE MARGINS NO LONGER CARRY THE PAD. They used to: three bottom bars were B, A
+ * and Start, and the right column's arrows were the d-pad. Entry 90 drew all of
+ * that on the glass instead and blanked those legends, so what is left on the
+ * margins is what has no drawn equivalent. The bottom strip is deliberately inert
+ * rather than a second set of A and B -- tapping blank glass and firing a button
+ * is the kind of fault a player blames on the emulator.
  *
- * SELECT has no button yet, which is a real gap: a few games use it to choose a
- * mode and cannot be played properly without it. Recorded rather than papered
- * over -- the left column has three free slots.
+ * SELECT IS NOW REACHABLE, which it was not before: the right column's second slot
+ * carries it. Zelda needs it to reach a saved game, and entry 90's own note records
+ * it as the gap that stopped some games being played at all.
  */
 static int pad_from_frame(const touch_frame_t *f)
 {
@@ -624,18 +639,38 @@ static int pad_from_frame(const touch_frame_t *f)
 
     for (int i = 0; i < f->n && i < TOUCH_POINTS; i++)
     {
-        if (f->p[i].region == EDGE_BOTTOM)
+        /*
+         * THE DRAWN CONTROLS WIN WHEN BOTH MATCH, and with 1.5x touch discs they
+         * now can. A's touch radius of 63 from fb centre 278 reaches fb 341, which
+         * is 22 px past the framebuffer wall at 319 and inside the right-hand
+         * column -- so one press can be both a drawn circle and a margin slot. The
+         * circle is what the operator aimed at and what is visible under the thumb;
+         * the margin underneath is furniture this app only partly uses. Emitting
+         * both would fire A and Start from one touch, which is the kind of double
+         * action a player blames on the emulator.
+         *
+         * The precedence is per POINT, not per frame, because a chord can put one
+         * finger on a circle and the other on a live margin and both should work.
+         */
+        const int ctl = nes_controls_hit(f->p[i].x, f->p[i].y);
+
+        switch (ctl)
         {
-            if (f->p[i].index == 0) pad |= NES_PAD_B;
-            if (f->p[i].index == 1) pad |= NES_PAD_A;
-            if (f->p[i].index == 2) pad |= NES_PAD_START;
+        case GP_A:     pad |= NES_PAD_A;     break;
+        case GP_B:     pad |= NES_PAD_B;     break;
+        case GP_UP:    pad |= NES_PAD_UP;    break;
+        case GP_DOWN:  pad |= NES_PAD_DOWN;  break;
+        case GP_LEFT:  pad |= NES_PAD_LEFT;  break;
+        case GP_RIGHT: pad |= NES_PAD_RIGHT; break;
+        default:                             break;
         }
-        else if (f->p[i].region == EDGE_RIGHT)
+
+        /* The margins: Start and Select on the right column, and only when this
+         * point did not hit a drawn control. */
+        if (ctl == GP_NONE && f->p[i].region == EDGE_RIGHT)
         {
-            if (f->p[i].index == 1) pad |= NES_PAD_LEFT;
-            if (f->p[i].index == 2) pad |= NES_PAD_RIGHT;
-            if (f->p[i].index == 3) pad |= NES_PAD_UP;
-            if (f->p[i].index == 4) pad |= NES_PAD_DOWN;
+            if (f->p[i].index == 0) pad |= NES_PAD_START;
+            if (f->p[i].index == 1) pad |= NES_PAD_SELECT;
         }
     }
 
@@ -704,14 +739,39 @@ static int pad_from_gamepad(void)
     return pad;
 }
 
-static void nes_app_touch(void *user, const touch_frame_t *f)
+/*
+ * Returns whether the frame hit a control, which is what the driver's haptic tap
+ * follows. It is computed from the cursor of the hit test itself, in two parts, so
+ * the driver can buzz for a drawn d-pad direction or circle AND for a live margin
+ * button -- but not for bare glass.
+ */
+static bool nes_app_touch(void *user, const touch_frame_t *f)
 {
     (void)user;
 
     if (!s_run)
-        return;
+        return false;
 
-    s_pad = pad_from_frame(f);
+    int pad = 0;
+    bool used = false;
+
+    if (f)
+    {
+        for (int i = 0; i < f->n && i < TOUCH_POINTS; i++)
+        {
+            if (nes_controls_hit(f->p[i].x, f->p[i].y) != GP_NONE)
+                used = true;
+
+            if (f->p[i].region == EDGE_RIGHT &&
+                display_margin_slot_live(1, f->p[i].index))
+                used = true;
+        }
+
+        pad = pad_from_frame(f);
+    }
+
+    s_pad = pad;
+    return used;
 }
 
 /* --- the emulation task --------------------------------------------------- */
@@ -968,9 +1028,12 @@ static void nes_task(void *arg)
 #define NES_DPAD_X          (NES_COL_EDGE - NES_DPAD_TIP_INSET)              /* -9 */
 #define NES_DPAD_Y      (NES_CTL_Y + (NES_CTL_BAND - NES_DPAD_S) / 2)    /* 264 */
 
-#define NES_PAD_D       84
-#define NES_PAD_GAP     32
-#define NES_PAD_CELL    16      /* one grid cell, as the operator counts them */
+#define NES_BTN_D       84
+#define NES_BTN_GAP     32
+
+/* The touch diameter, not the drawn one. 84 * 1.5 = 126. */
+#define NES_BTN_HIT_D   (NES_BTN_D * 3 / 2)
+#define NES_BTN_CELL    16      /* one grid cell, as the operator counts them */
 
 /*
  * THE CIRCLES ARE PLACED INDEPENDENTLY, IN CELLS, FROM A SHARED BASE COLUMN.
@@ -994,9 +1057,9 @@ static void nes_task(void *arg)
  * slightly flat edge rather than a step. Moving the circle up would make it worse
  * and down would make it better, but the vertical position is already accepted.
  */
-#define NES_PAD_XBASE   224
-#define NES_PAD_A_CELL  1       /* one cell right of the base */
-#define NES_PAD_B_CELL  (-1)    /* one cell left of the base */
+#define NES_BTN_XBASE   224
+#define NES_BTN_A_CELL  1       /* one cell right of the base */
+#define NES_BTN_B_CELL  (-1)    /* one cell left of the base */
 
 /*
  * VERTICAL AND PIXEL OFFSETS ARE PER CIRCLE TOO.
@@ -1018,22 +1081,22 @@ static void nes_task(void *arg)
  * restriction does not apply to it at all -- the lower band spans the whole glass.
  * Its bottom is fb 447 against a glass bottom of 456.
  */
-#define NES_PAD_A_HALF  1       /* half a cell down */
-#define NES_PAD_B_HALF  0
+#define NES_BTN_A_HALF  1       /* half a cell down */
+#define NES_BTN_B_HALF  0
 
-#define NES_PAD_A_XNUDGE (-4)   /* px, left */
-#define NES_PAD_B_XNUDGE 0
+#define NES_BTN_A_XNUDGE (-4)   /* px, left */
+#define NES_BTN_B_XNUDGE 0
 
-#define NES_PAD_A_X     (NES_PAD_XBASE + NES_PAD_A_CELL * NES_PAD_CELL +     \
-                         NES_PAD_A_XNUDGE)                                   /* 236 */
-#define NES_PAD_B_X     (NES_PAD_XBASE + NES_PAD_B_CELL * NES_PAD_CELL +     \
-                         NES_PAD_B_XNUDGE)                                   /* 208 */
+#define NES_BTN_A_X     (NES_BTN_XBASE + NES_BTN_A_CELL * NES_BTN_CELL +     \
+                         NES_BTN_A_XNUDGE)                                   /* 236 */
+#define NES_BTN_B_X     (NES_BTN_XBASE + NES_BTN_B_CELL * NES_BTN_CELL +     \
+                         NES_BTN_B_XNUDGE)                                   /* 208 */
 
-#define NES_PAD_Y       (NES_CTL_Y + (NES_CTL_BAND - (2 * NES_PAD_D + NES_PAD_GAP)) / 2)
+#define NES_BTN_Y       (NES_CTL_Y + (NES_CTL_BAND - (2 * NES_BTN_D + NES_BTN_GAP)) / 2)
 
-#define NES_PAD_A_Y     (NES_PAD_Y + NES_PAD_A_HALF * (NES_PAD_CELL / 2))    /* 256 */
-#define NES_PAD_B_Y     (NES_PAD_Y + NES_PAD_D + NES_PAD_GAP +                \
-                         NES_PAD_B_HALF * (NES_PAD_CELL / 2))                /* 364 */
+#define NES_BTN_A_Y     (NES_BTN_Y + NES_BTN_A_HALF * (NES_BTN_CELL / 2))    /* 256 */
+#define NES_BTN_B_Y     (NES_BTN_Y + NES_BTN_D + NES_BTN_GAP +                \
+                         NES_BTN_B_HALF * (NES_BTN_CELL / 2))                /* 364 */
 
 #define NES_COL_SLOTS   3
 
@@ -1051,14 +1114,41 @@ static const gamepad_t s_gp = {
     .line = 2,          /* the margin buttons' own border weight */
     .tip_r = 5,
 
-    .pad_cx = { NES_PAD_A_X + NES_PAD_D / 2, NES_PAD_B_X + NES_PAD_D / 2 },
-    .pad_cy = { NES_PAD_A_Y + NES_PAD_D / 2, NES_PAD_B_Y + NES_PAD_D / 2 },
-    .pad_d = { NES_PAD_D, NES_PAD_D },
+    .pad_cx = { NES_BTN_A_X + NES_BTN_D / 2, NES_BTN_B_X + NES_BTN_D / 2 },
+    .pad_cy = { NES_BTN_A_Y + NES_BTN_D / 2, NES_BTN_B_Y + NES_BTN_D / 2 },
+    .pad_d = { NES_BTN_D, NES_BTN_D },
+    /* 1.5x the drawn circle: 84 becomes 126, so the touch radius is 63 against a
+     * drawn 42. A thumb is wider than a 42 px half-disc and the operator asked for
+     * the larger target. The circles stay 84 px on the glass. */
+    .pad_hit_d = { NES_BTN_HIT_D, NES_BTN_HIT_D },
     .pad_label = { 'A', 'B' },
 
     .bg = 0x0000,
     .grid = 0,          /* black, as the Pokemon Mini settled on */
 };
+
+/*
+ * PANEL TO FRAMEBUFFER, WHICH IS THE CONVERSION THAT IS EASY TO SKIP.
+ *
+ * The touch controller reports panel coordinates, 0..409 by 0..501 (TCH-006 -- the
+ * controller's own resolution register says exactly PANEL_W x PANEL_H, so there is
+ * no axis swap, no mirroring and no scaling). The framebuffer is that same glass
+ * with its window offset already applied: fb 0 is panel 45 on both axes. So a
+ * point must lose DISPLAY_ORIGIN_X and DISPLAY_ORIGIN_Y before it means anything
+ * to the shapes above, which are all in framebuffer coordinates.
+ *
+ * Skipping it does not fail loudly. It shifts every hit 45 px down and right, so
+ * the d-pad's left arm stops responding while its right arm fires from outside the
+ * shape, which reads as "the controls are half dead" rather than as a units bug.
+ * This is also why `edges_hit()` takes panel coordinates and adds
+ * PANEL_COL_OFFSET itself: the side columns live in controller-RAM space, which is
+ * one offset further out than the panel. Two different offsets, two different
+ * directions, and only one of them belongs here.
+ */
+static int nes_controls_hit(int panel_x, int panel_y)
+{
+    return gamepad_hit(&s_gp, panel_x - DISPLAY_ORIGIN_X, panel_y - DISPLAY_ORIGIN_Y);
+}
 
 /*
  * Two pushes, not one rectangle, for the reason pm.c records at length: above the
@@ -1226,17 +1316,52 @@ bool nes_start(const char *rom_path)
     display_margin_label(0, 0, "Pause");
     display_margin_label(0, 1, "Reset");
     display_margin_label(0, 2, "Save");
-    display_margin_label(0, 3, " ");
-    display_margin_label(0, 4, " ");
 
     display_margin_label(1, 0, "Start");
     display_margin_label(1, 1, "Select");
-    display_margin_label(1, 2, " ");
-    display_margin_label(1, 3, " ");
-    display_margin_label(1, 4, " ");
+
+    /*
+     * THE SLOTS WITH NO DUTY ARE REMOVED, NOT MERELY BLANKED.
+     *
+     * Blanking the label left the BOX drawn and the slot LIVE: a finger on the
+     * glass over an empty box sent a key and buzzed, right beside the d-pad being
+     * tested. The operator reported it as phantom buttons and they were exactly
+     * that -- an outline with a hidden action under it.
+     *
+     * TWO SEPARATE FACTS, BOTH NEEDED. `display_margin_chrome(false)` removes the
+     * graphic so the glass is bare, and the same flag makes
+     * `display_margin_slot_live()` false, which is what stops `edge_press()`
+     * sending a key. Liveness is not a second switch an app can forget to set: it
+     * reads the chrome flag, so hiding a slot always makes it inert.
+     *
+     * The bottom strip in full, because the drawn A, B and the right column's
+     * Start and Select cover everything it used to do. The left column's last two
+     * slots and the right column's last three, for the same reason -- the drawn
+     * controls are directly below them and a live invisible target there would
+     * fire while the operator's thumb is on the cluster.
+     *
+     * The slots' LABELS are cleared on the way out as well, so a later app cannot
+     * inherit a word this one left behind. A space is still the right form for a
+     * label that must render as nothing, because NULL falls back to the shared
+     * table.
+     */
+    for (int s = 3; s < COL_N; s++)
+    {
+        display_margin_chrome(0, s, false);
+        display_margin_label(0, s, " ");
+    }
+
+    for (int s = 2; s < COL_N; s++)
+    {
+        display_margin_chrome(1, s, false);
+        display_margin_label(1, s, " ");
+    }
 
     for (int i = 0; i < BTN_N; i++)
+    {
+        display_margin_chrome(2, i, false);
         display_margin_btn_label(i, " ");
+    }
 
     /* The controls last, so they land on a cleared framebuffer rather than under
      * whatever the console left there. Failure is logged rather than fatal: a
@@ -1442,6 +1567,32 @@ void nes_stop(void)
      * keep between runs because there is nothing to convert into. That returns
      * 120 KB of PSRAM to the pool on every stop instead of holding it for the
      * life of the firmware. */
+
+    /*
+     * RESTORE THE SLOTS BEFORE GIVING THE SCREEN BACK, or the desktop and every
+     * later app inherit a column with holes in it. `display_margins_set()`
+     * repaints, so the chrome has to be back on first for the repaint to draw the
+     * whole column; done in the other order the boxes stay missing until something
+     * else forces a full repaint.
+     *
+     * The labels are cleared to the shared table rather than to a space, which is
+     * what NULL means here -- this app's words must not survive into the next one.
+     */
+    for (int s = 0; s < COL_N; s++)
+    {
+        display_margin_chrome(0, s, true);
+        display_margin_chrome(1, s, true);
+        display_margin_label(0, s, NULL);
+        display_margin_label(1, s, NULL);
+    }
+
+    for (int i = 0; i < BTN_N; i++)
+    {
+        display_margin_chrome(2, i, true);
+        display_margin_btn_label(i, NULL);
+    }
+
+    display_margin_column_slots(COL_N);
 
     display_margins_set(DISPLAY_MARGINS_DESKTOP);
     display_pixels_claim(false);

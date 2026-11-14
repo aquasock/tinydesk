@@ -34,6 +34,31 @@ typedef struct
 {
     edge_region_t region;   /* EDGE_NONE when this point is not present */
     int index;
+
+    /*
+     * WHERE ON THE GLASS, in PANEL coordinates: 0..409 by 0..501, the numbers
+     * the touch controller itself reports (TCH-006).
+     *
+     * These exist because a region and an index describe the MARGINS and nothing
+     * else. `edges_hit()` classifies the thirteen margin buttons and returns
+     * `EDGE_NONE` with index -1 for anything inside the framebuffer, so an app
+     * that draws its own controls -- the Pokemon Mini's d-pad, the NES's -- could
+     * not see a press on them at all. The driver was decoding these coordinates
+     * all along and then discarding them.
+     *
+     * PANEL, NOT FRAMEBUFFER, and the distinction has cost this project twice. The
+     * touch controller reports panel coordinates; the framebuffer is that window
+     * after subtracting `DISPLAY_ORIGIN_X` and `DISPLAY_ORIGIN_Y`, which are both
+     * 45. A consumer that forgets is off by 45 px on both axes, which on the d-pad
+     * reads as "the controls are dead on their left half" rather than as an
+     * obvious error. The conversion is the consumer's job because only the consumer
+     * knows whether it drew in framebuffer space or in panel space.
+     *
+     * Valid only while `region` is not EDGE_NONE -- though for a framebuffer point
+     * region IS EDGE_NONE and the coordinates are still what the consumer wants, so
+     * the presence test is `index >= 0` for a margin hit and `n` for a point. */
+    int x;
+    int y;
 } touch_point_t;
 
 #define TOUCH_POINTS 2
@@ -48,8 +73,21 @@ typedef struct
  * Called on every report while a consumer owns the framebuffer, and once with
  * n == 0 when everything has been released. Never called when nothing owns the
  * screen.
+ *
+ * RETURN TRUE IF A CONTROL FIRED. The return exists because the driver cannot
+ * answer that question itself and was guessing, which cost a real fault: while an
+ * app owned the screen the driver buzzed on EVERY press edge, so a finger on blank
+ * glass -- or on a margin slot this app had hidden -- produced the same haptic tap
+ * as a real button. The operator reported it as phantom buttons and it made the
+ * drawn controls impossible to test, because every touch felt like a hit.
+ *
+ * Only the app knows which pixels are controls: it drew them, and it may have
+ * hidden margin slots the driver still reports. So consumption is the app's
+ * answer, and the buzz follows it. A consumer that does not care can return false
+ * and get no haptics, which is the honest default -- silence rather than a tap
+ * that means nothing.
  */
-typedef void (*touch_app_touch_fn)(void *user, const touch_frame_t *frame);
+typedef bool (*touch_app_touch_fn)(void *user, const touch_frame_t *frame);
 
 /* Start polling the controller; false when it does not answer. */
 bool touch_init(touch_input_fn input);

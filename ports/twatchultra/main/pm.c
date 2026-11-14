@@ -482,12 +482,31 @@ static int pad_from_frame(const touch_frame_t *f)
     return pad;
 }
 
-static void pm_app_touch(void *user, const touch_frame_t *f)
+/* Returns whether the frame hit a control, for the driver's haptic tap. The
+ * Pokemon Mini draws its controls on the framebuffer but nothing hit-tests them
+ * yet, so a live margin slot is the whole of what can fire for now. */
+static bool pm_app_touch(void *user, const touch_frame_t *f)
 {
     (void)user;
     if (!s_run)
-        return;
+        return false;
+
     s_pad = pad_from_frame(f);
+
+    if (!f)
+        return false;
+
+    for (int i = 0; i < f->n && i < TOUCH_POINTS; i++)
+    {
+        if (f->p[i].region == EDGE_BOTTOM && display_margin_slot_live(2, f->p[i].index))
+            return true;
+        if (f->p[i].region == EDGE_RIGHT && display_margin_slot_live(1, f->p[i].index))
+            return true;
+        if (f->p[i].region == EDGE_LEFT && display_margin_slot_live(0, f->p[i].index))
+            return true;
+    }
+
+    return false;
 }
 
 /*

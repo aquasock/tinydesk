@@ -49,7 +49,28 @@ typedef struct
 
     int pad_cx[2];       /* circle centres, A then B */
     int pad_cy[2];
-    int pad_d[2];        /* circle diameters */
+    int pad_d[2];        /* circle diameters, as DRAWN */
+    /*
+     * Touch diameters, per circle, when they differ from what is drawn. 0 means
+     * "same as pad_d", so a layout that wants exact fidelity says nothing.
+     *
+     * A finger is not a stylus, and the operator found the 84 px circles needed a
+     * larger target than their own outline: 1.5x, which is 126 px, or a hit radius
+     * of 63 against the drawn 42. The DRAWING does not change -- the circles on the
+     * glass are still 84 px, because that is the size the operator positioned by
+     * eye -- and only the response grows. That split is why these are separate
+     * fields rather than one value used for both.
+     *
+     * A LARGER HIT BELT THAN DRAWN SHAPE HAS A COST WORTH NAMING: the disc reaches
+     * pixels that look like background, and it can reach into a neighbour. Here A's
+     * radius of 63 from fb centre 278 spans 215..341, which is 22 px past the
+     * framebuffer wall at 319 and into the right-hand column, and 13 px above the
+     * column's last slot. The operator accepted that knowingly, on the grounds that
+     * the slot it touches may be disabled anyway. When two targets overlap, the
+     * drawn control wins -- see pad_from_frame() in nes.c, which asks the shapes
+     * before the margins.
+     */
+    int pad_hit_d[2];
     char pad_label[2];   /* the letter drawn in each circle */
 
     uint16_t bg;         /* background fill, already byte-swapped */

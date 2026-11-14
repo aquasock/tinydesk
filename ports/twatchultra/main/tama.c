@@ -227,12 +227,12 @@ static bool enqueue_action(tama_act_t act)
     return true;
 }
 
-static void tama_app_touch(void *user, const touch_frame_t *tf)
+static bool tama_app_touch(void *user, const touch_frame_t *tf)
 {
     (void)user;
 
     if (!s_accept_input || !tf)
-        return;
+        return false;
 
     /*
      * The strip's bars go straight to the guest, positionally, as they did
@@ -291,6 +291,18 @@ static void tama_app_touch(void *user, const touch_frame_t *tf)
 
     for (int i = 0; i < n; i++)
         enqueue_action(acts[i]);
+
+    /* Whether anything fired, for the driver's haptic tap: a live bottom-strip bar
+     * or a margin slot the UI layer acted on. Bare glass reports false. */
+    if (n > 0)
+        return true;
+
+    for (int i = 0; i < tf->n && i < TOUCH_POINTS; i++)
+        if (tf->p[i].region == EDGE_BOTTOM &&
+            display_margin_slot_live(2, tf->p[i].index))
+            return true;
+
+    return false;
 }
 
 /* --- effects -------------------------------------------------------------- */

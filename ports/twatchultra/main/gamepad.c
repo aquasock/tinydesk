@@ -198,6 +198,21 @@ static bool gp_pad_inside(const gamepad_t *g, int i, int x, int y)
     return dx2 * dx2 + dy2 * dy2 <= rr * rr;
 }
 
+/* The same test against the TOUCH diameter, which may be larger than the drawn
+ * one. 0 in pad_hit_d means "same as drawn", so a layout that says nothing gets
+ * the old behaviour and there is no way to accidentally ask for a zero-radius
+ * target. */
+static bool gp_pad_hit_inside(const gamepad_t *g, int i, int x, int y)
+{
+    const int d = g->pad_hit_d[i] > 0 ? g->pad_hit_d[i] : g->pad_d[i];
+
+    const int dx2 = 2 * (x - g->pad_cx[i]);
+    const int dy2 = 2 * (y - g->pad_cy[i]);
+    const int rr = d - 1;
+
+    return dx2 * dx2 + dy2 * dy2 <= rr * rr;
+}
+
 static bool gp_pad_label_ink(const gamepad_t *g, int i, int x, int y)
 {
     const int px = (x - g->pad_cx[i]) + GP_GLYPH_W / 2;
@@ -314,33 +329,125 @@ bool gamepad_paint(const gamepad_t *g, int fb_x0, int fb_y0, int w, int h,
 
 /* --- hit testing ---------------------------------------------------------- */
 
+/*
+ * THE HIT AREA IS A DISC OF FOUR QUADRANTS, NOT THE DRAWN CROSS.
+ *
+ * The drawn shape is a cross: four arms with empty wedges between them. Measured
+ * on the real rasteriser, the painted arms cover about 72 percent of the disc that
+ * bounds them, so hitting only where the pixels are leaves four dead wedges -- and
+ * a thumb sliding from Up to Right passes through one, which drops the direction
+ * and reads as an unresponsive pad.
+ *
+ * The operator asked for the touchable area to be a circle split into four
+ * quadrants so a thumb can slide between directions, and that is what this does:
+ * every point within the radius picks the nearest axis. The DRAWING is unchanged --
+ * the cross is still what is on the glass, because it is what the other emulator
+ * shows and what the operator positioned by eye. Only the response is a disc.
+ *
+ * WHICH AXIS is decided from the two rotated magnitudes, and NOT from the shifted
+ * `u` and `v` the painter uses. That distinction is a measured bug rather than a
+ * preference: `(v * K) >> 16` on a negative product floors toward minus infinity,
+ * so `+50` and `-50` give 35 and 36 instead of a symmetric pair. The tie broke
+ * under that asymmetry and a thumb due east of centre -- a plain right-press --
+ * came back as UP. Comparing `|dx + dy|` against `|dy - dx|` is the same test with
+ * no division and no rounding, so it is exact at every angle.
+ *
+ * THE TIE CASE IS NOT RARE, WHICH IS WHY IT HAS ITS OWN RULE. `|dx + dy|` equals
+ * `|dy - dx|` exactly when `dx * dy == 0`, so it happens for every press that
+ * shares the centre's x or its y -- the whole vertical and horizontal lines
+ * through the pivot, not a measure-zero diagonal. The correct reading of a tie is
+ * the geometry itself: a tie on `dx == 0` is a point on the vertical line and
+ * wants a VERTICAL direction; a tie on `dy == 0` is a point on the horizontal line
+ * and wants a HORIZONTAL one. Nothing else can tie. So the seams fall exactly
+ * where the drawn arms are widest, which is the only tie-break that agrees with
+ * the screen.
+ *
+ * A SMALL DEAD CENTRE IS KEPT. Under about 8 px the thumb is on the pivot, where
+ * two axes are equally close and a direction would have to be invented from a
+ * pixel of noise. Nothing pressed is the honest answer there, and the zone is small
+ * enough that it cannot be felt while sliding.
+ *
+ * THE RADIUS IS THE DRAWN SHAPE'S OWN REACH, not a round number. The farthest
+ * painted pixel of a 168 px cross with 5 px rounded tips is 86.5 px from centre, so
+ * `size / 2 + 4` covers the visible shape completely and adds four pixels of
+ * tolerance at the tips -- a thumb that lands slightly outside the outline still
+ * registers, which is what makes the pad forgiving rather than fussy.
+ */
+#define GP_HIT_MARGIN 4
+#define GP_HIT_DEAD   8
+
+static int gp_abs(int v) { return v < 0 ? -v : v; }
+
 int gamepad_hit(const gamepad_t *g, int fb_x, int fb_y)
 {
     if (!g)
         return GP_NONE;
 
-    int sx, sy;
-    gp_to_shape(g, fb_x, fb_y, &sx, &sy);
-
-    if (gp_dpad_inside(g, sx, sy))
+    /*
+     * THE CIRCLES' TOUCH DISCS CAN OVERLAP EACH OTHER, so the nearest centre wins.
+     *
+     * At 1.5x the radius is 63 and the centres are 111.6 px apart, so the two discs
+     * intersect by 14.4 px. Testing A first would give that whole lens to A, which
+     * means a thumb on the top of B -- the natural place to press B -- would fire A.
+     * Nearest-centre resolves it the way a finger expects: the button you are
+     * closer to is the one you meant. Measured rather than assumed, and the reason
+     * this is not simply `for (b = 0; b < 2; b++)` any more.
+     *
+     * Comparing squared distances avoids a square root and cannot tie in practice;
+     * on an exact tie A wins, which is arbitrary but stable, and the lens is 14 px
+     * wide so no thumb lands there twice the same way.
+     */
     {
-        const int arm = g->size / 3;
+        int best = -1;
+        long best_d2 = 0;
 
-        if (sy < arm)
-            return GP_UP;
-        if (sy >= 2 * arm)
-            return GP_DOWN;
-        if (sx < arm)
-            return GP_LEFT;
-        if (sx >= 2 * arm)
-            return GP_RIGHT;
+        for (int b = 0; b < 2; b++)
+        {
+            if (!gp_pad_hit_inside(g, b, fb_x, fb_y))
+                continue;
 
-        return GP_NONE;      /* the centre square belongs to no direction */
+            const long ax = fb_x - g->pad_cx[b];
+            const long ay = fb_y - g->pad_cy[b];
+            const long d2 = ax * ax + ay * ay;
+
+            if (best < 0 || d2 < best_d2)
+            {
+                best = b;
+                best_d2 = d2;
+            }
+        }
+
+        if (best >= 0)
+            return best == 0 ? GP_A : GP_B;
     }
 
-    for (int b = 0; b < 2; b++)
-        if (gp_pad_inside(g, b, fb_x, fb_y))
-            return b == 0 ? GP_A : GP_B;
+    const int dx = fb_x - g->cx;       /* screen offsets: +x right, +y down */
+    const int dy = fb_y - g->cy;
 
-    return GP_NONE;
+    const int r = g->size / 2 + GP_HIT_MARGIN;
+    const int d2 = dx * dx + dy * dy;
+
+    if (d2 > r * r)
+        return GP_NONE;            /* outside the disc */
+
+    if (d2 < GP_HIT_DEAD * GP_HIT_DEAD)
+        return GP_NONE;            /* on the pivot: no direction is honest */
+
+    /* Distance-preserving rotated magnitudes, without a shift and its rounding. */
+    const int along_horiz = gp_abs(dx + dy);   /* the NE-SW arm pair */
+    const int along_vert  = gp_abs(dy - dx);   /* the NW-SE arm pair */
+
+    bool vertical;
+
+    if (along_horiz > along_vert)
+        vertical = false;
+    else if (along_vert > along_horiz)
+        vertical = true;
+    else
+        vertical = (dx == 0);      /* a tie lies on a screen axis: that axis wins */
+
+    if (vertical)
+        return (dy - dx) < 0 ? GP_UP : GP_DOWN;
+
+    return (dx + dy) < 0 ? GP_LEFT : GP_RIGHT;
 }

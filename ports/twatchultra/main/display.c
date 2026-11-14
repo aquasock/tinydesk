@@ -1732,6 +1732,34 @@ void display_margin_colours(uint16_t *fill, uint16_t *edge, uint16_t *label)
 }
 
 /*
+ * The single answer to "is this slot a button?", asked by the painter and by the
+ * touch driver.
+ *
+ * Three ways a slot is not live, and they are all the same statement: it is past
+ * the app's drawn count, its graphic has been removed, or the index is outside the
+ * slot's own range. The bottom strip has BTN_N slots for a whole row of three, so
+ * it keeps its own bound rather than sharing COL_N.
+ *
+ * NOT BULLETPROOF AGAINST A SECOND WRITER, and that is acceptable: s_col_n and
+ * s_nochrome are written only from the app's own task at start and stop, and the
+ * touch driver reads them. A read that races a write can be a slot stale for one
+ * poll, which is a press accepted or refused once -- not a stuck state.
+ */
+bool display_margin_slot_live(int col, int index)
+{
+    if (index < 0)
+        return false;
+
+    if (col == 2)
+        return index < BTN_N && !s_nochrome[2][index];
+
+    if (col != 0 && col != 1)
+        return false;
+
+    return index < s_col_n && !s_nochrome[col][index];
+}
+
+/*
  * Set how many column slots an app draws. Defaults to COL_N; pass COL_N to
  * restore. Repaints both columns, because the visible change is immediate and
  * routing it through the paint task would drop it exactly when it is wanted.

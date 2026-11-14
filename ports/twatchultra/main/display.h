@@ -259,6 +259,22 @@ void display_margin_chrome(int col, int index, bool on);
 void display_margin_column_slots(int n);
 
 /*
+ * IS THIS SLOT A LIVE BUTTON?
+ *
+ * A slot that is not drawn must not act. The painter and the touch driver were
+ * deciding that separately -- the painter from `s_col_n` and `s_nochrome`, the
+touch driver from nothing at all -- so an app that hid slots left them live: the
+ * boxes vanished and a finger on the black glass underneath still sent a key and
+ * still buzzed. Reported on the NES, where the blank slots sit right beside the
+ * drawn d-pad and fired while the operator was testing it.
+ *
+ * One predicate, asked by both, so "not drawn" and "not live" are the same fact
+ * rather than two that can disagree (the fault TCH-011 records for ownership).
+ * `col` is 0 left, 1 right, 2 bottom strip.
+ */
+bool display_margin_slot_live(int col, int index);
+
+/*
  * Push a picture in PANEL coordinates, without the framebuffer's clip.
  *
  * display_picture_rows() stops at the 320x416 framebuffer; the glass is 502 rows

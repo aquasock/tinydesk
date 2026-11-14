@@ -119,22 +119,54 @@
 #define CHIP_9220       0x9220
 
 /* A pressed finger that stops reporting is treated as released after this,
- * because the controller never sends a release event of its own. */
-#define RELEASE_MS      250
+ * because the controller never sends a release event of its own.
+ *
+ * 100 MS, DOWN FROM 250, AND THE THREE SYMPTOMS THAT FORCED IT ARE ONE FAULT.
+ *
+ * Reported from the glass: a single tap on the d-pad moved Zelda's name-entry
+ * cursor two places, fast A presses were swallowed, and the d-pad felt laggy in
+ * the overworld. All three are the release being late, because `s_pad` is a
+ * HELD state: it stays set until this timeout expires, so a 120 ms tap became a
+ * 370 ms press. A menu that scrolls while a direction is held therefore moved
+ * twice, and two taps 150 ms apart were merged into one continuous press so the
+ * second was never seen as a press at all.
+ *
+ * The old 250 was chosen against a claim that the controller re-reports a held
+ * finger every ~66 ms, so 250 was about four report periods of tolerance. But
+ * this driver does not wait for the controller's own cadence: while `s_pressed`
+ * is true it reads the whole block every ACTIVE_MS, and each read is
+ * acknowledged, so the timing that actually matters is the 20 ms poll, not the
+ * part's report interval. A timeout of 100 ms therefore tolerates FOUR
+ * consecutive failed reads, which is a much larger guard than one dropped
+ * report and is the real margin to protect.
+ *
+ * The floor is set by the opposite risk: if a held finger ever goes longer than
+ * this between press blocks, the driver will release it and a held direction
+ * will stutter. That is why the value was not taken lower still, and if a hold
+ * ever feels like it is dropping out, the number to raise is this one. */
+#define RELEASE_MS      100
 /* Wake-up period while a finger is down, and while nothing is touching.
  *
- * The interrupt wakes this task when the controller has a report, so neither
- * number is the detection latency in normal use. They are the FALLBACK, and
- * they are deliberately two rates: 20 ms while pressed keeps a drag up with
- * the controller's own ~66 ms report period, and a slow 250 ms poll while
- * idle costs almost nothing but means a dead INT line degrades touch to
- * sluggish rather than losing it (TCH-009, verified in the Linux driver).
+ * IDLE_MS IS NOW 50, DOWN FROM 250, AND THAT WAS THE SECOND HALF OF THE SAME
+ * FAULT. This period is the fallback for when the interrupt does not wake the
+ * task, and it is also the state the task sleeps in immediately after every
+ * release. At 250 ms that made a fast second tap easy to miss outright: the
+ * first tap's release put the loop back to a 250 ms sleep, and if the interrupt
+ * did not fire the next press was not read until that expired -- by which time
+ * the finger had often gone, so the press was never seen. That is the reported
+ * "hit A fast enough and it stops capturing my presses".
  *
+ * The cost is bus traffic, and it is small: 20 reads a second against 4, on a
+ * bit-banged 100 kHz bus where a 15-byte block is on the order of 1.5 ms, so
+ * roughly 3 percent duty. The interrupt is still the mechanism meant to do the
+ * work, and the cost of these timers only matters when it is not.
+ *
+ * ACTIVE_MS while pressed keeps a drag up with the controller's own cadence.
  * Without the interrupt the active period is used unconditionally, which is
- * exactly what this driver did before: ~50 reads a second on a bus shared
- * with the PMU, the expander, the RTC and the haptic driver. */
+ * what this driver did before: ~50 reads a second on a bus shared with the PMU,
+ * the expander, the RTC and the haptic driver. */
 #define ACTIVE_MS       20
-#define IDLE_MS         250
+#define IDLE_MS         50
 
 /* Floor between services when the interrupt keeps firing. The controller only
  * pulses INT when it has something, so this should never bite -- but a stuck
@@ -178,7 +210,7 @@ static volatile bool s_dumping;
 static touch_app_touch_fn s_app_touch;
 static void *s_app_touch_user;
 
-static void deliver_app_touch(const touch_frame_t *f);
+static bool deliver_app_touch(const touch_frame_t *f);
 static bool s_app_active;        /* the app currently has points down */
 static int s_last_x = -1, s_last_y = -1;
 
@@ -484,18 +516,29 @@ static void edge_press(const edge_hit_t *hit, int y)
      * plausible line with the wrong action means the index. */
     ESP_LOGI(TAG, "e%d i%d", (int)hit->region, hit->index);
 
+    /*
+     * A SLOT THAT IS NOT DRAWN DOES NOT ACT, and the check is here rather than in
+     * every app because this is the one place a margin press becomes a key.
+     *
+     * The fault it fixes was measured: an app that hid slots left them live, so
+     * the glass under a blank slot still sent a key and still buzzed, right beside
+     * the controls the operator was testing. `edges_hit()` classifies against
+     * COL_N and knows nothing about what the app draws, so the driver has to ask
+     * -- and it asks the same predicate the painter uses, so 'not drawn' and 'not
+     * live' cannot drift apart.
+     */
     switch (hit->region)
     {
     case EDGE_LEFT:
-        if (hit->index >= 0 && hit->index < COL_N)
+        if (display_margin_slot_live(0, hit->index))
             key = s_fkey[hit->index];
         break;
     case EDGE_RIGHT:
-        if (hit->index >= 0 && hit->index < COL_N)
+        if (display_margin_slot_live(1, hit->index))
             key = s_rkey[hit->index];
         break;
     case EDGE_BOTTOM:
-        if (hit->index >= 0 && hit->index < BTN_N)
+        if (display_margin_slot_live(2, hit->index))
             key = s_bkey[hit->index];
         break;
     default:
@@ -527,12 +570,33 @@ static void edge_press(const edge_hit_t *hit, int y)
  * which holds only while every iteration takes exactly one poll period. With
  * the interrupt the loop wakes when the controller reports, so an iteration
  * can be any length, and counting iterations would have tied the release to
- * the wake rate instead of to the 250 ms the value means. */
-static void release_if_idle(void)
+ * the wake rate instead of to the 250 ms the value means.
+ *
+ * TWO KINDS OF "NOT A PRESS", AND CONFLATING THEM WAS THE DRAG FAULT.
+ *
+ * A block that is fifteen 0xFF bytes means nothing is touching the glass: the
+ * controller reports idle that way (TCH-012), and that is a FACT about the
+ * finger rather than an absence of news. A block whose first byte is ACK_BYTE
+ * means the part was acknowledged and had nothing new to say, which says nothing
+ * at all about whether a finger is still down.
+ *
+ * Treating both as "wait RELEASE_MS then release" cost the operator precise
+ * movement on Zelda's overworld: he reported the character overshooting and
+ * being unable to line up with a cave door. At 60 frames a second a 100 ms late
+ * release is SIX FRAMES of travel after the thumb has lifted, and at 100 ms it
+ * was fifteen. The timeout exists only to bridge the controller's ~66 ms report
+ * interval for a HELD finger -- an all-0xFF block needs no bridging and is
+ * released on the next poll, which is 20 ms.
+ *
+ * `idle_confirmed` is that distinction, and it comes from the block rather than
+ * from a judgement here. */
+static void release_if_idle(bool idle_confirmed)
 {
     if (!s_pressed)
         return;
-    if (esp_timer_get_time() - s_last_press_us < (int64_t)RELEASE_MS * 1000)
+
+    if (!idle_confirmed &&
+        esp_timer_get_time() - s_last_press_us < (int64_t)RELEASE_MS * 1000)
         return;
 
     /* Tell the app the glass is clear. One empty frame ends a chord, a hold and
@@ -648,6 +712,21 @@ static void poll_task(void *arg)
         s_reads++;
 
         /*
+         * IS ANYTHING TOUCHING THE GLASS AT ALL?
+         *
+         * Fifteen 0xFF bytes is idle, and the controller says so plainly (TCH-012).
+         * That is a different statement from a block with ACK_BYTE in byte 0, which
+         * only means the part had no new report -- a finger can be held and produce
+         * one of those. The release path needs the difference, so it is decided here
+         * once, from the block itself, rather than inferred later.
+         */
+        bool idle_block = true;
+
+        for (int k = 0; k < REPORT_LEN; k++)
+            if (b[k] != 0xFF)
+                idle_block = false;
+
+        /*
          * Capture before any interpretation, so what lands in the file is what
          * the controller said rather than what this driver understood.
          *
@@ -664,13 +743,7 @@ static void poll_task(void *arg)
          */
         if (s_dumping && s_dump_n < s_dump_cap)
         {
-            bool idle = true;
-
-            for (int k = 0; k < REPORT_LEN; k++)
-                if (b[k] != 0xFF)
-                    idle = false;
-
-            if (!idle)
+            if (!idle_block)
             {
                 memcpy(s_dump_buf[s_dump_n], b, REPORT_LEN);
                 s_dump_n++;
@@ -754,7 +827,7 @@ static void poll_task(void *arg)
 
         if (!press)
         {
-            release_if_idle();
+            release_if_idle(idle_block);
             continue;
         }
 
@@ -813,6 +886,14 @@ static void poll_task(void *arg)
                 f.p[0].region = hit.region;
                 f.p[0].index = hit.index;
 
+                /* The coordinates travel too, and they are the reason this
+                 * struct grew: a region and an index describe the margins, and a
+                 * press on a control the app drew for itself is inside the
+                 * framebuffer, where edges_hit() returns EDGE_NONE. The driver
+                 * decoded these two numbers and threw them away. */
+                f.p[0].x = x;
+                f.p[0].y = y;
+
                 /* The second point, at bytes 8..10 with its event code at byte 7
                  * and its validity marker at byte 12. Same 12-bit encoding as
                  * the first: x = (hi1 << 4) | (lo >> 4), y = (hi2 << 4) | (lo &
@@ -831,14 +912,32 @@ static void poll_task(void *arg)
 
                     f.p[1].region = hit2.region;
                     f.p[1].index = hit2.index;
+                    f.p[1].x = x2;
+                    f.p[1].y = y2;
                     f.n = 2;
                 }
 
                 s_app_active = true;
 
-                deliver_app_touch(&f);
+                /*
+                 * THE BUZZ FOLLOWS CONSUMPTION, NOT THE PRESS EDGE.
+                 *
+                 * This used to fire `haptic_tap()` on ANY press while an app owned
+                 * the screen, so a finger on blank glass, on a margin slot the app
+                 * had hidden, or on the padding between two drawn controls all felt
+                 * exactly like a real button. The operator reported it as phantom
+                 * buttons still vibrating after the slots themselves were removed,
+                 * and it made the d-pad impossible to test because every touch
+                 * appeared to register.
+                 *
+                 * The driver cannot answer this alone. Margin-slot liveness is now
+                 * knowable (`display_margin_slot_live`), but whether a point INSIDE
+                 * the framebuffer hit a control is known only to the app that drew
+                 * it, so the answer comes back from the callback.
+                 */
+                const bool used = deliver_app_touch(&f);
 
-                if (edge)
+                if (edge && used)
                 {
                     ESP_LOGI(TAG, "e%d i%d n%d", (int)hit.region, hit.index, f.n);
                     haptic_tap();
@@ -926,15 +1025,23 @@ bool touch_add_app_touch(touch_app_touch_fn fn, void *user)
 }
 
 /* Every registered consumer, in registration order. Only the one that owns the
- * screen acts; the others check their own running state and return. */
-static void deliver_app_touch(const touch_frame_t *f)
+ * screen acts; the others check their own running state and return.
+ *
+ * Returns true if ANY consumer reported that a control fired, which is what the
+ * haptic tap follows. Only one app can own the screen at a time, so in practice
+ * this is one consumer's answer with the others returning false. */
+static bool deliver_app_touch(const touch_frame_t *f)
 {
-    if (s_app_touch)
-        s_app_touch(s_app_touch_user, f);
+    bool used = false;
+
+    if (s_app_touch && s_app_touch(s_app_touch_user, f))
+        used = true;
 
     for (int i = 0; i < APP_TOUCH_MAX; i++)
-        if (s_app_touch_extra[i])
-            s_app_touch_extra[i](s_app_touch_extra_user[i], f);
+        if (s_app_touch_extra[i] && s_app_touch_extra[i](s_app_touch_extra_user[i], f))
+            used = true;
+
+    return used;
 }
 
 /* --- the raw-block dump -------------------------------------------------- */
