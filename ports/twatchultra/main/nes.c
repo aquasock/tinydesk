@@ -38,6 +38,7 @@
  * path, which is why the component lists "." and "nes" in INCLUDE_DIRS. */
 #include "nes/nes.h"
 #include "nes/apu.h"
+#include "sound.h"
 #include "palettes.h"
 
 static const char *TAG = "nes";
@@ -188,6 +189,71 @@ static volatile uint32_t s_us_blit_last;
  * Same shape and same reason as `pm start <rom> noblit` in pm.c.
  */
 static bool s_nobl_diag;
+
+/* --- audio -----------------------------------------------------------------
+ *
+ * THE APU WAS ALWAYS SYNTHESISING; NOTHING WAS COLLECTING ITS OUTPUT.
+ * `nes_emulate()` ends with `apu_emulate()`, which calls
+ * `apu_process(apu.buffer, samples_per_frame, stereo)` and fills the APU's own
+ * buffer once per frame. The port has been doing that since its first boot.
+ * What was missing was only the step that hands those samples to a DAC.
+ *
+ * THE FIRST VERSION OF THIS CALLED `apu_process()` AGAIN, AND THAT IS THE BUG
+ * THAT WAS HEARD RATHER THAN SEEN. `apu_process()` does not merely copy: it
+ * advances every channel -- volume decay, length counters, envelope phase,
+ * sweep. Calling it a second time per frame ran the whole sound engine at
+ * twice its intended rate against a buffer nobody read, and the result was
+ * reported by ear as "scratchy and tiny" before any counter showed it. Nothing
+ * in `nes status` could have caught it: frames were clean, the blit was clean,
+ * and no sample was dropped.
+ *
+ * SO THE SAMPLES ARE TAKEN, NOT MADE. `nes_getptr()` returns the machine
+ * struct, which carries `apu_t *apu`, which carries the buffer and its size --
+ * none of which needs an edit to the vendored core, unlike `apu_getcontext()`,
+ * which is a stub that prints "Not implemented". One channel is copied out
+ * because `sound_stream_write()` duplicates a mono sample into both slots.
+ *
+ * THE 0.16 PERCENT PITCH ERROR IS INHERITED AND DELIBERATE. nofrendo computes
+ * `samples_per_frame = sample_rate / refresh_rate` with refresh_rate as the
+ * integer 60, giving 735, while the port paces frames at 60.0988 Hz where the
+ * true figure is 733.79. Playing all 735 at 44.1 kHz makes the music 2.8 cents
+ * sharp -- about a fortieth of a semitone. The alternative is dropping 1.2
+ * samples a frame, which is an audible click every frame, so the pitch error
+ * is the better trade by a wide margin. Revisit only if the DECLARED rate is
+ * changed to match: 735 samples at 60.0988 Hz is 44,172 Hz.
+ */
+static bool s_audio;
+static int  s_aud_samples;      /* samples the APU produces per frame */
+static bool s_aud_stereo;       /* how apu_process was told to emit */
+static const int16_t *s_aud_buf;/* the APU's own output buffer, once found */
+/* THE RATE WE ACTUALLY PRODUCE, AND WHAT IT DID AND DID NOT FIX.
+ *
+ * nofrendo computes `samples_per_frame = sample_rate / refresh_rate` with
+ * refresh_rate as the integer 60, giving 735. The port paces frames at
+ * 60.0988 Hz, so the true output rate is 735 x 60.0988 = 44,172.6 Hz. Telling
+ * the DAC 44,100 made us produce 0.165 percent faster than it drained.
+ *
+ * THAT WAS NOT THE CAUSE OF THE DROPS, AND THE MEASUREMENT SAID SO. The drop
+ * count read 1,341 at 44,100 Hz and 1,341 again at 44,172 -- identical, so the
+ * hypothesis was wrong. What the log then showed is that every drop happens at
+ * frame 0 and frame 3 and never again: 735 refused, then 159, then silence for
+ * the rest of the run. That is the DMA ring not being ready at the instant the
+ * channel is opened, not a rate mismatch, and it is why the operator heard
+ * "the same underruns in the same place" -- the same place was the start.
+ *
+ * 44,172 IS STILL THE RIGHT NUMBER and is kept for a reason that survives:
+ * it is the correct pitch. The NES really does run at 60.0988 Hz, so playing
+ * its 735 samples at 44.1 kHz put the music 2.8 cents sharp. Matching the
+ * declared rate to production also means no drift accumulates over a long
+ * session, which is worth having whether or not it fixed anything audible.
+ *
+ * Files are the fact: /sd/nes_audio.log records every refused write with its
+ * frame number, because a total in `nes status` cannot distinguish a startup
+ * transient from a recurring stall and the two want opposite fixes. */
+#define NES_AUDIO_HZ   44172
+#define NES_AUD_MAX    736
+
+static int16_t s_pcm[NES_AUD_MAX];
 
 /*
  * CUMULATIVE counters, and the last-second figures above are not enough.
@@ -606,6 +672,50 @@ static void nes_task(void *arg)
 
 
         nes_emulate(true);
+
+        /* Synthesise this frame's samples and hand them to the DAC. The write
+         * never blocks -- see sound_stream_write(): a full ring drops samples
+         * rather than stalling the frame loop, which matters here because the
+         * emulator has about 4.5 ms of slack and one frame of audio is 13.9 ms
+         * of real time. */
+        if (s_audio && s_aud_buf)
+        {
+            const int n = s_aud_samples > NES_AUD_MAX ? NES_AUD_MAX : s_aud_samples;
+
+            /* TAKE ONE CHANNEL of what the APU already produced. apu_emulate()
+             * runs at the end of nes_emulate() and fills the APU's own buffer
+             * with s_aud_samples stereo frames; sound_stream_write() duplicates
+             * a mono sample into both slots, so half of it has to go. */
+            if (s_aud_stereo)
+                for (int i = 0; i < n; i++)
+                    s_pcm[i] = s_aud_buf[2 * i];
+            else
+                for (int i = 0; i < n; i++)
+                    s_pcm[i] = s_aud_buf[i];
+
+            const uint32_t before = sound_stream_dropped();
+            sound_stream_write(s_pcm, n);
+
+            /* WHEN, not how many. A total says the ring refused something; the
+             * frame number says whether that was a startup transient or a
+             * moment in the game, and the two want opposite fixes. */
+            const uint32_t after = sound_stream_dropped();
+            if (after != before)
+            {
+                /* TO A FILE, because printf scrolls off a 26-row terminal long
+                 * before anyone can read it and the interesting question is the
+                 * frame number, not the total. */
+                FILE *f = fopen("/sd/nes_audio.log", "a");
+                if (f)
+                {
+                    fprintf(f, "frame %lu dropped %lu of %d\n",
+                            (unsigned long)s_frames,
+                            (unsigned long)(after - before), n);
+                    fclose(f);
+                }
+            }
+        }
+
         s_frames++;
         fps_frames++;
         acc_emu += (uint32_t)(esp_timer_get_time() - t0);
@@ -784,6 +894,45 @@ bool nes_start(const char *rom_path)
     }
     s_pad = 0;
     s_paused = false;
+    /* Audio last, so a failure here does not leave a half-started machine. Best
+     * effort by design: a watch with no working amplifier still runs the game. */
+    {
+        nes_t *m = nes_getptr();
+        apu_t *a = m ? m->apu : NULL;
+
+        s_aud_buf = a ? (const int16_t *)a->buffer : NULL;
+        s_aud_samples = a ? a->samples_per_frame : 0;
+        s_aud_stereo = a ? a->stereo : false;
+
+        if (!s_aud_buf || s_aud_samples <= 0)
+        {
+            printf("nes: APU buffer not available\n");
+            s_aud_buf = NULL;
+        }
+    }
+
+    {
+        FILE *f = fopen("/sd/nes_audio.log", "w");
+        if (f)
+            fclose(f);
+    }
+    s_audio = sound_stream_open(NES_AUDIO_HZ);
+
+    if (!s_audio)
+        printf("nes: no audio (amplifier did not come up)\n");
+
+    /* LET THE CHANNEL SETTLE BEFORE THE FIRST WRITE. Measured: without this the
+     * very first frame loses all 735 of its samples and the third loses 159 --
+     * about 20 ms of audio refused while the freshly enabled DMA ring is not
+     * yet accepting, which is heard as a stutter at the start of every run and
+     * was reported as "the same underruns in the same place" because the same
+     * place was the beginning.
+     *
+     * The delay is paid once, at start, and the loop has not begun so nothing
+     * is being produced during it. */
+    if (s_audio)
+        vTaskDelay(pdMS_TO_TICKS(100));
+
     s_run = true;
     s_blit_done = s_blit_skipped = 0;
 
@@ -834,6 +983,17 @@ bool nes_start(const char *rom_path)
     return true;
 
 fail_queues:
+    /* Audio is opened before the queues, so this path can reach it. Closing it
+     * here is not tidiness: an unclosed stream leaves the I2S channel
+     * reconfigured to 44.1 kHz stereo, and the next `play` of a WAV would come
+     * out at the wrong rate and the BEL would be pitched wrong. */
+    if (s_audio)
+    {
+        sound_stream_close();
+        s_audio = false;
+    }
+    s_run = false;
+
     if (s_free_q)
     {
         vQueueDelete(s_free_q);
@@ -886,6 +1046,14 @@ void nes_stop(void)
     {
         vQueueDelete(s_filled_q);
         s_filled_q = NULL;
+    }
+
+    /* After the task, so nothing can write into a stream that is being taken
+     * away -- the same ordering argument as the blit task above. */
+    if (s_audio)
+    {
+        sound_stream_close();
+        s_audio = false;
     }
 
     nes_shutdown();
@@ -1011,6 +1179,15 @@ static int cmd_nes(tdsh_session_t *session, int argc, char **argv)
 
         if (s_nes)
             printf("rom=%s paused=%d\n", s_rom_path, s_paused ? 1 : 0);
+
+        /* Whether the amp came up and whether samples are being dropped. A
+         * climbing drop count means the ring is the wrong shape, not that the
+         * sound is broken. */
+        if (s_audio)
+            printf("audio %d Hz mono, %lu drops\n", NES_AUDIO_HZ,
+                   (unsigned long)sound_stream_dropped());
+        else
+            printf("audio off\n");
 
         printf("vidbuf=%s%s blits=%lu skipped=%lu\n",
                s_vidbuf_internal ? "INTERNAL" : "PSRAM",
