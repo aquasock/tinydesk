@@ -25,6 +25,11 @@
 
 static nes_t nes;
 
+/* Counted so a caller can tell "NMI fires" from "NMI never fires" without
+ * guessing from the CPU's program counter, which sits in a wait loop between
+ * interrupts and looks identical in both cases. */
+unsigned long nes_nmi_count;
+
 nes_t *nes_getptr(void)
 {
     return &nes;
@@ -46,7 +51,10 @@ void nes_emulate(bool draw)
         {
             elapsed_cycles += nes6502_execute(6);
             if (nes.ppu->ctrl0 & PPU_CTRL0F_NMI)
+            {
+                nes_nmi_count++;
                 nes6502_nmi();
+            }
 
             if (nes.mapper->vblank)
                 nes.mapper->vblank(&nes);

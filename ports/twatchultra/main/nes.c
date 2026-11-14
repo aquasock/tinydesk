@@ -39,6 +39,7 @@
  * path, which is why the component lists "." and "nes" in INCLUDE_DIRS. */
 #include "nes/nes.h"
 #include "nes/apu.h"
+#include "nes/mem.h"
 #include "sound.h"
 #include "palettes.h"
 
@@ -1763,6 +1764,95 @@ static int cmd_nes(tdsh_session_t *session, int argc, char **argv)
         return 0;
     }
 
+    if (argc >= 2 && strcmp(sub, "ppudump") == 0)
+    {
+        /*
+         * WHAT THE PPU ACTUALLY HOLDS, to the card.
+         *
+         * AccuracyCoin renders as pink tiled squares filling the screen while
+         * `jam=0`, `pc=80dd` and `ctrl1=0e` all say the CPU is running and
+         * background rendering is switched on. Those facts leave three places the
+         * fault can be, and they are three different bugs:
+         *
+         *   - the NAMETABLE holds garbage, so the CPU wrote nonsense (a game-code
+         *     fault, or a VRAM addressing fault in the PPU);
+         *   - the nametable looks sensible but the CHR page holds zeros, so tile
+         *     data never reached the PPU (a cartridge-loading fault);
+         *   - both are fine and the PALETTE is garbage, which is a different fault
+         *     again and would explain "pink" specifically.
+         *
+         * Thirty-two bytes of palette, sixty-four of nametable and the first bytes
+         * of each CHR page separate them in one reading. Written to a file because
+         * the terminal is forty columns and this is a hex dump.
+         */
+        if (!s_nes || !s_nes->ppu)
+        {
+            printf("no ppu\n");
+            return 1;
+        }
+
+        FILE *df = fopen("/sd/ppu.txt", "w");
+        if (!df)
+        {
+            printf("no card\n");
+            return 1;
+        }
+
+        const ppu_t *p = s_nes->ppu;
+
+        fprintf(df, "ctrl0=%02x ctrl1=%02x stat=%02x bg_base=%d obj_base=%d\n",
+                p->ctrl0, p->ctrl1, p->stat, p->bg_base, p->obj_base);
+        fprintf(df, "palette:");
+        for (int i = 0; i < 32; i++)
+            fprintf(df, " %02x", p->palette[i]);
+        fprintf(df, "\n");
+
+        fprintf(df, "nametab:");
+        for (int i = 0; i < 64; i++)
+            fprintf(df, " %02x", p->nametab ? p->nametab[i] : 0);
+        fprintf(df, "\n");
+
+        /*
+         * ALL FOUR NAMETABLES, because "nametable 0 is empty" does not mean the
+         * ROM drew nothing.
+         *
+         * `ctrl0` bits 1:0 select which nametable the PPU SHOWS, and they were 0
+         * here, but the ROM is free to have written into any of the four and
+         * switched later. AccuracyCoin left nametable 0 empty and the palette set,
+         * which is consistent with drawing into another table -- or with not
+         * drawing at all. Sixteen bytes from each of the four separates those in
+         * one reading.
+         */
+        for (int nt = 0; nt < 4; nt++)
+        {
+            fprintf(df, "nt%d:", nt);
+            const int base = nt * PPU_PAGESIZE;
+
+            for (int i = 0; i < 16; i++)
+                fprintf(df, " %02x", p->nametab ? p->nametab[base + i] : 0);
+            fprintf(df, "\n");
+        }
+
+        /* The attribute table, which is what turns tile indices into colours and
+         * is the other half of a "pink tiles" reading. */
+        fprintf(df, "attr:");
+        for (int i = 0x3C0; i < 0x400; i++)
+            fprintf(df, " %02x", p->nametab ? p->nametab[i] : 0);
+        fprintf(df, "\n");
+
+        for (int pg = 0; pg < 2; pg++)
+        {
+            fprintf(df, "chr%d:", pg);
+            for (int i = 0; i < 32; i++)
+                fprintf(df, " %02x", p->page[pg] ? p->page[pg][i] : 0);
+            fprintf(df, "\n");
+        }
+
+        fclose(df);
+        printf("wrote /sd/ppu.txt\n");
+        return 0;
+    }
+
     if (argc >= 2 && strcmp(sub, "stalls") == 0)
     {
         /* Dump the RAM ring. Nothing is written to the card, on the reasoning
@@ -1799,6 +1889,74 @@ static int cmd_nes(tdsh_session_t *session, int argc, char **argv)
 
         if (s_nes)
             printf("rom=%s paused=%d\n", s_rom_path, s_paused ? 1 : 0);
+
+        /*
+         * WHETHER THE 6502 IS STILL EXECUTING, which every other figure hides.
+         *
+         * A jammed CPU and a healthy one look identical from outside: the frame
+         * loop keeps stepping, the blitter keeps pushing, `fps` reads 60 and the
+         * PPU keeps scanning whatever the nametable happened to hold. AccuracyCoin
+         * rendered as pink tiled squares filling the screen while all of that read
+         * normal, and the two candidates -- a CPU that halted, versus a CPU that is
+         * fine and a renderer that is not -- want completely different work.
+         *
+         * `jammed` is nofrendo's own flag for an opcode it refuses to execute, and
+         * `pc` says where. AccuracyCoin deliberately executes the whole undocumented
+         * instruction set, so a JAM is a real possibility on this ROM in a way it
+         * never was on Zelda. The PPU's ctrl0 says whether background and sprite
+         * rendering are even switched on, which is the other way a screen can be
+         * nonsense with nothing wrong in the emulator.
+         */
+        if (s_nes && s_nes->cpu)
+        {
+            const nes6502_t *c = s_nes->cpu;
+
+            printf("cpu pc=%04lx jam=%d a=%02x x=%02x y=%02x p=%02x\n",
+                   (unsigned long)(c->pc_reg & 0xFFFF), c->jammed ? 1 : 0,
+                   c->a_reg, c->x_reg, c->y_reg, c->p_reg);
+
+            /*
+             * THE NMI VECTOR AND WHAT IS AT IT.
+             *
+             * AccuracyCoin's main loop parks at `JMP $80DD` with the nametable
+             * still empty, and its NMI and IRQ vectors both point INTO RAM ($0700
+             * and $0600), so the ROM installs its own handlers there rather than
+             * running them from the cartridge. That makes "was a handler ever
+             * installed" the first question: a vector into RAM that was never
+             * written turns every NMI into a jump to zeros, which decode as BRK and
+             * land on the IRQ vector, which is also in RAM. Nothing draws and
+             * nothing faults -- exactly the observed state.
+             *
+             * Read through mem_getbyte() rather than cpu->pages[], because page
+             * indices there are 2 KB and getting the shift wrong reads the wrong
+             * bank silently.
+             */
+            printf("nmi_vec=%04x irq_vec=%04x\n",
+                   (unsigned)mem_getword(NMI_VECTOR), (unsigned)mem_getword(IRQ_VECTOR));
+
+            printf("at0700:");
+            for (int i = 0; i < 12; i++)
+                printf(" %02x", mem_getbyte(0x0700 + i));
+            printf("\n");
+
+            printf("at0600:");
+            for (int i = 0; i < 12; i++)
+                printf(" %02x", mem_getbyte(0x0600 + i));
+            printf("\n");
+
+            /* The ROM's own test counter, incremented before each JSR in the
+             * linear list at $80A0. A large value says the list ran; zero says it
+             * never started. */
+            extern unsigned long nes_nmi_count;
+            printf("test_ctr_ec=%02x nmi=%lu\n",
+                   mem_getbyte(0x00EC), nes_nmi_count);
+
+        }
+
+        if (s_nes && s_nes->ppu)
+            printf("ppu ctrl0=%02x ctrl1=%02x stat=%02x vaddr=%04x\n",
+                   s_nes->ppu->ctrl0, s_nes->ppu->ctrl1, s_nes->ppu->stat,
+                   (unsigned)(s_nes->ppu->vaddr & 0xFFFF));
 
         /* Whether the amp came up and whether samples are being dropped. A
          * climbing drop count means the ring is the wrong shape, not that the

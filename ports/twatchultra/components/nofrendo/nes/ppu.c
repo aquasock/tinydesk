@@ -709,6 +709,34 @@ void ppu_reset(void)
    ppu.stat = 0;
    ppu.flipflop = 0;
    ppu.vaddr = ppu.vaddr_latch = 0x2000;
+
+   /*
+    * THE $2007 ADDRESS INCREMENT IS 1 AFTER RESET, NOT 0, AND LEAVING IT AT 0 COST
+    * A WHOLE ROM.
+    *
+    * `ppu_init()` memsets the struct, so `vaddr_inc` starts at zero and stays there
+    * until the cartridge happens to write $2000 -- the only place it is ever
+    * assigned. On real hardware $2000 resets to 0, bit 2 (ADDRINC) is clear, and
+    * the increment is therefore ONE from power-on.
+    *
+    * The consequence is not subtle once it is measured. AccuracyCoin fills its
+    * nametables before it ever touches $2000, so every one of those writes ran
+    * `ppu.vaddr += 0` and landed on the same byte: the instrument counted 4459
+    * nametable writes with 4096 of them at exactly $2000, the nametable came out
+    * all zeros except its first entry, and the screen showed tile 0 repeated in
+    * every cell -- a field of identical rings. The ROM looked broken and the CPU,
+    * the NMI and the $2007 write path were all provably fine.
+    *
+    * Reads are affected the same way, since $2007 read shares this increment, so a
+    * cartridge reading back a nametable it just wrote would see the same address
+    * over and over.
+    *
+    * Zelda never tripped it because MMC1 writes $2000 as part of its reset
+    * sequence. That is the shape of the bug: it only bites a cartridge that fills
+    * VRAM before setting the PPU control register.
+    */
+   ppu.vaddr_inc = 1;
+
    ppu.oam_addr = 0;
    ppu.tile_xofs = 0;
    ppu.latch = 0;
