@@ -246,11 +246,38 @@ uint8_t hid_gamepad_hat(void)
     return s_gp_hat;
 }
 
+/* The last report as received. Written from the Bluetooth task, read from a shell
+ * command; the reader may see a torn mix of two reports if it reads mid-write, so
+ * it is a snapshot for a human rather than a value to branch on. */
+static hid_gamepad_last_t s_gp_last;
+
+hid_gamepad_last_t hid_gamepad_last(void)
+{
+    return s_gp_last;
+}
+
 hid_gamepad_mask_t hid_gamepad_report(const hid_gamepad_layout_t *g,
                                       const uint8_t *r, size_t len)
 {
     if (!g || !g->ok || !r)
         return 0;
+
+    /* Record before any early return, so a report rejected below still shows up
+     * in the diagnostic -- a report that never reaches the decode is one of the
+     * cases worth seeing. */
+    s_gp_last.len      = (uint16_t)(len > 0xFFFF ? 0xFFFF : len);
+    s_gp_last.id       = len ? r[0] : 0;
+    s_gp_last.want_id  = g->button.id;
+    s_gp_last.count    = g->count;
+    s_gp_last.btn_pos  = g->button.pos;
+    s_gp_last.btn_size = g->button.size;
+    s_gp_last.hat_pos  = g->hat.pos;
+    s_gp_last.hat_size = g->hat.size;
+    s_gp_last.ids      = g->ids;
+    s_gp_last.reports++;
+
+    for (size_t i = 0; i < sizeof(s_gp_last.bytes); i++)
+        s_gp_last.bytes[i] = i < len ? r[i] : 0;
 
     if (g->ids && (len < 1 || r[0] != g->button.id))
         return 0;                       /* another report of this interface */

@@ -106,6 +106,41 @@ hid_gamepad_mask_t hid_gamepad_report(const hid_gamepad_layout_t *layout,
 hid_gamepad_mask_t hid_gamepad_state(void);
 uint8_t hid_gamepad_hat(void);
 
+/*
+ * WHAT THE LAST REPORT ACTUALLY CONTAINED, for a fault that every other view
+ * hides.
+ *
+ * Measured on the watch: the d-pad decodes correctly while every face button
+ * reads zero -- `gamepad=0x0000` on a mask taken straight from the decoder while
+ * the hat cycles 0,2,4,6. The parser passes 27 checks on the host against the
+ * captured descriptor, so the descriptor and the decode are not in question; what
+ * is left is the report itself, and its LENGTH is the prime suspect. The hat sits
+ * at bit 96 and the buttons at bit 104, which with a prepended report ID means
+ * byte 13 and byte 14: a report one byte shorter than the descriptor expects
+ * would decode the hat perfectly and every button as zero, which is exactly the
+ * symptom.
+ *
+ * So this records the length, the report ID, the parsed field positions and the
+ * first bytes verbatim. Guessing between a short report, a different controller
+ * revision and a field-id mismatch is what the file is for.
+ */
+typedef struct
+{
+    uint16_t len;        /* bytes handed to the decoder, report ID included */
+    uint8_t  id;         /* r[0] as received */
+    uint8_t  want_id;    /* the layout's own report ID */
+    uint8_t  count;      /* buttons the descriptor declared */
+    uint16_t btn_pos;    /* bit offset of the first button */
+    uint8_t  btn_size;   /* bits per button */
+    uint16_t hat_pos;
+    uint8_t  hat_size;
+    bool     ids;        /* the layout expects a report ID */
+    uint8_t  bytes[16];  /* the report as received */
+    uint32_t reports;    /* how many reports have been decoded */
+} hid_gamepad_last_t;
+
+hid_gamepad_last_t hid_gamepad_last(void);
+
 /* The Mouse and Keyboard apps' settings (td_sysinfo_t.mouse, .keyboard), or
  * NULL before hid_input_init(). */
 const td_mouse_ops_t *hid_input_mouse_ops(void);

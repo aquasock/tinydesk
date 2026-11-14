@@ -717,6 +717,24 @@ static volatile int s_pad;
 #define GP_BIT_VIEW   10
 #define GP_BIT_MENU   11
 
+/*
+ * THE HAT IS EIGHT-WAY AND THE ODD VALUES ARE DIAGONALS.
+ *
+ * This used to map only 0, 2, 4 and 6, on the stated grounds that "a 4-bit hat
+ * switch cannot report one, so every other value is either a cardinal direction or
+ * centred". MEASURED, THAT IS FALSE: a capture on the watch recorded hat=1 in the
+ * middle of a thumb roll, and it produced NES=0x00 -- the direction was dropped.
+ *
+ * The controller reports 1..8 clockwise from up, and hid_gamepad_report() turns
+ * that into 0..7, so even values are the cardinals and odd values are the four
+ * diagonals. The premise was wrong and the cost was real: diagonal walking does
+ * not exist without them, which in Zelda is how you cross a room without
+ * staircasing.
+ *
+ * A diagonal is two directions at once, which the NES pad expresses as two bits --
+ * the console's own D-pad is a cross of four switches and pressing a corner closes
+ * two of them. So 1 is UP|RIGHT, 3 is DOWN|RIGHT, 5 is DOWN|LEFT and 7 is UP|LEFT.
+ */
 static int pad_from_gamepad(void)
 {
     hid_gamepad_mask_t m = hid_gamepad_state();
@@ -728,13 +746,23 @@ static int pad_from_gamepad(void)
     if (m & (1u << GP_BIT_VIEW)) pad |= NES_PAD_SELECT;
     if (m & (1u << GP_BIT_MENU)) pad |= NES_PAD_START;
 
-    /* 0..7 clockwise from up, 0xFF for centred. Diagonals are deliberately not
-     * offered: a 4-bit hat switch cannot report one, so every other value is
-     * either a cardinal direction or centred. */
-    if (hat == 0) pad |= NES_PAD_UP;
-    else if (hat == 2) pad |= NES_PAD_RIGHT;
-    else if (hat == 4) pad |= NES_PAD_DOWN;
-    else if (hat == 6) pad |= NES_PAD_LEFT;
+    /* X and Y have no NES equivalent -- the console has two face buttons and this
+     * controller has four -- so they are deliberately unmapped rather than aliased
+     * onto A and B, which would make a reflex press of the wrong button do the
+     * wrong thing. */
+
+    switch (hat)
+    {
+    case 0: pad |= NES_PAD_UP;                          break;
+    case 1: pad |= NES_PAD_UP    | NES_PAD_RIGHT;       break;
+    case 2: pad |= NES_PAD_RIGHT;                       break;
+    case 3: pad |= NES_PAD_DOWN  | NES_PAD_RIGHT;       break;
+    case 4: pad |= NES_PAD_DOWN;                        break;
+    case 5: pad |= NES_PAD_DOWN  | NES_PAD_LEFT;        break;
+    case 6: pad |= NES_PAD_LEFT;                        break;
+    case 7: pad |= NES_PAD_UP    | NES_PAD_LEFT;        break;
+    default: break;                 /* 0xFF: centred */
+    }
 
     return pad;
 }
@@ -1671,6 +1699,35 @@ static int cmd_nes(tdsh_session_t *session, int argc, char **argv)
 
         printf("sampling 30 s -> /sd/nespad.txt\n");
 
+        /*
+         * THE LAYOUT AND THE LAST REPORT GO IN THE HEADER, once, before any
+         * sampling.
+         *
+         * Everything the earlier capture said was that every button read zero
+         * while the hat cycled correctly, and that cannot distinguish a report
+         * that is too short from a descriptor that declared no buttons from a
+         * field-id mismatch. Those are three different faults with three
+         * different fixes, so the facts that separate them are written down
+         * before the first press rather than inferred afterwards.
+         */
+        {
+            hid_gamepad_last_t L = hid_gamepad_last();
+
+            fprintf(pf, "layout: ids=%d report_id=%u count=%u btn_pos=%u btn_size=%u "
+                        "hat_pos=%u hat_size=%u\n",
+                    (int)L.ids, (unsigned)L.want_id, (unsigned)L.count,
+                    (unsigned)L.btn_pos, (unsigned)L.btn_size,
+                    (unsigned)L.hat_pos, (unsigned)L.hat_size);
+
+            fprintf(pf, "last report: len=%u id=0x%02x reports=%lu\n",
+                    (unsigned)L.len, (unsigned)L.id, (unsigned long)L.reports);
+
+            fprintf(pf, "bytes:");
+            for (size_t k = 0; k < sizeof(L.bytes); k++)
+                fprintf(pf, " %02x", L.bytes[k]);
+            fprintf(pf, "\n");
+        }
+
         int last = -1;
 
         for (int i = 0; i < 300; i++)
@@ -1687,6 +1744,18 @@ static int cmd_nes(tdsh_session_t *session, int argc, char **argv)
             }
 
             vTaskDelay(pdMS_TO_TICKS(100));
+        }
+
+        /* Where it ended up, so a press made late in the window still lands in the
+         * file rather than needing another run. */
+        {
+            hid_gamepad_last_t L = hid_gamepad_last();
+
+            fprintf(pf, "final: len=%u id=0x%02x reports=%lu bytes:",
+                    (unsigned)L.len, (unsigned)L.id, (unsigned long)L.reports);
+            for (size_t k = 0; k < sizeof(L.bytes); k++)
+                fprintf(pf, " %02x", L.bytes[k]);
+            fprintf(pf, "\n");
         }
 
         fclose(pf);
