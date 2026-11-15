@@ -60,7 +60,19 @@ static const ble_uuid128_t s_tx_uuid =
     BLE_UUID128_INIT(0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
                      0x93, 0xf3, 0xa3, 0xb5, 0x03, 0x00, 0x40, 0x6e);
 
-#define BLEUART_RX_RING 4096    /* client -> shell; absorbs a write burst */
+/*
+ * RING SIZES ARE A MEMORY BUDGET, NOT A PREFERENCE.
+ *
+ * This board reports 31 KB of free internal RAM with the USB host stack linked
+ * in. The rings plus the mbuf pool were consuming 28 KB of it -- 16 KB tx,
+ * 4 KB rx, 8 KB of mbufs -- which leaves nothing for the display, the shell or
+ * WiFi. A sustained transfer that crashes after about fifteen seconds while a
+ * short burst succeeds is what starvation looks like.
+ *
+ * 4 KB of tx is twenty 200-byte notifications, which is ample: the consumer is
+ * the notify task draining at the connection interval, not a slow human.
+ */
+#define BLEUART_RX_RING 2048    /* client -> shell; absorbs a write burst */
 
 /* Flow control. The shell drains one byte per poll, so a client that writes a
  * burst can outrun it. Rather than drop silently -- which corrupted a file
@@ -73,7 +85,7 @@ static const ble_uuid128_t s_tx_uuid =
 #define BLEUART_XON_AT  (BLEUART_RX_RING * 1 / 4)
 #define BLEUART_XOFF    0x13    /* Ctrl-S */
 #define BLEUART_XON     0x11    /* Ctrl-Q */
-#define BLEUART_TX_RING 16384    /* shell -> client */
+#define BLEUART_TX_RING 4096     /* shell -> client; 20 notifications */
 #define BLEUART_ADV_NAME "TinyDesk"
 /*
  * HOW LONG TO WAIT FOR A NOTIFICATION TO LEAVE BEFORE SENDING THE NEXT.
@@ -110,6 +122,18 @@ static volatile uint32_t s_tx_sent;    /* bytes successfully notified */
 static volatile uint32_t s_tx_failed;  /* notifications the stack refused */
 static volatile uint16_t s_mtu = 23;   /* negotiated ATT MTU */
 static volatile int s_last_nrc;        /* last notify error code */
+
+/* Set while `bleuart fetch` is streaming a file.
+ *
+ * The display mirror and a file transfer share ONE 4 KB TX ring, and the
+ * desktop repaints far faster than the link drains. Letting them compete
+ * starves the file -- and because the fetch loop waited on that ring, it spun
+ * forever and took the shell task with it: every command typed afterwards did
+ * nothing, which reads as "the console died".
+ *
+ * So the mirror yields for the duration. Losing a few frames of desktop costs
+ * nothing here: a client collecting a file is not watching the desktop. */
+static volatile bool s_fetching;
 
 /*
  * THE WRITE PATH, which is the only way a byte enters the shell.
@@ -372,16 +396,29 @@ static void tx_task(void *arg)
             s_tx_failed++;
             s_last_nrc = rc;
 
-            /* OUT OF MBUFS MEANS STOP TALKING. Retrying immediately deepens the
-             * shortage and starves the receive path too, which is how a console
-             * that is only trying to print ends up unable to hear anything.
-             * Dropping the chunk loses output; spamming the pool loses the
-             * session. */
+            /* OUT OF MBUFS MEANS PAUSE, AND NOTHING ELSE.
+             *
+             * THIS MBUF MUST NOT BE FREED HERE. ble_gatts_notify_custom() sets
+             * txom = NULL unconditionally after calling ble_att_clt_tx_notify(),
+             * so NimBLE takes ownership of the mbuf whether the notify succeeds
+             * or fails -- and frees it itself on the failure path.
+             *
+             * An earlier revision freed it on BLE_HS_ENOMEM, which is a double
+             * free. The visible symptom was not a double-free report but pool
+             * CORRUPTION: the next allocation returned a block whose om_omp
+             * pointer was garbage, and ble_hs_mbuf_gen_pkt() dereferenced it:
+             *
+             *   Crashed task: 'bleuart'
+             *   #0 ble_hs_mbuf_gen_pkt  ble_hs_mbuf.c:42
+             *   #3 tx_task              bleuart.c:353
+             *
+             * It appeared under load, which is why a 4 KB transfer at gentle
+             * pacing passed for hours and typing into minicom killed the board in
+             * seconds. The pause below is the whole backoff; ownership stays with
+             * NimBLE. */
             if (rc == BLE_HS_ENOMEM)
-            {
-                os_mbuf_free_chain(om);
                 vTaskDelay(pdMS_TO_TICKS(20));
-            }
+
             continue;
         }
 
@@ -532,6 +569,21 @@ int bleuart_write(const uint8_t *buf, int len)
     return (int)n;
 }
 
+/* Blocking variant, used only by `fetch`: wait for ring space instead of
+ * dropping. The console path needs the non-blocking write; a file transfer
+ * needs the opposite, because a dropped chunk is a hole in the file.
+ *
+ * Returns 0 on timeout, so the caller can bound its wait. */
+static int bleuart_write_wait(const uint8_t *buf, int len, TickType_t ticks)
+{
+    if (!s_up || !buf || len <= 0)
+        return 0;
+
+    const size_t n = xRingbufferSend(s_tx, buf, (size_t)len, ticks);
+
+    return (int)n;
+}
+
 /* --- the hooks the shared layer calls ------------------------------------
  *
  * Strong definitions for the weak defaults: bt_hid.c's sync callback brings the
@@ -571,6 +623,11 @@ int board_serial2_alt_read(void)
 
 int board_serial2_alt_write(const uint8_t *buf, int len)
 {
+    /* Yield the TX ring to an in-progress file transfer. Reporting len keeps the
+     * caller's "accepted" contract intact; these are mirror bytes, not data. */
+    if (s_fetching)
+        return len;
+
     return bleuart_write(buf, len);
 }
 
@@ -640,39 +697,77 @@ static int cmd_bleuart(tdsh_session_t *session, int argc, char **argv)
         }
 
         unsigned long total = 0;
+        bool stuck = false;
 
-        for (;;)
+        s_fetching = true;
+
+        while (!stuck)
         {
-            uint8_t chunk[512];
+            uint8_t chunk[256];
             const size_t n = fread(chunk, 1, sizeof(chunk), f);
 
             if (n == 0)
                 break;
 
             size_t off = 0;
+            int stalls = 0;
 
-            /* bleuart_write is non-blocking and returns a short count, so a
-             * full ring is retried rather than dropped -- the notify task
-             * drains it at the connection interval. */
+            /* BLOCK FOR RING SPACE, WITH A CEILING.
+             *
+             * The old loop polled every 5 ms and never gave up. When the ring
+             * stayed full it looped forever and the shell never returned to a
+             * prompt, so every later command was silently swallowed. A
+             * transfer that cannot make progress now ends and says so instead
+             * of hanging the only channel available to report it. */
             while (off < n)
             {
-                const int w = bleuart_write(chunk + off, (int)(n - off));
+                const int w = bleuart_write_wait(chunk + off, (int)(n - off),
+                                                 pdMS_TO_TICKS(500));
 
                 if (w > 0)
+                {
                     off += (size_t)w;
+                    stalls = 0;
+                    continue;
+                }
 
-                vTaskDelay(pdMS_TO_TICKS(5));
+                if (++stalls > 4)
+                {
+                    stuck = true;
+                    break;
+                }
             }
+
+            if (stuck)
+                break;
 
             total += n;
         }
 
         fclose(f);
 
-        /* Give the notify task time to empty the ring before the shell prints
-         * anything that would interleave with the last of the data. */
-        vTaskDelay(pdMS_TO_TICKS(300));
-        printf("bleuart: fetched %lu bytes from %s\n", total, argv[2]);
+        /* Let the notify task empty the ring before the shell prints anything
+         * that would interleave with the last of the data. */
+        {
+            int i;
+
+            for (i = 0; i < 40; i++)
+            {
+                size_t held = 0;
+
+                vRingbufferGetInfo(s_tx, NULL, NULL, NULL, NULL, &held);
+
+                if (held == 0)
+                    break;
+
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+        }
+
+        s_fetching = false;
+
+        printf("bleuart: fetched %lu bytes from %s%s\n", total, argv[2],
+               stuck ? " (client stopped reading)" : "");
         return 0;
     }
 
@@ -721,8 +816,8 @@ static int cmd_bleuart(tdsh_session_t *session, int argc, char **argv)
 
 static const tdsh_command_t s_bleuart_cmd = {
     "bleuart",
-    "bleuart [adv]",
-    "BLE serial console: state, or restart advertising",
+    "bleuart [adv|drop|fetch <path>]",
+    "BLE serial console: state, restart advertising, drop link, send a file",
     cmd_bleuart,
     TDSH_CMD_INTERACTIVE,
 };
