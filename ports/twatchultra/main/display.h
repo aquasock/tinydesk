@@ -310,6 +310,21 @@ bool display_margin_strip_is_tall(void);
 bool display_panel_rows(int cx, int cy, int w, int h, display_row_fn fn);
 
 /*
+ * Push a caller's pixels to a panel rectangle, with NO ownership requirement.
+ *
+ * For furniture that lives OUTSIDE the framebuffer and must remain visible while
+ * an app owns the glass -- the status strip in rows 1..43 is the first user. The
+ * caller supplies the pixels, so there is no shared buffer to race, and the push
+ * is atomic against other writers because every band programs its window inside
+ * one SPI bus acquisition.
+ *
+ * Controller coordinates: x from PANEL_COL_OFFSET, y from 0. The rectangle must
+ * be entirely on the glass; a clipped one is refused rather than truncated.
+ * Pixels must already be in the panel's byte order.
+ */
+bool display_panel_push(int cx, int cy, int w, int h, const uint16_t *pixels);
+
+/*
  * Compare the framebuffer against the cell grid, and the grid against what the
  * painter believes it has drawn.
  *

@@ -259,6 +259,7 @@ static bool chip_temp(int *tenths_c)
       /* Time zone: the same offset file TinyDesk Shell's `tz` command uses, so the
  * taskbar clock and `date` agree. Re-read now and then (tz may change it). */
 static long s_tz;
+static bool s_tz_valid;          /* a value has actually been read from a file */
 static int64_t s_tz_read_us = -1;
 static char s_tz_user[32];
 
@@ -268,27 +269,64 @@ static void tz_path(char *out, size_t cap)
     snprintf(out, cap, "%.140s" TZ_NAME, td_session_home());
 }
 
+/*
+ * The user's time zone, as an offset from UTC in seconds.
+ *
+ * THE FAILED READ USED TO BE CACHED FOR THE FULL THIRTY SECONDS, and that is the
+ * fault the status strip exposed: `td_session_home()` is a static that
+ * `compute_paths()` fills at login, so anything asking for the offset BEFORE the
+ * desktop has logged in builds the path `/.tdsh_tz`, fails to open it, and caches
+ * 0 -- which reads as UTC. Measured on the watch: `home='/fs/root'` and the file
+ * opening fine, while `get_tz` returned 0, because the call that mattered had
+ * happened twenty-five seconds earlier, before login, and the failure was still
+ * inside its window.
+ *
+ * A FAILED READ IS NOW REPORTED AS A FAILURE, and that is the actual defect this
+ * function had. It returned true while handing back whatever was in `s_tz` -- 0
+ * when the file had never been read -- so "I could not find your time zone" and
+ * "your time zone is UTC" arrived as the same answer. Something that DISPLAYS the
+ * offset therefore showed UTC and called it success, and the operator saw the clock
+ * revert from local time to UTC after a while, with no error anywhere.
+ *
+ * `*seconds` is still filled in on failure, so the callers that ignore the return
+ * value keep the last known offset rather than reading uninitialized memory -- but
+ * a caller that wants to distinguish the two cases now can.
+ *
+ * THE CACHE WINDOW IS DELIBERATELY UNCHANGED AT THIRTY SECONDS, including for a
+ * miss. An earlier attempt retried on the very next call after a failure, which
+ * was wrong in the other direction: this function sits on the taskbar's paint path
+ * and on the status strip, both of which run on timers, so "retry every call"
+ * turns one failed open into an open per tick forever.
+ */
 static bool get_tz(long *seconds)
 {
     int64_t now = esp_timer_get_time();
     bool other_user = strcmp(s_tz_user, td_session_user()) != 0;
+    bool ok = s_tz_valid;
+
     if (s_tz_read_us < 0 || other_user || now - s_tz_read_us > 30000000)
     {
         char path[160];
         tz_path(path, sizeof(path));
         snprintf(s_tz_user, sizeof(s_tz_user), "%s", td_session_user());
-        s_tz = 0;
+
+        long value = 0;
         FILE *f = fopen(path, "r");
         if (f)
         {
-            if (fscanf(f, "%ld", &s_tz) != 1)
-                s_tz = 0;
+            if (fscanf(f, "%ld", &value) == 1)
+            {
+                s_tz = value;
+                s_tz_valid = true;
+                ok = true;
+            }
             fclose(f);
         }
         s_tz_read_us = now;
     }
+
     *seconds = s_tz;
-    return true;
+    return ok;
 }
 
 static bool set_tz(long seconds)

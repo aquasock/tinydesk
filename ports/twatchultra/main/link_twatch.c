@@ -45,6 +45,7 @@
 #include "pmbench.h"
 #include "gbcbench.h"
 #include "gb.h"
+#include "statusbar.h"
 #include "pm.h"
 #include "hal_mux.h"
 #include "tinydesk/td_picture.h"
@@ -532,6 +533,21 @@ bool link_init(void)
 
     /* What the PMU is currently configured to do about charging. Read only:
      * see charge.c for why the first move on a battery is measurement. */
+
+    /*
+     * THE STATUS STRIP, and it has to be started HERE rather than earlier.
+     *
+     * `display_init()` above runs `panel_fill()`, which blacks the entire panel
+     * including rows 0..43; a strip started before it would be wiped a moment
+     * later. Nothing after this point repaints those rows -- the margin painters
+     * begin at row 44 -- so once these pixels land they stay until the strip
+     * itself changes them.
+     *
+     * Not fatal when it fails: a watch without a clock in the bezel is a watch,
+     * and the desktop's own taskbar clock is unaffected.
+     */
+    if (!statusbar_start())
+        ESP_LOGW(TAG, "status strip did not start");
     /* The play command, registered here because link_init() runs after
      * tdsh_espidf_init() and this port has no earlier hook of its own. */
     if (tdsh_register_command(&s_play_cmd) != 0)

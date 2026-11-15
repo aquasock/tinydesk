@@ -1789,6 +1789,50 @@ void display_margin_label(int col, int index, const char *text)
 }
 
 /*
+ * Push a caller's pixels to an arbitrary panel rectangle, WITH NO OWNERSHIP
+ * REQUIREMENT.
+ *
+ * This exists for the status strip in rows 1..43, which is above the framebuffer
+ * and inside no app's territory, so `display_panel_rows()`'s refusal -- correct
+ * for anything that might be drawing over a picture -- is backwards for it. The
+ * strip must stay visible while an emulator owns the framebuffer, which is the
+ * whole reason it lives there rather than in the taskbar.
+ *
+ * THREE THINGS MAKE IT SAFE WITHOUT A LOCK, and each is a property already in this
+ * file rather than a new promise:
+ *
+ *   - `push_pixels_raw_buf()` acquires the SPI bus and programs the window inside
+ *     that acquisition, so each band is atomic against another writer. That is the
+ *     same guarantee the app blit and the margin painter already rely on.
+ *   - The pixels belong to the CALLER. `display_panel_rows()` writes into
+ *     `s_tx_app`, which `gamepad_paint()` also uses; borrowing it here would race
+ *     an app drawing its controls. A caller's own buffer cannot race anybody.
+ *   - It touches no framebuffer, no `s_vt` and no `s_shown` cell record. There is
+ *     no state for a second writer to corrupt, so ownership is irrelevant to it by
+ *     construction rather than by permission.
+ *
+ * Coordinates are CONTROLLER coordinates, the same space `edges.h` and
+ * `display_panel_rows()` use: x from PANEL_COL_OFFSET, y from 0. Pixels must
+ * already be in the panel's byte order.
+ */
+bool display_panel_push(int cx, int cy, int w, int h, const uint16_t *pixels)
+{
+    if (!s_spi || !pixels || w <= 0 || h <= 0)
+        return false;
+
+    /* Refuse a rectangle that would be clipped rather than sending part of it. A
+     * silently truncated bar is worse than one that does not appear, and the
+     * strip's placement is arithmetic that can be checked here. */
+    if (cx < 0 || cy < 0 ||
+        cx + w > PANEL_COL_OFFSET + DISPLAY_PANEL_W ||
+        cy + h > DISPLAY_PANEL_H)
+        return false;
+
+    push_pixels_raw_buf(cx, cy, w, h, (uint16_t *)pixels);
+    return true;
+}
+
+/*
  * Push a picture in PANEL coordinates, past the framebuffer's bottom edge.
  *
  * display_picture_rows() works in framebuffer coordinates and clips to the
