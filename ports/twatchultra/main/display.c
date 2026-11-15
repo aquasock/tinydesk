@@ -329,6 +329,10 @@ static int64_t s_us_window, s_us_xmit;
  * is the picture conversion for an app that has one. See display_convert_us(). */
 static int64_t s_us_convert;
 static uint32_t s_pushes;
+/* Bands skipped because the SPI bus was held by the other pusher. Non-zero is
+ * normal under load; a rate that climbs without bound would mean one pusher is
+ * starving the other. */
+static uint32_t s_bus_misses;
 
 void display_push_stats_reset(void)
 {
@@ -496,7 +500,39 @@ static void push_pixels_raw_buf(int cx, int cy, int w, int h, uint16_t *buf)
      * window write land between this one's window and its pixels even with the
      * bus held, because the panel latches on CS.
      */
-    spi_device_acquire_bus(s_spi, portMAX_DELAY);
+    /*
+     * THE ACQUIRE'S RESULT HAS TO BE CHECKED, AND NOT CHECKING IT WAS A REBOOT.
+     *
+     * spi_device_acquire_bus() returns ESP_ERR_INVALID_STATE when a polling
+     * transaction is already in flight on this device handle
+     * (spi_master.c:1273, "Cannot acquire bus when a polling transaction is in
+     * progress"). Two tasks reach this function on the same s_spi -- the paint
+     * task through flush_rect(), and the status strip's own task through
+     * display_panel_push() -- so that window really exists.
+     *
+     * Ignoring the failure and carrying on is what made it fatal: the function
+     * went on to program CS and the window registers, and then called
+     * spi_device_release_bus(), which asserts
+     *
+     *     assert failed: spi_device_release_bus spi_master.c:1330 (ret == ESP_OK)
+     *
+     * because spi_bus_lock_acquire_end() refuses to release a bus this device
+     * never acquired. That assert is a panic, and with the console compiled out
+     * a panic is a reboot -- the board restarted about five seconds after a USB
+     * DAC was attached, which is simply when the console was busy enough for the
+     * two pushers to overlap. The coredump named it in one run after three
+     * guesses had failed: frames push_pixels_raw_buf -> push_pixels ->
+     * flush_rect on the paint task.
+     *
+     * Returning here loses one band of one frame -- a cosmetic glitch -- and
+     * cannot reboot the watch. s_bus_misses counts it, so the rate is
+     * observable rather than assumed.
+     */
+    if (spi_device_acquire_bus(s_spi, portMAX_DELAY) != ESP_OK)
+    {
+        s_bus_misses++;
+        return;
+    }
 
     int64_t t_w0 = esp_timer_get_time();
     uint8_t cas[4] = { (uint8_t)((cx >> 8) & 0xFF), (uint8_t)(cx & 0xFF),

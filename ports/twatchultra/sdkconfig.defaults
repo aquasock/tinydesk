@@ -231,3 +231,26 @@ CONFIG_ESP32S3_INSTRUCTION_CACHE_SIZE=0x8000
 # the data cache to 64 KB would have taken internal RAM below the 65,536 bytes
 # tdsh's SSH server refuses to start below.
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+
+#
+# THE USB HOST'S CONTROL TRANSFER BUFFER, AND WHY 512 RATHER THAN THE DEFAULT 256
+#
+# The host library allocates one buffer per attached device for transfers to its
+# control endpoint, and CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE bounds it. The
+# IDF Kconfig states the consequence plainly: "Devices with configuration
+# descriptors larger than this limit cannot be supported."
+#
+# That is not a theoretical limit. The USB-C DAC this board is being taught to
+# drive -- TTGK KM-HIFI-384KHZ, 3302:3366 -- reports wTotalLength 0x01a6, which
+# is 422 bytes: four interfaces, a UAC2 audio function with two clock sources
+# and two feature units, and three alternate settings on the playback interface.
+# At the 256-byte default the host enumerates far enough to report "config desc
+# is larger than control transfer max length", fails the set-configuration
+# stage with "check short config desc", and never reaches the device. The
+# failure reads as a dead DAC and is entirely this build's buffer.
+#
+# 512 covers 422 with room for a device that reports a little more. The cost is
+# one buffer of this size per attached device, in internal RAM, only while a
+# device is attached -- and this board's USB host runs only in the diagnostic and
+# in whatever audio mode replaces it.
+CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=512

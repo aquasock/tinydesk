@@ -882,6 +882,25 @@ static void kick(void)
 
 /* ------------------------------------------------------------ the stack */
 
+  /* The port's BLE serial service, if it has one (see on_sync below). The
+ * default does nothing, so this file needs no knowledge of any port. */
+__attribute__((weak)) void board_ble_uart_on_sync(void)
+{
+}
+
+  /* The same feature's REGISTRATION half, which must run before the host starts.
+ *
+ * Separated from the sync half because NimBLE's service initialisers require
+ * sysinit to be active -- ble_svc_gap_init() asserts SYSINIT_ASSERT_ACTIVE() and
+ * aborts otherwise. Registering from the sync callback therefore panics, which
+ * is exactly what happened: "assert failed: ble_svc_gap_init
+ * ble_svc_gap.c:333". Registration belongs beside nimble_port_init(), and only
+ * advertising belongs after the sync.
+ */
+__attribute__((weak)) void board_ble_uart_register(void)
+{
+}
+
 static void on_sync(void)
 {
     lock();
@@ -893,6 +912,20 @@ static void on_sync(void)
     lock();
     kick();
     unlock();
+
+    /*
+     * A BLE SERIAL PORT, WHERE THE PORT WANTS ONE.
+     *
+     * Called here and not in board code because the host has only just synced:
+     * a GATT service registered before this point has no address or attribute
+     * table to register into, and one registered after an asynchronous kick()
+     * could be missed while a scan is already running.
+     *
+     * WEAK, so the shared layer stays free of the feature. A port that wants a
+     * console over BLE defines this strongly; every other port links the empty
+     * default below and behaves exactly as before.
+     */
+    board_ble_uart_on_sync();
 }
 
 static void on_reset(int reason)
@@ -950,6 +983,11 @@ static bool radio_start(void)
     ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
     ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
     ble_store_config_init();
+
+    /* Any port-supplied GATT services go in here, while the host is initialised
+     * but not yet running -- the window NimBLE's sysinit assertions allow. */
+    board_ble_uart_register();
+
     nimble_port_freertos_init(host_task);
     size_t after = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     s_stack_heap = before > after ? (uint32_t)(before - after) : 0;

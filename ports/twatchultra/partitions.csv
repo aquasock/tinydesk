@@ -10,6 +10,11 @@
 nvs,        data, nvs,      0x9000,   0x6000,
 phy_init,   data, phy,      0xF000,   0x1000,
 ota_0,      app,  ota_0,    0x10000,  0x300000,
-ota_1,      app,  ota_1,    0x310000, 0x300000,
+ota_1,      app,  ota_1,    0x310000, 0x2F0000,
+# 64 KB carved out of ota_1's tail for panic backtraces. ota_1 holds the
+# inactive A/B slot and has never been used here (no update feed), and the
+# app is 0x2d5750 so 0x2F0000 still fits it. See EMU-021 in the reference:
+# with the console compiled out, this is the only way a panic reports itself.
+coredump,   data, coredump, 0x600000, 0x10000,
 otadata,    data, ota,      0x610000, 0x2000,
 storage,    data, littlefs, 0x620000, 0x9E0000,

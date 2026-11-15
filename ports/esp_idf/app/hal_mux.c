@@ -147,15 +147,55 @@ static int telnet_client(int display)
 
       /* ------------------------------------------------- second serial port */
 
+/*
+ * THE SECOND SERIAL PORT'S TRANSPORT IS NOT NECESSARILY A UART.
+ *
+ * Display 2 is "a serial-like stream", and a UART is only one way to be one. A
+ * port may supply another -- the T-Watch Ultra uses Bluetooth LE, because its
+ * USB port has to be free to be a host and WiFi does not fit in the heap -- and
+ * this layer should not know that.
+ *
+ * WEAK DEFAULTS, the same shape as the other board hooks here: a port with no
+ * other transport links these three and nothing changes. The board key
+ * `display2.transport = ble` selects it.
+ */
+__attribute__((weak)) bool board_serial2_alt_open(void)
+{
+    return false;
+}
+
+__attribute__((weak)) int board_serial2_alt_read(void)
+{
+    return -1;
+}
+
+__attribute__((weak)) int board_serial2_alt_write(const uint8_t *buf, int len)
+{
+    (void)buf;
+    (void)len;
+    return 0;
+}
+
 static int s_s2_uart = -2;   /* -2: not read yet, -1: not configured */
 static int s_s2_tx, s_s2_rx, s_s2_baud;
 static char s_s2_label[48];
 static bool s_s2_open;
+static bool s_s2_alt;        /* the transport is the port's alternate, not a UART */
 
 static void serial2_config(void)
 {
     if (s_s2_uart != -2)
         return;
+    const char *transport = tdsh_board_get("display2.transport");
+
+    if (transport && strcmp(transport, "ble") == 0)
+    {
+        s_s2_alt = true;
+        s_s2_uart = -1;          /* no UART: the alternate transport supplies it */
+        snprintf(s_s2_label, sizeof(s_s2_label), "Serial 2: Bluetooth LE");
+        return;
+    }
+
     s_s2_uart = tdsh_board_int("display2.uart", -1);
     s_s2_tx = tdsh_board_int("display2.tx", -1);
     s_s2_rx = tdsh_board_int("display2.rx", -1);
@@ -174,6 +214,14 @@ static void serial2_config(void)
 static bool serial2_open(void)
 {
     serial2_config();
+
+    if (s_s2_alt)
+    {
+        if (!s_s2_open)
+            s_s2_open = board_serial2_alt_open();
+        return s_s2_open;
+    }
+
     if (s_s2_open || s_s2_uart < 0)
         return s_s2_open;
     uart_config_t cfg = {
@@ -206,18 +254,25 @@ static void serial2_close(void)
 {
     if (!s_s2_open)
         return;
-    uart_driver_delete((uart_port_t)s_s2_uart);
+    if (!s_s2_alt)
+        uart_driver_delete((uart_port_t)s_s2_uart);
     s_s2_open = false;
 }
 
 static int serial2_read(void)
 {
+    if (s_s2_alt)
+        return s_s2_open ? board_serial2_alt_read() : -1;
+
     uint8_t b;
     return s_s2_open && uart_read_bytes((uart_port_t)s_s2_uart, &b, 1, 0) == 1 ? b : -1;
 }
 
 static int serial2_write(const uint8_t *buf, int len)
 {
+    if (s_s2_alt)
+        return s_s2_open ? board_serial2_alt_write(buf, len) : 0;
+
     size_t room = 0;
     if (!s_s2_open || uart_get_tx_buffer_free_size((uart_port_t)s_s2_uart, &room) != ESP_OK)
         return 0;
@@ -351,7 +406,10 @@ static bool ops_available(int display, int src)
     if (display != 1)
         return false;
     serial2_config();
-    return src == TD_DISPLAY_OFF || src == TD_DISPLAY_TELNET || (src == TD_DISPLAY_SERIAL && s_s2_uart >= 0);
+    /* A port-supplied transport (BLE on the watch) is as available as a UART:
+     * the check is that a transport EXISTS, not that it has a UART number. */
+    return src == TD_DISPLAY_OFF || src == TD_DISPLAY_TELNET ||
+           (src == TD_DISPLAY_SERIAL && (s_s2_alt || s_s2_uart >= 0));
 }
 
 static int ops_source(int display)

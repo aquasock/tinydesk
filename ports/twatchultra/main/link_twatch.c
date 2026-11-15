@@ -24,6 +24,8 @@
  */
 #include "link.h"
 #include "sdpaths.h"
+#include "usbdiag.h"
+#include "bleuart.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -561,6 +563,12 @@ bool link_init(void)
 
     if (tdsh_register_command(&s_vbus_cmd) != 0)
         ESP_LOGW(TAG, "vbus command did not register");
+
+    if (!bleuart_register_command())
+        ESP_LOGW(TAG, "bleuart command did not register");
+
+    if (!usbdiag_register_command())
+        ESP_LOGW(TAG, "usbdiag command did not register");
 
     if (tdsh_register_command(&s_pattern_cmd) != 0)
         ESP_LOGW(TAG, "pattern command did not register");

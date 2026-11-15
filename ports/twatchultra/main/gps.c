@@ -800,7 +800,12 @@ static bool gps_app_start(const char **why)
         return false;
     }
 
-    snprintf(s_app_model, sizeof(s_app_model), "%s", p.model);
+    /* An explicit precision rather than a bare "%s": the probe buffer is 31
+     * bytes and this one is 24, so the copy is a truncation and the compiler
+     * is right to say so. Naming the limit makes the truncation a decision
+     * instead of a warning, and a model string longer than 23 characters
+     * would not fit the app's field anyway. */
+    snprintf(s_app_model, sizeof(s_app_model), "%.23s", p.model);
     nmea_init(&s_app_nmea);
 
     taskENTER_CRITICAL(&s_app_lock);
