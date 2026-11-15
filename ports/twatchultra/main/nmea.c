@@ -135,7 +135,91 @@ static bool is_talker_rmc(const char *s)
     return strlen(s) >= 5 && strcmp(s + 2, "RMC") == 0;
 }
 
-/* hhmmss.ss -> hour, minute, second_x100 */
+static bool is_talker_gsv(const char *s)
+{
+    return strlen(s) >= 5 && strcmp(s + 2, "GSV") == 0;
+}
+
+/*
+ * GSV, FOR THE SKY VIEW ONLY.
+ *
+ * `$GPGSV,<messages>,<this one>,<in view>,<prn>,<elev>,<azimuth>,<snr>,...`
+ * repeats `<in view>` in every message of a constellation's series, so the value
+ * is idempotent and may be read from whichever message arrives. What it is NOT is
+ * a system total: each constellation reports its own count, so the honest figure
+ * when a receiver is tracking GPS and Galileo is the SUM of the two.
+ *
+ * SUMMING NEEDS A STALENESS RULE, because a constellation that stops being
+ * reported would otherwise keep contributing its last count for ever. Entries
+ * not updated within NMEA_GSV_STALE sentences are dropped from the sum; at the
+ * dozen sentences a second this receiver sends, that is about half a minute,
+ * which is longer than any real sky-view change and short enough that a lost
+ * antenna stops claiming satellites.
+ *
+ * Field 3 is checked for sanity rather than trusted: a receiver with no sky view
+ * sends 0, and a value past the constellation's capacity is damage.
+ */
+#define NMEA_GSV_STALE 400
+
+static void do_gsv(nmea_state_t *s, char **f, int n)
+{
+    int vis;
+
+    if (!field_int((const char *const *)f, n, 3, &vis))
+        return;
+    if (vis < 0 || vis > 64)
+        return;
+
+    const char *talker = f[0];
+
+    if (strlen(talker) < 5)
+        return;
+
+    nmea_gsv_t *slot = NULL, *spare = NULL;
+
+    for (int i = 0; i < NMEA_GSV_TALKERS; i++)
+    {
+        nmea_gsv_t *g = &s->gsv[i];
+
+        if (g->talker[0] == '\0')
+        {
+            if (!spare)
+                spare = g;
+            continue;
+        }
+        if (g->talker[0] == talker[0] && g->talker[1] == talker[1])
+        {
+            slot = g;
+            break;
+        }
+    }
+
+    if (!slot)
+        slot = spare;
+    if (!slot)
+        return;              /* eight constellations is already generous */
+
+    slot->talker[0] = talker[0];
+    slot->talker[1] = talker[1];
+    slot->talker[2] = '\0';
+    slot->in_view = vis;
+    slot->last_seen = s->sentences;
+
+    int total = 0;
+
+    for (int i = 0; i < NMEA_GSV_TALKERS; i++)
+    {
+        const nmea_gsv_t *g = &s->gsv[i];
+
+        if (g->talker[0] == '\0')
+            continue;
+        if (s->sentences - g->last_seen > NMEA_GSV_STALE)
+            continue;
+        total += g->in_view;
+    }
+
+    s->sats_in_view = total;
+}
 static bool parse_time(const char *s, int *h, int *m, int *sec100)
 {
     size_t len = strlen(s);
@@ -259,7 +343,7 @@ static void do_gga(nmea_state_t *s, char **f, int n)
     if (field_str((const char *const *)f, n, 8, &hd))
     {
         double d = strtod(hd, NULL);
-        s->hdop_x10 = (int)(d * 100.0 + 0.5);
+        s->hdop_x100 = (int)(d * 100.0 + 0.5);
     }
 
     /* Altitude in metres with one decimal; stored in cm. */
@@ -415,6 +499,11 @@ bool nmea_line(nmea_state_t *s, const char *line)
     if (is_talker_rmc(f[0]))
     {
         do_rmc(s, f, n);
+        return true;
+    }
+    if (is_talker_gsv(f[0]))
+    {
+        do_gsv(s, f, n);
         return true;
     }
 

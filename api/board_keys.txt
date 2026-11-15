@@ -30,6 +30,7 @@ rs485.N.uart
 sd.miso
 sd.mosi
 sd.sclk
+ssh.autostart
 store.url
 touch.int
 update.url

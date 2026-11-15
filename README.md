@@ -40,6 +40,8 @@ Terminal window. The core is portable C11; ports exist for ESP32 boards
   apps and caches (`/sd/TinyDesk`).
 * Bluetooth LE keyboards and mice on the ESP32 boards with PSRAM (`bt.enable = 1`):
   pair them in the Bluetooth app or with `bt`; they reconnect by themselves.
+* SSH at boot on the ESP32 boards (`ssh.autostart = 1`), once root's password has
+  been changed: the server starts by itself instead of being started from the shell.
 * Kiosk mode: one Python app on the whole screen instead of the desktop
   (`kiosk.app`), for operator panels; root's password leaves it.
 * Two displays (Settings -> Displays): the board's own link, Telnet

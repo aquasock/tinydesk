@@ -20,6 +20,7 @@
 #include <stdint.h>
 
 #include "nmea.h"
+#include "tinydesk/td_sysinfo.h"
 
 /*
  * Open the rail and the UART, and ask the module who it is.
@@ -72,5 +73,21 @@ int gps_pps_level(void);
 
 /* Register the `gps` shell command. */
 bool gps_register_command(void);
+
+/*
+ * The GPS app's view of the receiver, for td_sysinfo_t.
+ *
+ * start() powers the module and a task parses it; stop() drops the rail. The app
+ * calls them as its window opens and closes, which is the whole power policy --
+ * see the comment on td_gps_ops_t in td_sysinfo.h.
+ *
+ * The receiver is exclusive: the shell command and the app cannot both parse it,
+ * because two readers of one UART each get half the sentences and both look
+ * faulty. Each refuses while the other has it.
+ */
+const td_gps_ops_t *gps_sysinfo_ops(void);
+
+/* The strong definition of main.c's weak board hook: this board has a receiver. */
+const td_gps_ops_t *board_gps_ops(void);
 
 #endif

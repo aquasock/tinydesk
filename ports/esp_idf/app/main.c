@@ -390,6 +390,22 @@ static int board_batteries(td_battery_t *out, int max)
     return board_battery_read(out, max);
 }
 
+  /* The GNSS receiver, for the GPS app.
+ *
+ * WEAK AND NULL BY DEFAULT, so a board with no receiver gets a GPS app that
+ * says so rather than a link error. This is the same shape as
+ * board_battery_read() above and for the same reason: the desktop has to work
+ * on a board with nothing fitted. A port with a receiver defines this
+ * strongly.
+ *
+ * The receiver is NOT started here. td_gps_ops_t hands the app start() and
+ * stop() precisely so that opening the window is what powers the module -- see
+ * the comment on that type in td_sysinfo.h. */
+__attribute__((weak)) const td_gps_ops_t *board_gps_ops(void)
+{
+    return NULL;
+}
+
   /* What a BEL means on this board. The weak default does nothing, so a board
  * with no speaker ignores BEL the way every terminal does. */
 __attribute__((weak)) void board_bell(void)
@@ -916,6 +932,7 @@ void app_main(void)
     usb_hid_start();                            /* a USB keyboard and mouse (usb.host = 1) */
 #endif
     s_info.bt = bt_hid_start();                 /* Bluetooth keyboards and mice (bt.enable = 1) */
+    s_info.gps = board_gps_ops();               /* the GPS app, where the board has a receiver */
     s_info.mouse = hid_input_mouse_ops();       /* the Mouse and Keyboard apps, when either is on */
     s_info.keyboard = hid_input_keyboard_ops();
 

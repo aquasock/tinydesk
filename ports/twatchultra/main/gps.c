@@ -56,6 +56,12 @@ static const uint8_t MON_VER[] = { 0xB5, 0x62, 0x0A, 0x04, 0x00, 0x00, 0x0E, 0x3
 static bool s_open;
 static int s_pps = -1;
 
+/* The GPS app's task holds the receiver while its window is open. Declared
+ * up here rather than with the rest of the app's state because cmd_gps()
+ * below has to refuse while it is set, and this is the one thing the two
+ * halves of the file have to agree on. */
+static volatile bool s_app_open;
+
 /* --- UBX framing --------------------------------------------------------- */
 
 /* Fletcher checksum over a UBX payload, which is what the module uses. Written
@@ -428,8 +434,8 @@ static void report(const nmea_state_t *n, void *ctx)
 
     printf(" s%02d", n->sats_used);
 
-    if (n->hdop_x10)
-        printf(" hd%d.%02d", n->hdop_x10 / 100, n->hdop_x10 % 100);
+    if (n->hdop_x100)
+        printf(" hd%d.%02d", n->hdop_x100 / 100, n->hdop_x100 % 100);
 
     if (n->have_pos)
         printf(" %.5f %.5f", n->lat, n->lon);
@@ -492,6 +498,15 @@ static void raw_sink(const char *line, void *ctx)
 static int cmd_gps(tdsh_session_t *session, int argc, char **argv)
 {
     (void)session;
+
+    /* The app's window holds the receiver while it is open, and two parsers on
+     * one UART each see half the sentences -- a receiver that reads as faulty
+     * from both sides at once. Say so instead of half-working. */
+    if (s_app_open)
+    {
+        printf("the GPS app has the receiver open; close its window first\n");
+        return 1;
+    }
 
     const bool raw = (argc >= 2 && strcmp(argv[1], "raw") == 0);
     const bool settime = (argc >= 2 && strcmp(argv[1], "time") == 0);
@@ -641,4 +656,228 @@ static const tdsh_command_t s_gps_cmd = {
 bool gps_register_command(void)
 {
     return tdsh_register_command(&s_gps_cmd) == 0;
+}
+
+/* --- the GPS app ----------------------------------------------------------
+ *
+ * The app opens the receiver when its window opens and drops it when the window
+ * closes. That is a deliberate power decision and it is the reason the ops type
+ * has start() and stop() at all: a GNSS module draws tens of milliamps, and a
+ * watch has none to spare for a window nobody is looking at. The cost is that
+ * the first reading after opening is empty and a cold fix takes minutes, so the
+ * window shows what it learns immediately -- satellites in view appear within a
+ * second or two, long before a fix is possible.
+ *
+ * ONE READER, ONE PARSER. The shell's `gps` command parses this same byte stream
+ * from its own nmea_state_t, so two readers would split the sentences between
+ * them and each would see half of a receiver that looks broken. Whichever side
+ * opens first owns the port and the other is told so rather than being allowed
+ * to half-work.
+ */
+#define GPS_APP_POLL_MS 100
+#define GPS_APP_STACK   4096
+
+static volatile bool s_app_run;
+static TaskHandle_t s_app_task;
+static nmea_state_t s_app_nmea;          /* owned by the pump task alone */
+static td_gps_t s_app_snapshot;          /* published for the app */
+static portMUX_TYPE s_app_lock = portMUX_INITIALIZER_UNLOCKED;
+static char s_app_model[24];
+
+/* Double to 1e-7 degrees, rounded away from zero. Written out rather than using
+ * lround() so this file needs no <math.h>, and rounded rather than truncated
+ * because truncation is a systematic bias of up to 1.1 cm in one direction. */
+static int32_t to_e7(double v)
+{
+    const double s = v * 1e7;
+
+    return (int32_t)(s < 0 ? s - 0.5 : s + 0.5);
+}
+
+/* Copy the parser's state into the published snapshot. Called from the pump
+ * task; the copy into s_app_snapshot happens under the lock so a reader never
+ * sees a half-updated struct. */
+static void gps_app_publish(void)
+{
+    td_gps_t t;
+
+    memset(&t, 0, sizeof(t));
+
+    t.receiver_open = true;
+    snprintf(t.model, sizeof(t.model), "%s", s_app_model);
+
+    t.time_valid = s_app_nmea.have_time;
+    t.hour = s_app_nmea.hour;
+    t.minute = s_app_nmea.minute;
+    t.second = s_app_nmea.second_x100 / 100;
+
+    t.date_valid = s_app_nmea.have_date;
+    t.year = s_app_nmea.year;
+    t.month = s_app_nmea.month;
+    t.day = s_app_nmea.day;
+
+    t.fix = s_app_nmea.fix_quality;
+    t.sats_used = s_app_nmea.sats_used;
+    t.sats_in_view = s_app_nmea.sats_in_view;
+
+    /* 99.99 is the receiver's "no HDOP" sentinel, and a dilution of precision of
+     * a hundred is not a precision -- it is an absence. Shown as a number it
+     * would read as a terrible measurement rather than as no measurement. */
+    if (s_app_nmea.hdop_x100 > 0 && s_app_nmea.hdop_x100 < 9999)
+    {
+        t.hdop_valid = true;
+        t.hdop_x100 = s_app_nmea.hdop_x100;
+    }
+
+    if (s_app_nmea.have_pos)
+    {
+        t.have_pos = true;
+        t.lat_e7 = to_e7(s_app_nmea.lat);
+        t.lon_e7 = to_e7(s_app_nmea.lon);
+    }
+    if (s_app_nmea.have_alt)
+    {
+        t.have_alt = true;
+        t.alt_cm = s_app_nmea.alt_cm;
+    }
+    if (s_app_nmea.have_speed)
+    {
+        t.have_speed = true;
+        t.speed_mm_s = s_app_nmea.speed_mm_s;
+    }
+    if (s_app_nmea.have_course)
+    {
+        t.have_course = true;
+        t.course_mdeg = s_app_nmea.course_mdeg;
+    }
+
+    t.sentences = s_app_nmea.sentences;
+    t.checksum_errors = s_app_nmea.failed_checksum;
+
+    taskENTER_CRITICAL(&s_app_lock);
+    s_app_snapshot = t;
+    taskEXIT_CRITICAL(&s_app_lock);
+}
+
+static void gps_app_task(void *arg)
+{
+    (void)arg;
+
+    while (s_app_run)
+    {
+        gps_pump(&s_app_nmea);
+        gps_app_publish();
+        /* 100 ms, which is a twentieth of the sentence rate: the parser is fed
+         * faster than the receiver speaks, so no sentence waits, and the task
+         * sleeps five sixths of its life. */
+        vTaskDelay(pdMS_TO_TICKS(GPS_APP_POLL_MS));
+    }
+
+    s_app_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static bool gps_app_start(const char **why)
+{
+    if (s_app_open)
+        return true;                     /* reopening an open window is not an error */
+
+    if (s_open)
+    {
+        /* The shell command has it. Two parsers on one UART each see half the
+         * sentences and both look faulty. */
+        if (why)
+            *why = "in use by the gps command";
+        return false;
+    }
+
+    gps_probe_t p;
+
+    if (!gps_open(&p))
+    {
+        if (why)
+            *why = "rail or UART would not start";
+        return false;
+    }
+
+    snprintf(s_app_model, sizeof(s_app_model), "%s", p.model);
+    nmea_init(&s_app_nmea);
+
+    taskENTER_CRITICAL(&s_app_lock);
+    memset(&s_app_snapshot, 0, sizeof(s_app_snapshot));
+    taskEXIT_CRITICAL(&s_app_lock);
+
+    s_app_run = true;
+    s_app_open = true;
+
+    /* 4096, and the number is reasoned rather than guessed at: this task's
+     * deepest path is gps_open() -> uart_driver_install(), and gps_open() has
+     * already returned by the time the task runs, so the task itself only holds
+     * a td_gps_t and the parser's statics. 4096 is comfortably above that, and
+     * the previous cycle's lesson is that a stack sized to "it does almost
+     * nothing" is how a board comes to reboot every thirty-three seconds. */
+    if (xTaskCreate(gps_app_task, "gps", GPS_APP_STACK, NULL, 2, &s_app_task) != pdPASS)
+    {
+        s_app_run = false;
+        s_app_open = false;
+        gps_close();
+        if (why)
+            *why = "no task";
+        return false;
+    }
+
+    return true;
+}
+
+static void gps_app_stop(void)
+{
+    if (!s_app_open)
+        return;
+
+    s_app_run = false;
+
+    /* Wait for the task to notice and delete itself rather than deleting it from
+     * under a uart_read_bytes(). Five hundred milliseconds is fifty poll
+     * intervals, so this only bites if the task is wedged -- and if it is, the
+     * delete below is the right answer anyway. */
+    for (int i = 0; i < 50 && s_app_task; i++)
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+    if (s_app_task)
+    {
+        vTaskDelete(s_app_task);
+        s_app_task = NULL;
+    }
+
+    s_app_open = false;
+    gps_close();
+}
+
+static bool gps_app_status(td_gps_t *out)
+{
+    if (!out || !s_app_open)
+        return false;
+
+    taskENTER_CRITICAL(&s_app_lock);
+    *out = s_app_snapshot;
+    taskEXIT_CRITICAL(&s_app_lock);
+
+    return true;
+}
+
+static const td_gps_ops_t s_gps_ops = {
+    .start = gps_app_start,
+    .stop = gps_app_stop,
+    .status = gps_app_status,
+};
+
+/* Installed into td_sysinfo_t by main.c through the weak board_gps_ops(). */
+const td_gps_ops_t *gps_sysinfo_ops(void)
+{
+    return &s_gps_ops;
+}
+
+const td_gps_ops_t *board_gps_ops(void)
+{
+    return &s_gps_ops;
 }

@@ -14,6 +14,7 @@
  *        altitude, and the geoid separation
  *   RMC  time, date, position, speed over ground, course, and status
  *
+ * GSV is read as well, but only for its satellite count -- see `sats_in_view`.
  * Everything else is counted and ignored. A receiver sends a dozen sentence
  * types and parsing them all would be work with no consumer; the count of
  * unparsed ones is reported instead, so their absence from the parse is
@@ -38,13 +39,28 @@ enum
     NMEA_FIX_DR = 6,
 };
 
+/* How many constellations' sky views are tracked at once. A multi-GNSS
+ * receiver reports GPS, GLONASS, Galileo and BeiDou; eight leaves room for
+ * the QZSS and NavIC talkers as well without a table anyone has to grow. */
+#define NMEA_GSV_TALKERS 8
+
+typedef struct
+{
+    char talker[3];      /* "GP", "GL", "GA", "GB", "GQ", "BD", ... */
+    int in_view;         /* that constellation's own satellite count */
+    unsigned last_seen;  /* `sentences` when this entry was last updated */
+} nmea_gsv_t;
+
 typedef struct
 {
     /* --- GGA --- */
     bool have_gga;
     int fix_quality;     /* NMEA_FIX_*, 0 = no fix */
     int sats_used;       /* satellites used in the fix, not visible */
-    int hdop_x10;        /* HDOP in hundredths; 0 when the field is empty */
+    int hdop_x100;       /* HDOP in hundredths, so 92 is 0.92; 0 when the field
+                          * is empty. Named for its units: the field was once
+                          * called hdop_x10 while holding hundredths, which is
+                          * a factor-of-ten trap for anyone reading it. */
     int32_t alt_cm;      /* altitude above mean sea level, cm */
     bool have_alt;       /* false when the field was empty or malformed */
     int32_t geoid_cm;    /* geoid separation, cm */
@@ -74,6 +90,18 @@ typedef struct
     unsigned sentences;
     unsigned failed_checksum;
     unsigned ignored;    /* well-formed but not a sentence this parses */
+
+    /* --- GSV: the sky view ---
+     *
+     * `sats_in_view` is NOT the GGA satellite count and the difference matters
+     * outdoors and in: GGA reports the satellites USED in a fix, which is zero
+     * when there is no fix no matter how much sky the antenna can see. GSV
+     * reports what the receiver can HEAR, so it is the only figure that says
+     * anything when a receiver is working correctly indoors and simply cannot
+     * fix. A receiver sending GSV with eight satellites in view is healthy; one
+     * with none has an antenna problem. */
+    nmea_gsv_t gsv[NMEA_GSV_TALKERS];
+    int sats_in_view;    /* summed over the talkers still being heard */
 } nmea_state_t;
 
 /* Zero a state. */

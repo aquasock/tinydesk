@@ -60,7 +60,7 @@ static void test_gga_with_fix(void)
     CHECK(s.have_gga);
     CHECK(s.fix_quality == 1);
     CHECK(s.sats_used == 8);
-    CHECK(s.hdop_x10 == 92);
+    CHECK(s.hdop_x100 == 92);
     CHECK(s.have_alt);
     CHECK(s.alt_cm == 54540);
     CHECK(s.have_geoid);
@@ -338,6 +338,87 @@ static void test_short_and_empty_fields(void)
     CHECK(!s.have_pos);     /* quality says fixed but no coordinates given */
 }
 
+static void test_gsv_sums_constellations(void)
+{
+    nmea_state_t s;
+    nmea_init(&s);
+
+    char line[128];
+
+    /* GPS can hear 11 satellites. */
+    with_checksum(line, sizeof(line),
+                  "GPGSV,3,1,11,01,05,040,20,02,12,120,31,03,40,200,18");
+    CHECK(nmea_line(&s, line));
+    CHECK(s.sats_in_view == 11);
+
+    /* Galileo adds 7. The figure is the SUM and not the larger of the two,
+     * which is the whole reason for a per-talker table: a receiver listening to
+     * two constellations has more satellites than either one reports. */
+    with_checksum(line, sizeof(line), "GAGSV,1,1,07,11,,,,");
+    CHECK(nmea_line(&s, line));
+    CHECK(s.sats_in_view == 18);
+
+    /* GSV repeats a constellation's count in every message of its series, so a
+     * later message must not double it. */
+    with_checksum(line, sizeof(line), "GPGSV,3,2,11,04,15,300,25");
+    CHECK(nmea_line(&s, line));
+    CHECK(s.sats_in_view == 18);
+}
+
+static void test_gsv_no_sky_is_zero(void)
+{
+    nmea_state_t s;
+    nmea_init(&s);
+
+    char line[128];
+    with_checksum(line, sizeof(line), "GPGSV,1,1,00");
+    CHECK(nmea_line(&s, line));
+    CHECK(s.sats_in_view == 0);
+}
+
+static void test_gsv_empty_count_changes_nothing(void)
+{
+    nmea_state_t s;
+    nmea_init(&s);
+
+    char line[128];
+    with_checksum(line, sizeof(line), "GPGSV,1,1,11,01,05,040,20");
+    CHECK(nmea_line(&s, line));
+    CHECK(s.sats_in_view == 11);
+
+    /* An empty count field is not a report of zero satellites -- the same rule
+     * the position fields follow. */
+    with_checksum(line, sizeof(line), "GPGSV,1,1,,01,05,040,20");
+    CHECK(nmea_line(&s, line));
+    CHECK(s.sats_in_view == 11);
+
+    /* And an impossible count is damage, not data. */
+    with_checksum(line, sizeof(line), "GPGSV,1,1,99,01,05,040,20");
+    CHECK(nmea_line(&s, line));
+    CHECK(s.sats_in_view == 11);
+}
+
+static void test_gsv_stale_constellation_dropped(void)
+{
+    nmea_state_t s;
+    nmea_init(&s);
+
+    char line[128];
+    with_checksum(line, sizeof(line), "GPGSV,1,1,11,01,05,040,20");
+    CHECK(nmea_line(&s, line));
+    with_checksum(line, sizeof(line), "GAGSV,1,1,07,11,,,,");
+    CHECK(nmea_line(&s, line));
+    CHECK(s.sats_in_view == 18);
+
+    /* Galileo stops being reported. Pushing the sentence counter past the
+     * staleness window must drop it rather than leave its last count in the sum
+     * for ever. */
+    s.sentences += 500;
+    with_checksum(line, sizeof(line), "GPGSV,1,1,11,01,05,040,20");
+    CHECK(nmea_line(&s, line));
+    CHECK(s.sats_in_view == 11);
+}
+
 int main(void)
 {
     test_gga_with_fix();
@@ -355,6 +436,11 @@ int main(void)
     test_unknown_sentence_ignored();
     test_non_nmea_ignored_silently();
     test_short_and_empty_fields();
+
+    test_gsv_sums_constellations();
+    test_gsv_no_sky_is_zero();
+    test_gsv_empty_count_changes_nothing();
+    test_gsv_stale_constellation_dropped();
 
     return TD_TEST_RESULT();
 }

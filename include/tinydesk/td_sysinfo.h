@@ -261,6 +261,90 @@ typedef struct
                                    * thermistor mode, so it is not the cell's
                                    * temperature */
 
+    /* ------------------------------------------------------------------ GPS */
+
+/* Fix quality, from the receiver's own GGA quality field. 0 means no fix at
+ * all, and that is a state to show rather than a fault to hide: a receiver
+ * indoors is working perfectly and cannot fix, which are different things. */
+enum
+{
+    TD_GPS_FIX_NONE = 0,
+    TD_GPS_FIX_GPS = 1,          /* plain GPS fix */
+    TD_GPS_FIX_DGPS = 2,         /* differential */
+    TD_GPS_FIX_PPS = 3,
+    TD_GPS_FIX_RTK = 4,          /* real-time kinematic, floating */
+    TD_GPS_FIX_FRTK = 5,         /* real-time kinematic, fixed */
+    TD_GPS_FIX_DR = 6,
+};
+
+/* A snapshot of the receiver.
+ *
+ * POSITION IS IN 1e-7 DEGREES, NOT FLOATS, and the units are the point: the
+ * receiver sends 4 decimal places of arc-minute, which is about 1.7e-6 degrees,
+ * so 1e-7 units carry more resolution than the data and lose nothing. Integers
+ * keep this struct usable from a task that has no floating point, and make the
+ * app's formatting exact rather than dependent on printf's rounding. The range
+ * is well inside int32: 180e7 is 1.8e9 against a 2.147e9 ceiling.
+ *
+ * EVERY READING HAS A `have_` FLAG, for the same reason the NMEA parser does:
+ * a receiver without a fix sends empty fields, and an empty field read as zero
+ * is a valid-looking position off the coast of Africa. */
+typedef struct
+{
+    bool receiver_open;          /* the port has the rail and the UART up */
+    char model[24];              /* "MIA-M10Q" when the receiver identified
+                                  * itself, else empty. Not every unit answers
+                                  * the identification poll (GPS-003). */
+
+    bool time_valid;             /* UTC below is usable */
+    int hour, minute, second;
+    bool date_valid;
+    int year, month, day;
+
+    int fix;                     /* TD_GPS_FIX_*, 0 for no fix */
+    int sats_used;               /* in the fix; 0 when there is none */
+    int sats_in_view;            /* the antenna can hear, whether or not a
+                                  * fix is possible; 0 when nothing is known.
+                                  * The honest number indoors. */
+    bool hdop_valid;             /* false when the field is empty, and also
+                                  * when it carries the 99.99 no-fix sentinel */
+    int hdop_x100;               /* HDOP in hundredths, e.g. 92 for 0.92 */
+
+    bool have_pos;
+    int32_t lat_e7, lon_e7;      /* 1e-7 degrees, north and east positive */
+
+    bool have_alt;
+    int32_t alt_cm;              /* above mean sea level */
+
+    bool have_speed;
+    int32_t speed_mm_s;
+
+    bool have_course;
+    int32_t course_mdeg;
+
+    unsigned sentences;          /* sentences parsed since the window opened */
+    unsigned checksum_errors;
+} td_gps_t;
+
+typedef struct
+{
+        /* Power the receiver and start parsing. False when the board has no
+     * receiver or its rail or UART will not come up; `*why` then holds a
+     * short reason worth showing.
+     *
+     * THE PORT DECIDES WHEN TO POWER THE RECEIVER, and this pair exists so that
+     * a window can. Calling start() twice is not an error; the second call is
+     * expected when a window is reopened. A board that wants the receiver on all
+     * the time ignores stop() and keeps it running. */
+    bool (*start)(const char **why);
+    void (*stop)(void);
+
+        /* The latest snapshot. False when the receiver is not running. Cheap:
+     * the port parses on its own task and this copies the last result, so a
+     * window may call it every tick without owning a UART or blocking. */
+    bool (*status)(td_gps_t *out);
+} td_gps_ops_t;
+
     /* ------------------------------------------------------------ Bluetooth */
 
     /* Bluetooth keyboards and mice, for the Bluetooth app and the bt command.
@@ -648,6 +732,11 @@ typedef struct
      * registers the port already has cached rather than a bus round trip per
      * field. A board with no fuel gauge leaves it NULL and the app says so. */
     int (*batteries)(td_battery_t *out, int max);
+
+        /* Optional: a GNSS receiver (the GPS app). NULL on a board with none or
+     * a build without one, and the app then says so rather than showing an
+     * empty window. See td_gps_ops_t above for why start/stop are a pair. */
+    const td_gps_ops_t *gps;
 
         /* Optional: what a BEL means on this board -- a beep, a flash, nothing.
      * Called when a terminal application receives a BEL in ordinary text, from
