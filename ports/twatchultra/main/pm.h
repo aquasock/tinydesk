@@ -26,13 +26,15 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define PM_ROM_DEFAULT "/sd/pinball.min"
+#define PM_ROM_DEFAULT   "/sd/media/min/homebrew/Pokemon Pinball Mini (USA, Europe).min"
+#define PM_ROM_FLAT      "/sd/pinball.min"
 
 /* A retail BIOS dump, placed on the device by whoever owns one. It is not in
  * this repository and must not be: a retail cartridge needs the retail BIOS,
  * because the GPL free BIOS that ships in the core idles at $0040 and never
  * hands over to a commercial cartridge. */
-#define PM_BIOS_DEFAULT "/sd/bios.rom"
+#define PM_BIOS_DEFAULT  "/sd/bios/bios.rom"
+#define PM_BIOS_FLAT     "/sd/bios.rom"
 
 /* 3x integer scale. ODD OFFSETS DO NOT COST HERE: (320-288)/2 is 16, a multiple
  * of 4, so a row copy stays aligned for the panel's 4-byte SPI framing. A top

@@ -25,6 +25,7 @@
 #include "display.h"
 #include "edges.h"
 #include "gamepad.h"
+#include "sdpaths.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -910,7 +911,7 @@ static void nes_task(void *arg)
                 /* TO A FILE, because printf scrolls off a 26-row terminal long
                  * before anyone can read it and the interesting question is the
                  * frame number, not the total. */
-                FILE *f = fopen("/sd/nes_audio.log", "a");
+                FILE *f = fopen(sd_out("/sd/diag", "nes_audio.log"), "a");
                 if (f)
                 {
                     fprintf(f, "frame %lu dropped %lu of %d\n",
@@ -1232,6 +1233,15 @@ bool nes_start(const char *rom_path)
         strncpy(s_rom_path, rom_path, sizeof(s_rom_path) - 1);
         s_rom_path[sizeof(s_rom_path) - 1] = '\0';
     }
+    else
+    {
+        /* The default lives in two places on the card -- the organised tree and
+         * the flat root an older card has. See sdpaths.h. */
+        const char *def = sd_media(NES_ROM_DEFAULT, NES_ROM_FLAT);
+
+        strncpy(s_rom_path, def, sizeof(s_rom_path) - 1);
+        s_rom_path[sizeof(s_rom_path) - 1] = '\0';
+    }
 
     if (!s_nes)
     {
@@ -1435,7 +1445,7 @@ bool nes_start(const char *rom_path)
     }
 
     {
-        FILE *f = fopen("/sd/nes_audio.log", "w");
+        FILE *f = fopen(sd_out("/sd/diag", "nes_audio.log"), "w");
         if (f)
             fclose(f);
     }
@@ -1443,7 +1453,7 @@ bool nes_start(const char *rom_path)
     /* Removed on each start: the ring is in RAM and starts empty, but the old
      * file may still be on the card and stale evidence is worse than none. */
     {
-        FILE *f = fopen("/sd/nes_stall.log", "w");
+        FILE *f = fopen(sd_out("/sd/diag", "nes_stall.log"), "w");
         if (f)
             fclose(f);
     }
@@ -1690,7 +1700,7 @@ static int cmd_nes(tdsh_session_t *session, int argc, char **argv)
          * 30 seconds is long enough to press everything and short enough that
          * the file cannot grow without bound.
          */
-        FILE *pf = fopen("/sd/nespad.txt", "w");
+        FILE *pf = fopen(sd_out("/sd/diag", "nespad.txt"), "w");
 
         if (!pf)
         {
@@ -1791,7 +1801,7 @@ static int cmd_nes(tdsh_session_t *session, int argc, char **argv)
             return 1;
         }
 
-        FILE *df = fopen("/sd/ppu.txt", "w");
+        FILE *df = fopen(sd_out("/sd/diag", "ppu.txt"), "w");
         if (!df)
         {
             printf("no card\n");

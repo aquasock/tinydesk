@@ -24,7 +24,8 @@
 #include "display.h"
 #include "tmc_core.h"
 
-#define TAMA_ROM_DEFAULT "/sd/rom.bin"
+#define TAMA_ROM_DEFAULT "/sd/media/tama/rom.bin"
+#define TAMA_ROM_FLAT    "/sd/rom.bin"
 
 /* Where the frame lands on the panel: centred, so the bezel is symmetric. The
  * emulator's geometry comes from tmc_core.h rather than being restated, so a

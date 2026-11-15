@@ -37,6 +37,8 @@
 #include "display.h"
 #include "font8x16.h"
 #include "edges.h"
+#include "gamepad.h"
+#include "sdpaths.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -457,34 +459,109 @@ static void pm_blit_task(void *arg)
 #define PMK_RIGHT  (1 << 6)
 #define PMK_POWER  (1 << 7)
 
+/*
+ * The drawn controls and the margin buttons, as one Pokemon Mini pad.
+ *
+ * THE DRAWN CONTROLS WIN WHEN BOTH MATCH, per point, because they now can: the
+ * d-pad's left arm sits at fb -4 and its disc reaches the glass outside the
+ * framebuffer, where the left column's lower slots are. A press that lands on the
+ * arm and on a margin at once is aimed at the arm -- it is the thing under the
+ * thumb and the thing drawn there. Emitting both would move the pet and fire Pause
+ * from one touch.
+ *
+ * THE MARGINS ALSO CHANGE MEANING HERE, which is the substantive part. The bottom
+ * strip used to BE the action buttons -- B, A, C left to right -- and the right
+ * column's arrows were the d-pad, because nothing was drawn that could be pressed.
+ * Both jobs are done by the drawn controls now, so the margins carry what has no
+ * drawn equivalent instead: Sound, Speed, Save, Load, Hold and the emulator's own
+ * SS, and the strip is deliberately INERT rather than a second set of A and B.
+ * Tapping bare glass that fires a button is the kind of fault a player blames on
+ * the emulator, and the labels already say what each slot is.
+ *
+ * Select has no equivalent on this console, so the right column's second slot is
+ * left unassigned rather than inventing a duty for it.
+ */
+/* Reached from pad_from_frame(), which sits above the geometry it needs. */
+static int pm_button_at(int panel_x, int panel_y);
+
 static int pad_from_frame(const touch_frame_t *f)
 {
     int pad = 0;
+
     if (!f)
         return 0;
 
     for (int i = 0; i < f->n && i < TOUCH_POINTS; i++)
     {
-        if (f->p[i].region == EDGE_BOTTOM)
+        const int btn = pm_button_at(f->p[i].x, f->p[i].y);
+
+        switch (btn)
         {
-            if (f->p[i].index == 0) pad |= PMK_B;
-            if (f->p[i].index == 1) pad |= PMK_A;
-            if (f->p[i].index == 2) pad |= PMK_C;
+        case GP_UP:    pad |= PMK_UP;    break;
+        case GP_DOWN:  pad |= PMK_DOWN;  break;
+        case GP_LEFT:  pad |= PMK_LEFT;  break;
+        case GP_RIGHT: pad |= PMK_RIGHT; break;
+        case GP_A:     pad |= PMK_A;     break;
+        case GP_B:     pad |= PMK_B;     break;
+        default:                         break;
         }
-        else if (f->p[i].region == EDGE_RIGHT)
+
+        /* A margin only when this point hit no drawn control. */
+        if (btn != GP_NONE)
+            continue;
+
+        /*
+         * AND ONLY WHEN THE SLOT IS LIVE, which is what stops a button nobody can
+         * see from working. The first version of this skipped the check, so the
+         * bottom strip's third bar -- bare glass, opened up as a strip slot but
+         * drawn with no box and no label -- still fired C. The operator found it
+         * on a test cartridge that counts presses: an invisible target worked and
+         * the visible C button next to it did nothing. `display_margin_slot_live()`
+         * is the same predicate the painter uses, so "not drawn" and "not live"
+         * cannot drift apart.
+         */
+        int col;
+
+        switch (f->p[i].region)
         {
-            if (f->p[i].index == 1) pad |= PMK_LEFT;
-            if (f->p[i].index == 2) pad |= PMK_RIGHT;
-            if (f->p[i].index == 3) pad |= PMK_UP;
-            if (f->p[i].index == 4) pad |= PMK_DOWN;
+        case EDGE_LEFT:   col = 0; break;
+        case EDGE_RIGHT:  col = 1; break;
+        case EDGE_BOTTOM: col = 2; break;
+        default:          continue;      /* not a margin at all */
         }
+
+        if (!display_margin_slot_live(col, f->p[i].index))
+            continue;
+
+        /*
+         * C IS ON THE RIGHT COLUMN, slot 3 -- where its label has been since the
+         * labels were written. The first version put it on the bottom strip's
+         * third bar, which is bare glass and carries no label, so the drawn C
+         * button vibrated and did nothing while an unmarked patch of screen two
+         * inches away pressed it.
+         *
+         * The column's last two slots are blank and bare, so nothing else here
+         * claims them.
+         */
+        if (f->p[i].region == EDGE_RIGHT && f->p[i].index == 2)
+            pad |= PMK_C;
     }
+
     return pad;
 }
 
-/* Returns whether the frame hit a control, for the driver's haptic tap. The
- * Pokemon Mini draws its controls on the framebuffer but nothing hit-tests them
- * yet, so a live margin slot is the whole of what can fire for now. */
+/*
+ * Returns whether the frame hit a control, which is what the driver's haptic tap
+ * follows. The drawn d-pad and circles count, and so does a live margin slot.
+ *
+ * THE DRAWN CONTROLS WERE MISSING FROM THIS and the stale comment above them said
+ * why: it claimed nothing hit-tested the framebuffer yet. That stopped being true
+ * when pm_button_at() arrived, and the loops below were not updated with it -- so
+ * the d-pad and A and B moved the pet in silence while the margins buzzed. The
+ * operator found it immediately on a test cartridge.
+ *
+ * One predicate, pm_button_at(), answers for both the pad state and the feedback,
+ * so a control cannot respond without also being felt. */
 static bool pm_app_touch(void *user, const touch_frame_t *f)
 {
     (void)user;
@@ -498,11 +575,27 @@ static bool pm_app_touch(void *user, const touch_frame_t *f)
 
     for (int i = 0; i < f->n && i < TOUCH_POINTS; i++)
     {
-        if (f->p[i].region == EDGE_BOTTOM && display_margin_slot_live(2, f->p[i].index))
+        if (pm_button_at(f->p[i].x, f->p[i].y) != GP_NONE)
             return true;
-        if (f->p[i].region == EDGE_RIGHT && display_margin_slot_live(1, f->p[i].index))
-            return true;
-        if (f->p[i].region == EDGE_LEFT && display_margin_slot_live(0, f->p[i].index))
+    }
+
+    /* The margins, using the same per-region column index the mapping uses. This
+     * used to be three near-identical lines with the constants written out, which
+     * is how a wrong index survives: nothing ties them to pad_from_frame()'s
+     * switch. */
+    for (int i = 0; i < f->n && i < TOUCH_POINTS; i++)
+    {
+        int col;
+
+        switch (f->p[i].region)
+        {
+        case EDGE_LEFT:   col = 0; break;
+        case EDGE_RIGHT:  col = 1; break;
+        case EDGE_BOTTOM: col = 2; break;
+        default:          continue;
+        }
+
+        if (display_margin_slot_live(col, f->p[i].index))
             return true;
     }
 
@@ -1207,6 +1300,70 @@ static const uint16_t s_pad_label[2] = { 'A', 'B' };
 static int pad_cy(int i) { return pad_y(i) + PM_PAD_D / 2; }
 static int pad_cx(int i) { return pad_x(i) + PM_PAD_D / 2; }
 
+/*
+ * THE HIT TEST READS THE SAME LAYOUT THE PAINTER DOES.
+ *
+ * This is the shape the NES uses (gamepad_hit() in gamepad.c) applied to this
+ * emulator's own geometry rather than to a second copy of it. The d-pad and the two
+ * circles have been drawn here for weeks and never responded; the shapes, the
+ * rotation and the arrows all exist in pm.c, so what was missing was only the
+ * mapping from a point to a control.
+ *
+ * A DISC OF FOUR QUADRANTS, not the drawn cross. Measured on the NES -- same shape,
+ * same rotation, same 168 px size -- the painted arms cover about 72 percent of the
+ * disc that bounds them, so a thumb sliding from Up to Right falls into one of the
+ * four empty wedges and the direction drops out. Here it would be worse, because
+ * this d-pad is nudged 20 px left of the margin and its left arm sits over the
+ * glass outside the framebuffer. The touchable area is therefore the disc, and the
+ * DRAWING is unchanged.
+ *
+ * `pad_hit_d` is left 0, so the circles keep their drawn size as their target:
+ * nothing here has been tuned by thumb yet, and inventing a larger target before
+ * the operator has used it would be guesswork. It is one field if that changes.
+ */
+static const gamepad_t s_gp = {
+    .cx = PM_DPAD_X + PM_DPAD_S / 2,
+    .cy = PM_DPAD_Y + PM_DPAD_S / 2,
+    .size = PM_DPAD_S,
+    .rot_k = PM_ROT_K,          /* cos 45 in 16.16, the same rotation the painter uses */
+    .line = 2,
+    .tip_r = PM_DPAD_R,
+
+    .pad_cx = { 0, 0 },         /* filled per-circle below, since pad_cx() is a function */
+    .pad_cy = { 0, 0 },
+    .pad_d = { PM_PAD_D, PM_PAD_D },
+    .pad_hit_d = { 0, 0 },      /* 0 = same as drawn */
+    .pad_label = { 'A', 'B' },
+
+    .bg = 0x0000,
+    .grid = 0,
+};
+
+/* The circles are placed by functions, not by literals, so the layout struct is
+ * completed at the point of use rather than duplicating pad_x()/pad_y() here. */
+static void pm_gp(gamepad_t *g)
+{
+    *g = s_gp;
+
+    for (int i = 0; i < 2; i++)
+    {
+        g->pad_cx[i] = pad_cx(i);
+        g->pad_cy[i] = pad_cy(i);
+    }
+}
+
+/* A panel point to a Pokemon Mini button. The conversion is panel -> framebuffer,
+ * which is DISPLAY_ORIGIN on both axes; forgetting it shifts every hit 45 px down
+ * and right and reads as "the pad is dead on its left half". */
+static int pm_button_at(int panel_x, int panel_y)
+{
+    gamepad_t g;
+
+    pm_gp(&g);
+
+    return gamepad_hit(&g, panel_x - DISPLAY_ORIGIN_X, panel_y - DISPLAY_ORIGIN_Y);
+}
+
 /* Inside a circle of radius (D-1)/2, measured in half-pixels so the disc is
  * symmetric -- an even diameter has no centre pixel and an integer radius test
  * would put the bias on one side. */
@@ -1636,7 +1793,8 @@ bool pmini_start(const char *rom_path)
         return false;
     }
 
-    const char *path = rom_path ? rom_path : PM_ROM_DEFAULT;
+    const char *path = rom_path ? rom_path
+                                  : sd_media(PM_ROM_DEFAULT, PM_ROM_FLAT);
 
     int len = 0;
     s_rom = load_rom(path, &len);
@@ -1674,9 +1832,10 @@ bool pmini_start(const char *rom_path)
      * picture, which is the precise failure this project has already paid for
      * twice (core-log 66 and EMU-018). A refusal names the missing file.
      */
-    if (PokeMini_LoadBIOSFile(PM_BIOS_DEFAULT) <= 0 || PokeMini_FreeBIOS)
+    if (PokeMini_LoadBIOSFile(sd_media(PM_BIOS_DEFAULT, PM_BIOS_FLAT)) <= 0 || PokeMini_FreeBIOS)
     {
-        printf("pm: no retail BIOS at %s -- refusing to start\n", PM_BIOS_DEFAULT);
+        printf("pm: no retail BIOS at %s -- refusing to start\n",
+                   sd_media(PM_BIOS_DEFAULT, PM_BIOS_FLAT));
         printf("pm: the free BIOS boots no retail cartridge; put a 4096-byte\n");
         printf("pm: dump there (it is not part of this repository)\n");
         PokeMini_Destroy();
@@ -1685,7 +1844,8 @@ bool pmini_start(const char *rom_path)
         return false;
     }
 
-    snprintf(s_bios, sizeof(s_bios), "retail %s", PM_BIOS_DEFAULT);
+    snprintf(s_bios, sizeof(s_bios), "retail %s",
+                 sd_media(PM_BIOS_DEFAULT, PM_BIOS_FLAT));
 
     if (!PokeMini_SetMINMem(s_rom, len))
     {
@@ -2250,9 +2410,10 @@ static int cmd_pm(tdsh_session_t *session, int argc, char **argv)
             printf("pm: PokeMini_Create failed\n");
             return 1;
         }
-        if (PokeMini_LoadBIOSFile(PM_BIOS_DEFAULT) <= 0 || PokeMini_FreeBIOS)
+        if (PokeMini_LoadBIOSFile(sd_media(PM_BIOS_DEFAULT, PM_BIOS_FLAT)) <= 0 || PokeMini_FreeBIOS)
         {
-            printf("pm: no retail BIOS at %s -- refusing to measure\n", PM_BIOS_DEFAULT);
+            printf("pm: no retail BIOS at %s -- refusing to measure\n",
+                   sd_media(PM_BIOS_DEFAULT, PM_BIOS_FLAT));
             PokeMini_Destroy();
             heap_caps_free(rom);
             return 1;
@@ -2349,9 +2510,10 @@ static int cmd_pm(tdsh_session_t *session, int argc, char **argv)
             printf("pm: PokeMini_Create failed\n");
             return 1;
         }
-        if (PokeMini_LoadBIOSFile(PM_BIOS_DEFAULT) <= 0 || PokeMini_FreeBIOS)
+        if (PokeMini_LoadBIOSFile(sd_media(PM_BIOS_DEFAULT, PM_BIOS_FLAT)) <= 0 || PokeMini_FreeBIOS)
         {
-            printf("pm: no retail BIOS at %s -- refusing to measure\n", PM_BIOS_DEFAULT);
+            printf("pm: no retail BIOS at %s -- refusing to measure\n",
+                   sd_media(PM_BIOS_DEFAULT, PM_BIOS_FLAT));
             PokeMini_Destroy();
             heap_caps_free(rom);
             return 1;

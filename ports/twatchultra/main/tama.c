@@ -40,6 +40,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "sound.h"
+#include "sdpaths.h"
 #include "tama_ui.h"
 #include "touch.h"
 #include "tdsh.h"
@@ -50,8 +51,16 @@ static const char *TAG = "tama";
 #define TAMA_STACK      6144
 #define TAMA_PRIO       3
 #define TAMA_FRAME_US   (1000000 / TMC_FRAME_HZ)   /* 62500 */
-#define TAMA_SAVE_PATH  "/sd/tama.sav"
-#define TAMA_REPORT     "/sd/tama.txt"
+#define TAMA_SAVE_PATH  "/sd/saves/tama/tama.sav"
+#define TAMA_SAVE_FLAT  "/sd/tama.sav"
+
+/* The checkpoint, wherever the card keeps it. Resolved per call rather than
+ * cached, because `tama load` may run long after the card was swapped. */
+static const char *save_path(void)
+{
+    return sd_media(TAMA_SAVE_PATH, TAMA_SAVE_FLAT);
+}
+#define TAMA_REPORT     sd_out("/sd/diag", "tama.txt")
 
 static tmc *s_m;
 static uint8_t *s_rom;
@@ -564,7 +573,7 @@ static bool restart_guest(bool from_save)
     if (from_save)
     {
         uint8_t save[TMC_EEPROM_BYTES];
-        FILE *f = fopen(TAMA_SAVE_PATH, "rb");
+        FILE *f = fopen(save_path(), "rb");
 
         if (f)
         {
@@ -597,7 +606,7 @@ static bool save_checkpoint(void)
         return false;
 
     tmc_eeprom_save(s_m, save);
-    f = fopen(TAMA_SAVE_PATH, "wb");
+    f = fopen(save_path(), "wb");
 
     if (!f)
         return false;
@@ -668,9 +677,15 @@ static void apply_action(tama_act_t act)
 
     case TAMA_ACT_SHOT:
     {
-        char path[32];
+        /* The name first, then the directory, because sd_out()'s return is a
+         * PATH and using a path as a printf format is only accidentally safe --
+         * it happens to carry the %lu, and would break on any card path with a
+         * percent in it. Two snprintf calls and the hazard is gone. */
+        char name[32];
+        char path[96];
 
-        snprintf(path, sizeof(path), "/sd/tshot-%lu.bmp", (unsigned long)(s_shots + 1));
+        snprintf(name, sizeof(name), "tshot-%lu.bmp", (unsigned long)(s_shots + 1));
+        snprintf(path, sizeof(path), "%s", sd_out("/sd/shots", name));
         write_bmp(path);
         s_shots++;
         break;
@@ -957,7 +972,7 @@ static void tama_task(void *arg)
 
             if (s_log_bands && s_band_lines < BAND_LOG_MAX)
             {
-                FILE *bf = fopen("/sd/tamaband.txt", "a");
+                FILE *bf = fopen(sd_out("/sd/diag", "tamaband.txt"), "a");
 
                 if (bf)
                 {
@@ -1097,7 +1112,7 @@ bool tama_start(const char *rom_path)
      * file is the first boot, not an error. */
     {
         uint8_t save[TMC_EEPROM_BYTES];
-        FILE *f = fopen(TAMA_SAVE_PATH, "rb");
+        FILE *f = fopen(save_path(), "rb");
 
         if (f)
         {
@@ -1505,7 +1520,7 @@ static int cmd_tama(tdsh_session_t *session, int argc, char **argv)
 
         if (!arg || strcmp(arg, "on") == 0)
         {
-            FILE *bf = fopen("/sd/tamaband.txt", "w");
+            FILE *bf = fopen(sd_out("/sd/diag", "tamaband.txt"), "w");
             if (bf)
                 fclose(bf);
 

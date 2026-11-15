@@ -23,6 +23,7 @@
  *   lcd.mirror    1 (default): also send the picture to the USB port
  */
 #include "link.h"
+#include "sdpaths.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -163,7 +164,7 @@ static void report_paint(int what)
     printf("own=%d painted=%lu skip=%lu\n", owned ? 1 : 0,
            (unsigned long)painted, (unsigned long)suppressed);
 
-    FILE *f = fopen("/sd/pattern.txt", "w");
+    FILE *f = fopen(sd_out("/sd/diag", "pattern.txt"), "w");
 
     if (f)
     {
@@ -241,7 +242,7 @@ static int cmd_dcheck(tdsh_session_t *session, int argc, char **argv)
      * one line, but this runs while reproducing a rendering fault and the
      * screen may be exactly what is wrong. */
     {
-        FILE *f = fopen("/sd/dcheck.txt", "w");
+        FILE *f = fopen(sd_out("/sd/diag", "dcheck.txt"), "w");
 
         if (f)
         {
@@ -329,7 +330,7 @@ static int cmd_vbus(tdsh_session_t *session, int argc, char **argv)
     if (secs > 300)
         secs = 300;
 
-    FILE *f = fopen("/sd/vbus.log", "w");
+    FILE *f = fopen(sd_out("/sd/diag", "vbus.log"), "w");
 
     if (!f)
     {
@@ -356,7 +357,7 @@ static int cmd_vbus(tdsh_session_t *session, int argc, char **argv)
 
         const unsigned bat = (unsigned)(((bh & 0x3F) << 8) | bl);
 
-        f = fopen("/sd/vbus.log", "a");
+        f = fopen(sd_out("/sd/diag", "vbus.log"), "a");
         if (f)
         {
             fprintf(f, "%d,%u,%u,%u,%u,%u,%u\n", i, (unsigned)s0, (unsigned)s1,

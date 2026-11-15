@@ -68,6 +68,7 @@
  */
 
 #include "touch.h"
+#include "sdpaths.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -1103,7 +1104,7 @@ int touch_dump(int seconds)
     int n = s_dump_n;
     int kept = 0;
 
-    FILE *f = fopen("/sd/touch.txt", "w");
+    FILE *f = fopen(sd_out("/sd/diag", "touch.txt"), "w");
 
     if (!f)
         return -1;
