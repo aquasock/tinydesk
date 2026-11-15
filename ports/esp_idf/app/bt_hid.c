@@ -901,6 +901,13 @@ __attribute__((weak)) void board_ble_uart_register(void)
 {
 }
 
+  /* Does this port need the radio for something other than a keyboard? The BLE
+ * console answers yes. Weak and false by default so no other board changes. */
+__attribute__((weak)) bool board_bt_want_radio(void)
+{
+    return false;
+}
+
 static void on_sync(void)
 {
     lock();
@@ -1220,13 +1227,33 @@ const td_bt_ops_t *bt_hid_start(void)
     bool any = false;
     for (int i = 0; i < TD_BT_SLOTS; i++)
         any |= s_slots[i].used && s_slots[i].reconnect;
-    if (any)
+
+    /*
+     * A REASON TO START THE RADIO THAT IS NOT A KEYBOARD.
+     *
+     * The radio used to come up at boot only when a paired device had reconnect
+     * set, and otherwise stayed off until someone scanned. That is right for a
+     * keyboard and wrong for anything else living on the same radio: the BLE
+     * serial console is a PERIPHERAL this board offers, not a device it connects
+     * to, so with no bound keyboard the radio never came up and the console
+     * never advertised -- observed as a session that worked while a keyboard was
+     * paired and vanished after a reboot on a board with none.
+     *
+     * A port that has something else to run on the radio says so through this
+     * weak hook, and the radio comes up for it. Every other port links the empty
+     * default and is unchanged.
+     */
+    const bool want_radio = any || board_bt_want_radio();
+
+    if (want_radio)
     {
         lock();
         radio_start();   /* paired devices come back by themselves */
         unlock();
     }
-    ESP_LOGI(TAG, "Bluetooth keyboards and mice: %s", any ? "radio on for paired devices" : "radio off until a scan");
+    ESP_LOGI(TAG, "Bluetooth keyboards and mice: %s",
+             any ? "radio on for paired devices"
+                 : want_radio ? "radio on for a port service" : "radio off until a scan");
     return &s_ops;
 }
 

@@ -254,3 +254,24 @@ CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 # device is attached -- and this board's USB host runs only in the diagnostic and
 # in whatever audio mode replaces it.
 CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=512
+
+#
+# NIMBLE'S MBUF POOL, WHICH A CONSOLE CAN EMPTY FASTER THAN A KEYBOARD.
+#
+# The pool defaults to 12 blocks of 256 bytes. With the ATT MTU raised to 256,
+# ONE notification consumes a whole block, so a client that reads slower than the
+# console writes drains 12 blocks in a dozen notifications. That is BLE-002
+# reached from the console side: the pool empties and the stack starts failing.
+#
+# On this board it is worse than a dropped link. With a USB device attached,
+# free internal RAM measured 31 KB, and the exhausted pool reached an assert
+# inside ble_hs_mbuf_gen_pkt (ble_hs_mbuf.c:42) -- a PANIC, which with the
+# console compiled out is an unexplained reboot. The coredump named it:
+#
+#   #0 ble_hs_mbuf_gen_pkt  ble_hs_mbuf.c:42
+#   #3 tx_task              bleuart.c:353
+#
+# 32 blocks is 8 KB of internal RAM and gives the notify path room to lag a
+# connection interval without starving. It is the documented remedy, not a
+# guess.
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=32

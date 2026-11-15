@@ -39,6 +39,9 @@
 #include "freertos/ringbuf.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "host/ble_att.h"
+#include "host/ble_gap.h"
+#include "host/ble_hs_adv.h"
 #include "host/ble_hs.h"
 #include "host/util/util.h"
 #include "services/gap/ble_svc_gap.h"
@@ -72,7 +75,23 @@ static const ble_uuid128_t s_tx_uuid =
 #define BLEUART_XON     0x11    /* Ctrl-Q */
 #define BLEUART_TX_RING 16384    /* shell -> client */
 #define BLEUART_ADV_NAME "TinyDesk"
-#define BLEUART_NOTIFY_WAIT_MS 40
+/*
+ * HOW LONG TO WAIT FOR A NOTIFICATION TO LEAVE BEFORE SENDING THE NEXT.
+ *
+ * This was 200 and was lowered to 40 in an attempt to speed the console up,
+ * which was a mistake with a measured consequence: at 40 ms this task produces
+ * notifications faster than a 20 ms connection interval can carry them, the
+ * mbuf pool empties, and notify starts failing with BLE_HS_ENOMEM (6). The
+ * damage is not confined to output -- with no free mbufs the stack cannot
+ * RECEIVE either, so a client's writes are dropped before they reach the GATT
+ * callback. Observed exactly that: `tx failed=14 lasterr=6` beside `in=0`, and
+ * the same write landing (`in=10 out=10`) when sent before any output piled up.
+ *
+ * This is BLE-002's failure mode, reached from the other direction. The wait is
+ * generous on purpose: output a few milliseconds late is invisible, and an
+ * empty mbuf pool silently breaks the console in both directions.
+ */
+#define BLEUART_NOTIFY_WAIT_MS 200
 
 static RingbufHandle_t s_rx;         /* bytes the client sent          */
 static RingbufHandle_t s_tx;         /* bytes to notify to the client  */
@@ -87,6 +106,10 @@ static volatile bool s_xoff_sent;     /* the client has been told to pause */
 static volatile uint32_t s_rx_refused; /* writes refused for a full ring */
 static volatile uint32_t s_rx_bytes;   /* bytes accepted into the ring */
 static volatile uint32_t s_rx_out;     /* bytes actually handed to the reader */
+static volatile uint32_t s_tx_sent;    /* bytes successfully notified */
+static volatile uint32_t s_tx_failed;  /* notifications the stack refused */
+static volatile uint16_t s_mtu = 23;   /* negotiated ATT MTU */
+static volatile int s_last_nrc;        /* last notify error code */
 
 /*
  * THE WRITE PATH, which is the only way a byte enters the shell.
@@ -196,7 +219,9 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         if (event->connect.status == 0)
         {
             s_conn = event->connect.conn_handle;
-            ESP_LOGI(TAG, "console client connected (handle %d)", s_conn);
+            s_mtu = ble_att_mtu(s_conn);    /* whatever this link agreed */
+            ESP_LOGI(TAG, "console client connected (handle %d, mtu %u)",
+                     s_conn, (unsigned)s_mtu);
         }
         else
         {
@@ -217,6 +242,11 @@ static int gap_event(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_ADV_COMPLETE:
         advertise();
+        return 0;
+
+    case BLE_GAP_EVENT_MTU:
+        s_mtu = event->mtu.value;
+        ESP_LOGI(TAG, "mtu now %u", (unsigned)s_mtu);
         return 0;
 
     case BLE_GAP_EVENT_SUBSCRIBE:
@@ -291,8 +321,25 @@ static void tx_task(void *arg)
 
     for (;;)
     {
+        /*
+         * CHUNK BY THE NEGOTIATED MTU, NOT BY A GUESS.
+         *
+         * This asked for up to 240 bytes per notification regardless of what the
+         * link had agreed. A notification larger than MTU-3 cannot be sent: the
+         * stack refuses it, this task logged a warning and DROPPED the bytes, and
+         * the client saw a short file. That is why reading a 276-byte log
+         * produced fragments while a 4,000-byte WRITE -- which is chunked by the
+         * client's own MTU handling -- was byte-exact.
+         *
+         * s_mtu is updated on connect and on BLE_GAP_EVENT_MTU.
+         */
+        const uint16_t mtu = s_mtu > 23 ? s_mtu : 23;
+        size_t chunk_max = mtu > 3 ? (size_t)(mtu - 3) : 20;
+        if (chunk_max > 240)
+            chunk_max = 240;        /* no point making notifications huge */
+
         size_t len = 0;
-        uint8_t *p = xRingbufferReceiveUpTo(s_tx, &len, pdMS_TO_TICKS(1000), 240);
+        uint8_t *p = xRingbufferReceiveUpTo(s_tx, &len, pdMS_TO_TICKS(1000), chunk_max);
 
         if (!p)
             continue;
@@ -319,10 +366,26 @@ static void tx_task(void *arg)
 
         if (rc != 0)
         {
-            /* om is consumed on success only. */
-            ESP_LOGW(TAG, "notify: %d", rc);
+            /* om is consumed on success only. Counted rather than only logged:
+             * this is silent data loss on the read path and it has to be
+             * visible in `bleuart`, not buried in a log nobody can read. */
+            s_tx_failed++;
+            s_last_nrc = rc;
+
+            /* OUT OF MBUFS MEANS STOP TALKING. Retrying immediately deepens the
+             * shortage and starves the receive path too, which is how a console
+             * that is only trying to print ends up unable to hear anything.
+             * Dropping the chunk loses output; spamming the pool loses the
+             * session. */
+            if (rc == BLE_HS_ENOMEM)
+            {
+                os_mbuf_free_chain(om);
+                vTaskDelay(pdMS_TO_TICKS(20));
+            }
             continue;
         }
+
+        s_tx_sent += len;
 
         /* BLE-002: exactly one notification outstanding, so the mbuf pool cannot
          * be drained by this path. A client that never acknowledges costs this
@@ -520,6 +583,7 @@ int board_serial2_alt_write(const uint8_t *buf, int len)
  * from a PC that cannot see it.
  */
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "tdsh.h"
 
@@ -531,6 +595,101 @@ static int cmd_bleuart(tdsh_session_t *session, int argc, char **argv)
     {
         advertise();
         printf("bleuart: advertising restarted\n");
+        return 0;
+    }
+
+    /*
+     * `bleuart drop` -- terminate the current link, whoever owns it.
+     *
+     * THIS EXISTS BECAUSE A DEAD CLIENT IS INVISIBLE FROM HERE AND EXPENSIVE
+     * FROM THERE. When a client disconnects without a clean shutdown the watch
+     * holds the link until the BLE supervision timeout (about 20 seconds), and
+     * for that whole window it neither advertises nor accepts a new connection.
+     * From the PC that is indistinguishable from a dead watch, and the only cure
+     * was a reboot -- which happened four times in one session.
+     *
+     * Terminating from this side ends it immediately and re-advertises, so a new
+     * client can attach at once.
+     */
+    /*
+     * `bleuart fetch <path>` -- stream a file over the link, bypassing the
+     * terminal.
+     *
+     * WHY THIS EXISTS. Reading a file back with `cat` does not work, and the
+     * reason is not bandwidth: the console is a DISPLAY SOURCE, so the shell's
+     * output is rendered into a 40x26 terminal and the desktop's mirror sends
+     * only cells that changed. A file scrolls far faster than that diff can
+     * travel, so the top of it is gone before it is transmitted -- measured as
+     * 11 of 20 lines arriving, every one of them from the END of the output.
+     *
+     * This writes the file's bytes straight into the notification ring instead:
+     * no screen, no wrapping, no diff. The client receives the exact file.
+     *
+     * It prints nothing to the terminal on purpose -- progress messages would
+     * interleave with the data. The client knows how many bytes it asked for;
+     * the console's own `tx sent` counter confirms delivery.
+     */
+    if (argc >= 3 && strcmp(argv[1], "fetch") == 0)
+    {
+        FILE *f = fopen(argv[2], "rb");
+
+        if (!f)
+        {
+            printf("bleuart: cannot open %s\n", argv[2]);
+            return 1;
+        }
+
+        unsigned long total = 0;
+
+        for (;;)
+        {
+            uint8_t chunk[512];
+            const size_t n = fread(chunk, 1, sizeof(chunk), f);
+
+            if (n == 0)
+                break;
+
+            size_t off = 0;
+
+            /* bleuart_write is non-blocking and returns a short count, so a
+             * full ring is retried rather than dropped -- the notify task
+             * drains it at the connection interval. */
+            while (off < n)
+            {
+                const int w = bleuart_write(chunk + off, (int)(n - off));
+
+                if (w > 0)
+                    off += (size_t)w;
+
+                vTaskDelay(pdMS_TO_TICKS(5));
+            }
+
+            total += n;
+        }
+
+        fclose(f);
+
+        /* Give the notify task time to empty the ring before the shell prints
+         * anything that would interleave with the last of the data. */
+        vTaskDelay(pdMS_TO_TICKS(300));
+        printf("bleuart: fetched %lu bytes from %s\n", total, argv[2]);
+        return 0;
+    }
+
+    if (argc >= 2 && strcmp(argv[1], "drop") == 0)
+    {
+        if (s_conn == BLE_HS_CONN_HANDLE_NONE)
+        {
+            printf("bleuart: no connection to drop\n");
+            advertise();
+            return 0;
+        }
+
+        const int rc = ble_gap_terminate(s_conn, BLE_ERR_REM_USER_CONN_TERM);
+
+        printf("bleuart: terminate(%d) -> %d\n", (int)s_conn, rc);
+        s_conn = BLE_HS_CONN_HANDLE_NONE;
+        advertise();
         return 0;
     }
 
@@ -546,6 +705,9 @@ static int cmd_bleuart(tdsh_session_t *session, int argc, char **argv)
         printf("rx ring used=%u refused=%lu in=%lu out=%lu\n",
            (unsigned)used, (unsigned long)s_rx_refused,
            (unsigned long)s_rx_bytes, (unsigned long)s_rx_out);
+    printf("tx sent=%lu failed=%lu lasterr=%d mtu=%u\n",
+           (unsigned long)s_tx_sent, (unsigned long)s_tx_failed,
+           s_last_nrc, (unsigned)s_mtu);
     }
     if (s_tx)
     {
@@ -568,4 +730,13 @@ static const tdsh_command_t s_bleuart_cmd = {
 bool bleuart_register_command(void)
 {
     return tdsh_register_command(&s_bleuart_cmd) == 0;
+}
+
+/* The radio has a reason to run that is not a keyboard: this console is a
+ * peripheral the watch OFFERS, so it must be up at boot whether or not a
+ * keyboard is paired. Without this the radio stayed off until someone opened
+ * the Bluetooth app, and the console was invisible until they did. */
+bool board_bt_want_radio(void)
+{
+    return true;
 }

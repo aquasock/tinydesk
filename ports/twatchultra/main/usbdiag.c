@@ -54,6 +54,7 @@
 #include "usbdiag.h"
 
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -208,6 +209,20 @@ static void walk_config(const uint8_t *cfg, int len)
 /* True once this device address has already been reported, so the poll loop
  * logs each attachment once rather than every 200 ms. */
 static bool s_seen[USBDIAG_MAX_ADDR + 1];
+static volatile bool s_diag_running;
+
+/*
+ * The client event callback. Required even for a synchronous client (see the
+ * comment at registration), and it is where a device's arrival is first
+ * visible.
+ */
+static void on_client_event(const usb_host_client_event_msg_t *msg, void *arg)
+{
+    (void)arg;
+
+    if (msg->event == USB_HOST_CLIENT_EVENT_NEW_DEV)
+        logf_line("# client event: NEW_DEV address %d", (int)msg->new_dev.address);
+}
 
 /* The host library requires a CLIENT to open a device -- usb_host_device_open()
  * takes a client handle, not a bare address. A SYNCHRONOUS client is the right
@@ -290,6 +305,162 @@ static void report_device(uint8_t addr)
  * command that returned while a background task quietly waited would let the
  * operator do the physical steps before the log existed.
  */
+/*
+ * THE POLLING RUNS ON ITS OWN TASK, NOT THE SHELL'S.
+ *
+ * It used to run inline, and the shell task crashed -- the coredump named it
+ * outright ("Crashed task handle: ... name: 'tdsh'") with a null frame at #0,
+ * which is stack corruption. usb_host_lib_handle_events() and
+ * usb_host_client_handle_events() dispatch the host stack's own callbacks, and
+ * report_device() adds descriptor buffers on top of that; all of it landed on a
+ * task that was already holding the shell's parser and its output buffers.
+ *
+ * A dedicated 8 KB task is the shape this deserves: the shell returns to its
+ * prompt, the operator can keep using it, and the polling has room.
+ */
+static void usbdiag_task(void *arg)
+{
+    const int secs = (int)(intptr_t)arg;
+
+    /* Long enough for the operator to read the steps and pull the PC cable,
+     * during which the USB console still works. */
+    vTaskDelay(pdMS_TO_TICKS(12000));
+
+    logf_line("# host install begins");
+
+    /*
+     * THE INTERRUPT LEVEL IS WHAT WAS WRONG, and the first run's error code named
+     * it: usb_host_install() returned ESP_ERR_NOT_FOUND, which is not a return
+     * value anywhere in its own path. It comes from esp_intr_alloc(), which
+     * returns exactly that with "No free interrupt inputs for USB interrupt
+     * (flags 0x%X)" when no slot matching the requested flags is free.
+     *
+     * The HCD asks for ESP_INTR_FLAG_LEVEL1. On this board WiFi and BLE are both
+     * running by the time this runs, and the level-1 slots are taken. LEVEL3
+     * works -- verified on hardware.
+     */
+    static const struct { int flags; const char *name; } levels[] = {
+        { ESP_INTR_FLAG_LEVEL3, "LEVEL3" },
+        { ESP_INTR_FLAG_LEVEL2 | ESP_INTR_FLAG_LEVEL3, "LEVEL2|LEVEL3" },
+        { ESP_INTR_FLAG_LEVEL1, "LEVEL1" },
+        { 0, "default(0)" },
+    };
+
+    esp_err_t err = ESP_FAIL;
+
+    for (size_t i = 0; i < sizeof(levels) / sizeof(levels[0]); i++)
+    {
+        const usb_host_config_t host = {
+            .skip_phy_setup = false,
+            .intr_flags = levels[i].flags,
+        };
+
+        err = usb_host_install(&host);
+
+        logf_line("# usb_host_install(%s flags=0x%X) -> %s (0x%X)",
+                  levels[i].name, (unsigned)levels[i].flags,
+                  esp_err_to_name(err), (unsigned)err);
+
+        if (err == ESP_OK)
+            break;
+    }
+
+    if (err != ESP_OK)
+    {
+        logf_line("# host install failed; stopping");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    memset(s_seen, 0, sizeof(s_seen));
+
+    /*
+     * A SYNCHRONOUS CLIENT STILL NEEDS AN EVENT CALLBACK, AND ITS ABSENCE WAS A
+     * NULL-POINTER JUMP THAT REBOOTED THE BOARD.
+     *
+     * usb_host_client_register() validates async.client_event_callback ONLY when
+     * is_synchronous is false (usb_host.c:667), but
+     * usb_host_client_handle_events() invokes it unconditionally whenever an
+     * event message is queued (usb_host.c:809). A synchronous client that omits
+     * the callback therefore registers fine and then calls address zero the
+     * moment a device is attached:
+     *
+     *   exccause 0x14 InstFetchProhibitedCause
+     *   pc       0x0
+     *   Crashed task: 'usbdiag'
+     *
+     * THIS COST FOUR RUNS AND NEARLY CONDEMNED THE USB PORT. A run with nothing
+     * attached completed and logged "# done: 0 device(s)"; every run with a
+     * device -- a UAC2 DAC and an 8BitDo controller, two completely different
+     * devices -- crashed at the same point. Two devices failing identically is
+     * not a device problem, it is a harness problem, and that is the shape the
+     * evidence had from the second run.
+     *
+     * is_synchronous only means the client's TRANSFERS block; events still
+     * arrive, so a callback is required either way.
+     */
+    const usb_host_client_config_t client_cfg = {
+        .is_synchronous = true,
+        .max_num_event_msg = 4,
+        .async = { .client_event_callback = on_client_event, .callback_arg = NULL },
+    };
+    err = usb_host_client_register(&client_cfg, &s_client);
+
+    logf_line("# usb_host_client_register -> %s (0x%X)",
+              esp_err_to_name(err), (unsigned)err);
+
+    if (err != ESP_OK)
+    {
+        usb_host_uninstall();
+        vTaskDelete(NULL);
+        return;
+    }
+
+    const int64_t end = xTaskGetTickCount() + pdMS_TO_TICKS(secs * 1000);
+
+    while (xTaskGetTickCount() < end)
+    {
+        uint32_t flags = 0;
+
+        usb_host_lib_handle_events(pdMS_TO_TICKS(100), &flags);
+        usb_host_client_handle_events(s_client, pdMS_TO_TICKS(100));
+
+        uint8_t list[DIAG_MAX_DEVICES];
+        int n = 0;
+
+        if (usb_host_device_addr_list_fill(DIAG_MAX_DEVICES, list, &n) == ESP_OK)
+        {
+            for (int i = 0; i < n && i < DIAG_MAX_DEVICES; i++)
+            {
+                const uint8_t a = list[i];
+
+                if (a == 0 || a > USBDIAG_MAX_ADDR || s_seen[a])
+                    continue;
+
+                s_seen[a] = true;
+                logf_line("# attached (t=%lums)", (unsigned long)esp_log_timestamp());
+                report_device(a);
+            }
+        }
+    }
+
+    int total = 0;
+
+    for (int i = 1; i <= USBDIAG_MAX_ADDR; i++)
+        if (s_seen[i])
+            total++;
+
+    logf_line("# done: %d device(s) enumerated in %d s", total, secs);
+    logf_line("# %s", total ? "port works as a host and enumerated something"
+                            : "NOTHING enumerated -- FS/HS or CC role is the question");
+
+    usb_host_client_deregister(s_client);
+    usb_host_uninstall();
+
+    s_diag_running = false;
+    vTaskDelete(NULL);
+}
+
 static int cmd_usbdiag(tdsh_session_t *session, int argc, char **argv)
 {
     (void)session;
@@ -354,159 +525,45 @@ static int cmd_usbdiag(tdsh_session_t *session, int argc, char **argv)
     printf("usbdiag: wait, then: 3. unplug everything, replug the PC cable\n");
     printf("usbdiag: the console goes away while it is a host -- expected\n");
 
-    /* A pause long enough to read the instruction and pull the cable, during
-     * which the console still works. */
-    /* Long enough to read the four steps and pull the cable. */
-    vTaskDelay(pdMS_TO_TICKS(12000));
-
     /*
-     * RELEASE THE USB-SERIAL-JTAG DRIVER FIRST, and this is the finding the
-     * first run produced.
+     * THE OPERATOR'S STEPS, AND WHY THEY CANNOT BE DESIGNED AWAY.
      *
-     * The first attempt called usb_host_install() with the console's USJ driver
-     * still installed and got ESP_ERR_NOT_FOUND, and the console died anyway --
-     * so the PHY pads had been switched to the OTG controller before the
-     * failure. USJ and OTG are two peripherals sharing one set of D+/D- pads and
-     * one internal PHY, and the USJ driver enables those pads for itself
-     * (usb_serial_jtag_ll_phy_enable_pad(true)) at install. The OTG controller
-     * cannot come up while that is true.
-     *
-     * Uninstalling the USJ driver hands the pads back. The console therefore
-     * stops working HERE, a few lines earlier than it otherwise did, which is
-     * why the operator is told before this point that it will.
+     * The watch has one USB-C port. It is either a DEVICE (plugged into the PC,
+     * console alive, cannot be a host) or a HOST (plugged into the splitter,
+     * console dead). There is no third state, so a host test requires unplugging
+     * from the PC. The splitter supplies power on one branch and carries the DAC
+     * on the other, which is why the board keeps running with the PC unplugged.
      */
-    /*
-     * THE INTERRUPT LEVEL IS WHAT WAS WRONG, and the first run's error code named
-     * it: usb_host_install() returned ESP_ERR_NOT_FOUND, which is not a return
-     * value anywhere in its own path. It comes from esp_intr_alloc(), which
-     * returns exactly that with "No free interrupt inputs for USB interrupt
-     * (flags 0x%X)" when no slot matching the requested flags is free.
-     *
-     * The HCD asks for ESP_INTR_FLAG_LEVEL1. On this board WiFi and BLE are both
-     * running by the time this command executes, and the level-1 slots are
-     * taken, so the allocation fails and the whole stack unwinds. The same
-     * reason would apply to usb_hid.c, which requests the same flag -- and
-     * usb.host has never been set on this board, so that path has never been
-     * exercised to find out.
-     *
-     * So the flags are tried in order and each attempt is logged with its
-     * numeric code. A level-3 interrupt is the usual home for a USB host
-     * controller on this SoC, and 0 (the default) lets the allocator choose.
-     *
-     * THE USJ DRIVER IS LEFT ALONE. An earlier revision uninstalled it to free
-     * the PHY pads and the board rebooted inside that call, because the console
-     * task is blocked in usb_serial_jtag_read_bytes() -- which is the task
-     * running this command. A driver cannot be torn down under its own blocking
-     * reader. If the PHY really is the conflict, the install below will say so
-     * with an error of its own and the console will survive.
-     */
-    static const struct {
-        int flags;
-        const char *name;
-    } levels[] = {
-        { ESP_INTR_FLAG_LEVEL3, "LEVEL3" },
-        { ESP_INTR_FLAG_LEVEL2 | ESP_INTR_FLAG_LEVEL3, "LEVEL2|LEVEL3" },
-        { ESP_INTR_FLAG_LEVEL1, "LEVEL1" },
-        { 0, "default(0)" },
-    };
+    printf("usbdiag: %d seconds, log -> /sd/diag/usbdiag.log\n", secs);
+    printf("usbdiag: NOW: 1. unplug this cable from the PC\n");
+    printf("usbdiag:       2. plug in the splitter, with power AND the DAC\n");
+    printf("usbdiag: wait, then: 3. unplug everything, replug the PC cable\n");
+    printf("usbdiag: polling now runs on its own task; this shell stays usable\n");
 
-    esp_err_t err = ESP_FAIL;
-
-    for (size_t i = 0; i < sizeof(levels) / sizeof(levels[0]); i++)
+    if (s_diag_running)
     {
-        const usb_host_config_t host = {
-            .skip_phy_setup = false,
-            .intr_flags = levels[i].flags,
-        };
-
-        err = usb_host_install(&host);
-
-        logf_line("# usb_host_install(%s flags=0x%X) -> %s (0x%X)",
-                  levels[i].name, (unsigned)levels[i].flags,
-                  esp_err_to_name(err), (unsigned)err);
-
-        if (err == ESP_OK)
-            break;
-    }
-
-    if (err != ESP_OK)
-    {
-        printf("usbdiag: host install FAILED: %s\n", esp_err_to_name(err));
+        printf("usbdiag: already running\n");
         return 1;
     }
 
-    memset(s_seen, 0, sizeof(s_seen));
+    s_diag_running = true;
 
-    const usb_host_client_config_t client_cfg = {
-        .is_synchronous = true,
-        .max_num_event_msg = 4,
-    };
-    err = usb_host_client_register(&client_cfg, &s_client);
-
-    logf_line("# usb_host_client_register -> %s", esp_err_to_name(err));
-
-    if (err != ESP_OK)
+    /*
+     * THE OPERATOR GETS A HEAD START, NOT A BLOCKING PAUSE.
+     *
+     * The task is started immediately so the countdown runs in parallel with the
+     * operator pulling the cable. Its first act is to wait 12 seconds, which is
+     * long enough to read the four steps and unplug; during that window the USB
+     * console still works, so the shell can return its prompt.
+     */
+    if (xTaskCreate(usbdiag_task, "usbdiag", 8192, (void *)(intptr_t)secs, 3, NULL) != pdPASS)
     {
-        printf("usbdiag: client register FAILED: %s\n", esp_err_to_name(err));
-        usb_host_uninstall();
+        s_diag_running = false;
+        printf("usbdiag: no task\n");
         return 1;
     }
 
-    /* Drive the host library's own event loop from this task rather than a
-     * second one: usb_host_lib_handle_events() has to be called for enumeration
-     * to make progress, and this command wants to be the only thing doing it. */
-    const int64_t end = xTaskGetTickCount() + pdMS_TO_TICKS(secs * 1000);
-
-    while (xTaskGetTickCount() < end)
-    {
-        uint32_t flags = 0;
-
-        usb_host_lib_handle_events(pdMS_TO_TICKS(100), &flags);
-        usb_host_client_handle_events(s_client, pdMS_TO_TICKS(100));
-
-        uint8_t list[DIAG_MAX_DEVICES];
-        int n = 0;
-
-        if (usb_host_device_addr_list_fill(DIAG_MAX_DEVICES, list, &n) == ESP_OK)
-        {
-            for (int i = 0; i < n && i < DIAG_MAX_DEVICES; i++)
-            {
-                const uint8_t a = list[i];
-
-                if (a == 0 || a > USBDIAG_MAX_ADDR || s_seen[a])
-                    continue;
-
-                s_seen[a] = true;
-                logf_line("# attached (t=%lums)", (unsigned long)(esp_log_timestamp()));
-                report_device(a);
-            }
-        }
-    }
-
-    /* Count what was seen, so a log with no devices in it can still be read as
-     * a definite answer rather than a truncated file. */
-    int total = 0;
-
-    for (int i = 1; i <= USBDIAG_MAX_ADDR; i++)
-        if (s_seen[i])
-            total++;
-
-    logf_line("# done: %d device(s) enumerated in %d s", total, secs);
-    logf_line("# %s", total ? "port works as a host and enumerated something"
-                            : "NOTHING enumerated -- FS/HS or CC role is the question");
-
-    /* Order matters: a client must close its devices before it deregisters, and
-     * the library cannot uninstall while a client is registered. */
-    usb_host_client_deregister(s_client);
-    usb_host_uninstall();
-
-    /* No restore is needed: the USJ driver was never uninstalled, so the
-     * console's peripheral is untouched. usb_host_uninstall() above drops the
-     * OTG controller's reference to the shared PHY, which is what hands the
-     * pads back. The console may need the cable replugged to re-enumerate,
-     * because the host side reset the port. */
-    printf("usbdiag: done, %d device(s). Replug the PC and read /sd/diag/usbdiag.log\n", total);
-
+    printf("usbdiag: task started; unplug from the PC within 12 s\n");
     return 0;
 }
 
