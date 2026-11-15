@@ -43,6 +43,8 @@
 #include "nes.h"
 #include "tama.h"
 #include "pmbench.h"
+#include "gbcbench.h"
+#include "gb.h"
 #include "pm.h"
 #include "hal_mux.h"
 #include "tinydesk/td_picture.h"
@@ -561,6 +563,12 @@ bool link_init(void)
 
     if (!pmbench_register_command())
         ESP_LOGW(TAG, "pmbench command did not register");
+
+    if (!gbcbench_register_command())
+        ESP_LOGW(TAG, "gbcbench command did not register");
+
+    if (!gb_register_command())
+        ESP_LOGW(TAG, "gb command did not register");
 
     if (!pmini_register_command())
         ESP_LOGW(TAG, "pm command did not register");
