@@ -1042,6 +1042,21 @@ typedef struct
     int n;
     int x, y;        /* top-left of the label's bounding box */
     label_rot_t rot;
+    /*
+     * PIXEL DOUBLING, 1 for a normal glyph and 2 for the arrows.
+     *
+     * An arrow is one 8x16 cell, which in a 41 px face looks lost; the operator
+     * asked for it twice the size. The font has one size, so this scales the
+     * SAMPLING rather than the bitmap: each source pixel becomes a 2x2 block.
+     * That keeps every edge on a whole pixel and every stroke the same weight -- a
+     * bilinear or fractional scale of an 8x16 bitmap looks blurred, and a 2x block
+     * looks like a bigger version of the same arrow, which is what was wanted.
+     *
+     * It is a parameter of label_place() rather than a field set afterwards, for
+     * the reason the arrows themselves taught: a value written after a call that
+     * already read it is a bug that compiles and ships.
+     */
+    int scale;
 } label_pos_t;
 
 /* Decode UTF-8 into code points, stopping at cap. A malformed sequence yields
@@ -1110,15 +1125,21 @@ static int utf8_cells(const char *s, uint16_t *out, int cap)
  * that the text overran its border. Stood on end it needs 56 of the 61 rows a
  * slot offers and 16 of the 41 columns. */
 static void label_place(const char *s, int x0, int x1, int y0, int y1, label_rot_t rot,
-                        label_pos_t *out)
+                        int scale, label_pos_t *out)
 {
     int w, h;
     int cx, cy;
 
+    if (scale < 1)
+        scale = 1;
+
     out->n = utf8_cells(s, out->cp, LABEL_MAX_CELLS);
     out->rot = rot;
-    w = rot == LABEL_UPRIGHT ? out->n * CELL_W : CELL_H;
-    h = rot == LABEL_UPRIGHT ? CELL_H : out->n * CELL_W;
+    out->scale = scale;
+
+    /* The cell is CELL_W x CELL_H times `scale`, so the bounding box follows. */
+    w = (rot == LABEL_UPRIGHT ? out->n * CELL_W : CELL_H) * scale;
+    h = (rot == LABEL_UPRIGHT ? CELL_H : out->n * CELL_W) * scale;
     cx = x0 + (x1 - x0 + 1 - w) / 2;
     cy = y0 + (y1 - y0 + 1 - h) / 2;
     out->x = cx < x0 ? x0 : cx;
@@ -1148,9 +1169,22 @@ static void label_place(const char *s, int x0, int x1, int y0, int y1, label_rot
  * row of the band; characters are laid out from the top down. The two are exact
  * opposites, so the same column reads upright from either edge of the watch
  * depending on which way it is turned.
+ *
+ * SCALED, EVERY SOURCE PIXEL BECOMES A SQUARE OF `scale` BY `scale`. So the
+ * pixel offset is divided by the scale BEFORE the cell arithmetic, not after: a
+ * label two cells wide at scale 2 is 32 px across, and `dx / (CELL_W * scale)`
+ * with `(dx / scale) % CELL_W` for the bit would be the same thing written two
+ * ways. Keeping a single division and using it for both is what stops the two
+ * from drifting, and it is why the block below reads the way it does.
+ *
+ * At scale 1 this is exactly the arithmetic that was here before, term for term.
  */
 static bool label_bit(const label_pos_t *p, int x, int y)
 {
+    const int scale = p->scale > 0 ? p->scale : 1;
+    const int cw = CELL_W * scale;      /* a cell as drawn  */
+    const int ch = CELL_H * scale;
+
     int dx = x - p->x, dy = y - p->y;
     int idx, gy, gx;
     const uint8_t *glyph;
@@ -1160,32 +1194,32 @@ static bool label_bit(const label_pos_t *p, int x, int y)
 
     if (p->rot == LABEL_UPRIGHT)
     {
-        if (dy >= CELL_H)
+        if (dy >= ch)
             return false;
-        idx = dx / CELL_W;
+        idx = dx / cw;
         if (idx >= p->n)
             return false;
-        gy = dy;
-        gx = dx % CELL_W;
+        gy = dy / scale;
+        gx = (dx % cw) / scale;
     }
     else
     {
-        if (dx >= CELL_H)
+        if (dx >= ch)
             return false;
-        if (dy >= p->n * CELL_W)
+        if (dy >= p->n * cw)
             return false;
 
         if (p->rot == LABEL_CCW)
         {
-            idx = p->n - 1 - dy / CELL_W;   /* first character at the bottom */
-            gy = dx;                        /* glyph top edge -> left  */
-            gx = (CELL_W - 1) - (dy % CELL_W);  /* glyph left edge -> bottom */
+            idx = p->n - 1 - dy / cw;           /* first character at the bottom */
+            gy = dx / scale;                    /* glyph top edge -> left  */
+            gx = (CELL_W - 1) - (dy % cw) / scale;  /* glyph left edge -> bottom */
         }
         else
         {
-            idx = dy / CELL_W;                  /* first character at the top */
-            gy = (CELL_H - 1) - dx;             /* glyph top edge -> right */
-            gx = dy % CELL_W;                   /* glyph left edge -> top  */
+            idx = dy / cw;                      /* first character at the top */
+            gy = (CELL_H - 1) - dx / scale;     /* glyph top edge -> right */
+            gx = (dy % cw) / scale;             /* glyph left edge -> top  */
         }
     }
 
@@ -1241,7 +1275,7 @@ static void paint_buttons(void)
         const char *text = s_ovr_btn_set[s] ? s_ovr_btn[s] : label_at(s);
 
         label_place(text, g0 + BTN_RADIUS, g1 - BTN_RADIUS,
-                    BTN_Y0 + BTN_RADIUS, BTN_Y1 - BTN_RADIUS, LABEL_UPRIGHT, &label[s]);
+                    BTN_Y0 + BTN_RADIUS, BTN_Y1 - BTN_RADIUS, LABEL_UPRIGHT, 1, &label[s]);
     }
 
     /* The window is the whole strip; every transfer below continues it, so CS
@@ -1374,6 +1408,67 @@ static corners_t column_corners(int s, bool desk_right)
 
 /* One column, at controller x0..x1. desk_right says which side the desktop is
  * on, which is the only thing that differs between the two. */
+/*
+ * IS THIS LABEL EXACTLY ONE MULTI-BYTE CHARACTER?
+ *
+ * Those are the four arrows, and they are the one case where the column's
+ * rotation is wrong rather than merely awkward. Every glyph is drawn through
+ * label_bit(), which for a rotated column transposes the 8x16 bitmap: the
+ * glyph's rows become the pixel's columns. That is exactly right for a word --
+ * "Super+D" has to stand on end to fit in a 41 px face -- and exactly wrong for
+ * an arrow, because rotating an arrow does not make it stand on end, it makes it
+ * point somewhere else.
+ *
+ * MEASURED ON THE GLASS RATHER THAN REASONED ABOUT, and the result was one fault
+ * with two symptoms. The label table lists left, right, up, down in slot order
+ * and always has. The operator reported that BOTH the order and the glyphs were
+ * wrong, and that is exactly what a rotation does:
+ *
+ *     glyph   transposed direction    what appeared
+ *     left    cell moves down         a down arrow
+ *     right   cell moves up           an up arrow
+ *     up      cell moves left         a left arrow
+ *     down    cell moves right        a right arrow
+ *
+ * So top to bottom the column read down, up, left, right. That looks like a table
+ * in the wrong order and is not, so the fix belongs in the renderer: swapping the
+ * table entries to compensate would make the TABLE a lie about a rendering bug,
+ * and the next person to read it would be misled.
+ *
+ * IT TAKES THE STRING, NOT THE DECODED CODE POINTS, and that is the correction to
+ * this function's first version. That version took `label[s].cp` and `label[s].n`
+ * as arguments to the very label_place() call that fills those fields, so it read
+ * uninitialized stack and returned false almost always -- which left the arrows
+ * rotated and produced a build that changed nothing at all. The operator noticed,
+ * because a comment claiming a fix is not a fix. The string is available before
+ * the call, so the classification is made from the string.
+ *
+ * A single character above U+007F is the whole test because nothing else in any
+ * column label is one: the words are ASCII and each arrow is one cell, so the
+ * classification is exact rather than a heuristic.
+ */
+static bool label_is_glyph(const char *s)
+{
+    const unsigned char *p = (const unsigned char *)s;
+
+    if (!p || p[0] < 0x80)
+        return false;
+
+    const int extra = (p[0] & 0xE0) == 0xC0 ? 1
+                    : (p[0] & 0xF0) == 0xE0 ? 2
+                    : (p[0] & 0xF8) == 0xF0 ? 3
+                    : 0;
+
+    if (!extra)
+        return false;
+
+    for (int i = 1; i <= extra; i++)
+        if (p[i] < 0x80 || p[i] > 0xBF)   /* malformed continuation */
+            return false;
+
+    return p[extra + 1] == '\0';
+}
+
 static void paint_column(int x0, int x1, bool desk_right, label_rot_t rot,
                          const char *(*label_at)(int),
                          const char *const *ovr)
@@ -1434,8 +1529,29 @@ static void paint_column(int x0, int x1, bool desk_right, label_rot_t rot,
         /* An override wins over the table for that one slot. */
         const char *text = (ovr && ovr[s]) ? ovr[s] : label_at(s);
 
+        /*
+         * A GLYPH IS DRAWN UPRIGHT AND AT DOUBLE SIZE, WHATEVER THE COLUMN DOES
+         * WITH ITS WORDS.
+         *
+         * Upright because rotating an arrow changes which way it points, which is
+         * the fault this function's comment above records. Double size because a
+         * single 8x16 cell in a 41 px face reads as a smudge from arm's length,
+         * and the operator asked for it twice the size.
+         *
+         * THE DOUBLED BOX STILL FITS THE FACE with room to spare: 16 px wide
+         * against 41, and 32 tall against a face of about 61 between the corner
+         * radii. It is centred by label_place() like anything else, so the arrow
+         * stays on the axis of the button it belongs to rather than growing off
+         * one edge -- which is the failure this would have had if the drawing were
+         * grown from its top-left instead.
+         *
+         * The nudge below still applies afterwards, and a glyph never has one.
+         */
         label_place(text, x0 + BTN_BORDER, x1 - BTN_BORDER,
-                    g0 + BTN_RADIUS, g1 - BTN_RADIUS, rot, &label[s]);
+                    g0 + BTN_RADIUS, g1 - BTN_RADIUS,
+                    label_is_glyph(text) ? LABEL_UPRIGHT : rot,
+                    label_is_glyph(text) ? 2 : 1,
+                    &label[s]);
 
         /* Then the slot's nudge, clamped inside the face: label_place() already
          * guarantees the word fits, so a nudge large enough to push it out is a

@@ -200,10 +200,25 @@ static void launch(void)
         return;
 
     s_batt = batt ? td_label(s_win, 1, 1, 0, "") : NULL;
-    td_label(s_win, 1, 1 + top, 13, psram ? "Internal RAM" : "RAM in use");
+    /*
+     * "Internal SRAM", NOT "Internal RAM", because this reading is the ESP32's
+     * internal static RAM specifically -- the figure that the task stacks, the
+     * WiFi buffers and the instruction path all compete for -- and the word RAM
+     * here sits one line above "PSRAM", which is a different pool with different
+     * pressure and a different failure mode. Two lines labelled RAM and PSRAM read
+     * as the same thing at different speeds; SRAM against PSRAM reads as the two
+     * distinct pools they are.
+     *
+     * Both this and the row below are exactly 13 characters, which is the width
+     * this label already had, so the progress bars at column 14 and the figures at
+     * 33 do not move. The row below lost its two leading spaces in the change: it
+     * used to be indented under the label above it, and "SRAM Peak Use" is a full
+     * label rather than a continuation.
+     */
+    td_label(s_win, 1, 1 + top, 13, psram ? "Internal SRAM" : "RAM in use");
     s_free_bar = td_progress(s_win, 14, 1 + top, 18);
     s_free_txt = td_label(s_win, 33, 1 + top, 0, "");
-    td_label(s_win, 1, 2 + top, 13, "  peak use");
+    td_label(s_win, 1, 2 + top, 13, "SRAM Peak Use");
     s_min_bar = td_progress(s_win, 14, 2 + top, 18);
     s_min_txt = td_label(s_win, 33, 2 + top, 0, "");
     s_ps_bar = s_ps_txt = NULL;
