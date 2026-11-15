@@ -58,6 +58,11 @@ static uint8_t *s_rom;
 static uint16_t *s_frame;
 static TaskHandle_t s_task;
 static volatile bool s_run;
+
+/* Defined with the stop path further down; the guest task calls the teardown when
+ * Exit ended the run from inside it. */
+static void tama_teardown(void);
+static bool s_torn_down;
 static uint32_t s_frames;
 static uint32_t s_blits;
 
@@ -182,7 +187,59 @@ static char s_rom_path[64] = TAMA_ROM_DEFAULT;
 static tama_ui_t s_ui;
 static volatile bool s_paused;
 static volatile int s_speed = 1;         /* 1, 2 or 4 -- a guest-cycle multiplier */
-static volatile bool s_sound_on = true;
+/*
+ * THE SOUND BUTTON CYCLES A VOLUME, not a mute toggle.
+ *
+ * 100 -> 75 -> 50 -> 25 -> Mute -> 100. The percentages are of the CONTROL'S
+ * TRAVEL, which is what a volume knob's numbers mean, and NOT the amplitude:
+ * dividing the samples by the percentage is what made the steps uneven.
+ *
+ * THE EAR IS LOGARITHMIC, AND LINEAR STEPS SOUND WRONG. Scaling the samples
+ * linearly gave steps of 2.5 dB, 3.5 dB and 6.0 dB -- so 100% and 75% were
+ * barely distinguishable, and the drop from 50% to 25% was obvious. Reported on
+ * the glass exactly that way, and the arithmetic agrees: 20*log10(0.75) is
+ * -2.50 dB against 20*log10(0.50) at -6.02. The steps are equal in amplitude and
+ * nothing like equal in loudness.
+ *
+ * So each step is a fixed 4 dB instead, and the amplitude follows from that. The
+ * gain column is 10^(dB/20) in thousandths: 1.000, 0.631, 0.398, 0.251. Integer
+ * thousandths keep the hot loop as one multiply and divide, and the ratios
+ * between adjacent steps are all 0.631, so every press sounds like the same
+ * change.
+ *
+ * MUTE IS NOT A dB STEP. It is silence, which has no finite ratio to the step
+ * above it, so it is the last entry in the cycle rather than a fifth level.
+ *
+ * THE LABEL SHOWS THE CURRENT LEVEL, not the next one. Speed shows the rate a
+ * press will select because a rate is momentary and the button's only meaning is
+ * "change it"; a volume is a standing property of what you are hearing, and a
+ * label reading "75%" while the watch is plainly at full volume would be the
+ * label/duty split this project has removed twice already.
+ */
+static const struct { uint8_t pct; uint16_t gain; const char *label; }
+    s_vol[] = {
+        { 100, 1000, "100%" },   /*   0 dB */
+        {  75,  631,  "75%" },    /*  -4 dB */
+        {  50,  398,  "50%" },    /*  -8 dB */
+        {  25,  251,  "25%" },    /* -12 dB */
+        {   0,    0, "Mute" },
+    };
+
+#define S_VOL_N ((int)(sizeof(s_vol) / sizeof(s_vol[0])))
+
+/* Index into s_vol. Volatile because the shell reads it while the guest task
+ * writes it, and an aligned int is atomic on this core. */
+static volatile int s_vol_i;
+
+static int vol_gain(void)
+{
+    int i = s_vol_i;
+
+    if (i < 0 || i >= S_VOL_N)
+        i = 0;
+
+    return s_vol[i].gain;      /* thousandths; 0 is mute */
+}
 static uint32_t s_shots;
 
 /* The guest's cycle count as of the last frame, so the shell can report
@@ -201,12 +258,35 @@ static uint32_t s_resets;
  * about what the file should hold. */
 static bool s_protect_save;
 
-/* Pending beeps, so the guest task never blocks on the amplifier: sound_beep()
- * plays 200 ms and 200 ms is three frames of guest time. */
-static TaskHandle_t s_beep_task;
-static bool s_sound_active;       /* last observed audio-active state */
-static int64_t s_last_beep_us;
-static uint32_t s_beeps;
+/*
+ * THE GUEST'S OWN SOUND, SAMPLED -- not a canned bell.
+ *
+ * This used to call `sound_beep()`, which is the terminal's BEL: a fixed 1 kHz
+ * square for 200 ms, fired on the rising edge of "the guest is making a noise".
+ * The machine does not sound like that. `splb32_sound` already models a PWM
+ * channel and a tone channel whose levels flip on driver timer overflows, and
+ * `tmc_audio_sample()` reads that mix -- so the beep the pet makes can be its own.
+ *
+ * A FRAME IS STEPPED IN ONE-SAMPLE SLICES, and that is the whole reason the old
+ * approach could not be reused. The toggles happen INSIDE `tmc_run()`, at the
+ * tone's own rate; reading the level once per frame would alias the waveform into
+ * nonsense, and reading it never is what the BEL was doing. One sample period is
+ * 250 cycles at 16 kHz against a 4 MHz clock, so a frame is 1000 short calls
+ * rather than one long one.
+ *
+ * 16 kHz, not 44.1: a piezo beeper's fundamental is a couple of kilohertz and its
+ * harmonics die fast, so 8 kHz of bandwidth is the useful part. The cost is 1000
+ * `tmc_run()` calls a frame, which `tama status` reports as `emu=` so it stays
+ * measured rather than assumed.
+ */
+#define TAMA_AUDIO_HZ       16000
+#define TAMA_SAMPLES_FRAME  (TAMA_AUDIO_HZ / TMC_FRAME_HZ)          /* 1000 */
+#define TAMA_CYC_SAMPLE     (TMC_CLOCK_HZ / TAMA_AUDIO_HZ)          /* 250  */
+
+static int16_t *s_pcm;            /* PSRAM, written once and handed to I2S */
+static bool s_audio;
+static uint32_t s_beeps;          /* frames that carried any sound at all */
+static volatile uint32_t s_emu_us;  /* guest-step time, so audio cost stays measured */
 
 /* --- report ---------------------------------------------------------------
  *
@@ -238,7 +318,7 @@ static void report(const char *what, const char *extra)
                 (unsigned long long)cyc,
                 (unsigned long long)(cyc / TMC_CLOCK_HZ),
                 (unsigned long long)((cyc % TMC_CLOCK_HZ) / 1000),
-                s_paused ? 1 : 0, s_speed, s_sound_on ? 1 : 0,
+                s_paused ? 1 : 0, s_speed, s_vol[s_vol_i].pct,
                 (unsigned long)s_shots, (unsigned long)s_saves,
                 (unsigned long)s_loads, (unsigned long)s_resets,
                 s_ui.refused, (unsigned long)s_beeps);
@@ -364,15 +444,31 @@ static bool tama_app_touch(void *user, const touch_frame_t *tf)
     for (int i = 0; i < n; i++)
         enqueue_action(acts[i]);
 
-    /* Whether anything fired, for the driver's haptic tap: a live bottom-strip bar
-     * or a margin slot the UI layer acted on. Bare glass reports false. */
-    if (n > 0)
-        return true;
+    /*
+     * WHETHER TO BUZZ, which is not the same question as whether an action ran.
+     *
+     * This used to report consumption only when `tama_ui_update()` emitted an
+     * action, so the arm -- a modifier with no action by design -- was silent,
+     * which is the one press that most needs confirming. Gated buttons were
+     * silent too, and that part was right: an unarmed Save does nothing, and a
+     * buzz for it would claim otherwise.
+     *
+     * So the arm is passed through as `armed` and the predicate decides per slot:
+     * arm always, ungated always, gated only while armed. A bottom-strip bar also
+     * counts, because it goes to the guest rather than through the action table.
+     */
+    const bool armed = tama_ui_armed(&f);
 
     for (int i = 0; i < tf->n && i < TOUCH_POINTS; i++)
+    {
         if (tf->p[i].region == EDGE_BOTTOM &&
+            tf->p[i].index >= 0 && tf->p[i].index < TAMA_BTN_N &&
             display_margin_slot_live(2, tf->p[i].index))
             return true;
+
+        if (tama_ui_haptic_of(tf->p[i].region, tf->p[i].index, armed))
+            return true;
+    }
 
     return false;
 }
@@ -512,30 +608,6 @@ static bool save_checkpoint(void)
     return ok;
 }
 
-/* --- the beep task -------------------------------------------------------- */
-
-/*
- * sound_beep() plays 200 ms and blocks while it does, which is three frames of
- * guest time. So it runs here and the guest task only ever raises a
- * notification -- which coalesces, so a burst of guest audio becomes one beep
- * rather than a queue of them.
- */
-static void beep_task(void *arg)
-{
-    (void)arg;
-
-    for (;;)
-    {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
-        if (s_sound_on)
-        {
-            s_beeps++;
-            sound_beep();
-        }
-    }
-}
-
 /* --- actions -------------------------------------------------------------- */
 
 /*
@@ -554,7 +626,21 @@ static void refresh_labels(void)
 
     display_margin_label(0, 0, s_paused ? "Resume" : "Pause");
     display_margin_label(0, 3, rate);
-    display_margin_label(0, 4, s_sound_on ? "On" : "Off");
+
+    /*
+     * SOUND LIVES ON THE RIGHT COLUMN, under Shot, and reads the current level.
+     * A volume is a standing property of what you are hearing, so showing what it
+     * IS beats showing what the next press would select -- see s_vol[] for why
+     * that differs from Speed.
+     */
+    {
+        int i = s_vol_i;
+
+        if (i < 0 || i >= S_VOL_N)
+            i = 0;
+
+        display_margin_label(1, 2, s_vol[i].label);
+    }
 }
 
 static void apply_action(tama_act_t act)
@@ -570,7 +656,14 @@ static void apply_action(tama_act_t act)
         break;
 
     case TAMA_ACT_SOUND:
-        s_sound_on = !s_sound_on;
+        {   /* 100 -> 75 -> 50 -> 25 -> Mute -> 100. */
+            int i = s_vol_i + 1;
+
+            if (i >= S_VOL_N)
+                i = 0;
+
+            s_vol_i = i;
+        }
         break;
 
     case TAMA_ACT_SHOT:
@@ -597,7 +690,6 @@ static void apply_action(tama_act_t act)
         if (restart_guest(true))
         {
             s_protect_save = false;
-            s_sound_active = false;
         }
         break;
 
@@ -609,8 +701,22 @@ static void apply_action(tama_act_t act)
             /* The checkpoint is deliberately left alone, and quitting must not
              * overwrite it -- see s_protect_save. */
             s_protect_save = true;
-            s_sound_active = false;
         }
+        break;
+
+    case TAMA_ACT_EXIT:
+        /*
+         * GATED, like Reset, and this is the reason it is: leaving the emulator is
+         * the one action here that cannot be undone from the glass. A gated press
+         * is a two-thumb deliberate act, which is the right cost for the button
+         * that ends the session.
+         *
+         * Nothing is written on the way out. The checkpoint on the card is what
+         * `save` last put there, and an exit that silently saved would make the
+         * Save button meaningless -- the operator's last explicit statement about
+         * the file is the one that should stand.
+         */
+        s_run = false;
         break;
 
     default:
@@ -736,24 +842,77 @@ static void tama_task(void *arg)
          * beeps, and a beep is 200 ms long, so two inside 250 ms overlap into
          * noise rather than into two sounds.
          */
+        /*
+         * ONE FRAME, STEPPED IN ONE-SAMPLE SLICES, WITH THE GUEST'S AUDIO READ
+         * ALONGSIDE IT.
+         *
+         * The toggles that make the waveform happen inside `tmc_run()` at the
+         * tone's own rate, so the level has to be read at least once per sample
+         * period or the wave aliases. See TAMA_AUDIO_HZ above.
+         *
+         * With sound off the guest is stepped in one call and no samples are
+         * generated, which is both cheaper and exactly right: muting should not
+         * change how fast the pet runs.
+         */
+        const int samples = TAMA_SAMPLES_FRAME;
+        const int64_t t_emu = esp_timer_get_time();
+        const uint64_t total = (uint64_t)TMC_FRAME_CYCLES * (uint64_t)s_speed;
+
+        /*
+         * ONE STEPPING LOOP, ONE TARGET, AUDIO RENDERED ALONGSIDE IT.
+         *
+         * Not a loop in this file calling `tmc_run()` per sample: that was measured
+         * running the guest 41 percent fast, because each call overshoots by up to
+         * one instruction and a thousand calls compound. See tmc_run_audio().
+         *
+         * Muted, the guest is stepped with no rendering at all -- muting must not
+         * change how fast the pet runs, and `tmc_run` reaches the same target.
+         */
+        const int gain = vol_gain();      /* thousandths, 0 = mute */
+
+        if (s_audio && gain > 0)
         {
-            bool active = tmc_audio_active(s_m) != 0;
+            int nonzero = 0;
 
-            if (active && !s_sound_active && s_sound_on && s_beep_task)
+            tmc_run_audio(s_m, total, s_pcm, samples);
+
+            /* SCALE, DON'T SILENCE. The waveform and its pitch come from the
+             * guest's own timer registers, so attenuating the samples preserves
+             * both and only changes loudness. The gain is the equal-dB taper in
+             * thousandths -- see s_vol[] for why it is not the percentage. */
+            if (gain != 1000)
             {
-                int64_t now_us = esp_timer_get_time();
-
-                if (s_last_beep_us == 0 || now_us - s_last_beep_us > 250000)
-                {
-                    s_last_beep_us = now_us;
-                    xTaskNotifyGive(s_beep_task);
-                }
+                for (int i = 0; i < samples; i++)
+                    s_pcm[i] = (int16_t)(((int32_t)s_pcm[i] * gain) / 1000);
             }
 
-            s_sound_active = active;
+            for (int i = 0; i < samples; i++)
+                if (s_pcm[i])
+                    nonzero++;
+
+            /* ONE WRITE PER FRAME. Sixteen writes a frame cost 1.4 ms on the
+             * Pokemon Mini, measured -- the driver takes a lock and inspects the
+             * DMA on every call, and the ring does not care whether samples arrive
+             * in one lump or several. Slicing matters for PITCH and is
+             * synthesis-side; the flush is not. */
+            sound_stream_write(s_pcm, samples);
+
+            if (nonzero)
+                s_beeps++;
+        }
+        else if (s_audio)
+        {
+            /* Keep the stream fed so the ring does not underrun into silence that
+             * is indistinguishable from a mute. */
+            tmc_run(s_m, total);
+            sound_stream_write(s_pcm, samples);
+        }
+        else
+        {
+            tmc_run(s_m, total);
         }
 
-        tmc_run(s_m, (uint64_t)TMC_FRAME_CYCLES * (uint64_t)s_speed);
+        s_emu_us = (uint32_t)(esp_timer_get_time() - t_emu);
         s_cycles = tmc_cycles(s_m);
 
         /* Dirty rows only. An icon flip is one band; a blank frame is nothing
@@ -838,7 +997,13 @@ static void tama_task(void *arg)
         }
     }
 
+    /*
+     * Exit ended the run from inside this task, so this task must give the glass
+     * back rather than deleting itself and leaving the display claimed. Claiming
+     * is idempotent, so a shell `tama stop` racing this simply loses and returns.
+     */
     s_task = NULL;
+    tama_teardown();
     vTaskDelete(NULL);
 }
 
@@ -992,6 +1157,10 @@ bool tama_start(const char *rom_path)
      * construction rather than by luck -- and this is why the call is not
      * deferred to the task.
      */
+    /* A thumb finds wide, short boxes fussy; doubling the strip's height makes
+     * each target about square and the pet's picture ends 14 rows above it. */
+    display_margin_strip_tall(true);
+
     display_margins_set(DISPLAY_MARGINS_APP);
 
     s_frames = 0;
@@ -1007,22 +1176,43 @@ bool tama_start(const char *rom_path)
      * applied before it. */
     s_paused = false;
     s_speed = 1;
-    s_sound_on = true;
+    s_vol_i = 0;            /* full volume on every start */
     s_shots = s_saves = s_loads = s_resets = 0;
     s_beeps = 0;
     s_cycles = 0;
-    s_sound_active = false;
-    s_last_beep_us = 0;
     s_protect_save = false;
     tama_ui_init(&s_ui);
 
     refresh_labels();
 
-    /* One task for the beeps, for the life of the process: sound_beep() blocks
-     * for 200 ms and that is three frames of guest time, so the guest raises a
-     * notification and this plays it. */
-    if (!s_beep_task)
-        xTaskCreate(beep_task, "tama-beep", 3072, NULL, 2, &s_beep_task);
+    /*
+     * THE AUDIO STREAM, opened for the life of the run.
+     *
+     * Same non-blocking `sound_stream_*` sink the NES and Pokemon Mini use, so
+     * the pet's beeper goes through the one path this board has proved. The
+     * buffer is PSRAM because it is written once per frame and read by the DMA
+     * from internal memory -- 2 KB of the scarcest resource is not worth holding
+     * for a buffer that is only ever touched by index.
+     *
+     * Best effort: a watch whose amplifier did not come up still runs the pet.
+     */
+    if (!s_pcm)
+        s_pcm = (int16_t *)heap_caps_malloc((size_t)TAMA_SAMPLES_FRAME * sizeof(int16_t),
+                                            MALLOC_CAP_SPIRAM);
+
+    if (s_pcm)
+    {
+        memset(s_pcm, 0, (size_t)TAMA_SAMPLES_FRAME * sizeof(int16_t));
+        s_audio = sound_stream_open(TAMA_AUDIO_HZ);
+
+        if (!s_audio)
+            printf("no audio (amplifier did not come up)\n");
+    }
+    else
+    {
+        s_audio = false;
+        printf("no psram for audio\n");
+    }
 
     /* One queue for the life of the process: the touch driver holds a handle to
      * this sink for ever, so deleting the queue between runs would leave it
@@ -1044,6 +1234,7 @@ bool tama_start(const char *rom_path)
         return false;
     }
 
+    s_torn_down = false;
     s_run = true;
     s_accept_input = true;
 
@@ -1067,9 +1258,42 @@ bool tama_start(const char *rom_path)
     return true;
 }
 
+/*
+ * TEARDOWN, CALLED BY WHICHEVER PATH GETS THERE FIRST.
+ *
+ * There are now two ways a run ends: the shell command, and the Exit button on the
+ * glass. Both must free the machine, report, close the audio stream and give the
+ * screen back -- and neither may do it twice, because freeing `s_m` underneath the
+ * other is worse than leaking it.
+ *
+ * So the work is claimed under a critical section rather than guarded by a flag
+ * test. `tama_stop()` waits for the task and then claims; the guest task, ending
+ * because Exit set `s_run` false, claims on its way out. The loser returns
+ * immediately, which is why this is a claim and not a lock: the loser has nothing
+ * to wait for.
+ */
+static portMUX_TYPE s_td_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static bool claim_teardown(void)
+{
+    bool mine = false;
+
+    portENTER_CRITICAL(&s_td_mux);
+
+    if (!s_torn_down)
+    {
+        s_torn_down = true;
+        mine = true;
+    }
+
+    portEXIT_CRITICAL(&s_td_mux);
+
+    return mine;
+}
+
 void tama_stop(void)
 {
-    if (!s_task)
+    if (!s_task && s_torn_down)
         return;
 
     /* Stop accepting button presses FIRST: the sink writes to a queue the guest
@@ -1090,6 +1314,14 @@ void tama_stop(void)
         return;
     }
 
+    tama_teardown();
+}
+
+static void tama_teardown(void)
+{
+    if (!claim_teardown())
+        return;
+
     /*
      * The automatic checkpoint, skipped after a Reset.
      *
@@ -1108,12 +1340,41 @@ void tama_stop(void)
 
     report("stop", NULL);
 
+    /* Close the stream BEFORE the machine goes away, so nothing can write into a
+     * sink whose producer is being taken apart -- the same ordering the other two
+     * emulators use. */
+    if (s_audio)
+    {
+        sound_stream_close();
+        s_audio = false;
+    }
+
     tmc_free(s_m);
     heap_caps_free(s_frame);
     heap_caps_free(s_rom);
     s_m = NULL;
     s_frame = NULL;
     s_rom = NULL;
+
+    /*
+     * CLEAR THE LABEL OVERRIDES BEFORE GIVING THE GLASS BACK.
+     *
+     * `paint_margins()` consults `overrides_for()` even in DESKTOP mode, so an
+     * app's override survives its own exit and reappears on the desktop's labels.
+     * This emulator has been leaving "Resume", "2x" and a sound word on the
+     * desktop's columns since those labels were added, which is the same fault
+     * entry 73 fixed for the Pokemon Mini by clearing on stop -- and the same one
+     * that once left the desktop's words on the Tamagotchi's spare slots.
+     *
+     * NULL clears an override and restores the shared table, which is what the
+     * desktop wants. Done BEFORE display_margins_set(), so the repaint it triggers
+     * is the one that draws the cleared labels rather than a second full pass.
+     */
+    for (int i = 0; i < COL_N; i++)
+    {
+        display_margin_label(0, i, NULL);
+        display_margin_label(1, i, NULL);
+    }
 
     /* Restore the margins FIRST, while the pixels are still claimed: the call
      * paints synchronously and needs to be the only writer, which ownership
@@ -1168,7 +1429,14 @@ static int cmd_tama(tdsh_session_t *session, int argc, char **argv)
                    (unsigned long long)cyc,
                    (unsigned long long)(cyc / TMC_CLOCK_HZ),
                    (unsigned long long)((cyc % TMC_CLOCK_HZ) / 1000),
-                   s_paused ? 1 : 0, s_speed, s_sound_on ? "on" : "off");
+                   s_paused ? 1 : 0, s_speed, s_vol_i == S_VOL_N - 1 ? "mute" : "on");
+
+            /* The guest step, with audio on and slicing at one sample period.
+             * A 16 Hz frame budget is 62,500 us, so this is the number that says
+             * whether sample-accurate audio is affordable. */
+            printf("emu=%luus audio=%d beeps=%lu\n",
+                   (unsigned long)s_emu_us, s_audio ? 1 : 0,
+                   (unsigned long)s_beeps);
         }
         report("status", NULL);
         return 0;

@@ -62,6 +62,7 @@ typedef enum
     TAMA_ACT_SOUND,      /* toggle the guest's beeps                       */
     TAMA_ACT_SHOT,       /* write the frame to a .bmp on the card          */
     TAMA_ACT_RESET,      /* gated: fresh machine, guest state discarded    */
+    TAMA_ACT_EXIT,       /* gated: leave the emulator, back to the shell   */
 } tama_act_t;
 
 /* At most two actions can complete in one report: one from each finger, and at
@@ -99,6 +100,34 @@ bool tama_ui_armed(const tama_ui_frame_t *f);
 /* The action a single point means, or TAMA_ACT_NONE. Exposed so the label table
  * in edges.h and this mapping can be checked against each other. */
 tama_act_t tama_ui_action_of(edge_region_t region, int index);
+
+/*
+ * Should touching this slot give haptic feedback?
+ *
+ * TWO RULES, and the difference between them is what the operator corrected:
+ *
+ *   the ARM always buzzes, because it is a control whose only job is to be held
+ *   and the player needs to feel that it has taken;
+ *   a GATED action buzzes only while the arm is held, because unarmed it does
+ *   nothing at all -- and a buzz for a press that provably did nothing is a lie
+ *   the finger can detect;
+ *   an UNGATED action always buzzes, since it fires on every press.
+ *
+ * THE FIRST VERSION OF THIS FUNCTION DID NOT TAKE `armed` AND WAS WRONG IN BOTH
+ * DIRECTIONS AT ONCE. It returned true for every mapped action whether or not it
+ * would fire, so Save and Load buzzed when the arm was down (correct) and equally
+ * when it was not (wrong -- the operator heard it and said so). The reason it had
+ * no `armed` parameter is that its author reasoned "a physical button clicks
+ * whether or not the machine acts on it", which is true of a real button and not
+ * of this one: a gated margin slot is not a button that fails, it is a button
+ * that is not armed, and the whole point of the interlock is that an unarmed
+ * press is not a press.
+ *
+ * `armed` is whether the arm slot is occupied in the frame being delivered, so
+ * the caller passes what the UI layer is about to decide on -- not a cached
+ * reading from a previous frame.
+ */
+bool tama_ui_haptic_of(edge_region_t region, int index, bool armed);
 
 /* True when that action may only fire while armed. */
 bool tama_ui_is_gated(tama_act_t act);

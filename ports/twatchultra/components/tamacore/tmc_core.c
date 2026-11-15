@@ -464,6 +464,56 @@ void tmc_redraw(tmc *m)
     m->shadow_valid = true;
 }
 
+void tmc_run_audio(tmc *m, uint64_t cycles, int16_t *out, int n)
+{
+    if (!m)
+    {
+        if (out)
+            for (int i = 0; i < n; i++)
+                out[i] = 0;
+        return;
+    }
+
+    splb32 *c = m->cpu;
+    const uint64_t start = splb32_state_cycles(c);
+    const uint64_t target = start + cycles;
+    int si = 0;
+
+    if (!out || n <= 0)
+    {
+        while (splb32_state_cycles(c) < target)
+            splb32_step(c);
+        return;
+    }
+
+    for (;;)
+    {
+        const uint64_t now = splb32_state_cycles(c);
+
+        /* Emit every sample boundary the guest has now passed. The boundaries are
+         * computed by fraction rather than by division so the last one lands
+         * exactly on `cycles`. */
+        while (si < n)
+        {
+            const uint64_t b = start + (cycles * (uint64_t)(si + 1)) / (uint64_t)n;
+
+            if (now < b)
+                break;
+
+            out[si++] = (int16_t)tmc_audio_sample(m);
+        }
+
+        if (now >= target)
+            break;
+
+        splb32_step(c);
+    }
+
+    /* The final partial period, held at the level the last step left. */
+    while (si < n)
+        out[si++] = (int16_t)tmc_audio_sample(m);
+}
+
 void tmc_button(tmc *m, int index, bool down)
 {
     static const uint8_t bit[3] = { 0x01, 0x02, 0x04 };
@@ -507,4 +557,23 @@ const uint8_t *tmc_dpram(const tmc *m)
 int tmc_audio_active(const tmc *m)
 {
     return m ? splb32_audio_active(m->cpu) : 0;
+}
+
+int tmc_audio_sample(const tmc *m)
+{
+    if (!m)
+        return 0;
+
+    /* -1..+1 per channel; sum, clamp, scale. The clamp matters because two
+     * channels at full envelope would otherwise wrap rather than saturate, which
+     * is a click on every chord -- and the hardware, with one speaker and a
+     * finite rail, saturates. */
+    double v = splb32_audio_level(m->cpu, 0) + splb32_audio_level(m->cpu, 1);
+
+    if (v > 1.0)
+        v = 1.0;
+    else if (v < -1.0)
+        v = -1.0;
+
+    return (int)(v * 32767.0);
 }

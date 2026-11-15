@@ -73,6 +73,31 @@
 #define BTN_Y1   (DISPLAY_PANEL_H - 1)
 #define BTN_N    3
 
+/*
+ * THE STRIP'S TOUCH AREA IS TWICE ITS DRAWN HEIGHT when an app owns the screen.
+ *
+ * The drawn strip is 41 rows and each button is 107 wide, so the boxes are wide
+ * letters rather than squares and a thumb finds them fussy. Doubling the HEIGHT
+ * makes each touch target about square (82 against 107) without touching the
+ * artwork at all -- and it can only grow UPWARD, because BTN_Y1 is the last row of
+ * the glass.
+ *
+ * Two geometry facts make that safe. The extended region reaches panel row 420,
+ * which is framebuffer row 375, and the Tamagotchi's picture ends at framebuffer
+ * row 361 -- so the larger target does not reach into the pet. It does however
+ * lie INSIDE the framebuffer's own rows, which on the DESKTOP are the bottom two
+ * lines of the console.
+ *
+ * SO IT IS GATED ON OWNERSHIP, and that gate is the point rather than a detail.
+ * An app that claims the pixels loses nothing by a taller strip, because its own
+ * content ends well above it. The desktop would lose the bottom of its console to
+ * Tab, Enter and Ctrl+Q -- touching two lines of shell output would type into the
+ * shell. `display_pixels_claimed()` is already the predicate the driver gates the
+ * margins on (TCH-011), so this uses the same one rather than inventing a second
+ * idea of who owns the glass.
+ */
+#define BTN_HIT_Y0   (BTN_Y0 - (BTN_Y1 - BTN_Y0 + 1))
+
 /* The gap between adjacent buttons, and the corner radius, are the same in
  * both groups -- that is what makes the column and the strip read as one frame
  * drawn round the desktop rather than as two unrelated things. */
@@ -182,7 +207,7 @@ static inline const char *left_label(int i)
 static inline const char *left_label_app(int i)
 {
     static const char *const labels[COL_N] = {
-        "Pause", "Save", "Load", "Speed", "Sound",
+        "Pause", "Save", "Load", "Speed", "",
     };
 
     return i >= 0 && i < COL_N ? labels[i] : "";
@@ -193,9 +218,9 @@ static inline const char *right_label_app(int i)
     static const char *const labels[COL_N] = {
         "Hold",                 /* the arm: held for a gated button */
         "Shot",
-        "",                     /* blank: nothing assigned yet          */
-        "",
-        "Reset",
+        "Sound",                /* cycle 100/75/50/25/Mute              */
+        "Reset",                /* gated: needs the arm                 */
+        "Exit",                 /* gated: needs the arm                 */
     };
 
     return i >= 0 && i < COL_N ? labels[i] : "";
@@ -287,13 +312,33 @@ typedef struct
  * taller. A caller that passed controller coordinates instead would be off by
  * exactly that 22 columns, which reads as "the column is dead on its outer
  * half" rather than as an obvious error. */
-static inline void edges_hit(int panel_x, int panel_y, edge_hit_t *hit)
+static inline void edges_hit(int panel_x, int panel_y, bool tall_strip, edge_hit_t *hit)
 {
     int x = panel_x + PANEL_COL_OFFSET;
     int y = panel_y;
 
     hit->region = EDGE_NONE;
     hit->index = -1;
+
+    /*
+     * THE STRIP IS TESTED FIRST, and it has to be. The columns and the strip
+     * occupy the same rows once the strip is doubled -- its top reaches panel 420
+     * while the columns run to 460 -- and the column test RETURNS for any x in the
+     * framebuffer, which would hide the strip's upper half entirely. The two never
+     * overlap in x, so testing the strip first is unambiguous rather than a
+     * priority: BTN_X0..BTN_X1 is inside the framebuffer's width and the columns
+     * sit outside it on both sides.
+     *
+     * `tall_strip` is the ownership gate described at BTN_HIT_Y0. A caller passes
+     * true only when an app owns the glass.
+     */
+    if (x >= BTN_X0 && x <= BTN_X1 && y >= (tall_strip ? BTN_HIT_Y0 : BTN_Y0) &&
+        y <= BTN_Y1)
+    {
+        hit->region = EDGE_BOTTOM;
+        hit->index = btn_slot_at(x);
+        return;
+    }
 
     if (y >= COL_Y0 && y <= COL_Y1)
     {
@@ -310,13 +355,6 @@ static inline void edges_hit(int panel_x, int panel_y, edge_hit_t *hit)
             return;
         }
         return;      /* including the framebuffer, which is not an edge */
-    }
-
-    if (y >= BTN_Y0 && y <= BTN_Y1 && x >= BTN_X0 && x <= BTN_X1)
-    {
-        hit->region = EDGE_BOTTOM;
-        hit->index = btn_slot_at(x);
-        return;
     }
 
     if (y <= TOP_Y1 && x >= LEFT_X0 && x <= RIGHT_X1)

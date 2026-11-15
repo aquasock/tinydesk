@@ -31,14 +31,28 @@ static const ui_entry_t s_map[] = {
     { EDGE_LEFT, 1, TAMA_ACT_SAVE },
     { EDGE_LEFT, 2, TAMA_ACT_LOAD },
     { EDGE_LEFT, 3, TAMA_ACT_SPEED },
-    { EDGE_LEFT, 4, TAMA_ACT_SOUND },
 
     /* Right column: the arm at the top where a thumb naturally rests, the
-     * screenshot next to it because it is harmless, and Reset at the BOTTOM --
-     * the last place a finger sliding down the glass arrives. Distance is not
-     * the guarantee (the arm is); it is the second line of defence. */
+     * screenshot next to it because it is harmless, Sound directly under it,
+     * and Reset at the BOTTOM -- the last place a finger sliding down the glass
+     * arrives. Distance is not the guarantee (the arm is); it is the second line
+     * of defence.
+     *
+     * RESET MOVED UP ONE SLOT to fill the gap Sound left behind when it moved,
+     * at the operator's request, so the column reads Hold / Shot / Sound / Reset
+     * with no hole and nothing at the bottom. The second-line-of-defence argument
+     * is weaker for it -- Reset is now two slots from the arm rather than four --
+     * and that is a deliberate trade for a tidier column, recorded so it is not
+     * mistaken for an oversight.
+     *
+     * SOUND MOVED HERE FROM THE LEFT COLUMN at the operator's request, so it sits
+     * under Shot rather than at the bottom of the left column. It is a MOVE and
+     * not a second button: two slots driving one action would both want to show
+     * the state, and the left column's last slot is now genuinely empty. */
     { EDGE_RIGHT, 1, TAMA_ACT_SHOT },
-    { EDGE_RIGHT, 4, TAMA_ACT_RESET },
+    { EDGE_RIGHT, 2, TAMA_ACT_SOUND },
+    { EDGE_RIGHT, 3, TAMA_ACT_RESET },
+    { EDGE_RIGHT, 4, TAMA_ACT_EXIT },
 };
 
 #define MAP_N ((int)(sizeof(s_map) / sizeof(s_map[0])))
@@ -95,7 +109,28 @@ tama_act_t tama_ui_action_of(edge_region_t region, int index)
 
 bool tama_ui_is_gated(tama_act_t act)
 {
-    return act == TAMA_ACT_SAVE || act == TAMA_ACT_LOAD || act == TAMA_ACT_RESET;
+    return act == TAMA_ACT_SAVE || act == TAMA_ACT_LOAD ||
+           act == TAMA_ACT_RESET || act == TAMA_ACT_EXIT;
+}
+
+bool tama_ui_haptic_of(edge_region_t region, int index, bool armed)
+{
+    /* The arm is a control even though it has no action: it is held, not
+     * pressed, and feeling it take is the point. */
+    if (region == ARM_REGION && index == ARM_INDEX)
+        return true;
+
+    tama_act_t act = tama_ui_action_of(region, index);
+
+    if (act == TAMA_ACT_NONE)
+        return false;               /* blank slot, or bare glass */
+
+    /* A gated button unarmed is not a press. Buzzing for it would tell the finger
+     * something happened, when the interlock exists precisely so that it did not. */
+    if (tama_ui_is_gated(act) && !armed)
+        return false;
+
+    return true;
 }
 
 const char *tama_ui_action_name(tama_act_t act)
@@ -109,6 +144,7 @@ const char *tama_ui_action_name(tama_act_t act)
     case TAMA_ACT_SOUND: return "sound";
     case TAMA_ACT_SHOT:  return "shot";
     case TAMA_ACT_RESET: return "reset";
+    case TAMA_ACT_EXIT:  return "exit";
     default:             return "none";
     }
 }

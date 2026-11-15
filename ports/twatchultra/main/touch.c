@@ -212,6 +212,9 @@ static void *s_app_touch_user;
 
 static bool deliver_app_touch(const touch_frame_t *f);
 static bool s_app_active;        /* the app currently has points down */
+/* How many points the last delivered frame carried, so a second finger arriving
+ * can be told from the frame merely repeating. See the buzz decision below. */
+static int s_app_prev_n;
 static int s_last_x = -1, s_last_y = -1;
 
 /* When the last press report arrived. RELEASE_MS is measured against this and
@@ -612,6 +615,7 @@ static void release_if_idle(bool idle_confirmed)
         empty.p[1].region = EDGE_NONE;
 
         s_app_active = false;
+        s_app_prev_n = 0;
 
         deliver_app_touch(&empty);
     }
@@ -840,7 +844,9 @@ static void poll_task(void *arg)
 
             s_last_press_us = esp_timer_get_time();
 
-            edges_hit(x, y, &hit);
+            /* Tall strip only where the app asked for it; see
+             * display_margin_strip_tall(). */
+            edges_hit(x, y, display_margin_strip_is_tall(), &hit);
 
             /* Who owns the glass decides whether the margins are controls at
              * all. `app` is the desktop's own answer and it is not enough:
@@ -908,7 +914,7 @@ static void poll_task(void *arg)
                     int y2 = (b[9] << 4) | (b[10] & 0x0F);
                     edge_hit_t hit2;
 
-                    edges_hit(x2, y2, &hit2);
+                    edges_hit(x2, y2, display_margin_strip_is_tall(), &hit2);
 
                     f.p[1].region = hit2.region;
                     f.p[1].index = hit2.index;
@@ -937,7 +943,26 @@ static void poll_task(void *arg)
                  */
                 const bool used = deliver_app_touch(&f);
 
-                if (edge && used)
+                /*
+                 * A NEW FINGER IS A NEW CLICK, not only the first one.
+                 *
+                 * `edge` is `!s_pressed`, which is true only for the report where
+                 * the glass went from untouched to touched. That is the right
+                 * definition of "a press started" for the desktop's pointer, and
+                 * the wrong one for an app whose controls can be used in a CHORD:
+                 * the operator holds the Hold arm with one thumb and presses Save
+                 * with another, and the second finger arrives while `s_pressed` is
+                 * already true, so nothing buzzed for it.
+                 *
+                 * So a buzz also fires when the frame carries MORE POINTS than the
+                 * previous one. A finger lifting does not buzz -- that is a
+                 * release, and the count falls rather than rises.
+                 */
+                const bool arrived = edge || f.n > s_app_prev_n;
+
+                s_app_prev_n = f.n;
+
+                if (arrived && used)
                 {
                     ESP_LOGI(TAG, "e%d i%d n%d", (int)hit.region, hit.index, f.n);
                     haptic_tap();

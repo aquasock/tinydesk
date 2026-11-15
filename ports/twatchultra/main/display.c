@@ -1577,8 +1577,27 @@ static void paint_margins(void)
  * left for the painter would be dropped exactly when it is wanted. Ownership is
  * what makes the synchronous version safe, so ownership is what it requires.
  */
+/* Whether the bottom strip's touch target is doubled. Read by touch.c, written by
+ * an app at start. See display_margin_strip_tall(). */
+static volatile bool s_strip_tall;
+
+void display_margin_strip_tall(bool tall)
+{
+    s_strip_tall = tall;
+}
+
+bool display_margin_strip_is_tall(void)
+{
+    return s_strip_tall;
+}
+
 void display_margins_set(display_margins_t mode)
 {
+    /* Returning the glass to the desktop also returns the strip to its drawn
+     * height, so an app cannot leave the desktop more eager than it found it. */
+    if (mode == DISPLAY_MARGINS_DESKTOP)
+        s_strip_tall = false;
+
     if (!s_fb || mode == s_margin_mode)
         return;
 

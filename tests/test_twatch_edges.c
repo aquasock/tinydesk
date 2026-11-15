@@ -101,9 +101,34 @@ static int to_panel(int ctl_x)
  * holes in the hit test, they belong to a neighbouring button, which is what
  * makes a press on a one-pixel seam do something rather than nothing.
  */
-static int ref_region(int ctl_x, int ctl_y, int *index)
+/*
+ * When an app owns the glass the bottom strip's touch area is twice its drawn
+ * height, growing upward, because BTN_Y1 is the last row of the glass. That makes
+ * it overlap the columns' rows, so it is tested FIRST here exactly as it is in
+ * edges.h -- the two never overlap in x, so the order is unambiguous.
+ */
+#define CTL_STRIP_H     (CTL_BTN_Y1 - CTL_BTN_Y0 + 1)          /* 41 */
+#define CTL_BTN_TALL_Y0 (CTL_BTN_Y0 - CTL_STRIP_H)             /* 420 */
+
+static int ref_region(int ctl_x, int ctl_y, bool tall, int *index)
 {
     *index = -1;
+
+    {
+        const int y0 = tall ? CTL_BTN_TALL_Y0 : CTL_BTN_Y0;
+
+        if (ctl_y >= y0 && ctl_y <= CTL_BTN_Y1 &&
+            ctl_x >= CTL_FB_X0 && ctl_x <= CTL_FB_X1)
+        {
+            for (int i = N_BTN - 1; i >= 0; i--)
+                if (ctl_x >= k_btn_x[i])
+                {
+                    *index = i;
+                    break;
+                }
+            return EDGE_BOTTOM;
+        }
+    }
 
     if (ctl_y >= CTL_FB_Y0 && ctl_y <= CTL_FB_Y1)
     {
@@ -128,18 +153,6 @@ static int ref_region(int ctl_x, int ctl_y, int *index)
             return EDGE_RIGHT;
         }
         return EDGE_NONE;               /* the framebuffer: not a touch target */
-    }
-
-    if (ctl_y >= CTL_BTN_Y0 && ctl_y <= CTL_BTN_Y1 &&
-        ctl_x >= CTL_FB_X0 && ctl_x <= CTL_FB_X1)
-    {
-        for (int i = N_BTN - 1; i >= 0; i--)
-            if (ctl_x >= k_btn_x[i])
-            {
-                *index = i;
-                break;
-            }
-        return EDGE_BOTTOM;
     }
 
     if (ctl_y < CTL_FB_Y0 && ctl_x >= CTL_LEFT_X0 && ctl_x <= CTL_RIGHT_X1)
@@ -248,7 +261,7 @@ static void test_slot_boundaries(void)
  * everything in the right region but assigns the wrong button would otherwise
  * pass on a sweep that only compared region names.
  */
-static void test_every_point_of_the_glass(void)
+static void sweep_glass(bool tall)
 {
     int disagree_region = 0, disagree_index = 0;
     int n_left = 0, n_bottom = 0, n_right = 0, n_top = 0, n_none = 0;
@@ -260,9 +273,9 @@ static void test_every_point_of_the_glass(void)
         {
             edge_hit_t hit;
             int ref_index = -1;
-            int ref = ref_region(x + RAM_OFFSET, y, &ref_index);
+            int ref = ref_region(x + RAM_OFFSET, y, tall, &ref_index);
 
-            edges_hit(x, y, &hit);
+            edges_hit(x, y, tall, &hit);
 
             if ((int)hit.region != ref)
             {
@@ -295,20 +308,47 @@ static void test_every_point_of_the_glass(void)
     }
 
     if (disagree_region || disagree_index)
-        printf("  first disagreement at panel (%d,%d)\n", first_bad_x, first_bad_y);
+        printf("  first disagreement at panel (%d,%d), tall=%d\n",
+               first_bad_x, first_bad_y, (int)tall);
 
     CHECK_EQ(disagree_region, 0);
     CHECK_EQ(disagree_index, 0);
 
-    /* The counts are the painted areas, derived from the facts rather than
-     * from the code: a 45-wide column over 416 rows is 18,720 points, a
-     * 320x41 strip is 13,120, and the top margin is everything above the
-     * framebuffer across the full 410. */
+    /* Counts are the painted areas, derived from the facts rather than from the
+     * code: a 45-wide column over 416 rows is 18,720 points, the top margin is
+     * everything above the framebuffer across the full 410, and the strip is
+     * 320 rows wide over its own height -- 41 normally, 82 when an app owns the
+     * glass and the strip is doubled. */
     CHECK_EQ(n_left, 45 * FB_H);
     CHECK_EQ(n_right, 45 * FB_H);
-    CHECK_EQ(n_bottom, FB_W * (CTL_BTN_Y1 - CTL_BTN_Y0 + 1));
+    CHECK_EQ(n_bottom, FB_W * (tall ? 2 * CTL_STRIP_H : CTL_STRIP_H));
     CHECK_EQ(n_top, FB_INSET * GLASS_W);
     CHECK_EQ(n_left + n_right + n_bottom + n_top + n_none, GLASS_W * GLASS_H);
+}
+
+/*
+ * The same sweep in both ownership states, because the strip's height depends on
+ * it and a gate that only works one way is not a gate.
+ */
+static void test_every_point_of_the_glass(void)
+{
+    sweep_glass(false);      /* desktop: strip at its drawn size  */
+    sweep_glass(true);       /* app owns the glass: strip doubled */
+}
+
+/* The gate itself: the same point is the strip in one state and the framebuffer
+ * in the other. This is the fault the gate exists to prevent -- a taller strip on
+ * the desktop would eat two lines of the console. */
+static void test_tall_strip_is_gated(void)
+{
+    edge_hit_t hit;
+    const int y = CTL_BTN_TALL_Y0 + 4;      /* inside the doubled area only */
+
+    edges_hit(FB_INSET + FB_W / 2, y, true, &hit);
+    CHECK_EQ(hit.region, EDGE_BOTTOM);
+
+    edges_hit(FB_INSET + FB_W / 2, y, false, &hit);
+    CHECK_EQ(hit.region, EDGE_NONE);
 }
 
 /*
@@ -325,31 +365,31 @@ static void test_panel_coordinates(void)
 {
     edge_hit_t hit;
 
-    edges_hit(0, CTL_FB_Y0, &hit);
+    edges_hit(0, CTL_FB_Y0, false, &hit);
     CHECK_EQ(hit.region, EDGE_LEFT);
     CHECK_EQ(hit.index, 0);
 
-    edges_hit(0, CTL_FB_Y1, &hit);
+    edges_hit(0, CTL_FB_Y1, false, &hit);
     CHECK_EQ(hit.region, EDGE_LEFT);
     CHECK_EQ(hit.index, N_COL - 1);
 
-    edges_hit(GLASS_W - 1, CTL_FB_Y0, &hit);
+    edges_hit(GLASS_W - 1, CTL_FB_Y0, false, &hit);
     CHECK_EQ(hit.region, EDGE_RIGHT);
     CHECK_EQ(hit.index, 0);
 
-    edges_hit(GLASS_W - 1, CTL_FB_Y1, &hit);
+    edges_hit(GLASS_W - 1, CTL_FB_Y1, false, &hit);
     CHECK_EQ(hit.region, EDGE_RIGHT);
     CHECK_EQ(hit.index, N_COL - 1);
 
     /* The framebuffer is not a touch target, and neither is the gap between
      * the strip and the columns. */
-    edges_hit(FB_INSET + FB_W / 2, CTL_FB_Y0 + FB_H / 2, &hit);
+    edges_hit(FB_INSET + FB_W / 2, CTL_FB_Y0 + FB_H / 2, false, &hit);
     CHECK_EQ(hit.region, EDGE_NONE);
 
-    edges_hit(0, CTL_BTN_Y0, &hit);
+    edges_hit(0, CTL_BTN_Y0, false, &hit);
     CHECK_EQ(hit.region, EDGE_NONE);        /* below the left column */
 
-    edges_hit(GLASS_W - 1, CTL_BTN_Y0, &hit);
+    edges_hit(GLASS_W - 1, CTL_BTN_Y0, false, &hit);
     CHECK_EQ(hit.region, EDGE_NONE);        /* below the right column */
 }
 
@@ -374,8 +414,8 @@ static void test_the_columns_mirror(void)
         {
             edge_hit_t l, r;
 
-            edges_hit(to_panel(x), y, &l);
-            edges_hit(to_panel(axis_sum - x), y, &r);
+            edges_hit(to_panel(x), y, false, &l);
+            edges_hit(to_panel(axis_sum - x), y, false, &r);
 
             if (l.region != EDGE_LEFT || r.region != EDGE_RIGHT || l.index != r.index)
                 mismatches++;
@@ -504,6 +544,7 @@ int main(void)
     test_slot_boundaries();
     test_panel_coordinates();
     test_every_point_of_the_glass();
+    test_tall_strip_is_gated();
     test_the_columns_mirror();
     test_margin_labels();
 

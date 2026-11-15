@@ -275,6 +275,24 @@ touch driver from nothing at all -- so an app that hid slots left them live: the
 bool display_margin_slot_live(int col, int index);
 
 /*
+ * Give the bottom strip twice its drawn height as a touch target.
+ *
+ * OPT-IN PER APP, NOT DERIVED FROM OWNERSHIP, and that distinction is the whole
+ * point. The doubled area reaches framebuffer rows 375..415 -- which the
+ * Tamagotchi leaves empty because its picture ends at row 361, and which the
+ * Pokemon Mini's d-pad and the NES's A and B circles occupy. Those two hit-test
+ * their drawn controls and would win, but the Pokemon Mini does not hit-test
+ * anything yet, so a taller strip there would fire Shake, A and B from a finger on
+ * its d-pad.
+ *
+ * So an app says what it wants and the other two say nothing. Cleared by
+ * display_margins_set(DISPLAY_MARGINS_DESKTOP) so an app cannot leave the glass
+ * more eager than it found it.
+ */
+void display_margin_strip_tall(bool tall);
+bool display_margin_strip_is_tall(void);
+
+/*
  * Push a picture in PANEL coordinates, without the framebuffer's clip.
  *
  * display_picture_rows() stops at the 320x416 framebuffer; the glass is 502 rows

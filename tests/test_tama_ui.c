@@ -139,7 +139,7 @@ static void test_gated_without_arm_is_refused(void)
     static const struct { edge_region_t r; int i; tama_act_t a; } gated[] = {
         { EDGE_LEFT, 1, TAMA_ACT_SAVE },
         { EDGE_LEFT, 2, TAMA_ACT_LOAD },
-        { EDGE_RIGHT, 4, TAMA_ACT_RESET },
+        { EDGE_RIGHT, 3, TAMA_ACT_RESET },
     };
 
     for (size_t k = 0; k < sizeof(gated) / sizeof(gated[0]); k++)
@@ -172,7 +172,7 @@ static void test_gated_with_arm_fires(void)
     static const struct { edge_region_t r; int i; tama_act_t a; } gated[] = {
         { EDGE_LEFT, 1, TAMA_ACT_SAVE },
         { EDGE_LEFT, 2, TAMA_ACT_LOAD },
-        { EDGE_RIGHT, 4, TAMA_ACT_RESET },
+        { EDGE_RIGHT, 3, TAMA_ACT_RESET },
     };
 
     for (size_t k = 0; k < sizeof(gated) / sizeof(gated[0]); k++)
@@ -210,7 +210,7 @@ static void test_arm_released_before_action_is_refused(void)
 
     step(&ui, frame1(ARM_R, ARM_I), NULL);            /* arm down      */
     step(&ui, empty_frame(), NULL);                   /* arm lifted    */
-    CHECK_EQ(step(&ui, frame1(EDGE_RIGHT, 4), &act), 0);
+    CHECK_EQ(step(&ui, frame1(EDGE_RIGHT, 3), &act), 0);
     CHECK(act == TAMA_ACT_NONE);
     CHECK(ui.refused > 0);
 
@@ -253,6 +253,46 @@ static void test_order_does_not_matter(void)
     CHECK(act == TAMA_ACT_LOAD);
 }
 
+/* --- haptic feedback ------------------------------------------------------ */
+
+/*
+ * Every slot with a duty buzzes; the arm buzzes; blank slots and bare glass do
+ * not. This is what makes an unarmed Save FEEL like a press even though it
+ * correctly does nothing -- the operator asked for it after finding those two
+ * cases silent.
+ */
+static void test_haptic_follows_what_would_fire(void)
+{
+    /* The arm buzzes on its own: it is held, and feeling it take is the point. */
+    CHECK(tama_ui_haptic_of(EDGE_RIGHT, 0, false));
+    CHECK(tama_ui_haptic_of(EDGE_RIGHT, 0, true));
+
+    /* GATED BUTTONS BUZZ ONLY WHEN ARMED. An unarmed Save does nothing, so a buzz
+     * would claim otherwise -- the operator heard exactly that and rejected it. */
+    CHECK(!tama_ui_haptic_of(EDGE_LEFT, 1, false));    /* Save, unarmed */
+    CHECK( tama_ui_haptic_of(EDGE_LEFT, 1, true));     /* Save, armed   */
+    CHECK(!tama_ui_haptic_of(EDGE_LEFT, 2, false));    /* Load, unarmed */
+    CHECK( tama_ui_haptic_of(EDGE_LEFT, 2, true));     /* Load, armed   */
+    CHECK(!tama_ui_haptic_of(EDGE_RIGHT, 3, false));   /* Reset, unarmed */
+    CHECK( tama_ui_haptic_of(EDGE_RIGHT, 3, true));    /* Reset, armed   */
+
+    /* Ungated buttons always buzz, armed or not: they fire either way. */
+    CHECK(tama_ui_haptic_of(EDGE_LEFT, 0, false));     /* Pause  */
+    CHECK(tama_ui_haptic_of(EDGE_LEFT, 3, false));     /* Speed  */
+    CHECK(tama_ui_haptic_of(EDGE_RIGHT, 1, false));    /* Shot   */
+    CHECK(tama_ui_haptic_of(EDGE_RIGHT, 2, false));    /* Sound  */
+
+    /* Exit is gated like Reset: silence unarmed, a click when armed. The right
+     * column has no blank slot left -- all five are controls. */
+    CHECK(!tama_ui_haptic_of(EDGE_RIGHT, 4, false));
+    CHECK( tama_ui_haptic_of(EDGE_RIGHT, 4, true));
+
+    /* Below the last slot there is geometry but no control. */
+    CHECK(!tama_ui_haptic_of(EDGE_RIGHT, COL_N, true));
+    CHECK(!tama_ui_haptic_of(EDGE_NONE, 0, true));
+    CHECK(!tama_ui_haptic_of(EDGE_NONE, -1, true));
+}
+
 /* --- ungated buttons ------------------------------------------------------ */
 
 static void test_ungated_need_no_arm(void)
@@ -260,7 +300,7 @@ static void test_ungated_need_no_arm(void)
     static const struct { edge_region_t r; int i; tama_act_t a; } plain[] = {
         { EDGE_LEFT, 0, TAMA_ACT_PAUSE },
         { EDGE_LEFT, 3, TAMA_ACT_SPEED },
-        { EDGE_LEFT, 4, TAMA_ACT_SOUND },
+        { EDGE_RIGHT, 2, TAMA_ACT_SOUND },
         { EDGE_RIGHT, 1, TAMA_ACT_SHOT },
     };
 
@@ -404,6 +444,7 @@ int main(void)
     test_gated_with_arm_fires();
     test_arm_released_before_action_is_refused();
     test_order_does_not_matter();
+    test_haptic_follows_what_would_fire();
     test_ungated_need_no_arm();
     test_press_edge_only();
     test_two_plain_at_once();

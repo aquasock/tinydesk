@@ -169,6 +169,49 @@ uint64_t tmc_cycles(const tmc *m);
  */
 int tmc_audio_active(const tmc *m);
 
+/*
+ * ONE AUDIO SAMPLE, mixed from both channels, as a signed 16-bit value.
+ *
+ * The V3 drives its piezo with a PWM channel and a tone channel, and
+ * splb32_sound models both as a square wave whose level flips on driver timer
+ * overflows. Those overflows happen INSIDE tmc_run(), at the tone's own rate --
+ * `splb32_audio_level()` returns the level left by the last flip -- so a front end
+ * that reads it once per frame gets a badly aliased version of the waveform, and
+ * one that reads it never gets anything at all.
+ *
+ * The only faithful way is to step the guest in slices no longer than one sample
+ * period and read the level after each. The caller owns that loop; this function
+ * is the read, and it exists so the mixing rule lives in one place instead of in
+ * every front end.
+ *
+ * Both channels are summed and clamped. They are independent -- one can hold a
+ * tone while the other holds a PWM amplitude -- and the machine has a single
+ * speaker, so the sum is what it sounds like.
+ */
+int tmc_audio_sample(const tmc *m);
+
+/*
+ * STEP THE GUEST AND RENDER ITS AUDIO IN THE SAME PASS.
+ *
+ * The reason this exists rather than a loop in the front end is arithmetic, and it
+ * was measured: `splb32_run_cycles()` stops when its target is reached but cannot
+ * stop mid-instruction, so EVERY call overshoots by up to one instruction. One call
+ * per frame overshoots once and nobody notices. A thousand calls -- one per audio
+ * sample, which is what reproducing the waveform needs -- overshoot an extra
+ * thousand instructions, and the guest was measured running 352,700 cycles per
+ * frame instead of 250,000: 41 percent fast, with the pet ageing at the wrong rate
+ * and every sound at the wrong pitch.
+ *
+ * So the stepping and the sampling happen in ONE loop against ONE target. The
+ * residual overshoot is what a single `tmc_run()` would have, which is the floor.
+ *
+ * Sample i is taken once the guest has passed cycle `cycles * (i+1) / n`, so the
+ * quantisation is one instruction rather than one sample period, and `out` always
+ * receives exactly `n` values -- the tail is filled with the final level so a
+ * caller never has to guess how many were produced.
+ */
+void tmc_run_audio(tmc *m, uint64_t cycles, int16_t *out, int n);
+
 /* The guest's 512-byte display RAM, for a caller that wants to draw the frame
  * itself rather than through tmc_frame() -- the dirty-row check does exactly
  * that, so it can build a full-repaint reference to compare against. */
