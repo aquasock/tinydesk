@@ -1138,9 +1138,13 @@ static const gamepad_t s_gp = {
     .cx = NES_DPAD_X + NES_DPAD_S / 2,
     .cy = NES_DPAD_Y + NES_DPAD_S / 2,
     .size = NES_DPAD_S,
-    /* Rotated 45 degrees clockwise, matching the Pokemon Mini. cos(45) in 16.16
-     * fixed point: exactly representable, so the shape is identical run to run. */
+    /* Rotated 45 degrees clockwise, matching the Pokemon Mini. cos(45) and sin(45)
+     * in 16.16 fixed point: equal and exactly representable, so the shape is
+     * identical run to run. `rot_s` is stated rather than left out because the
+     * field defaults to zero, which is an UPRIGHT pad -- the comment above this
+     * line used to claim 65536 was upright, and it was not. */
     .rot_k = 46341,
+    .rot_s = 46341,
     .line = 2,          /* the margin buttons' own border weight */
     .tip_r = 5,
 

@@ -227,6 +227,19 @@ static bool s_ovr_btn_set[BTN_N];
  *
  * Indexed [column][slot] with the same column numbering as the label overrides:
  * 0 left, 1 right, 2 the bottom strip.
+ *
+ * PAINT_COLUMN() USED TO READ THIS WITH THE INDEXES SWAPPED, and the damage was
+ * narrow and confusing rather than obvious. It read `[desk_right ? 1 : 0]`, so the
+ * LEFT column consulted the RIGHT column's state. For the Pokemon Mini nothing
+ * changed, because its two tables are identical; for the NES and the Game Boy it
+ * meant a right-column write decided whether a LEFT-column box was drawn. The Game
+ * Boy blanks its right slots 2 to 4 and labels its left slot 2 "Save", so Save
+ * lost its outline and the operator reported exactly that. The give-away is
+ * `s_lab_dy[desk_right ? 0 : 1]` four lines away in the same function using the
+ * opposite convention, and `display_margin_slot_live()` -- which decides whether a
+ * button RESPONDS -- using the documented one. So painting and liveness disagreed
+ * about which slots were bare, which is the label/duty mismatch `edges.h` exists to
+ * prevent.
  */
 static bool s_nochrome[3][COL_N];
 
@@ -1471,7 +1484,7 @@ static void paint_column(int x0, int x1, bool desk_right, label_rot_t rot,
                         if (yy < g0 || yy > g1)
                             continue;
 
-                        if (s_nochrome[desk_right ? 1 : 0][s])
+                        if (s_nochrome[desk_right ? 0 : 1][s])
                         {
                             /* No box; the label alone, on the glass. */
                             if (label_bit(&label[s], x, yy))

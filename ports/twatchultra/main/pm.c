@@ -1325,7 +1325,10 @@ static const gamepad_t s_gp = {
     .cx = PM_DPAD_X + PM_DPAD_S / 2,
     .cy = PM_DPAD_Y + PM_DPAD_S / 2,
     .size = PM_DPAD_S,
-    .rot_k = PM_ROT_K,          /* cos 45 in 16.16, the same rotation the painter uses */
+    .rot_k = PM_ROT_K,          /* 16.16 cos of 45 degrees */
+    .rot_s = PM_ROT_K,          /* and the sine, which equals it at 45 degrees.
+                                 * Stated explicitly: the field defaults to zero,
+                                 * which would draw an upright pad. */
     .line = 2,
     .tip_r = PM_DPAD_R,
 

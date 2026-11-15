@@ -35,15 +35,22 @@
  * A layout, in FRAMEBUFFER coordinates -- the 320x416 window, not the 410x502
  * panel. The paint call converts; nothing else here knows about the panel.
  *
- * `rot_k` is the d-pad's rotation as 16.16 fixed-point cosine: 65536 is upright,
- * 46341 is cos(45). The arms and the arrows rotate together, because the
- * transform is applied to the incoming point rather than to a rotated bitmap.
+ * `rot_k` and `rot_s` are the d-pad's rotation as the 16.16 fixed-point cosine
+ * and sine of the angle: 65536/0 is upright, 46341/46341 is 45 degrees clockwise.
+ * They are a PAIR and not one number because the transform is a real inverse
+ * rotation, `u = dx*cos + dy*sin`, `v = dy*cos - dx*sin`. An earlier version
+ * carried the cosine alone and hardcoded `sin = cos`, which meant every d-pad
+ * was a 45-degree diamond and `rot_k` could only scale it -- 65536 drew a
+ * DIFFERENT-SIZED diamond rather than an upright cross, despite the comment
+ * that said otherwise. If a layout omits `rot_s` the pad is upright, which is
+ * the honest reading of a rotation of zero.
  */
 typedef struct
 {
     int cx, cy;          /* d-pad centre */
     int size;            /* d-pad side length; arms are a third of it */
-    int rot_k;           /* 16.16 cos of the rotation */
+    int rot_k;           /* 16.16 cos of the rotation, 65536 = upright */
+    int rot_s;           /* 16.16 sin of the rotation, 0 = upright      */
     int line;            /* outline thickness, the margin buttons' own weight */
     int tip_r;           /* arm-tip corner radius, 0 for sharp */
 
@@ -72,6 +79,19 @@ typedef struct
      */
     int pad_hit_d[2];
     char pad_label[2];   /* the letter drawn in each circle */
+
+    /*
+     * The d-pad's touch radius, when it should not be the drawn shape's own reach.
+     * 0 means `size / 2 + 4` -- the cross's painted extent plus 4 px, which is
+     * what every layout got before this field existed.
+     *
+     * Same reasoning as `pad_hit_d`: the RESPONSE is allowed to be larger than the
+     * drawing, and the amount is the app's own decision rather than something this
+     * module should assume. The Game Boy sets it 20 percent above the default
+     * because its control band is short and a thumb needs more room than the cross
+     * occupies.
+     */
+    int dpad_hit_r;
 
     uint16_t bg;         /* background fill, already byte-swapped */
     int grid;            /* grid pitch in px, 0 for none */

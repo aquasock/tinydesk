@@ -39,11 +39,13 @@ static void gp_to_shape(const gamepad_t *g, int fx, int fy, int *sx, int *sy)
     const int dx = fx - g->cx;
     const int dy = fy - g->cy;
 
-    /* Inverse of a clockwise rotation, which is why the signs read backwards: a
-     * point in the screen's upper right maps to the TOP arm. At rot_k 65536 this
-     * is the identity and the d-pad is upright. */
-    const int u = ((dx + dy) * g->rot_k) >> 16;
-    const int v = ((dy - dx) * g->rot_k) >> 16;
+    /* Inverse of a clockwise rotation: a point in the screen's upper right maps
+     * to the pad's top-right, which at 45 degrees is the TOP arm. Both terms are
+     * needed. With the cosine alone -- the form this had -- the 45-degree term
+     * is always present whatever the constant, so an upright pad was not
+     * expressible at all and `rot_k` could only scale the diamond. */
+    const int u = (dx * g->rot_k + dy * g->rot_s) >> 16;
+    const int v = (dy * g->rot_k - dx * g->rot_s) >> 16;
 
     *sx = u + g->size / 2;
     *sy = v + g->size / 2;
@@ -378,6 +380,8 @@ bool gamepad_paint(const gamepad_t *g, int fb_x0, int fb_y0, int w, int h,
 
 static int gp_abs(int v) { return v < 0 ? -v : v; }
 
+static int dpad_hit_radius(const gamepad_t *g);
+
 int gamepad_hit(const gamepad_t *g, int fb_x, int fb_y)
 {
     if (!g)
@@ -424,7 +428,7 @@ int gamepad_hit(const gamepad_t *g, int fb_x, int fb_y)
     const int dx = fb_x - g->cx;       /* screen offsets: +x right, +y down */
     const int dy = fb_y - g->cy;
 
-    const int r = g->size / 2 + GP_HIT_MARGIN;
+    const int r = dpad_hit_radius(g);
     const int d2 = dx * dx + dy * dy;
 
     if (d2 > r * r)
@@ -433,9 +437,26 @@ int gamepad_hit(const gamepad_t *g, int fb_x, int fb_y)
     if (d2 < GP_HIT_DEAD * GP_HIT_DEAD)
         return GP_NONE;            /* on the pivot: no direction is honest */
 
-    /* Distance-preserving rotated magnitudes, without a shift and its rounding. */
-    const int along_horiz = gp_abs(dx + dy);   /* the NE-SW arm pair */
-    const int along_vert  = gp_abs(dy - dx);   /* the NW-SE arm pair */
+    /*
+     * THE DIRECTION IS DECIDED IN THE PAD'S OWN FRAME, which is the only way a
+     * rotated pad and an upright one can share one hit test.
+     *
+     * This used to compare |dx+dy| against |dy-dx| -- the 45-degree frame the
+     * whole module assumed -- so a pad drawn upright would have been hit-tested
+     * as a diamond: the painter and the test would disagree about which arm is
+     * where, which is exactly the class of fault this module exists to prevent.
+     *
+     * The products are compared BEFORE the >>16, deliberately. At 45 degrees the
+     * cosine and sine are equal, so these reduce to (dx+dy)*46341 and
+     * (dy-dx)*46341, whose ordering is identical to the unrotated comparison the
+     * previous code made -- bit for bit, not approximately -- so the NES and the
+     * Pokemon Mini behave exactly as they did.
+     */
+    const int cu = dx * g->rot_k + dy * g->rot_s;
+    const int cv = dy * g->rot_k - dx * g->rot_s;
+
+    const int along_horiz = gp_abs(cu);        /* the left-right arm pair */
+    const int along_vert  = gp_abs(cv);        /* the up-down arm pair    */
 
     bool vertical;
 
@@ -444,10 +465,27 @@ int gamepad_hit(const gamepad_t *g, int fb_x, int fb_y)
     else if (along_vert > along_horiz)
         vertical = true;
     else
-        vertical = (dx == 0);      /* a tie lies on a screen axis: that axis wins */
+        /* A tie lies on one of the pad's own diagonals, where either answer is
+         * honest. `cu == cv` generalises the previous rule: at 45 degrees it is
+         * exactly `dx == 0`, which is what this used to test. */
+        vertical = (cu == cv);
 
     if (vertical)
-        return (dy - dx) < 0 ? GP_UP : GP_DOWN;
+        return cv < 0 ? GP_UP : GP_DOWN;
 
-    return (dx + dy) < 0 ? GP_LEFT : GP_RIGHT;
+    return cu < 0 ? GP_LEFT : GP_RIGHT;
+}
+
+/* Static: an implementation detail of gamepad_hit(). It was exported for one
+ * diagnostic and that diagnostic is gone, so it does not get to stay in the public
+ * surface.
+ */
+static int dpad_hit_radius(const gamepad_t *g)
+{
+    if (!g)
+        return 0;
+
+    /* 0 means the drawn shape's own reach: `size / 2` for the cross plus 4 px of
+     * tolerance at the tips. A layout that wants a wider response says so. */
+    return g->dpad_hit_r > 0 ? g->dpad_hit_r : g->size / 2 + GP_HIT_MARGIN;
 }

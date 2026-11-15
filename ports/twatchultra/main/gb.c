@@ -140,6 +140,8 @@ static void gb_fill_row(void *ctx, int row, int col, uint16_t *dst, int n)
 
 /* --- the blit task, on core 1 -------------------------------------------- */
 
+/* Defined with the controls further down, where `s_gp` exists. */
+
 static void gb_blit_task(void *arg)
 {
     (void)arg;
@@ -593,55 +595,78 @@ static void gb_task(void *arg)
  *
  * The operator asked for this port to carry the same drawn d-pad and two circles
  * the Pokemon Mini and NES have, rather than the margin columns it shipped with.
- * The shapes, the 45-degree rotation, the disc-shaped four-quadrant hit test and
- * the 1.5x touch discs all come from `gamepad.c`, which is where that furniture
- * has lived since it was factored out of `pm.c` -- so this is a layout, not a
- * second rasteriser.
+ * The shapes, the disc-shaped four-quadrant hit test and the 1.5x touch discs all
+ * come from `gamepad.c`, which is where that furniture has lived since it was
+ * factored out of `pm.c` -- so this is a layout, not a second rasteriser.
  *
- * THE SIZES COULD NOT BE COPIED, AND THE REASON IS ARITHMETIC. `gamepad.c`
- * paints a cross whose arms are a third of the frame, rotated 45 degrees, so a
- * frame of S paints a bounding span of about S * 0.471 both ways rather than S.
- * The NES has 217 glass rows below its 240-row picture and fits a 168 px frame
- * (163 painted) and two 84 px circles with a 32 px gap (200) with room to spare.
- * This port's picture is 288 rows tall, twice the NES's 2x scale of a 144-line
- * screen, so the band below it is 169 rows -- smaller than the NES cluster itself.
+ * THE ROTATION IS UPRIGHT, AT THE OPERATOR'S DIRECTION, and that is now
+ * expressible: `gamepad_t` carries a cosine and a sine, so 65536 and 0 is no
+ * rotation and the arms point at the four sides of the glass. Until that pair
+ * existed the module could only draw 45-degree diamonds, whatever `rot_k` said.
  *
- * So the frame is 148 instead of 168, which paints about 142 rows and leaves 13
- * clear above and below, and the circles are 74 instead of 84 with the gap cut
- * from 32 to 12, which is 160 of the 169 available. Every one of those numbers is
- * the largest value that leaves the cluster clear of the picture above it and the
- * glass below, and the alternatives were measured rather than guessed: at the
- * NES's 168 the frame touches the picture, and at two 84 px circles the pair
- * needs 200 rows in a 169-row band and does not fit at all.
+ * THE SIZES COULD NOT BE COPIED, AND THE REASON IS ARITHMETIC. A frame of S
+ * paints a bounding span of about S * 0.943 when it is rotated 45 degrees, so the
+ * NES fits a 168 px frame into 158 painted rows. This port's picture is 288 rows
+ * tall, twice the NES's 2x scale of a 144-line screen, so the band below it is 169
+ * rows -- smaller than the NES cluster itself.
  *
- * THE HORIZONTAL POSITIONS ARE THE NES'S OWN, unchanged, and that is deliberate:
- * the d-pad's left tip lands on the left column's axis and A and B sit in the
- * same columns on all three emulators, so a thumb that has learned one has
- * learned the others. `GB_DPAD_TIP_INSET` is not a constant in that sense -- it
- * is 8 at a 168 px frame and 7 at 148, because it is where the rasterised tip
- * actually falls, and it moves with the frame size. It is written as a literal
- * with this note rather than derived, because deriving it would need the
- * rasteriser's own geometry and would still be an approximation.
+ * Upright, the cross reaches its full frame, so 148 paints 148: that is 10 rows
+ * clear above and 11 below in a 169-row band. The circles are 74 instead of 84
+ * with the gap cut from 32 to 12, which is 160 of the 169 available, and the
+ * pair sits at rows 292..451 with six clear at the bottom. The alternatives were
+ * measured rather than guessed: at the NES's 168 the frame touches the picture,
+ * and at two 84 px circles the pair needs 200 rows in a 169-row band and does not
+ * fit at all.
+ *
+ * THE HORIZONTAL POSITIONS ARE THE NES'S, EXCEPT WHERE THE OPERATOR MOVED THEM.
+ * The d-pad's left edge lands on the left column's axis -- that is the same rule
+ * the NES follows, and it is now the frame's own left edge because an upright
+ * cross reaches its bounding box, where a 45-degree diamond did not: the diamond
+ * needed a 7 px inset to put its leftmost painted pixel on that axis, and an
+ * upright one needs none. A and B sit at the NES's columns of 236 and 208, with A
+ * moved two cells (32 px) right to 268 at the operator's direction, which puts it
+ * 22 px past the framebuffer wall and against the right column's inner edge. It is
+ * fully painted because the whole cluster sits below the side columns, where the
+ * push spans the entire glass.
  */
 #define GB_GLASS_BOT    (DISPLAY_PANEL_H - DISPLAY_ORIGIN_Y)              /* 457 */
 #define GB_CTL_Y        (GB_HEIGHT * GB_SCALE)                            /* 288 */
 #define GB_CTL_BAND     (GB_GLASS_BOT - GB_CTL_Y)                         /* 169 */
 
 #define GB_DPAD_S       148
-#define GB_DPAD_TIP_INSET  7
+#define GB_DPAD_TIP_INSET  0     /* upright: the painted edge is the frame edge */
+
+/*
+ * THE D-PAD'S TOUCH DISC IS 20 PERCENT WIDER THAN THE DRAWN CROSS, at the
+ * operator's direction after a rectangular hit area was tried and rejected.
+ *
+ * gamepad.c's default is `size / 2 + 4` -- the cross's painted extent plus 4 px of
+ * tolerance at the tips -- which is 78 at this frame size. 78 * 1.2 is 94, and the
+ * "20 percent" is of the RADIUS, not the area: a thumb's reach is a length, so the
+ * linear reading is the one that matters and the one the operator meant.
+ *
+ * IT COSTS TEN ROWS OF PICTURE. At 94 the disc's top is fb 278 and the guest's
+ * last row is 287, so a press in a narrow band along the bottom of the screen can
+ * register as Up. That is the same trade the circles have always made -- A's disc
+ * reaches 14 rows in -- and it is accepted here for the same reason: the pad was
+ * judged too small to use, and a slightly eager edge is better than a pad that
+ * misses. The B circle's disc starts at fb 190, so the enlarged pad does not reach
+ * it and the two cannot fire from one press.
+ */
+#define GB_DPAD_HIT_R   94
+
 #define GB_COL_EDGE     (LEFT_X1 - PANEL_COL_OFFSET - DISPLAY_ORIGIN_X)   /* -1 */
-#define GB_DPAD_X       (GB_COL_EDGE - GB_DPAD_TIP_INSET)                 /* -8 */
+#define GB_DPAD_X       (GB_COL_EDGE - GB_DPAD_TIP_INSET)                 /* -1 */
 #define GB_DPAD_Y       (GB_CTL_Y + (GB_CTL_BAND - GB_DPAD_S) / 2)        /* 298 */
 
 #define GB_BTN_D        74
 #define GB_BTN_GAP      12
 #define GB_BTN_HIT_D    (GB_BTN_D * 3 / 2)                               /* 111 */
 
-/* The NES's own columns: A one cell right of the base, B one cell left. */
-#define GB_BTN_A_X      236
+#define GB_BTN_A_X      268     /* 236 + two 16 px cells, by direction */
 #define GB_BTN_B_X      208
 #define GB_BTN_Y        (GB_CTL_Y + (GB_CTL_BAND - (2 * GB_BTN_D + GB_BTN_GAP)) / 2)
-#define GB_BTN_A_Y      GB_BTN_Y                                         /* 292 */
+#define GB_BTN_A_Y      (GB_BTN_Y + 4)  /* 296: four px down, by direction */
 #define GB_BTN_B_Y      (GB_BTN_Y + GB_BTN_D + GB_BTN_GAP)               /* 378 */
 
 /* Three column slots, as the NES has: Start and Select plus a blank. Fewer slots
@@ -654,8 +679,11 @@ static const gamepad_t s_gp = {
     .cx = GB_DPAD_X + GB_DPAD_S / 2,
     .cy = GB_DPAD_Y + GB_DPAD_S / 2,
     .size = GB_DPAD_S,
-    /* 45 degrees, the Pokemon Mini's rotation. cos(45) in 16.16 fixed point. */
-    .rot_k = 46341,
+    /* UPRIGHT. Cosine 65536 and sine 0 is no rotation at all, so the cross's
+     * arms point at the four sides of the glass and its bounding box is exactly
+     * the 148 px frame. */
+    .rot_k = 65536,
+    .rot_s = 0,
     .line = 2,
     .tip_r = 5,
 
@@ -664,6 +692,8 @@ static const gamepad_t s_gp = {
     .pad_d = { GB_BTN_D, GB_BTN_D },
     .pad_hit_d = { GB_BTN_HIT_D, GB_BTN_HIT_D },
     .pad_label = { 'A', 'B' },
+
+    .dpad_hit_r = GB_DPAD_HIT_R,
 
     .bg = 0x0000,
     .grid = 0,
@@ -975,11 +1005,30 @@ bool gb_start(const char *rom_path)
     display_margin_label(1, 0, "Start");
     display_margin_label(1, 1, "Select");
 
+    /*
+     * SLOT 2 KEEPS ITS BOX, WITH NO WORD ON IT. This port reserves three column
+     * slots and draws all three, so the column reads as the same three-button stack
+     * as the other two emulators; the Game Boy has only two margin controls, so the
+     * third is furniture rather than a duty. It is NOT live -- `pad_from_frame()`
+     * answers only for slots 0 and 1 -- and a box that does nothing is honest, where
+     * blank glass that fires a button is the fault this project reported twice.
+     *
+     * THIS SLOT IS WHY THE SWAPPED INDEX IN paint_column() MATTERED. Before that was
+     * fixed, the painter consulted the LEFT column's chrome state for the right one,
+     * so this slot read the left column's slot 2 -- which carries "Save" and a box --
+     * and drew a box nobody had asked for. Fixing the index made the column honour
+     * its own state and the box vanished, which the operator noticed immediately.
+     * The box is therefore requested here explicitly rather than left to a bug: the
+     * line below is what says so, and slots 3 and 4 stay bare.
+     */
+    display_margin_chrome(1, 2, true);
+    display_margin_label(1, 2, " ");
+
     /* The column slots past the drawn ones, and the whole bottom strip: blank and
      * not live, so blank glass cannot fire a button. The strip's touch area is
      * double height when an app owns the glass, so it reaches fb 375 and overlaps
      * B's own disc -- harmless only because the drawn control is tested first. */
-    for (int s = 2; s < COL_N; s++)
+    for (int s = 3; s < COL_N; s++)
     {
         display_margin_chrome(1, s, false);
         display_margin_label(1, s, " ");
@@ -1349,7 +1398,7 @@ static int cmd_gb(tdsh_session_t *session, int argc, char **argv)
 
 static const tdsh_command_t s_gb_cmd = {
     "gb",
-    "gb [start [rom] | stop | save | status]",
+    "gb [start [rom] | stop | save | rsave | status]",
     "Game Boy / Game Boy Color emulator",
     cmd_gb,
     TDSH_CMD_INTERACTIVE,
