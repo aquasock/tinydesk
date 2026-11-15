@@ -22,7 +22,25 @@
 #include "freertos/task.h"
 #include "tdsh_espidf.h"
 
-#define IN_BUFFER      256
+/*
+ * THE INPUT BUFFER IS A FILE-TRANSFER SIZE, NOT A KEYBOARD SIZE.
+ *
+ * It was 256, which holds about six typed command lines. That is ample for a
+ * human and far too small for a console being used as a data channel: a client
+ * sending a file a line at a time puts 1000 bytes through here in three
+ * seconds, and everything past the first 256 was DROPPED by backend_write()
+ * below, silently, because xStreamBufferSend() with a zero timeout returns a
+ * short count and its caller ignores the count.
+ *
+ * Measured before the change: a 1000-byte transfer into littlefs arrived as
+ * 760, 800 and 920 bytes on three runs, varying only with pacing, while the BLE
+ * console's own counters read `in=1853 out=1853 refused=0` -- every byte it took
+ * was delivered. The loss was here.
+ *
+ * 2048 matches the output buffer and holds fifty of those lines. The shell's
+ * input stream is heap, not static RAM.
+ */
+#define IN_BUFFER      2048
 #define OUT_BUFFER     2048
 #define SHELL_PRIORITY 4        /* below the UI task, so typing stays smooth */
 
@@ -173,10 +191,54 @@ static int backend_read(void *ctx, uint8_t *buf, int cap)
     return s_started ? (int)xStreamBufferReceive(s_out, buf, (size_t)cap, 0) : 0;
 }
 
+/*
+ * HOW A KEY REACHES THE SHELL, AND WHY IT MAY NOW WAIT.
+ *
+ * xStreamBufferSend() with a zero timeout accepts what fits and returns the
+ * count; the old code passed the result straight back to a caller that ignores
+ * it, so a full buffer meant keys vanished. That is invisible while typing and
+ * became data loss the moment the console carried a file.
+ *
+ * A bounded wait instead gives the whole chain its backpressure: the shell
+ * drains, this blocks briefly, the desktop's key handling slows, fewer bytes
+ * leave the transport, and the transport's own flow control (XOFF for the BLE
+ * console) tells the far end to pause. That is what a serial console does.
+ *
+ * THE TOTAL WAIT IS BOUNDED and the function returns whichever is smaller of
+ * "everything sent" and "budget used up". A wedged shell must not freeze the
+ * desktop for ever, so after KEY_SEND_BUDGET_MS the remainder is abandoned --
+ * still a possible loss, but now only behind a fault rather than under ordinary
+ * load, and the short count is returned so a caller CAN see it.
+ */
+#define KEY_SEND_SLICE_MS   20
+#define KEY_SEND_BUDGET_MS  2000
+
 static int backend_write(void *ctx, const uint8_t *buf, int len)
 {
     (void)ctx;
-    return s_started ? (int)xStreamBufferSend(s_in, buf, (size_t)len, 0) : 0;
+
+    if (!s_started || !buf || len <= 0)
+        return 0;
+
+    int sent = 0;
+    int waited = 0;
+
+    while (sent < len && waited < KEY_SEND_BUDGET_MS)
+    {
+        const size_t n = xStreamBufferSend(s_in, buf + sent, (size_t)(len - sent),
+                                           pdMS_TO_TICKS(KEY_SEND_SLICE_MS));
+
+        sent += (int)n;
+
+        if (sent < len)
+            waited += KEY_SEND_SLICE_MS;
+    }
+
+    if (sent < len)
+        ESP_LOGW(TAG, "shell input full: %d of %d bytes after %d ms",
+                 sent, len, waited);
+
+    return sent;
 }
 
 /* The console session's user (boot user, or whoever logged in). */

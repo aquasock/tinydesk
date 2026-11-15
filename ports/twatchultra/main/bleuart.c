@@ -57,10 +57,22 @@ static const ble_uuid128_t s_tx_uuid =
     BLE_UUID128_INIT(0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
                      0x93, 0xf3, 0xa3, 0xb5, 0x03, 0x00, 0x40, 0x6e);
 
-#define BLEUART_RX_RING 2048    /* client -> shell */
-#define BLEUART_TX_RING 8192    /* shell -> client */
+#define BLEUART_RX_RING 4096    /* client -> shell; absorbs a write burst */
+
+/* Flow control. The shell drains one byte per poll, so a client that writes a
+ * burst can outrun it. Rather than drop silently -- which corrupted a file
+ * transfer on the first attempt, 800 of 1000 bytes arriving -- the ring has
+ * watermarks: crossing the high one sends XOFF on the notify characteristic and
+ * crossing the low one sends XON, which is what a serial console has always
+ * done. A client that ignores them still cannot lose data quietly, because a
+ * full ring now REFUSES the write instead of accepting and discarding it. */
+#define BLEUART_XOFF_AT (BLEUART_RX_RING * 3 / 4)
+#define BLEUART_XON_AT  (BLEUART_RX_RING * 1 / 4)
+#define BLEUART_XOFF    0x13    /* Ctrl-S */
+#define BLEUART_XON     0x11    /* Ctrl-Q */
+#define BLEUART_TX_RING 16384    /* shell -> client */
 #define BLEUART_ADV_NAME "TinyDesk"
-#define BLEUART_NOTIFY_WAIT_MS 200
+#define BLEUART_NOTIFY_WAIT_MS 40
 
 static RingbufHandle_t s_rx;         /* bytes the client sent          */
 static RingbufHandle_t s_tx;         /* bytes to notify to the client  */
@@ -71,6 +83,10 @@ static uint8_t s_addr_type;
 static bool s_up;
 static bool s_registered;    /* the GATT service is in the attribute table */
 static bool s_tx_task;
+static volatile bool s_xoff_sent;     /* the client has been told to pause */
+static volatile uint32_t s_rx_refused; /* writes refused for a full ring */
+static volatile uint32_t s_rx_bytes;   /* bytes accepted into the ring */
+static volatile uint32_t s_rx_out;     /* bytes actually handed to the reader */
 
 /*
  * THE WRITE PATH, which is the only way a byte enters the shell.
@@ -102,11 +118,42 @@ static int gatt_access(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt
     if (os_mbuf_copydata(ctxt->om, 0, len, buf) != 0)
         return BLE_ATT_ERR_UNLIKELY;
 
-    /* Non-blocking: a client that outruns the shell loses bytes rather than
-     * stalling the radio's task. The shell reads at 20 ms intervals and a human
-     * types, so the ring only fills if something is wrong. */
+    /*
+     * A FULL RING REFUSES THE WRITE; IT DOES NOT SWALLOW IT.
+     *
+     * This used to accept the bytes and drop them with a log line, which is
+     * silent data loss: a 1000-byte file transfer arrived as 800 bytes and the
+     * only trace was a warning nobody was reading. Returning
+     * BLE_ATT_ERR_INSUFFICIENT_RES makes a write-with-response client's stack
+     * report a failure, so it can retry -- and the ATT layer only acknowledges
+     * after this callback returns, so nothing has been committed yet.
+     *
+     * A write-WITHOUT-response client gets no error, which is why XOFF exists:
+     * crossing the high watermark sends Ctrl-S on the notify characteristic, as
+     * a serial console always has. A client that honours it never reaches the
+     * refusal. A client that honours neither is the one case that can still lose
+     * data, and that is stated in the header rather than discovered.
+     *
+     * Blocking here instead would be simpler and is the wrong trade: this runs in
+     * NimBLE's host task, and BLE-004 records what starving that task costs.
+     */
     if (xRingbufferSend(s_rx, buf, len, 0) != pdTRUE)
-        ESP_LOGW(TAG, "rx ring full, %u bytes dropped", (unsigned)len);
+    {
+        s_rx_refused++;
+        return BLE_ATT_ERR_INSUFFICIENT_RES;
+    }
+
+    s_rx_bytes += len;
+
+    size_t held = 0;
+    vRingbufferGetInfo(s_rx, NULL, NULL, NULL, NULL, &held);
+
+    if (held >= BLEUART_XOFF_AT && !s_xoff_sent)
+    {
+        s_xoff_sent = true;
+        const uint8_t c = BLEUART_XOFF;
+        xRingbufferSend(s_tx, &c, 1, 0);
+    }
 
     return 0;
 }
@@ -379,21 +426,47 @@ int bleuart_read(void)
         return -1;
 
     const int b = p[0];
+    s_rx_out++;
     vRingbufferReturnItem(s_rx, p);
+
+    /* Release a paused client once the ring has drained enough. */
+    if (s_xoff_sent)
+    {
+        size_t held = 0;
+        vRingbufferGetInfo(s_rx, NULL, NULL, NULL, NULL, &held);
+
+        if (held <= BLEUART_XON_AT)
+        {
+            s_xoff_sent = false;
+            const uint8_t c = BLEUART_XON;
+            xRingbufferSend(s_tx, &c, 1, 0);
+        }
+    }
+
     return b;
 }
 
+/*
+ * OUTPUT IS NON-BLOCKING, AND THAT IS DELIBERATE.
+ *
+ * Blocking here was tried and rejected: this is called from the console and
+ * renderer path, so stalling it for a slow client stalls the desktop, which then
+ * repaints -- reading a 4,000-byte file back produced 17,700 bytes of screen
+ * traffic with not one of the file's 100 line markers intact. Backpressure
+ * belongs on the INPUT side (where a lost byte corrupts a file quietly) and must
+ * not be added here, where a lost byte only shortens what a diagnostic prints.
+ *
+ * So a full ring returns a short count. The ring is large enough for a burst of
+ * ordinary command output, and a client that reads promptly never sees a drop.
+ */
 int bleuart_write(const uint8_t *buf, int len)
 {
     if (!s_up || !buf || len <= 0)
         return 0;
 
-    /* Non-blocking and best-effort, like the shell's own serial write: a full
-     * ring loses output rather than stalling the caller. */
-    if (xRingbufferSend(s_tx, buf, (size_t)len, 0) != pdTRUE)
-        return 0;
+    const size_t n = xRingbufferSend(s_tx, buf, (size_t)len, 0);
 
-    return len;
+    return (int)n;
 }
 
 /* --- the hooks the shared layer calls ------------------------------------
@@ -470,7 +543,9 @@ static int cmd_bleuart(tdsh_session_t *session, int argc, char **argv)
         UBaseType_t items = 0;
         vRingbufferGetInfo(s_rx, NULL, NULL, NULL, NULL, &used);
         (void)items;
-        printf("rx ring used=%u\n", (unsigned)used);
+        printf("rx ring used=%u refused=%lu in=%lu out=%lu\n",
+           (unsigned)used, (unsigned long)s_rx_refused,
+           (unsigned long)s_rx_bytes, (unsigned long)s_rx_out);
     }
     if (s_tx)
     {
