@@ -255,6 +255,21 @@ CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 # in whatever audio mode replaces it.
 CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=512
 
+# THE HOST FIFO IS BIASED TOWARD PERIODIC OUT, BECAUSE AUDIO CANNOT FIT OTHERWISE
+#
+# The S3's DWC controller has one data FIFO split three ways (RX, non-periodic
+# TX, periodic TX), and IDF sizes the split from this choice. At the default
+# "Balanced", periodic TX gets OTG_DFIFO_DEPTH/8 = 32 words (usb_dwc_hal.c:202),
+# so the HCD refuses any isochronous OUT endpoint above 128 bytes. Measured on
+# the watch: claiming the DAC's playback alternate failed with "HCD DWC: EP MPS
+# (768) exceeds supported limit (128)". The Kconfig help claims 192 for Balanced;
+# the code and the board say 128. The DAC's smallest playback alternate is 384.
+#
+# Periodic OUT moves the remainder to periodic TX (Kconfig help: 600 bytes). The
+# cost is IN endpoints limited to 128 bytes, which still covers HID keyboards and
+# mice and the DAC's own 64-byte interrupt endpoint.
+CONFIG_USB_HOST_HW_BUFFER_BIAS_PERIODIC_OUT=y
+
 #
 # NIMBLE'S MBUF POOL, WHICH A CONSOLE CAN EMPTY FASTER THAN A KEYBOARD.
 #

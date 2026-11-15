@@ -558,13 +558,30 @@ int bleuart_read(void)
  *
  * So a full ring returns a short count. The ring is large enough for a burst of
  * ordinary command output, and a client that reads promptly never sees a drop.
+ *
+ * THE RETURN VALUE IS A BYTE COUNT, AND xRingbufferSend() DOES NOT RETURN ONE.
+ * It returns pdTRUE/pdFALSE, and on a byte buffer it is all-or-nothing. This
+ * function used to return that flag, so every successful write reported ONE
+ * byte. td_render_flush() then resent out+1, out+2, ... each time accepted in
+ * full, until the ring filled; the next write returned 0, the renderer dropped
+ * the frame, marked the link down and repainted the whole screen 500 ms later,
+ * for ever. Captured on 2026-11-15: every BLE repaint was one 1,024-byte render
+ * buffer followed by copies of it shifted by 1, 2 and 3 bytes, 4,090 bytes in
+ * all, ~24 KB/s on an idle desktop. The "17,700 bytes" above is the same fault.
+ * So: send what fits, and report exactly that.
  */
 int bleuart_write(const uint8_t *buf, int len)
 {
     if (!s_up || !buf || len <= 0)
         return 0;
 
-    const size_t n = xRingbufferSend(s_tx, buf, (size_t)len, 0);
+    size_t n = xRingbufferGetCurFreeSize(s_tx);
+
+    if (n > (size_t)len)
+        n = (size_t)len;
+
+    if (n == 0 || xRingbufferSend(s_tx, buf, n, 0) != pdTRUE)
+        return 0;
 
     return (int)n;
 }
@@ -573,15 +590,15 @@ int bleuart_write(const uint8_t *buf, int len)
  * dropping. The console path needs the non-blocking write; a file transfer
  * needs the opposite, because a dropped chunk is a hole in the file.
  *
- * Returns 0 on timeout, so the caller can bound its wait. */
+ * Returns the bytes queued (all of them: a byte-buffer send is all-or-nothing),
+ * or 0 on timeout, so the caller can bound its wait. len must not exceed the
+ * ring, which `fetch`'s 256-byte chunks never do. */
 static int bleuart_write_wait(const uint8_t *buf, int len, TickType_t ticks)
 {
     if (!s_up || !buf || len <= 0)
         return 0;
 
-    const size_t n = xRingbufferSend(s_tx, buf, (size_t)len, ticks);
-
-    return (int)n;
+    return xRingbufferSend(s_tx, buf, (size_t)len, ticks) == pdTRUE ? len : 0;
 }
 
 /* --- the hooks the shared layer calls ------------------------------------

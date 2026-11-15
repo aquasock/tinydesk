@@ -16,7 +16,12 @@
  *                                    reason it was nearly given up on
  *   bcdADC         0x0204
  *   iface 0        AudioControl
- *   iface 1 alt 3  ep 0x01 isochronous Synchronous OUT, mps 768, interval 1
+ *   iface 1        ep 0x01 isochronous Synchronous OUT, interval 1, three alts:
+ *                  alt 1  2 ch S16  mps 384   <- the one this driver uses
+ *                  alt 2  2 ch S24  mps 576
+ *                  alt 3  2 ch S32  mps 768
+ *   clock 9        reached via input terminal 1; RANGE reports 8000 16000
+ *                  32000 44100 48000 96000 Hz
  *   iface 2        AudioStreaming IN (microphone path), unused here
  *   iface 3        interrupt IN (HID-style controls), unused here
  *
@@ -32,9 +37,9 @@
  * above:
  *
  *   1. SET_CUR the Clock Source's Sample Rate Control to the rate we want.
- *   2. SET_INTERFACE interface 1, alternate setting 3 -- the one that carries
- *      the isochronous OUT endpoint. Alternate 0 has no endpoint; selecting it
- *      is how the stream is stopped.
+ *   2. SET_INTERFACE interface 1 to the 2-channel 16-bit alternate (alt 1 on
+ *      this DAC), chosen from the format descriptors rather than assumed.
+ *      Alternate 0 has no endpoint; selecting it is how the stream is stopped.
  *   3. Submit isochronous OUT transfers, one packet per frame, 192 bytes each
  *      at 48 kHz stereo 16-bit (48000 / 1000 * 2 channels * 2 bytes).
  *
@@ -49,6 +54,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/ringbuf.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "usb/usb_host.h"
 
@@ -67,12 +73,17 @@ static const char *TAG = "uac2";
 #define CS_INTERFACE        0x24
 #define AC_HEADER           0x01
 #define AC_CLOCK_SOURCE     0x0A
-#define AC_INPUT_TERMINAL   0x02
-#define AS_FORMAT_TYPE_I    0x02
+#define AC_INPUT_TERMINAL   0x02    /* inside the AudioControl interface */
+#define AS_GENERAL          0x01    /* inside an AudioStreaming interface */
+#define AS_FORMAT_TYPE_I    0x02    /* inside an AudioStreaming interface */
 
 /* UAC2 control selector for the sample rate, from the Audio 2.0 spec 5.2.3.1. */
 #define UAC2_CS_SAM_FREQ    0x01
 #define UAC2_CN_NONE        0x00
+
+/* UAC2 class requests (Audio 2.0 spec A.14). */
+#define UAC2_REQ_CUR        0x01
+#define UAC2_REQ_RANGE      0x02
 
 /* Playback geometry. 48 kHz stereo S16 is what every emulator in this tree can
  * be resampled to and what the descriptor's largest alt setting supports. */
@@ -95,6 +106,7 @@ static uint8_t s_dev_addr;
 static bool s_host_installed;
 
 /* Discovered from the device's own descriptors. */
+static uint8_t s_ac_iface;      /* AudioControl interface: addresses its entities */
 static uint8_t s_clock_id;
 static uint8_t s_as_iface;
 static uint8_t s_as_alt;
@@ -112,57 +124,70 @@ static volatile uint32_t s_xfer_errors;
 static volatile uint32_t s_underruns;
 static volatile uint32_t s_missed;      /* packets the controller reported SKIPPED */
 static volatile int s_last_status = -1;
-static TaskHandle_t s_task;
+static TaskHandle_t s_task;             /* the client's event loop */
+static TaskHandle_t s_lib_task;         /* the host library's event loop */
+static SemaphoreHandle_t s_ctrl_done;   /* a control transfer has completed */
+
+/* How long uac2_open() waits for the DAC to attach and enumerate after the host
+ * comes up. Enumeration of this dongle measured well under a second. */
+#define UAC2_ATTACH_WAIT_MS 2000
 
 static void on_client_event(const usb_host_client_event_msg_t *msg, void *arg);
 
 /* ---------------------------------------------------------------- helpers */
 
-static const uint8_t *find_cs_descriptor(const uint8_t *cfg, int len, int subtype,
-                                         int *out_len)
-{
-    int i = 0;
-
-    while (i + 2 <= len)
-    {
-        const int blen = cfg[i];
-        const int btype = cfg[i + 1];
-
-        if (blen < 2 || i + blen > len)
-            break;
-
-        if (btype == CS_INTERFACE && blen >= 3 && cfg[i + 2] == subtype)
-        {
-            *out_len = blen;
-            return &cfg[i];
-        }
-
-        i += blen;
-    }
-
-    *out_len = 0;
-    return NULL;
-}
-
 /*
  * Walk the configuration and record what the playback path needs.
  *
- * The AudioStreaming interface is chosen by its ENDPOINT, not by its interface
- * number: alternate settings share an interface number, and only one of them
- * carries the isochronous OUT endpoint. Picking the first alternates that has an
- * OUT endpoint is therefore the correct rule, and it is what makes this work
- * without knowing the device's alternate-setting numbering in advance.
+ * CLASS-SPECIFIC SUBTYPES MEAN DIFFERENT THINGS IN DIFFERENT INTERFACES, which
+ * is what the first version of this got wrong: subtype 0x02 is an Input Terminal
+ * inside the AudioControl interface and a Format Type descriptor inside an
+ * AudioStreaming one. So every CS_INTERFACE descriptor is read in the context of
+ * the interface descriptor that precedes it.
+ *
+ * THE UAC2 LAYOUTS (Audio 2.0 spec, 4.7.2.1 / 4.7.2.4 / 4.9.2 and Frmts 2.0
+ * 2.3.1.6), all of which the first version read with UAC1 offsets:
+ *
+ *   Clock Source     8 bytes:  bClockID at +3
+ *   Input Terminal  17 bytes:  bTerminalID at +3, bCSourceID at +7
+ *   AS General      16 bytes:  bTerminalLink at +3, bNrChannels at +10
+ *   Format Type I    6 bytes:  bSubslotSize at +4, bBitResolution at +5
+ *
+ * UAC2 format descriptors carry NO sample rates: a rate list comes from a RANGE
+ * request on the clock entity, which uac2_open() makes once the device is open.
+ *
+ * Every playback alternate is recorded, and the one chosen is the 2-channel,
+ * 2-byte-subslot one, because that is what this driver sends. A device with no
+ * such alternate is refused with its formats logged, rather than fed 16-bit
+ * frames it would play as noise.
  */
+#define UAC2_MAX_ALTS   8
+#define UAC2_MAX_TERMS  8
+
+typedef struct
+{
+    uint8_t alt, ep, interval, term, channels, subslot, bits;
+    uint16_t mps;
+} as_alt_t;
+
 static bool parse_config(const uint8_t *cfg, int len)
 {
-    int i = 0;
-    int cur_iface = -1, cur_alt = 0, cur_sub = 0;
-    bool have_clk = false;
+    as_alt_t alts[UAC2_MAX_ALTS];
+    int nalts = 0;
+    uint8_t term_id[UAC2_MAX_TERMS], term_clk[UAC2_MAX_TERMS];
+    int nterms = 0;
+    uint8_t first_clock = 0;
+
+    int cur_iface = -1, cur_alt = 0, cur_class = 0, cur_sub = 0;
+    as_alt_t cur = { 0 };
+    int as_iface = -1;
 
     s_as_iface = 0xFF;
+    s_ac_iface = 0;
+    s_clock_id = 0;
     s_nrates = 0;
 
-    while (i + 2 <= len)
+    for (int i = 0; i + 2 <= len; )
     {
         const int blen = cfg[i];
         const int btype = cfg[i + 1];
@@ -170,83 +195,113 @@ static bool parse_config(const uint8_t *cfg, int len)
         if (blen < 2 || i + blen > len)
             break;
 
-        if (btype == 0x04 && blen >= 9)              /* INTERFACE */
+        if (btype == 0x04 && blen >= 9)                 /* INTERFACE */
         {
             cur_iface = cfg[i + 2];
             cur_alt = cfg[i + 3];
+            cur_class = cfg[i + 5];
             cur_sub = cfg[i + 6];
+            memset(&cur, 0, sizeof(cur));
+            cur.alt = (uint8_t)cur_alt;
+
+            if (cur_class == USB_CLASS_AUDIO && cur_sub == AUDIO_SUBCLASS_AC)
+                s_ac_iface = (uint8_t)cur_iface;
         }
-        else if (btype == CS_INTERFACE && blen >= 3)
+        else if (btype == CS_INTERFACE && blen >= 3 && cur_class == USB_CLASS_AUDIO)
         {
             const int sub = cfg[i + 2];
 
-            if (sub == AC_CLOCK_SOURCE && blen >= 9 && !have_clk)
+            if (cur_sub == AUDIO_SUBCLASS_AC)
             {
-                /* bClockID, bmAttributes, bmControls, bAssocTerminal,
-                 * iClockSource. Any of the three clock types can set a rate, so
-                 * the id is taken without checking bmAttributes -- what matters
-                 * is that a Sample Rate control exists, and the SET_CUR below
-                 * will be refused by a device that has none, which is a truthful
-                 * failure rather than a silent one. */
-                s_clock_id = cfg[i + 3];
-                have_clk = true;
-                ESP_LOGI(TAG, "clock source id %u", s_clock_id);
-            }
-            else if (sub == AS_FORMAT_TYPE_I && blen >= 6)
-            {
-                /* Format Type I: bFormatType, bNrChannels, bSubframeSize,
-                 * bBitResolution, bSamFreqType, then either three-byte rates or
-                 * a lower/upper pair. Collected so the log can say what the
-                 * device supports, and so the rate can be checked rather than
-                 * assumed. */
-                const int nfreq = cfg[i + 7];
-                const int rate0 = i + 8;
-
-                if (nfreq > 0 && nfreq <= 8 && rate0 + nfreq * 3 <= i + blen)
+                if (sub == AC_CLOCK_SOURCE && blen >= 8 && !first_clock)
+                    first_clock = cfg[i + 3];
+                else if (sub == AC_INPUT_TERMINAL && blen >= 17 && nterms < UAC2_MAX_TERMS)
                 {
-                    for (int k = 0; k < nfreq && s_nrates < 8; k++)
-                    {
-                        const int o = rate0 + k * 3;
-                        s_rates[s_nrates++] = (uint32_t)cfg[o] |
-                                              ((uint32_t)cfg[o + 1] << 8) |
-                                              ((uint32_t)cfg[o + 2] << 16);
-                    }
+                    term_id[nterms] = cfg[i + 3];
+                    term_clk[nterms] = cfg[i + 7];
+                    nterms++;
+                }
+            }
+            else if (cur_sub == AUDIO_SUBCLASS_AS)
+            {
+                if (sub == AS_GENERAL && blen >= 16)
+                {
+                    cur.term = cfg[i + 3];
+                    cur.channels = cfg[i + 10];
+                }
+                else if (sub == AS_FORMAT_TYPE_I && blen >= 6)
+                {
+                    cur.subslot = cfg[i + 4];
+                    cur.bits = cfg[i + 5];
                 }
             }
         }
-        else if (btype == 0x05 && blen >= 7)          /* ENDPOINT */
+        else if (btype == 0x05 && blen >= 7)            /* ENDPOINT */
         {
             const int addr = cfg[i + 2];
-            const int attr = cfg[i + 3];
-            const int xfer = attr & 0x03;
+            const int xfer = cfg[i + 3] & 0x03;
 
             /* 1 = isochronous. OUT only: this is a playback driver. */
-            if (xfer == 1 && !(addr & 0x80) && cur_sub == AUDIO_SUBCLASS_AS)
+            if (xfer == 1 && !(addr & 0x80) && cur_class == USB_CLASS_AUDIO &&
+                cur_sub == AUDIO_SUBCLASS_AS && nalts < UAC2_MAX_ALTS)
             {
-                s_as_iface = (uint8_t)cur_iface;
-                s_as_alt = (uint8_t)cur_alt;
-                s_ep_addr = (uint8_t)addr;
-                s_ep_mps = (uint16_t)(cfg[i + 4] | (cfg[i + 5] << 8));
-                s_ep_interval = cfg[i + 6];
+                cur.ep = (uint8_t)addr;
+                cur.mps = (uint16_t)(cfg[i + 4] | (cfg[i + 5] << 8));
+                cur.interval = cfg[i + 6];
+                alts[nalts++] = cur;
+                as_iface = cur_iface;
             }
         }
 
         i += blen;
     }
 
-    if (s_as_iface == 0xFF)
+    if (nalts == 0)
     {
         ESP_LOGE(TAG, "no isochronous OUT endpoint found");
         return false;
     }
 
-    ESP_LOGI(TAG, "as iface %u alt %u ep 0x%02X mps %u interval %u, %d rate(s)",
-             s_as_iface, s_as_alt, s_ep_addr, s_ep_mps, s_ep_interval, s_nrates);
+    int pick = -1;
 
-    for (int k = 0; k < s_nrates; k++)
-        ESP_LOGI(TAG, "  rate %lu", (unsigned long)s_rates[k]);
+    for (int k = 0; k < nalts; k++)
+    {
+        ESP_LOGI(TAG, "iface %d alt %u: %u ch, %u-byte slots, %u bits, ep 0x%02X mps %u",
+                 as_iface, alts[k].alt, alts[k].channels, alts[k].subslot, alts[k].bits,
+                 alts[k].ep, alts[k].mps);
 
-    if (!have_clk)
+        if (pick < 0 && alts[k].channels == UAC2_CHANNELS &&
+            alts[k].subslot == UAC2_BYTES_PER_SAMPLE && alts[k].mps >= UAC2_FRAME_BYTES)
+            pick = k;
+    }
+
+    if (pick < 0)
+    {
+        ESP_LOGE(TAG, "no %d-channel %d-byte alternate: this driver sends only that",
+                 UAC2_CHANNELS, UAC2_BYTES_PER_SAMPLE);
+        return false;
+    }
+
+    s_as_iface = (uint8_t)as_iface;
+    s_as_alt = alts[pick].alt;
+    s_ep_addr = alts[pick].ep;
+    s_ep_mps = alts[pick].mps;
+    s_ep_interval = alts[pick].interval;
+
+    /* The clock that drives THIS stream: the alternate links to an input
+     * terminal, and the terminal names its clock. This DAC has two clock
+     * sources, so taking the first one found would be a coin toss. */
+    for (int t = 0; t < nterms; t++)
+        if (term_id[t] == alts[pick].term)
+            s_clock_id = term_clk[t];
+
+    if (!s_clock_id)
+        s_clock_id = first_clock;
+
+    ESP_LOGI(TAG, "chose alt %u (ep 0x%02X mps %u), terminal %u, clock %u, AC iface %u",
+             s_as_alt, s_ep_addr, s_ep_mps, alts[pick].term, s_clock_id, s_ac_iface);
+
+    if (!s_clock_id)
         ESP_LOGW(TAG, "no clock source descriptor; rate control will be skipped");
 
     return true;
@@ -254,6 +309,26 @@ static bool parse_config(const uint8_t *cfg, int len)
 
 /* ------------------------------------------------------------ control I/O */
 
+/* Completion of a control transfer, run from the client task's
+ * usb_host_client_handle_events(). */
+static void ctrl_cb(usb_transfer_t *t)
+{
+    (void)t;
+    xSemaphoreGive(s_ctrl_done);
+}
+
+/*
+ * SUBMIT, THEN WAIT FOR THE COMPLETION CALLBACK.
+ *
+ * usb_host_transfer_submit_control() does not block (IDF 5.3.1 usb_host.c:1446):
+ * it queues the URB and returns, and the transfer's callback runs later from the
+ * client's usb_host_client_handle_events() -- which calls it unconditionally
+ * (usb_host.c:798), so a NULL callback is a jump to address zero. The first
+ * version of this assumed a "synchronous client" made submit block; IDF's own
+ * header says is_synchronous must be false. So the callback signals a semaphore
+ * and this waits on it. Never call this from the client task itself: that task is
+ * the one that delivers the completion.
+ */
 static esp_err_t ctrl(uint8_t bmRequestType, uint8_t bRequest, uint16_t wValue,
                       uint16_t wIndex, uint8_t *data, uint16_t len)
 {
@@ -274,7 +349,7 @@ static esp_err_t ctrl(uint8_t bmRequestType, uint8_t bRequest, uint16_t wValue,
 
     t->device_handle = s_dev;
     t->bEndpointAddress = 0;
-    t->callback = NULL;             /* synchronous client: the submit call blocks */
+    t->callback = ctrl_cb;
     t->context = NULL;
     t->timeout_ms = 1000;
     t->num_bytes = total;
@@ -295,7 +370,18 @@ static esp_err_t ctrl(uint8_t bmRequestType, uint8_t bRequest, uint16_t wValue,
     if (data && len && !(bmRequestType & 0x80))
         memcpy(p + 8, data, len);
 
+    xSemaphoreTake(s_ctrl_done, 0);         /* clear any stale completion */
+
     err = usb_host_transfer_submit_control(s_client, t);
+
+    if (err == ESP_OK && xSemaphoreTake(s_ctrl_done, pdMS_TO_TICKS(1500)) != pdTRUE)
+    {
+        /* Still in flight: freeing it now would hand the stack a dangling URB,
+         * so it is leaked instead. A control transfer that never completes means
+         * the device or the client loop is gone, and is reported as such. */
+        ESP_LOGE(TAG, "ctrl %02X/%02X: no completion", bmRequestType, bRequest);
+        return ESP_ERR_TIMEOUT;
+    }
 
     if (err == ESP_OK && t->status != USB_TRANSFER_STATUS_COMPLETED)
     {
@@ -310,6 +396,15 @@ static esp_err_t ctrl(uint8_t bmRequestType, uint8_t bRequest, uint16_t wValue,
     return err;
 }
 
+/*
+ * ENTITY REQUESTS ADDRESS wIndex = (entity id << 8) | AudioControl interface
+ * (Audio 2.0 spec 5.2.2). The first version had the two bytes swapped -- entity
+ * in the low byte, zero in the high -- so it addressed interface <clock id> and
+ * entity 0, which is not the clock.
+ */
+#define UAC2_CLOCK_WINDEX   ((uint16_t)((s_clock_id << 8) | s_ac_iface))
+#define UAC2_SAM_FREQ_WVAL  ((uint16_t)((UAC2_CS_SAM_FREQ << 8) | UAC2_CN_NONE))
+
 /* The sample rate, as a 4-byte little-endian value in Hz, on the clock entity. */
 static esp_err_t set_rate(uint32_t rate)
 {
@@ -319,10 +414,48 @@ static esp_err_t set_rate(uint32_t rate)
     uint8_t v[4] = { (uint8_t)(rate), (uint8_t)(rate >> 8),
                      (uint8_t)(rate >> 16), (uint8_t)(rate >> 24) };
 
-    return ctrl(0x21, 0x01,                     /* class, interface, host->device, SET_CUR */
-                (UAC2_CS_SAM_FREQ << 8) | 0x00, /* CS = SAM_FREQ_CONTROL, CN = 0 */
-                (UAC2_CN_NONE << 8) | s_clock_id,
-                v, 4);
+    return ctrl(0x21, UAC2_REQ_CUR,             /* class, interface, host->device */
+                UAC2_SAM_FREQ_WVAL, UAC2_CLOCK_WINDEX, v, 4);
+}
+
+/*
+ * The rates the clock supports, from a RANGE request: wNumSubRanges (2 bytes)
+ * then 12 bytes per subrange, dMIN / dMAX / dRES, each 4 bytes little-endian.
+ * A discrete-rate clock reports each rate as a subrange with dMIN == dMAX, which
+ * is what s_rates records; a continuous subrange records its two ends.
+ */
+static esp_err_t get_rates(void)
+{
+    uint8_t r[2 + 12 * 8];
+
+    s_nrates = 0;
+    if (!s_clock_id)
+        return ESP_ERR_NOT_SUPPORTED;
+
+    memset(r, 0, sizeof(r));
+
+    const esp_err_t err = ctrl(0xA1, UAC2_REQ_RANGE,    /* class, interface, device->host */
+                               UAC2_SAM_FREQ_WVAL, UAC2_CLOCK_WINDEX, r, sizeof(r));
+    if (err != ESP_OK)
+        return err;
+
+    int n = r[0] | (r[1] << 8);
+
+    if (n > 8)
+        n = 8;
+
+    for (int k = 0; k < n && s_nrates < 8; k++)
+    {
+        const uint8_t *s = &r[2 + 12 * k];
+        const uint32_t lo = s[0] | (s[1] << 8) | (s[2] << 16) | ((uint32_t)s[3] << 24);
+        const uint32_t hi = s[4] | (s[5] << 8) | (s[6] << 16) | ((uint32_t)s[7] << 24);
+
+        s_rates[s_nrates++] = lo;
+        if (hi != lo && s_nrates < 8)
+            s_rates[s_nrates++] = hi;
+    }
+
+    return ESP_OK;
 }
 
 static esp_err_t set_alt(uint8_t iface, uint8_t alt)
@@ -388,24 +521,42 @@ static void xfer_done(usb_transfer_t *t)
         s_frames_sent += UAC2_PKTS_PER_XFER;
 }
 
-static void pump_task(void *arg)
+/*
+ * THE TWO EVENT LOOPS IDF REQUIRES, AND WHY NEITHER IS OPTIONAL.
+ *
+ * The host LIBRARY processes attach, enumeration and detach only inside
+ * usb_host_lib_handle_events(); with nobody calling it a device is never
+ * enumerated, and usb_host_device_addr_list_fill() stays empty. That is exactly
+ * what the first version showed on hardware: `uac2` reported dev=0 with the DAC
+ * plugged in, while `usbdiag` -- which does run this loop -- enumerated it.
+ *
+ * The CLIENT receives transfer completions only inside
+ * usb_host_client_handle_events() (usb_host.h: "the transfer's callback will be
+ * called from the client's usb_host_client_handle_events()"). So xfer_done(),
+ * which refills and resubmits every isochronous transfer, and ctrl_cb() both
+ * run on this task. The first version had an idle task here and assumed the
+ * controller drove the rotation by itself; it does not.
+ */
+static void lib_task(void *arg)
 {
     (void)arg;
 
-    /* The three transfers are submitted back to back; from then on the
-     * controller's completion callbacks drive the rotation and this task has
-     * nothing to do but wait. That is why it costs no CPU: the loop is the USB
-     * peripheral's, not FreeRTOS's. */
     for (;;)
     {
-        if (!s_streaming)
-        {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
+        uint32_t flags = 0;
 
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        usb_host_lib_handle_events(portMAX_DELAY, &flags);
+        if (flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS)
+            usb_host_device_free_all();
     }
+}
+
+static void client_task(void *arg)
+{
+    (void)arg;
+
+    for (;;)
+        usb_host_client_handle_events(s_client, portMAX_DELAY);
 }
 
 /* ------------------------------------------------------------------ public */
@@ -434,14 +585,24 @@ bool uac2_open(void)
         s_host_installed = true;
     }
 
+    if (!s_lib_task &&
+        xTaskCreate(lib_task, "uac2_lib", 4096, NULL, 4, &s_lib_task) != pdPASS)
+    {
+        ESP_LOGE(TAG, "no host library task");
+        return false;
+    }
+
+    if (!s_ctrl_done && !(s_ctrl_done = xSemaphoreCreateBinary()))
+        return false;
+
     if (!s_client)
     {
-        /* is_synchronous = true, AND STILL A CALLBACK: the library invokes
-         * async.client_event_callback unconditionally on any queued event even
-         * for synchronous clients, so leaving it NULL jumps to address zero the
-         * moment a device attaches. That cost four diagnostic runs. */
+        /* is_synchronous = false: IDF 5.3.1's header says "Set to false for now",
+         * and the async event callback is mandatory -- the library calls it on
+         * every queued event, so a NULL one jumps to address zero the moment a
+         * device attaches. That cost four diagnostic runs in usbdiag. */
         const usb_host_client_config_t cfg = {
-            .is_synchronous = true,
+            .is_synchronous = false,
             .max_num_event_msg = 4,
             .async = { .client_event_callback = on_client_event, .callback_arg = NULL },
         };
@@ -453,12 +614,27 @@ bool uac2_open(void)
         }
     }
 
-    /* Find the DAC among the attached devices. */
+    /* Higher than the library task: this one refills the isochronous stream. */
+    if (!s_task && xTaskCreate(client_task, "uac2", 4096, NULL, 5, &s_task) != pdPASS)
+    {
+        ESP_LOGE(TAG, "no client task");
+        return false;
+    }
+
+    /* Find the DAC among the attached devices. A host that has only just been
+     * installed has not enumerated anything yet, so look again for a while
+     * rather than once. */
     uint8_t list[8];
     int n = 0;
 
-    if (usb_host_device_addr_list_fill(8, list, &n) != ESP_OK)
-        return false;
+    for (int waited = 0; ; waited += 100)
+    {
+        if (usb_host_device_addr_list_fill(8, list, &n) != ESP_OK)
+            return false;
+        if (n > 0 || waited >= UAC2_ATTACH_WAIT_MS)
+            break;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
 
     for (int i = 0; i < n; i++)
     {
@@ -501,17 +677,19 @@ bool uac2_open(void)
         return false;
     }
 
-    s_ring = xRingbufferCreate(UAC2_RING_BYTES, RINGBUF_TYPE_BYTEBUF);
+    const esp_err_t rerr = get_rates();
+
+    ESP_LOGI(TAG, "clock %u RANGE -> %s, %d rate(s)", s_clock_id, esp_err_to_name(rerr),
+             s_nrates);
+    for (int k = 0; k < s_nrates; k++)
+        ESP_LOGI(TAG, "  rate %lu", (unsigned long)s_rates[k]);
+
+    if (!s_ring)
+        s_ring = xRingbufferCreate(UAC2_RING_BYTES, RINGBUF_TYPE_BYTEBUF);
 
     if (!s_ring)
     {
         ESP_LOGE(TAG, "no memory for the PCM ring");
-        return false;
-    }
-
-    if (xTaskCreate(pump_task, "uac2", 4096, NULL, 5, &s_task) != pdPASS)
-    {
-        ESP_LOGE(TAG, "no task");
         return false;
     }
 
