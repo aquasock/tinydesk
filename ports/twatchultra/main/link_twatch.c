@@ -26,6 +26,7 @@
 #include "sdpaths.h"
 #include "usbdiag.h"
 #include "bleuart.h"
+#include "uac2.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -563,6 +564,9 @@ bool link_init(void)
 
     if (tdsh_register_command(&s_vbus_cmd) != 0)
         ESP_LOGW(TAG, "vbus command did not register");
+
+    if (!uac2_register_command())
+        ESP_LOGW(TAG, "uac2 command did not register");
 
     if (!bleuart_register_command())
         ESP_LOGW(TAG, "bleuart command did not register");
