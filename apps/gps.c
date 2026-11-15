@@ -35,10 +35,11 @@
  * right of the figures rather than a different layout to maintain.
  */
 #define GPS_W 38
-#define GPS_H 12
+#define GPS_H 13
 
 static td_window_t *s_win;
 static td_widget_t *s_fix, *s_lat, *s_lon, *s_sats, *s_hdop, *s_alt, *s_utc, *s_rx;
+static td_widget_t *s_msg;
 static char s_reason[64];   /* why the receiver did not start, shown in place of
                              * the readings rather than in a message box: it is
                              * advice to keep on screen while the window is open */
@@ -163,6 +164,46 @@ static void update(void)
         td_widget_printf(s_utc, "UTC:       waiting");
 }
 
+/*
+ * The clock button.
+ *
+ * THE RESULT IS REPORTED AS A WORD, NOT AS A SILENT SUCCESS. A button that does
+ * nothing visible is indistinguishable from one whose press was missed -- and
+ * this is the one control here that changes something outside the window, so it
+ * has to say so. The failure case is the common one for the first half minute
+ * after opening: the receiver has no UTC yet and the press must say that rather
+ * than appear to have worked.
+ */
+static void on_set_clock(td_widget_t *w, void *user)
+{
+    (void)w;
+    (void)user;
+
+    const td_gps_ops_t *g = gps();
+
+    if (!g || !g->set_time)
+    {
+        td_widget_printf(s_msg, "This board cannot set the clock.");
+        return;
+    }
+
+    if (!g->set_time())
+    {
+        td_widget_printf(s_msg, "No time from the receiver yet.");
+        return;
+    }
+
+    td_gps_t s;
+
+    memset(&s, 0, sizeof(s));
+    if (g->status && g->status(&s) && s.time_valid)
+        td_widget_printf(s_msg, "Clock set to %02d:%02d:%02d UTC.", s.hour, s.minute, s.second);
+    else
+        td_widget_printf(s_msg, "Clock set.");
+
+    update();
+}
+
 static void on_tick(td_window_t *win)
 {
     (void)win;
@@ -181,6 +222,7 @@ static void on_close(td_window_t *win)
         gps()->stop();
 
     s_win = NULL;
+    s_msg = NULL;
     s_reason[0] = '\0';
 }
 
@@ -239,6 +281,14 @@ static void launch(void)
     s_alt = td_label(s_win, 1, 5, 0, "");
     s_utc = td_label(s_win, 1, 6, 0, "");
     s_rx = td_label(s_win, 1, 8, 0, "");
+
+    /* The message and the button sit on the client's LAST TWO ROWS, addressed
+     * negatively so they follow the window if it is resized -- the bug the
+     * Network app's list hit when it computed those rows from the height it was
+     * given at launch. */
+    s_msg = td_label(s_win, 1, -2, 0, "");
+    if (g->set_time)
+        td_button(s_win, 0, -1, "Set clock", on_set_clock, NULL);
 
     update();
 

@@ -343,6 +343,19 @@ typedef struct
      * the port parses on its own task and this copies the last result, so a
      * window may call it every tick without owning a UART or blocking. */
     bool (*status)(td_gps_t *out);
+
+        /* Set the watch's clock from the receiver's current UTC. False when the
+     * receiver has not reported a usable time yet, or when the port refused.
+     *
+     * THIS IS WHY THE BUTTON IS WORTH HAVING: on a board that writes the time
+     * through to its RTC, a clock set here survives a power cycle, so a watch
+     * held up outdoors gets an accurate clock with no network at all (GPS-005).
+     * A port that applies the time only to the running system may still return
+     * true; the RTC survival is a property of the port, not of this call.
+     *
+     * OPTIONAL: NULL on a board with no clock to set, and the app then shows no
+     * button rather than one that cannot work. */
+    bool (*set_time)(void);
 } td_gps_ops_t;
 
     /* ------------------------------------------------------------ Bluetooth */

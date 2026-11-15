@@ -865,10 +865,48 @@ static bool gps_app_status(td_gps_t *out)
     return true;
 }
 
+/*
+ * Set the watch's clock from the receiver, for the app's button.
+ *
+ * THE SAME TWO STEPS THE SHELL COMMAND TAKES, and that is the point: it goes
+ * through board_time_apply(), which is settimeofday followed by
+ * board_time_set_post(), and the second step writes the PCF85063A. A version that
+ * called settimeofday alone would leave the chip holding the old value and the
+ * next boot, which seeds FROM the chip, would undo the correction. GPS-005
+ * records that defect and this reuses the fixed path rather than repeating it.
+ *
+ * The parser is copied out under the lock before converting, because the pump
+ * task owns s_app_nmea and the conversion reads eight fields of it. Copying 200
+ * bytes inside a critical section is cheaper than the alternative of computing
+ * the epoch in the pump task on every 100 ms tick for a button pressed monthly.
+ */
+static bool gps_app_set_time(void)
+{
+    if (!s_app_open)
+        return false;
+
+    nmea_state_t copy;
+
+    taskENTER_CRITICAL(&s_app_lock);
+    copy = s_app_nmea;
+    taskEXIT_CRITICAL(&s_app_lock);
+
+    int64_t utc = 0;
+
+    /* nmea_utc() applies this project's plausibility floor (2020..2100), so a
+     * receiver that has decoded a date but not yet the year it believes cannot
+     * set the watch to 1970. */
+    if (!nmea_utc(&copy, &utc))
+        return false;
+
+    return board_time_apply(utc);
+}
+
 static const td_gps_ops_t s_gps_ops = {
     .start = gps_app_start,
     .stop = gps_app_stop,
     .status = gps_app_status,
+    .set_time = gps_app_set_time,
 };
 
 /* Installed into td_sysinfo_t by main.c through the weak board_gps_ops(). */
