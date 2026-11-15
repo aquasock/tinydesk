@@ -137,5 +137,35 @@ void gnuboy_set_palette(gb_palette_t pal);
 
 int gnuboy_load_sram(const char *file);
 int gnuboy_save_sram(const char *file, bool quick_save);
+
+/*
+ * Copy the battery-backed RAM -- and the MBC3 time block when the cartridge has
+ * one -- into `dst`, in exactly the byte order gnuboy_save_sram() writes to a
+ * file. Returns the number of bytes written, or 0 when the cartridge has no
+ * battery or `cap` is too small.
+ *
+ * This exists so a host can take the snapshot on its own thread of execution and
+ * do the file I/O somewhere else. That matters on hardware where a card write
+ * costs longer than a video frame: calling gnuboy_save_sram() directly from the
+ * emulation loop stalls the guest for the whole transfer, while a memcpy of the
+ * same bytes is two orders of magnitude cheaper. The format is not reimplemented
+ * here -- it is copied from gnuboy_save_sram(), which is why the two cannot
+ * drift.
+ *
+ * TAKING THE SNAPSHOT CLEARS THE DIRTY FLAG, because ownership of those bytes has
+ * moved to the caller. That has to happen here, at the moment of the copy and in
+ * the thread that owns the banks, rather than after the write completes: a write
+ * takes a tenth of a second on this board, and anything the guest stored during
+ * that window must set the flag again so the NEXT save picks it up. Clearing
+ * afterwards would silently drop whatever landed in between.
+ *
+ * If the write then fails, the caller must call gnuboy_sram_mark_dirty() so the
+ * save is retried instead of being forgotten.
+ */
+size_t gnuboy_sram_snapshot(byte *dst, size_t cap);
+
+/* Mark the cartridge's save RAM as unsaved, so the next save writes it. Used
+ * after a failed write, since gnuboy_sram_snapshot() cleared the flag. */
+void gnuboy_sram_mark_dirty(void);
 int gnuboy_load_state(const char *file);
 int gnuboy_save_state(const char *file);

@@ -536,6 +536,65 @@ bool gnuboy_sram_dirty(void)
 }
 
 
+/*
+ * THE SNAPSHOT IS BYTE-FOR-BYTE WHAT gnuboy_save_sram() WRITES, and that is the
+ * whole point of it living here rather than in the host. gnuboy_save_sram() puts
+ * bank i at offset i * 8192, so the banks are already contiguous and the copy is
+ * one memcpy; the RTC block follows at ramsize * 8192 and is built with the same
+ * field order as the writer builds it. A host that reimplemented this would be
+ * one field reordered away from writing files its own loader cannot read.
+ */
+size_t gnuboy_sram_snapshot(byte *dst, size_t cap)
+{
+	if (!dst || !cart.has_battery || !cart.ramsize)
+		return 0;
+
+	const size_t banks = (size_t)cart.ramsize * 8192;
+	const size_t need = banks + (cart.has_rtc ? 48 : 0);
+
+	if (cap < need)
+		return 0;
+
+	memcpy(dst, cart.rambanks, banks);
+
+	if (cart.has_rtc)
+	{
+		uint64_t rt = RTC_BASE + cart.rtc.s + (cart.rtc.m * 60) + (cart.rtc.h * 3600) + (cart.rtc.d * 86400);
+		uint32_t *rtp = (uint32_t*)&rt;
+		uint32_t rtc_buf[12] = {
+			cart.rtc.s,
+			cart.rtc.m,
+			cart.rtc.h,
+			cart.rtc.d,
+			cart.rtc.flags,
+			cart.rtc.regs[0],
+			cart.rtc.regs[1],
+			cart.rtc.regs[2],
+			cart.rtc.regs[3],
+			cart.rtc.regs[4],
+			rtp[0],
+			rtp[1],
+		};
+
+		memcpy(dst + banks, rtc_buf, 48);
+	}
+
+	/* Ownership moves to the caller. Done here, in the thread that owns the banks,
+	 * so a write that lands during the file transfer sets the flag again. */
+	cart.sram_dirty = 0;
+	cart.sram_saved = (1u << cart.ramsize) - 1;
+
+	return need;
+}
+
+
+void gnuboy_sram_mark_dirty(void)
+{
+	if (cart.has_battery && cart.ramsize)
+		cart.sram_dirty = (1u << cart.ramsize) - 1;
+}
+
+
 int gnuboy_load_sram(const char *file)
 {
 	if (!cart.has_battery || !cart.ramsize || !file || !*file)

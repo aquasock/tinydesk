@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "display.h"
 #include "edges.h"
@@ -33,6 +34,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "gamepad.h"
 #include "gamepad.h"
 #include "touch.h"
 #include "sdpaths.h"
@@ -297,6 +299,210 @@ static void gb_audio_cb(void *buffer, size_t length)
     sound_stream_write((const int16_t *)buffer, (int)length);
 }
 
+/* --- save RAM ------------------------------------------------------------- */
+
+/*
+ * BATTERY-BACKED CARTRIDGE RAM, AS A FILE ON THE CARD.
+ *
+ * The core has the whole thing already: `gnuboy_load_sram()` and
+ * `gnuboy_save_sram()` read and write the eight kilobyte banks the cartridge's
+ * mapper exposes, plus the MBC3 time registers when the cartridge has them. What
+ * it does not have is an opinion about where that file lives or when it is
+ * written, which is what this section supplies.
+ *
+ * THE ONE ORDERING TRAP, AND IT IS SILENT: `gnuboy_reset(true)` calls
+ * `gb_hw_reset(true)` with `hard` set, which does
+ * `memset(cart.rambanks, 0xff, cart.ramsize * 8192)` and zeroes `cart.rtc`. Load
+ * before the reset and every byte is overwritten a moment later -- the save is
+ * read from the card, reported as loaded, and gone, with the game starting from
+ * a blank cartridge. So the load is after `gnuboy_reset()`, and the comment is
+ * here because the call order in gb_start() looks arbitrary otherwise.
+ *
+ * THE SAVE NAME COMES FROM THE ROM'S OWN NAME, which means one file per
+ * cartridge with no bookkeeping and nothing to configure: `Zelda...gbc` writes
+ * `Zelda....sav` in the same directory the layout reserves for saves. Renaming a
+ * ROM abandons its save, which is the standard behaviour of every emulator that
+ * does this and the only alternative is a catalogue nobody maintains.
+ */
+#define GB_SAVE_DIR     "/sd/saves/gbc"
+#define GB_SAVE_NAME_MAX 120          /* basename, before the extension      */
+
+/*
+ * HOW OFTEN A DIRTY SAVE IS WRITTEN WITHOUT BEING ASKED.
+ *
+ * The cartridge's own save command decides when the game writes SRAM, and this
+ * port has no way to know whether the write is finished. Twenty seconds is long
+ * enough that a game's burst of writes has settled and short enough that a
+ * yanked battery costs one save rather than a session. The first dirty frame
+ * saves immediately -- `s_sram_due_us` starts at zero -- because the common case
+ * is a player who saves and then puts the watch down, and that is exactly the
+ * window a fixed timer would miss.
+ */
+#define GB_AUTOSAVE_US  20000000
+
+static char s_save_path[256];
+static bool s_saveable;               /* cartridge has battery-backed RAM    */
+static uint32_t s_sram_saves;         /* writes that succeeded               */
+static uint32_t s_sram_us;            /* cost of the last write              */
+static uint32_t s_sram_snap_us;       /* cost of the last snapshot           */
+static int64_t s_sram_due_us;
+
+/*
+ * THE WRITE DOES NOT HAPPEN ON THE FRAME PATH, AND THAT IS THE WHOLE DESIGN.
+ *
+ * A 32 KB save measured 121 ms on this board, eight times in a row, and the
+ * cause is not this code: `tdsh_sdcard.c` mounts the card over SPI at
+ * `SD_MAX_KHZ` 10 MHz rather than through SDMMC, which puts the achieved
+ * throughput near 270 KB/s. Against a 16.7 ms frame and a 93 ms audio ring, a
+ * write taken inline drops seven frames and underruns the speaker -- audible as
+ * a click every time a game saves.
+ *
+ * So the guest task only ever does the cheap half: `gnuboy_sram_snapshot()`
+ * copies the banks into one of two PSRAM buffers, which keeps the file format in
+ * the core where it already lived, and hands the slot to a task whose entire job
+ * is `fopen`/`fwrite`/`fclose`. Two slots so a second save can be snapshotted
+ * while the first is still on the wire; when both are busy the save is skipped
+ * and retried on the next due tick, because losing one autosave is free and
+ * stalling the guest is not.
+ *
+ * The old code called `gnuboy_save_sram()` directly from the guest task and
+ * worked, which is why the cost was invisible until it was measured.
+ */
+#define GB_SRAM_SNAP_N   2
+#define GB_SRAM_SNAP_MAX (16 * 8192 + 48)   /* largest cartridge + RTC block */
+#define GB_SRAM_LOG      8
+
+static uint8_t *s_snap[GB_SRAM_SNAP_N];
+static size_t s_snap_len[GB_SRAM_SNAP_N];
+static QueueHandle_t s_snap_free;
+static QueueHandle_t s_snap_ready;
+static TaskHandle_t s_sram_task;
+static volatile uint32_t s_sram_pending;
+
+/* The shell asks, the guest task snapshots, the writer task writes, the shell
+ * reads the answer. A save from the tdsh task while the guest runs would be a
+ * second reader of the very banks the guest is writing, so the request is a
+ * counter rather than an action. */
+static volatile int s_sram_req;
+static volatile int s_sram_rc;
+static uint32_t s_sram_log[GB_SRAM_LOG];
+static volatile int s_sram_log_n;
+
+static void sram_path_for(const char *rom_path)
+{
+    s_save_path[0] = 0;
+
+    if (!rom_path || !*rom_path)
+        return;
+
+    const char *base = strrchr(rom_path, '/');
+    base = base ? base + 1 : rom_path;
+
+    size_t n = strlen(base);
+    const char *dot = strrchr(base, '.');
+
+    if (dot && dot > base)
+        n = (size_t)(dot - base);
+
+    if (n > GB_SAVE_NAME_MAX)
+        n = GB_SAVE_NAME_MAX;
+
+    /* Created on demand, like sd_out() does for diagnostics: a save that fails
+     * because a directory was never made is a support call, not a policy. */
+    (void)mkdir(GB_SAVE_DIR, 0777);
+
+    snprintf(s_save_path, sizeof(s_save_path), "%s/%.*s.sav",
+             GB_SAVE_DIR, (int)n, base);
+}
+
+/*
+ * THE FILE HALF. One `fopen`, one `fwrite`, one `fclose`, on a snapshot the
+ * guest task already took. `wb` truncates, which is what makes the file exactly
+ * the snapshot's length every time rather than leaving a longer previous save's
+ * tail behind it -- the loader reads bank by bank from fixed offsets, and a
+ * stale RTC block past the end of a shortened save would be read back.
+ */
+static int sram_write(const char *path, const uint8_t *data, size_t len)
+{
+    FILE *f = fopen(path, "wb");
+
+    if (!f)
+        return -1;
+
+    const size_t put = fwrite(data, 1, len, f);
+    const int shut = fclose(f);
+
+    return (put == len && shut == 0) ? 0 : -1;
+}
+
+/*
+ * Snapshot into a free slot and hand it to the writer.
+ *
+ * Returns true when a write was queued, false when the slots were busy or the
+ * cartridge has no save RAM. Called ONLY from the guest task, between frames,
+ * which is what makes reading `cart.rambanks` here safe.
+ */
+static bool sram_snapshot_and_queue(void)
+{
+    if (!s_saveable)
+        return false;
+
+    int slot = -1;
+
+    if (xQueueReceive(s_snap_free, &slot, 0) != pdTRUE)
+        return false;                    /* both slots in flight               */
+
+    const int64_t t0 = esp_timer_get_time();
+
+    s_snap_len[slot] = gnuboy_sram_snapshot(s_snap[slot], GB_SRAM_SNAP_MAX);
+    s_sram_snap_us = (uint32_t)(esp_timer_get_time() - t0);
+
+    if (!s_snap_len[slot])
+    {
+        xQueueSend(s_snap_free, &slot, 0);
+        return false;
+    }
+
+    s_sram_pending++;
+    xQueueSend(s_snap_ready, &slot, 0);
+    return true;
+}
+
+/* --- the save writer, on core 1 alongside the blitter -------------------- */
+
+static void gb_sram_task(void *arg)
+{
+    (void)arg;
+
+    int slot;
+
+    while (s_run || uxQueueMessagesWaiting(s_snap_ready))
+    {
+        if (xQueueReceive(s_snap_ready, &slot, pdMS_TO_TICKS(50)) != pdTRUE)
+            continue;
+
+        const int64_t t0 = esp_timer_get_time();
+        const int rc = sram_write(s_save_path, s_snap[slot], s_snap_len[slot]);
+
+        s_sram_us = (uint32_t)(esp_timer_get_time() - t0);
+        s_sram_rc = rc ? -1 : 0;
+
+        if (rc == 0)
+            s_sram_saves++;
+        else
+            gnuboy_sram_mark_dirty();   /* the snapshot cleared it; retry later */
+
+        if (s_sram_log_n < GB_SRAM_LOG)
+            s_sram_log[s_sram_log_n++] = s_sram_us;
+
+        xQueueSend(s_snap_free, &slot, 0);
+        s_sram_pending--;
+    }
+
+    s_sram_task = NULL;
+    vTaskDelete(NULL);
+}
+
 /* --- the guest task, on core 0 ------------------------------------------- */
 
 static void gb_task(void *arg)
@@ -335,6 +541,38 @@ static void gb_task(void *arg)
 
         s_frames++;
 
+        /*
+         * SAVE RAM: SNAPSHOT HERE, WRITE ELSEWHERE.
+         *
+         * This task is the only reader of `cart.rambanks`, so a snapshot taken
+         * here between two frames cannot tear: the guest is not executing when
+         * this line runs. That is why the shell's request is a counter. What
+         * lands in this frame's budget is a memcpy of at most 128 KB, not the
+         * 121 ms write.
+         */
+        {
+            const int64_t sram_now = esp_timer_get_time();
+
+            if (s_saveable &&
+                (s_sram_req > 0 ||
+                 (sram_now >= s_sram_due_us && gnuboy_sram_dirty())))
+            {
+                const bool queued = sram_snapshot_and_queue();
+
+                s_sram_due_us = sram_now + GB_AUTOSAVE_US;
+
+                if (s_sram_req > 0)
+                {
+                    s_sram_req--;
+
+                    /* A forced save that could not be queued must not leave
+                     * the shell waiting for an answer nobody will send. */
+                    if (!queued)
+                        s_sram_rc = -1;
+                }
+            }
+        }
+
         next += GB_FRAME_US;
         const int64_t now = esp_timer_get_time();
 
@@ -351,36 +589,176 @@ static void gb_task(void *arg)
 /* --- input --------------------------------------------------------------- */
 
 /*
- * The drawn and drawn-adjacent controls, as a Game Boy pad.
+ * THE POKEMON MINI'S FURNITURE, SIZED FOR A TIGHTER BAND.
  *
- * gnuboy's gb_padbtn_t is active-HIGH bit flags, unlike the console's own
- * active-low register, so this builds the mask gnuboy expects rather than the
- * one the hardware reads.
+ * The operator asked for this port to carry the same drawn d-pad and two circles
+ * the Pokemon Mini and NES have, rather than the margin columns it shipped with.
+ * The shapes, the 45-degree rotation, the disc-shaped four-quadrant hit test and
+ * the 1.5x touch discs all come from `gamepad.c`, which is where that furniture
+ * has lived since it was factored out of `pm.c` -- so this is a layout, not a
+ * second rasteriser.
  *
- * A and B have no drawn circles on this port -- the Game Boy's two face buttons
- * are where the NES's were, on the bottom strip -- because a 320-wide picture
- * leaves no room below it for a control cluster the way the NES's 256-wide
- * picture does. The margins are the whole controller, which is what the Pokemon
- * Mini did before its d-pad was drawn.
+ * THE SIZES COULD NOT BE COPIED, AND THE REASON IS ARITHMETIC. `gamepad.c`
+ * paints a cross whose arms are a third of the frame, rotated 45 degrees, so a
+ * frame of S paints a bounding span of about S * 0.471 both ways rather than S.
+ * The NES has 217 glass rows below its 240-row picture and fits a 168 px frame
+ * (163 painted) and two 84 px circles with a 32 px gap (200) with room to spare.
+ * This port's picture is 288 rows tall, twice the NES's 2x scale of a 144-line
+ * screen, so the band below it is 169 rows -- smaller than the NES cluster itself.
+ *
+ * So the frame is 148 instead of 168, which paints about 142 rows and leaves 13
+ * clear above and below, and the circles are 74 instead of 84 with the gap cut
+ * from 32 to 12, which is 160 of the 169 available. Every one of those numbers is
+ * the largest value that leaves the cluster clear of the picture above it and the
+ * glass below, and the alternatives were measured rather than guessed: at the
+ * NES's 168 the frame touches the picture, and at two 84 px circles the pair
+ * needs 200 rows in a 169-row band and does not fit at all.
+ *
+ * THE HORIZONTAL POSITIONS ARE THE NES'S OWN, unchanged, and that is deliberate:
+ * the d-pad's left tip lands on the left column's axis and A and B sit in the
+ * same columns on all three emulators, so a thumb that has learned one has
+ * learned the others. `GB_DPAD_TIP_INSET` is not a constant in that sense -- it
+ * is 8 at a 168 px frame and 7 at 148, because it is where the rasterised tip
+ * actually falls, and it moves with the frame size. It is written as a literal
+ * with this note rather than derived, because deriving it would need the
+ * rasteriser's own geometry and would still be an approximation.
  */
-static int pad_of_region(edge_region_t region, int index)
+#define GB_GLASS_BOT    (DISPLAY_PANEL_H - DISPLAY_ORIGIN_Y)              /* 457 */
+#define GB_CTL_Y        (GB_HEIGHT * GB_SCALE)                            /* 288 */
+#define GB_CTL_BAND     (GB_GLASS_BOT - GB_CTL_Y)                         /* 169 */
+
+#define GB_DPAD_S       148
+#define GB_DPAD_TIP_INSET  7
+#define GB_COL_EDGE     (LEFT_X1 - PANEL_COL_OFFSET - DISPLAY_ORIGIN_X)   /* -1 */
+#define GB_DPAD_X       (GB_COL_EDGE - GB_DPAD_TIP_INSET)                 /* -8 */
+#define GB_DPAD_Y       (GB_CTL_Y + (GB_CTL_BAND - GB_DPAD_S) / 2)        /* 298 */
+
+#define GB_BTN_D        74
+#define GB_BTN_GAP      12
+#define GB_BTN_HIT_D    (GB_BTN_D * 3 / 2)                               /* 111 */
+
+/* The NES's own columns: A one cell right of the base, B one cell left. */
+#define GB_BTN_A_X      236
+#define GB_BTN_B_X      208
+#define GB_BTN_Y        (GB_CTL_Y + (GB_CTL_BAND - (2 * GB_BTN_D + GB_BTN_GAP)) / 2)
+#define GB_BTN_A_Y      GB_BTN_Y                                         /* 292 */
+#define GB_BTN_B_Y      (GB_BTN_Y + GB_BTN_D + GB_BTN_GAP)               /* 378 */
+
+/* Three column slots, as the NES has: Start and Select plus a blank. Fewer slots
+ * than the five this port shipped with, because the d-pad and circles now carry
+ * the directions and the face buttons and the column does not need to. */
+#define GB_COL_SLOTS    3
+#define GB_COL_BOT      (COL_Y0 + (GB_COL_SLOTS * (COL_Y1 - COL_Y0 + 1)) / COL_N - 1)
+
+static const gamepad_t s_gp = {
+    .cx = GB_DPAD_X + GB_DPAD_S / 2,
+    .cy = GB_DPAD_Y + GB_DPAD_S / 2,
+    .size = GB_DPAD_S,
+    /* 45 degrees, the Pokemon Mini's rotation. cos(45) in 16.16 fixed point. */
+    .rot_k = 46341,
+    .line = 2,
+    .tip_r = 5,
+
+    .pad_cx = { GB_BTN_A_X + GB_BTN_D / 2, GB_BTN_B_X + GB_BTN_D / 2 },
+    .pad_cy = { GB_BTN_A_Y + GB_BTN_D / 2, GB_BTN_B_Y + GB_BTN_D / 2 },
+    .pad_d = { GB_BTN_D, GB_BTN_D },
+    .pad_hit_d = { GB_BTN_HIT_D, GB_BTN_HIT_D },
+    .pad_label = { 'A', 'B' },
+
+    .bg = 0x0000,
+    .grid = 0,
+};
+
+static int gb_controls_hit(int panel_x, int panel_y)
 {
-    if (region == EDGE_BOTTOM)
+    return gamepad_hit(&s_gp, panel_x - DISPLAY_ORIGIN_X, panel_y - DISPLAY_ORIGIN_Y);
+}
+
+/*
+ * PAINTED IN TWO BANDS, for the reason `nes_draw_controls()` documents: the side
+ * columns occupy the glass outside the framebuffer, so a glass-wide rectangle at
+ * their height would cut the third button in half. Rows down to the last drawn
+ * column slot are framebuffer-wide; below that the whole glass is free.
+ *
+ * Here the split barely matters -- the columns end at fb 293 and the lowest thing
+ * this cluster paints starts at 301 -- but painting one band instead of two would
+ * still be wrong the first time a control moved up, and the split costs nothing.
+ */
+static bool gb_draw_controls(void)
+{
+    if (!display_pixels_claimed())
+        return false;
+
+    uint16_t fill, edge, ink;
+    display_margin_colours(&fill, &edge, &ink);
+
+    const uint16_t face = display_swap16(fill);
+    const uint16_t e = display_swap16(edge);
+    const uint16_t i = display_swap16(ink);
+
+    gamepad_t g = s_gp;
+    g.bg = 0x0000;
+    g.grid_line = 0;
+
+    bool ok = true;
+
+    ok = gamepad_paint(&g, 0, GB_CTL_Y, DISPLAY_W,
+                       GB_COL_BOT - GB_CTL_Y + 1, face, e, i) && ok;
+
+    ok = gamepad_paint(&g, -DISPLAY_ORIGIN_X, GB_COL_BOT + 1, DISPLAY_PANEL_W,
+                       GB_GLASS_BOT - (GB_COL_BOT + 1), face, e, i) && ok;
+
+    return ok;
+}
+
+/*
+ * THE DRAWN CONTROLS AND THE MARGINS AS ONE GAME BOY PAD.
+ *
+ * gnuboy's `gb_padbtn_t` is active-HIGH bit flags, unlike the console's own
+ * active-low register, so this builds the mask gnuboy expects rather than the one
+ * the hardware reads.
+ *
+ * THE DRAWN CONTROLS WIN WHEN BOTH MATCH, per point rather than per frame. B's
+ * 111 px touch disc reaches 9 px into the right column and the bottom strip's
+ * touch area starts at fb 375, so one touch can be both a circle and a margin
+ * slot; emitting both would fire B and Select from one press. The circle is what
+ * the operator aimed at and what is visible under the thumb.
+ *
+ * WHAT IS LEFT ON THE MARGINS IS WHAT HAS NO DRAWN EQUIVALENT: Start and Select
+ * on the right column, the first two slots. The rest of the column and the whole
+ * bottom strip are blanked and their chrome off, because blank glass that fires a
+ * button is the fault the operator reported on this project twice already.
+ */
+static int pad_from_frame(const touch_frame_t *f)
+{
+    int pad = 0;
+
+    if (!f)
+        return 0;
+
+    for (int i = 0; i < f->n && i < TOUCH_POINTS; i++)
     {
-        if (index == 0) return GB_PAD_B;
-        if (index == 1) return GB_PAD_A;
-        if (index == 2) return GB_PAD_START;
-    }
-    else if (region == EDGE_RIGHT)
-    {
-        if (index == 0) return GB_PAD_UP;
-        if (index == 1) return GB_PAD_DOWN;
-        if (index == 2) return GB_PAD_LEFT;
-        if (index == 3) return GB_PAD_RIGHT;
-        if (index == 4) return GB_PAD_SELECT;
+        const int ctl = gb_controls_hit(f->p[i].x, f->p[i].y);
+
+        switch (ctl)
+        {
+        case GP_A:     pad |= GB_PAD_A;      break;
+        case GP_B:     pad |= GB_PAD_B;      break;
+        case GP_UP:    pad |= GB_PAD_UP;     break;
+        case GP_DOWN:  pad |= GB_PAD_DOWN;   break;
+        case GP_LEFT:  pad |= GB_PAD_LEFT;   break;
+        case GP_RIGHT: pad |= GB_PAD_RIGHT;  break;
+        default:                             break;
+        }
+
+        if (ctl == GP_NONE && f->p[i].region == EDGE_RIGHT)
+        {
+            if (f->p[i].index == 0) pad |= GB_PAD_START;
+            if (f->p[i].index == 1) pad |= GB_PAD_SELECT;
+        }
     }
 
-    return 0;
+    return pad;
 }
 
 static bool gb_app_touch(void *user, const touch_frame_t *f)
@@ -390,29 +768,24 @@ static bool gb_app_touch(void *user, const touch_frame_t *f)
     if (!s_run)
         return false;
 
-    int pad = 0;
     bool used = false;
 
     if (f)
     {
+        /* The predicate that answers for the pad state also answers for the
+         * feedback, so a control cannot respond without also being felt. */
         for (int i = 0; i < f->n && i < TOUCH_POINTS; i++)
         {
-            const int bit = pad_of_region(f->p[i].region, f->p[i].index);
+            if (gb_controls_hit(f->p[i].x, f->p[i].y) != GP_NONE)
+                used = true;
 
-            if (!bit)
-                continue;
-
-            const int col = f->p[i].region == EDGE_RIGHT ? 1 : 2;
-
-            if (!display_margin_slot_live(col, f->p[i].index))
-                continue;
-
-            pad |= bit;
-            used = true;
+            if (f->p[i].region == EDGE_RIGHT && f->p[i].index < 2 &&
+                display_margin_slot_live(1, f->p[i].index))
+                used = true;
         }
     }
 
-    s_pad = pad;
+    s_pad = pad_from_frame(f);
     return used;
 }
 
@@ -515,6 +888,51 @@ bool gb_start(const char *rom_path)
     gnuboy_reset(true);
 
     /*
+     * LOAD THE SAVE AFTER THE RESET, NEVER BEFORE. `gnuboy_reset(true)` fills
+     * `cart.rambanks` with 0xFF and zeroes `cart.rtc`, so a load placed before it
+     * is silently erased. `gnuboy_load_sram()`'s return value is also how this
+     * port learns whether the cartridge has a battery at all, because the core
+     * has no getter for it: -1 is "no battery or no RAM", -2 is "saveable but no
+     * file yet", 0 is "loaded".
+     */
+    sram_path_for(path);
+    s_sram_saves = 0;
+    s_sram_us = 0;
+    s_sram_due_us = 0;
+    s_sram_req = 0;
+    s_sram_rc = 0;
+    s_sram_pending = 0;
+    s_sram_saves = 0;
+    s_sram_us = 0;
+    s_sram_snap_us = 0;
+    s_sram_log_n = 0;
+
+    for (int i = 0; i < GB_SRAM_SNAP_N; i++)
+    {
+        if (!s_snap[i])
+            s_snap[i] = (uint8_t *)heap_caps_malloc(GB_SRAM_SNAP_MAX, MALLOC_CAP_SPIRAM);
+
+        if (!s_snap[i])
+        {
+            printf("gb: no PSRAM for the save snapshot\n");
+            s_saveable = false;      /* run without saving rather than not run */
+        }
+    }
+
+    {
+        const int rc = gnuboy_load_sram(s_save_path);
+
+        s_saveable = (rc != -1);
+
+        if (rc == 0)
+            printf("gb: save restored from %s\n", s_save_path);
+        else if (rc == -2)
+            printf("gb: no save yet at %s\n", s_save_path);
+        else
+            printf("gb: cartridge has no save RAM\n");
+    }
+
+    /*
      * BEST-EFFORT, like the other two ports: no amplifier is a quiet Game Boy,
      * not a failed start. The callback drops its samples when this is false, so
      * the only cost of a missing amp is that nothing is written.
@@ -528,44 +946,64 @@ bool gb_start(const char *rom_path)
     display_fill(0x0000);
 
     /*
-     * ALL FIVE COLUMN SLOTS, unlike the NES and the Pokemon Mini.
+     * THREE COLUMN SLOTS, AND THE CONTROLS ARE DRAWN ON THE GLASS.
      *
-     * Those two draw a d-pad and circles on the framebuffer and give the columns
-     * only three slots so the region below belongs to the drawn controls. This
-     * port draws nothing -- the picture is 320 wide and fills the glass edge to
-     * edge, leaving no framebuffer rows for a control cluster of the kind the
-     * NES's 256-wide picture leaves 176 of. So the margins are the WHOLE
-     * controller and every slot is used: the right column is the d-pad plus
-     * Select, and the bottom strip is B, A and Start.
+     * The first version of this port used all five column slots for the d-pad and
+     * the bottom strip for B, A and Start, on the reasoning that a 320-wide
+     * picture leaves no room below it for a control cluster. That reasoning was
+     * wrong: the picture is 288 rows tall in a 457-row glass, so there are 169
+     * rows below it, which is enough for the same furniture the other two
+     * emulators carry once it is sized for the band rather than copied from it.
      *
-     * The first version asked for three slots out of habit, which would have made
-     * Right and Select unreachable -- the slots existed in the mapping and had no
-     * glass to be touched on.
+     * So the right column now carries only what has no drawn equivalent, Start and
+     * Select, and every slot below them is blanked with its chrome off. A blank is
+     * a single space rather than NULL, because NULL falls back to the shared table
+     * and a cleared label has to render as nothing.
      */
-    display_margin_column_slots(COL_N);
+    display_margin_column_slots(GB_COL_SLOTS);
 
     display_margin_label(0, 0, "Pause");
     display_margin_label(0, 1, "Reset");
     display_margin_label(0, 2, "Save");
-    display_margin_label(0, 3, " ");
-    display_margin_label(0, 4, " ");
 
-    display_margin_label(1, 0, "Up");
-    display_margin_label(1, 1, "Down");
-    display_margin_label(1, 2, "Left");
-    display_margin_label(1, 3, "Right");
-    display_margin_label(1, 4, "Select");
+    for (int s = 3; s < COL_N; s++)
+    {
+        display_margin_chrome(0, s, false);
+        display_margin_label(0, s, " ");
+    }
 
-    display_margin_btn_label(0, "B");
-    display_margin_btn_label(1, "A");
-    display_margin_btn_label(2, "Start");
+    display_margin_label(1, 0, "Start");
+    display_margin_label(1, 1, "Select");
+
+    /* The column slots past the drawn ones, and the whole bottom strip: blank and
+     * not live, so blank glass cannot fire a button. The strip's touch area is
+     * double height when an app owns the glass, so it reaches fb 375 and overlaps
+     * B's own disc -- harmless only because the drawn control is tested first. */
+    for (int s = 2; s < COL_N; s++)
+    {
+        display_margin_chrome(1, s, false);
+        display_margin_label(1, s, " ");
+    }
+
+    for (int i = 0; i < BTN_N; i++)
+    {
+        display_margin_chrome(2, i, false);
+        display_margin_btn_label(i, " ");
+    }
 
     display_margins_set(DISPLAY_MARGINS_APP);
 
+    /* After the margins, so the cluster lands on glass whose furniture is already
+     * decided rather than under a repaint of it. */
+    if (!gb_draw_controls())
+        ESP_LOGW(TAG, "controls not drawn -- push refused?");
+
     s_free_q = xQueueCreate(GB_VBUF_N, sizeof(int));
     s_filled_q = xQueueCreate(GB_VBUF_N, sizeof(int));
+    s_snap_free = xQueueCreate(GB_SRAM_SNAP_N, sizeof(int));
+    s_snap_ready = xQueueCreate(GB_SRAM_SNAP_N, sizeof(int));
 
-    if (!s_free_q || !s_filled_q)
+    if (!s_free_q || !s_filled_q || !s_snap_free || !s_snap_ready)
     {
         printf("gb: no queues\n");
         goto fail_gb;
@@ -575,6 +1013,12 @@ bool gb_start(const char *rom_path)
     {
         int slot = i;
         xQueueSend(s_free_q, &slot, 0);
+    }
+
+    for (int i = 0; i < GB_SRAM_SNAP_N; i++)
+    {
+        int slot = i;
+        xQueueSend(s_snap_free, &slot, 0);
     }
 
     /*
@@ -619,6 +1063,19 @@ bool gb_start(const char *rom_path)
         printf("gb: no guest task\n");
         s_run = false;
         goto fail_gb;
+    }
+
+    /* ABOVE THE BLITTER, ON CORE 1. Measured both ways: at a lower priority the
+     * writer shares the core with the blitter and the same 32 KB takes 243 ms
+     * instead of 121, so the picture freezes twice as long for no gain. Above it,
+     * the write finishes in about 121 ms and the blitter is the one that waits --
+     * which costs painted frames, not emulated ones, because the guest keeps
+     * running and simply renders nothing while both buffers are held. */
+    if (xTaskCreatePinnedToCore(gb_sram_task, "gbsram", 4096, NULL, 6,
+                                &s_sram_task, 1) != pdPASS)
+    {
+        printf("gb: no save task -- running without autosave\n");
+        s_saveable = false;
     }
 
     printf("gb: running %s (%u bytes)\n", path, (unsigned)s_rom_len);
@@ -674,6 +1131,41 @@ void gb_stop(void)
     s_blit_task = NULL;
     s_task = NULL;
 
+    /*
+     * THE WRITER IS WAITED FOR, AND THEN ASKED FOR ONE LAST SAVE.
+     *
+     * An autosave may be on the wire when the guest stops, so the task is given
+     * time to drain rather than having its queues deleted underneath it. Once it
+     * has exited, the guest is gone and `cart.rambanks` is stable, so the final
+     * snapshot can be taken and written right here -- a 121 ms write at shutdown
+     * costs nothing, which is exactly the moment to pay it.
+     */
+    for (int i = 0; i < 200 && (s_sram_task || s_sram_pending); i++)
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+    s_sram_task = NULL;
+
+    if (s_saveable && gnuboy_sram_dirty())
+    {
+        const size_t len = gnuboy_sram_snapshot(s_snap[0], GB_SRAM_SNAP_MAX);
+
+        if (len && sram_write(s_save_path, s_snap[0], len) == 0)
+            printf("gb: saved %s\n", s_save_path);
+        else
+            printf("gb: could not write %s\n", s_save_path);
+    }
+
+    if (s_snap_free)
+    {
+        vQueueDelete(s_snap_free);
+        s_snap_free = NULL;
+    }
+    if (s_snap_ready)
+    {
+        vQueueDelete(s_snap_ready);
+        s_snap_ready = NULL;
+    }
+
     if (s_free_q)
     {
         vQueueDelete(s_free_q);
@@ -702,15 +1194,23 @@ void gb_stop(void)
     s_render_target = NULL;
 
     /* Clear the overrides before handing the glass back: an app's labels survive
-     * its exit otherwise, which is the fault entry 73 recorded. */
+     * its exit otherwise, which is the fault entry 73 recorded. The chrome is
+     * restored too, and that is not cosmetic: `s_nochrome` is state inside the
+     * display driver that both the app and desktop paint paths read, so a slot
+     * left bare by this app would come back as a desktop button with no box. */
     for (int i = 0; i < COL_N; i++)
     {
+        display_margin_chrome(0, i, true);
+        display_margin_chrome(1, i, true);
         display_margin_label(0, i, NULL);
         display_margin_label(1, i, NULL);
     }
 
     for (int i = 0; i < BTN_N; i++)
+    {
+        display_margin_chrome(2, i, true);
         display_margin_btn_label(i, NULL);
+    }
 
     display_margin_column_slots(COL_N);
     display_margins_set(DISPLAY_MARGINS_DESKTOP);
@@ -756,6 +1256,19 @@ static int cmd_gb(tdsh_session_t *session, int argc, char **argv)
 
         printf("\n");
 
+        /* Numbers first, and in milliseconds, because the path is long enough to
+         * wrap at 40 columns and microseconds made this line long enough to
+         * straddle a break -- a value split across two lines is unreadable to an
+         * operator and invisible to a grep. Milliseconds are also the unit these
+         * two numbers are interesting in. */
+        if (s_saveable)
+            printf("sram saves=%lu write=%lums snap=%lums\n",
+                   (unsigned long)s_sram_saves,
+                   (unsigned long)(s_sram_us / 1000),
+                   (unsigned long)(s_sram_snap_us / 1000));
+        else
+            printf("sram none\n");
+
         if (gb_running())
             printf("emu=%luus blit=%luus pad=%02x\n",
                    (unsigned long)s_emu_us, (unsigned long)s_blit_us,
@@ -764,13 +1277,79 @@ static int cmd_gb(tdsh_session_t *session, int argc, char **argv)
         return 0;
     }
 
-    printf("gb [start [rom] | stop | status]\n");
+    if (strcmp(sub, "rsave") == 0)
+    {
+        /* Repeat writes, for measuring what one costs. Each pass rewrites the
+         * whole file, so the reported microseconds are a distribution rather
+         * than one first-write artefact. The writes are queued to the guest
+         * task, one per frame, because doing them here would be a second writer
+         * on the banks the guest is still writing. */
+        if (!gb_running() || !s_saveable)
+        {
+            printf("gb: nothing to measure\n");
+            return 1;
+        }
+
+        s_sram_log_n = 0;
+        s_sram_req = GB_SRAM_LOG;
+
+        for (int i = 0; i < 500 && (s_sram_req > 0 || s_sram_pending); i++)
+            vTaskDelay(pdMS_TO_TICKS(10));
+
+        for (int i = 0; i < s_sram_log_n; i++)
+            printf("rsave %d: %luus\n", i, (unsigned long)s_sram_log[i]);
+
+        return 0;
+    }
+
+    if (strcmp(sub, "save") == 0)
+    {
+        if (!gb_running())
+        {
+            printf("gb: not running\n");
+            return 1;
+        }
+
+        if (!s_saveable)
+        {
+            printf("gb: this cartridge has no save RAM\n");
+            return 1;
+        }
+
+        /* Queued, then waited for: the guest task snapshots and the writer task
+         * writes, so this can neither do the work itself nor honestly claim it is
+         * done before both have finished. */
+        s_sram_rc = -2;                  /* not attempted yet                */
+        s_sram_log_n = 0;
+        s_sram_req = 1;
+
+        for (int i = 0; i < 600 && (s_sram_req > 0 || s_sram_pending); i++)
+            vTaskDelay(pdMS_TO_TICKS(10));
+
+        if (s_sram_req > 0 || s_sram_pending)
+        {
+            printf("gb: save still queued, the guest is not reaching its loop\n");
+            return 1;
+        }
+
+        if (s_sram_rc == 0)
+        {
+            printf("gb: saved %s (%luus write, %luus snapshot)\n", s_save_path,
+                   (unsigned long)s_sram_us, (unsigned long)s_sram_snap_us);
+            return 0;
+        }
+
+        printf("gb: save FAILED writing %s\n", s_save_path);
+        return 1;
+    }
+
+    printf("gb [start [rom] | stop | save | rsave | status]\n");
     return 1;
 }
 
 static const tdsh_command_t s_gb_cmd = {
     "gb",
-    "gb [start [rom] | stop | status]",
+    "gb [start [rom] | stop | save | status]",
     "Game Boy / Game Boy Color emulator",
     cmd_gb,
     TDSH_CMD_INTERACTIVE,
