@@ -31,6 +31,7 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 #include "tdsh_board.h"
 #include "tinydesk/td_sysinfo.h"
@@ -76,7 +77,31 @@ bool usbhost_install(void)
         ESP_LOGE(TAG, "usb_host_install: %s", esp_err_to_name(err));
         return false;
     }
-    if (xTaskCreate(lib_task, "usb_lib", 4096, NULL, 4, NULL) != pdPASS)
+    /*
+     * THE LIBRARY TASK'S STACK COMES FROM PSRAM, AND THAT IS THE FIX FOR THE
+     * INTERNAL-RAM WALL THIS PORT KEPT HITTING.
+     *
+     * In OTG mode the internal DMA-capable pool is the bottleneck, not a
+     * shortage of total RAM: measured on hardware it read dma free=6359 /
+     * largest=4096 at boot, and the USB audio claim -- which needs two
+     * 512-byte, 512-ALIGNED descriptor lists -- then asserted inside
+     * transfer_descriptor_list_alloc (hcd_dwc.c:1059) because no such hole was
+     * left (core-log entries 21 and 22). Three 4 KB internal task stacks are
+     * 12 KB of that pool, and NONE of them touches flash: usb_lib only services
+     * the host library's event queue. CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY
+     * is already enabled for this board, so moving them to PSRAM returns 12 KB
+     * to the pool that the claim, enumeration and the stream's transfers all
+     * share, with no reserve, no hold and no special ordering.
+     *
+     * SAFE AGAINST FLASH OPERATIONS: a PSRAM stack may not be RUNNING while the
+     * flash cache is disabled. OTA runs on the shell's task (an internal stack),
+     * and while it disables the cache IDF parks the other core at a safe point
+     * and disables interrupts, so a task with a PSRAM stack is never executing
+     * in that window. The rule this code must keep: no task created this way may
+     * itself call a flash or OTA API.
+     */
+    if (xTaskCreateWithCaps(lib_task, "usb_lib", 4096, NULL, 4, NULL,
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS)
     {
         ESP_LOGE(TAG, "no library task");
         return false;
@@ -144,6 +169,25 @@ void board_shell_task_prepare(void)
     heap_caps_free(s_shell_hold);
     s_shell_hold = NULL;
     heap_note("hole-free");
+}
+
+/*
+ * THE OTHER HALF, AND THE ONE THE USB AUDIO WORKER GATES ON. Releasing the hold
+ * is not the same event as the task existing: between the two, xTaskCreate takes
+ * the stack from the hole, and a DAC open running in that gap races the shell for
+ * it. So the worker waits for THIS, set after xTaskCreate returned, not for the
+ * release above. The weak default in tdsh_bridge_esp.c does nothing.
+ */
+static volatile bool s_shell_ready;
+
+void board_shell_task_ready(void)
+{
+    s_shell_ready = true;
+}
+
+bool usbhost_shell_ready(void)
+{
+    return s_shell_ready;
 }
 
 void usbhost_boot(void)

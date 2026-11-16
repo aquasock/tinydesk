@@ -171,6 +171,14 @@ __attribute__((weak)) void board_shell_task_prepare(void)
 {
 }
 
+/* Called after the shell's task exists, which is NOT the same moment as the
+ * release above: between them xTaskCreate takes the stack. A board that opens a
+ * USB device at boot waits for this one (usbhost.c), so the open cannot race
+ * the shell for the freed block. The default does nothing. */
+__attribute__((weak)) void board_shell_task_ready(void)
+{
+}
+
 static int backend_start(void *ctx, int cols, int rows)
 {
     (void)ctx;
@@ -193,6 +201,7 @@ static int backend_start(void *ctx, int cols, int rows)
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
         return -1;
     }
+    board_shell_task_ready();
     s_started = true;
     return 0;
 }

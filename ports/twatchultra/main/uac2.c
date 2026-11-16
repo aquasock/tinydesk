@@ -57,6 +57,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/ringbuf.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -116,7 +117,14 @@ static const char *TAG = "uac2";
  * line-in captures came back empty, so 8 is accepted by ear, not by
  * measurement, and a capture at 8 is still owed. */
 #define UAC2_PKTS_PER_XFER  8
-#define UAC2_XFERS          3
+#define UAC2_XFERS          3       /* what the pool is asked for */
+#define UAC2_XFERS_MIN      2       /* what a stream needs: one in flight while one fills */
+
+/* How the transfer count is decided. Three 1,536-byte buffers are 4,608 bytes of
+ * internal DMA RAM, and in OTG mode at boot the whole DMA pool was measured at
+ * 6,399 bytes free -- so three do not always fit and the count is chosen by what
+ * the pool gives, at least UAC2_XFERS_MIN. `uac2` reports it. */
+static int s_nxfers;
 
 /* A transfer's buffer is sized for the largest packet AT THE STREAM'S RATE --
  * ceil(rate / 1000) frames -- and reallocated with the stream on a rate change.
@@ -167,6 +175,8 @@ static bool s_hw_vol;           /* the playback FU's volume control answered RAN
 static int16_t s_vol_min, s_vol_max;   /* its range, 1/256 dB */
 static int s_vol_pct = 50;      /* what the operator asked for */
 static bool s_claimed;          /* the streaming interface is claimed (held while open) */
+static bool s_opened;           /* the open COMPLETED: claim, transfers and ring all present */
+static SemaphoreHandle_t s_open_lock;   /* one open at a time: the worker and the shell */
 static int16_t s_vol_db256;     /* what was last written to the DAC */
 static uint8_t s_clock_id;
 static uint8_t s_as_iface;
@@ -228,38 +238,56 @@ static void note_start_err(const char *step, esp_err_t err);
  * The client's event callback only wakes the worker -- opening a device is a
  * library call the client task must stay free to service. */
 static TaskHandle_t s_worker;
+
+/* How long the worker keeps trying an automatic open. Boot memory has not
+ * settled when the shell's task appears: the same open that was refused with
+ * ~2,700 bytes of DMA free at boot succeeded with 14,531 free a couple of
+ * minutes later, from the same build. A refusal is FREE to retry -- it holds
+ * nothing and resets nothing -- so the worker keeps trying for a bounded window
+ * and then goes quiet until a device event. This is deliberately not a count:
+ * what changes is time, not the number of attempts. */
+#define UAC2_OPEN_WINDOW_MS 120000
+#define UAC2_OPEN_STEP_MS   2000
 static char s_product[40];      /* the DAC's product string, for the USB page */
 
 /*
- * A DMA RESERVE FOR THE CLAIM. Claiming the streaming interface allocates two
- * 512-byte, 512-aligned descriptor lists in DMA-capable RAM, and IDF 5.3.1
- * PANICS when it cannot (reference USB-005). A DAC plugged in after a file has
- * been opened on the SD card -- which takes DMA RAM of its own -- would hit that.
- * So two blocks of exactly that shape are taken at boot and freed immediately
- * before the claim, leaving holes the claim's own allocation fits. Re-taken when
- * a DAC is unplugged and its pipe released. Sized from IDF 5.3.1:
- * XFER_LIST_LEN_ISOC 64 descriptors x 8 bytes, USB_DWC_QTD_LIST_MEM_ALIGN 512.
+ * WHAT THE CLAIM NEEDS, AND WHY THERE IS NO RESERVE OR HOLD.
+ *
+ * Claiming the streaming interface allocates, in this order inside
+ * hcd_pipe_alloc(): pipe_t (96 bytes), the channel object (20), a 20-byte block
+ * header, a 512-byte 512-ALIGNED descriptor list, another header (20), then a
+ * second 512-byte 512-aligned list. The last allocation ASSERTS when it fails
+ * (hcd_dwc.c:1059), so the claim does not return an error: it resets the board.
+ *
+ * THE SMALL INTERLEAVED CALLOCS ARE WHAT BREAK IT. They take 136 bytes between
+ * the two aligned lists, so each list has to skip up to 511 bytes to find a
+ * 512-aligned home -- which means a SINGLE CONTIGUOUS block of about 1.6 KB is
+ * needed, not two 512-byte holes. Measured on hardware, the pool after a DAC
+ * had enumerated read dma free=5215 / largest=2432: plenty of bytes, no hole
+ * that shape.
+ *
+ * WHAT DID NOT WORK, ALL OF IT TRIED ON HARDWARE:
+ *   - taking the transfers before the claim (they ate the pool)
+ *   - a reserve freed immediately before the claim (the claim's own two
+ *     calloc()s took the freed hole first, leaving nothing aligned)
+ *   - the same reserve held ACROSS the claim (1 KB the claim could not use)
+ *   - a 2 KB block held from boot (STARVED ENUMERATION: coredump, task
+ *     'usb_lib', device_alloc -> hcd_pipe_alloc -> the same assert)
+ *
+ * THE ACTUAL FIX IS ELSEWHERE: the three USB task stacks now live in PSRAM
+ * (usbhost.c, and the two here), returning 12 KB to the internal DMA pool that
+ * enumeration, the claim and the transfers all draw on. This file therefore
+ * needs no reserve, no hold and no special ordering -- just the check below,
+ * which refuses rather than asserting if the pool ever is too small.
  */
-#define UAC2_RESERVE_N      2
-#define UAC2_RESERVE_BYTES  512
-static void *s_reserve[UAC2_RESERVE_N];
+#define UAC2_CLAIM_LISTS    1024    /* 2 x 512-byte, 512-aligned descriptor lists */
+#define UAC2_CLAIM_OBJECTS  800     /* pipe_t, chan_obj, headers, alignment slack */
+#define UAC2_CLAIM_LARGEST  2048    /* one block must host both aligned lists */
 
-static void reserve_take(void)
-{
-    for (int i = 0; i < UAC2_RESERVE_N; i++)
-        if (!s_reserve[i])
-            s_reserve[i] = heap_caps_aligned_alloc(UAC2_RESERVE_BYTES, UAC2_RESERVE_BYTES,
-                                                   MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-}
-
-static void reserve_release(void)
-{
-    for (int i = 0; i < UAC2_RESERVE_N; i++)
-    {
-        heap_caps_free(s_reserve[i]);
-        s_reserve[i] = NULL;
-    }
-}
+/* The pool as the last open attempt saw it, for `uac2`: the numbers that decide
+ * whether a claim is attempted, and the reason it was not. */
+static uint32_t s_att_free, s_att_largest;
+static bool s_att_refused;
 
 /* ---------------------------------------------------------------- helpers */
 
@@ -888,6 +916,7 @@ static void forget_gone_device(void)
         return;
 
     s_streaming = false;
+    s_opened = false;           /* so the worker re-opens on the next plug */
 
     /* The transfers are kept and re-aimed at the new device by the next start;
      * freeing them here is what panicked (see UAC2_XFER_BUF_BYTES). */
@@ -900,13 +929,10 @@ static void forget_gone_device(void)
         s_dev = NULL;
     }
     s_product[0] = '\0';
-    /*
-     * NO reserve_take() here. It used to re-take the claim's block as soon as the
-     * device went away, which left DMA-capable RAM held across the re-enumeration
-     * that follows a re-plug -- the very window that panics in device_alloc()
-     * when the pool is empty. uac2_open() takes it again before the next claim,
-     * which is the only place it is needed.
-     */
+    /* No reserve to re-take: the claim is guarded by a pool check instead of by
+     * held memory (see UAC2_CLAIM_LISTS above). Holding DMA across the
+     * re-enumeration that follows a re-plug is the window that panics in
+     * device_alloc() when the pool is empty, so nothing is held here. */
 
     if (s_ring)
     {
@@ -925,6 +951,12 @@ static void forget_gone_device(void)
  * exist before a DAC can be seen, whether opened by hand or automatically. */
 static bool client_setup(void)
 {
+    /* Made here, so the automatic path (uac2_auto_start) creates it before its
+     * worker exists; uac2_open() then serialises that worker against a typed
+     * `uac2 open`. Two opens at once would each tear down the other's device. */
+    if (!s_open_lock && !(s_open_lock = xSemaphoreCreateMutex()))
+        return false;
+
     if (!s_ctrl_done && !(s_ctrl_done = xSemaphoreCreateBinary()))
         return false;
 
@@ -947,8 +979,11 @@ static bool client_setup(void)
         }
     }
 
-    /* Higher than the library task: this one refills the isochronous stream. */
-    if (!s_task && xTaskCreate(client_task, "uac2", 4096, NULL, 5, &s_task) != pdPASS)
+    /* Higher than the library task: this one refills the isochronous stream.
+     * PSRAM stack for the same reason as usb_lib (see usbhost.c): it is 4 KB of
+     * the internal DMA pool otherwise, and it never touches flash. */
+    if (!s_task && xTaskCreateWithCaps(client_task, "uac2", 4096, NULL, 5, &s_task,
+                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS)
     {
         ESP_LOGE(TAG, "no client task");
         return false;
@@ -957,39 +992,86 @@ static bool client_setup(void)
     return true;
 }
 
-/* The stream's three transfers, allocated once and kept (see
- * UAC2_XFER_BUF_BYTES). They need no device: it is set at each start. */
+/* The stream's transfers, allocated once and kept (see
+ * UAC2_XFER_BUF_BYTES). They need no device: it is set at each start.
+ *
+ * AS MANY AS THE POOL GIVES. Three are wanted and two are enough; failing the
+ * whole open because the third does not fit would refuse a stream that would
+ * have run. Fewer than two is not a stream -- one transfer in flight cannot be
+ * refilled while it plays. */
 static bool alloc_transfers(void)
 {
+    int n = 0;
+
     for (int i = 0; i < UAC2_XFERS; i++)
     {
-        if (s_xfer[i])
-            continue;
-
-        const esp_err_t aerr = usb_host_transfer_alloc(UAC2_XFER_BUF_BYTES, UAC2_PKTS_PER_XFER,
-                                                       &s_xfer[i]);
-        if (aerr != ESP_OK)
+        if (!s_xfer[i] &&
+            usb_host_transfer_alloc(UAC2_XFER_BUF_BYTES, UAC2_PKTS_PER_XFER, &s_xfer[i]) != ESP_OK)
         {
             s_xfer[i] = NULL;
-            note_start_err("transfer alloc", aerr);
-            return false;
+            break;                      /* keep what fits; the test below judges it */
         }
+        n++;
     }
+
+    if (n < UAC2_XFERS_MIN)
+    {
+        note_start_err("transfer alloc (DMA pool too small)", ESP_ERR_NO_MEM);
+        ESP_LOGE(TAG, "only %d of %d transfers fit in the DMA pool", n, UAC2_XFERS);
+        return false;
+    }
+
+    s_nxfers = n;
+    ESP_LOGI(TAG, "%d transfer(s) of %u bytes", s_nxfers, (unsigned)UAC2_XFER_BUF_BYTES);
     return true;
 }
 
-bool uac2_open(void)
+/*
+ * UNDO A PARTIAL OPEN. s_dev is set as soon as the DAC is opened, and several
+ * steps follow it that can fail, so s_dev was never proof of anything: on
+ * hardware a boot-time open failed at alloc_transfers, left s_dev set, and the
+ * `if (s_dev) return true` below then reported `open ok` for a driver with no
+ * transfers and no ring. The next `uac2 play` found the NULL ring and hit an
+ * IDF assert -- i.e. a reset, with no log (core-log entry 21, coredump
+ * uac2.c:1260).
+ *
+ * The claim is released if it was taken, and the device is closed and forgotten.
+ * The transfers and the PSRAM ring are KEPT: freeing the transfers on a
+ * teardown path is what panicked before (entry 18), and both are reused by the
+ * next attempt.
+ */
+static void open_fail(void)
+{
+    if (s_dev && s_claimed)
+    {
+        usb_host_interface_release(s_client, s_dev, s_as_iface);   /* may fail: gone */
+        s_claimed = false;
+    }
+
+    if (s_dev)
+    {
+        usb_host_device_close(s_client, s_dev);
+        s_dev = NULL;
+    }
+    s_dev_addr = 0;
+    s_product[0] = '\0';
+    s_opened = false;
+    ESP_LOGW(TAG, "open failed; device state cleared");
+}
+
+/* The body of uac2_open(), called with s_open_lock held and the host stack
+ * already installed. */
+static bool open_locked(void)
 {
     forget_gone_device();
 
-    if (s_dev)
+    if (s_opened)
         return true;
 
-    /* The host stack belongs to usbhost.c; in Normal mode a manual `uac2 open`
-     * still works as a diagnostic, and installs it (the port is then a host
-     * until the next restart). */
-    if (!usbhost_install())
-        return false;
+    /* A device left open by an attempt that failed before the ring: undo it
+     * instead of reporting it open. */
+    if (s_dev)
+        open_fail();
 
     if (!client_setup())
         return false;
@@ -1064,6 +1146,7 @@ bool uac2_open(void)
         !parse_config((const uint8_t *)cd, cd->wTotalLength))
     {
         ESP_LOGE(TAG, "cannot parse the DAC's configuration");
+        open_fail();
         return false;
     }
 
@@ -1075,38 +1158,48 @@ bool uac2_open(void)
         ESP_LOGI(TAG, "  rate %lu", (unsigned long)s_rates[k]);
 
     /*
-     * The reserve is taken HERE and not at boot: it exists to be held while the
-     * control requests above run and released at the claim, so the claim finds a
-     * contiguous block nothing else has taken -- not to sit in the pool while a
-     * device is still enumerating, which starves enumeration itself.
+     * MEASURE, THEN CLAIM -- OR REFUSE AND SAY WHY.
+     *
+     * The claim asserts instead of failing when the internal DMA pool cannot
+     * host its two 512-aligned descriptor lists, and an assert is a reset that
+     * cannot be read over BLE. A refusal is logged, shown by `uac2`, and can be
+     * retried, so the numbers are checked first. See the block comment above for
+     * what the pool has to hold and why a single contiguous region matters.
      */
-    reserve_take();
+    s_att_free = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_DMA);
+    s_att_largest = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
+    s_att_refused = false;
 
-    if (!alloc_transfers())
+    if (s_att_free < UAC2_CLAIM_LISTS + UAC2_CLAIM_OBJECTS || s_att_largest < UAC2_CLAIM_LARGEST)
+    {
+        s_att_refused = true;
+        note_start_err("no DMA for the claim", ESP_ERR_NO_MEM);
+        ESP_LOGE(TAG, "claim refused: dma free=%u largest=%u need free>=%u largest>=%u "
+                 "(the claim asserts, it does not fail)",
+                 (unsigned)s_att_free, (unsigned)s_att_largest,
+                 (unsigned)(UAC2_CLAIM_LISTS + UAC2_CLAIM_OBJECTS),
+                 (unsigned)UAC2_CLAIM_LARGEST);
+        open_fail();
         return false;
+    }
 
-    /*
-     * CLAIM ONCE, HERE, AND HOLD IT. Claiming allocates the pipe and the HCD's
-     * transfer-descriptor lists in DMA-capable internal RAM, and IDF 5.3.1
-     * ASSERTS when that allocation fails (hcd_dwc.c:1059 transfer_descriptor_
-     * list_alloc) -- a panic, not an error code. On hardware it fired when the
-     * file player started the stream: the SD card runs over SPI with DMA, so an
-     * open file had already taken DMA-capable RAM. Every DMA allocation the
-     * stream needs therefore happens in `uac2 open`, before any file is opened,
-     * and stop/rate changes only switch the alternate setting.
-     */
     if (!s_claimed)
     {
-        reserve_release();      /* make room exactly where the claim needs it */
-
         const esp_err_t cerr = usb_host_interface_claim(s_client, s_dev, s_as_iface, s_as_alt);
 
         if (cerr != ESP_OK)
         {
             note_start_err("claim at open", cerr);
+            open_fail();
             return false;
         }
         s_claimed = true;
+    }
+
+    if (!alloc_transfers())
+    {
+        open_fail();
+        return false;
     }
 
     hw_vol_probe();
@@ -1121,11 +1214,31 @@ bool uac2_open(void)
     if (!s_ring)
     {
         ESP_LOGE(TAG, "no memory for the PCM ring");
+        open_fail();
         return false;
     }
 
     ESP_LOGI(TAG, "DAC open: stereo S16, ring %u bytes in PSRAM", (unsigned)UAC2_RING_BYTES);
+    s_opened = true;
     return true;
+}
+
+bool uac2_open(void)
+{
+    /* THE HOST STACK FIRST. client_setup() registers a client against it, so
+     * calling it first would fail with ESP_ERR_INVALID_STATE on a board whose
+     * port is still Normal -- which is exactly the manual `uac2 open` that
+     * exists as a diagnostic. Then client_setup() makes the lock, and one open
+     * runs at a time. */
+    if (!usbhost_install())
+        return false;
+    if (!client_setup() || !s_open_lock)
+        return false;
+
+    xSemaphoreTake(s_open_lock, portMAX_DELAY);
+    const bool ok = open_locked();
+    xSemaphoreGive(s_open_lock);
+    return ok;
 }
 
 /* THE LAST START FAILURE, KEPT FOR `uac2`. A start attempted from the player's
@@ -1171,12 +1284,56 @@ static void worker_task(void *arg)
 {
     (void)arg;
 
+    /*
+     * WAIT FOR THE SHELL'S TASK TO EXIST BEFORE TAKING ANY DMA. This loop used to
+     * open at task start, while usbhost.c still held the shell's 25,600-byte
+     * block, and alloc_transfers failed with ESP_ERR_NO_MEM at 3338 ms; the same
+     * `uac2 open` typed from the shell afterwards succeeded. The gate cannot be
+     * the hold's release: opening the instant board_shell_task_prepare() frees
+     * the block races the shell for it. It is board_shell_task_ready(), called
+     * after xTaskCreate has taken the stack. Polled, not notified, because the
+     * shell can be ready before this task is even created.
+     */
+    while (!usbhost_shell_ready())
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+    /* When this attach was first attempted, and whether the window is open. */
+    TickType_t started = 0;
+
     for (;;)
     {
-        if (!s_dev || s_gone)
-            uac2_open();
+        if (!s_opened || s_gone)
+        {
+            if (!started)
+                started = xTaskGetTickCount();
+
+            /* The DMA pool is what decides it, so it leads (cf. usbhost.c's
+             * heap_note): dma=free/largest int=free/largest. */
+            ESP_LOGI(TAG, "open: dma=%u/%u int=%u/%u",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+
+            if (uac2_open())
+                started = 0;
+            else if ((xTaskGetTickCount() - started) * portTICK_PERIOD_MS < UAC2_OPEN_WINDOW_MS)
+            {
+                /* A refusal leaves nothing behind (open_fail) and cannot reset
+                 * the board, so waiting and trying again is safe, and memory
+                 * keeps being returned as boot finishes. */
+                ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(UAC2_OPEN_STEP_MS));
+                continue;
+            }
+            else
+            {
+                ESP_LOGE(TAG, "open still refused after %u s; idle until the DAC is "
+                         "re-plugged or `uac2 open` is typed",
+                         (unsigned)(UAC2_OPEN_WINDOW_MS / 1000));
+                started = 0;
+            }
+        }
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        vTaskDelay(pdMS_TO_TICKS(300));     /* let enumeration settle */
     }
 }
 
@@ -1184,6 +1341,7 @@ bool uac2_auto_start(void)
 {
     if (s_worker)
         return true;
+
     if (!usbhost_install() || !client_setup())
         return false;
 
@@ -1210,7 +1368,8 @@ bool uac2_auto_start(void)
      * The allocation belongs in uac2_open(), which runs once a device is
      * present, after enumeration and still before any file is opened.
      */
-    if (xTaskCreate(worker_task, "uac2dev", 4096, NULL, 3, &s_worker) != pdPASS)
+    if (xTaskCreateWithCaps(worker_task, "uac2dev", 4096, NULL, 3, &s_worker,
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS)
     {
         s_worker = NULL;
         return false;
@@ -1221,7 +1380,7 @@ bool uac2_auto_start(void)
 
 bool uac2_attached(void)
 {
-    return s_dev && !s_gone && s_claimed;
+    return s_opened && !s_gone;
 }
 
 const char *uac2_product(void)
@@ -1234,10 +1393,63 @@ bool uac2_start(void)
     return uac2_start_rate(UAC2_RATE);
 }
 
+/*
+ * WAKE THE DAC BEFORE FEEDING IT, BECAUSE ITS OUTPUT STAGE STARTS MUTED.
+ *
+ * THE SYMPTOM, REPEATED ON HARDWARE: the FIRST stream after the DAC is plugged
+ * in plays nothing, while the same file plays perfectly once the headphones
+ * have been unplugged and replugged. Replugging is a jack-detect event inside
+ * the dongle -- its own firmware re-arms the output stage -- and it is not
+ * something the host can ask for.
+ *
+ * WHY THE OBVIOUS FIX IS NOT AVAILABLE: writing the Feature Unit's MUTE control
+ * to unmute it stalls. `uac2 fu set` on this dongle reports
+ * `ctrl 21/01 status 4` (USB_TRANSFER_STATUS_STALL), so the mute cannot be
+ * cleared by a control request, and the volume can only be set on the channels
+ * that answer.
+ *
+ * WHAT IS LEFT, AND IT IS A REAL LEVER: the DAC re-arms its output on the
+ * STREAMING ALTERNATE SETTING TRANSITION. Selecting alternate 0 deselects the
+ * isochronous stream, and selecting the streaming alternate again brings it
+ * back up; a device that gates its output on "a live stream just started"
+ * gates it on exactly that. So every start cycles 0 -> alt, and re-asserts the
+ * volume afterwards (which also re-sends the mute request, harmlessly: a stall
+ * on a channel that refuses it is reported, not fatal).
+ *
+ * This is a mitigation with a measured symptom, not a confirmed root cause: the
+ * dongle's internal state cannot be observed from this side, so the evidence is
+ * behavioural -- the first start used to be silent and a replug fixed it, which
+ * a setting transition reproduces without touching the jack.
+ */
+static esp_err_t dac_wake(void)
+{
+    set_alt(s_as_iface, 0);             /* deselect the stream */
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    const esp_err_t err = set_alt(s_as_iface, s_as_alt);   /* and back up */
+
+    vTaskDelay(pdMS_TO_TICKS(20));
+    apply_volume();
+    return err;
+}
+
 bool uac2_start_rate(uint32_t rate)
 {
     if ((s_gone || !s_dev) && !uac2_open())
         return false;
+
+    /*
+     * NOTHING BELOW MAY TOUCH THE RING UNLESS THE OPEN COMPLETED. A failed open
+     * once left s_dev set with no ring, and the drain below then reached
+     * xRingbufferReceiveUpTo(NULL) -- an IDF assert, i.e. a reset with no log
+     * (core-log entry 21, coredump uac2.c:1260). The open is atomic now
+     * (open_fail), and this is the second lock on the same door.
+     */
+    if (!s_opened || !s_claimed || !s_ring)
+    {
+        note_start_err("DAC not open (run `uac2 open`)", ESP_ERR_INVALID_STATE);
+        return false;
+    }
 
     if (!rate_ok(rate))
     {
@@ -1283,7 +1495,7 @@ bool uac2_start_rate(uint32_t rate)
     if (rerr != ESP_OK)
         note_start_err("set_rate (not fatal)", rerr);
 
-    for (int i = 0; i < UAC2_XFERS; i++)
+    for (int i = 0; i < s_nxfers; i++)
     {
         if (!s_xfer[i])
         {
@@ -1309,7 +1521,7 @@ bool uac2_start_rate(uint32_t rate)
 
     s_streaming = true;
 
-    err = set_alt(s_as_iface, s_as_alt);
+    err = dac_wake();
     if (err != ESP_OK)
     {
         note_start_err("SET_INTERFACE", err);
@@ -1317,7 +1529,7 @@ bool uac2_start_rate(uint32_t rate)
         return false;
     }
 
-    for (int i = 0; i < UAC2_XFERS; i++)
+    for (int i = 0; i < s_nxfers; i++)
         usb_host_transfer_submit(s_xfer[i]);
 
     ESP_LOGI(TAG, "streaming on ep 0x%02X", s_ep_addr);
@@ -1755,6 +1967,27 @@ static int cmd_uac2(tdsh_session_t *session, int argc, char **argv)
         return 0;
     }
 
+    if (argc >= 2 && strcmp(argv[1], "wake") == 0)
+    {
+        /* The hook a headphone replug has been standing in for: cycle the
+         * streaming alternate and re-assert the volume, so a DAC whose output
+         * stage came up muted can be re-armed without touching the jack. */
+        if (!s_opened || !s_claimed)
+        {
+            printf("uac2: not open -- `uac2 open` first\n");
+            return 1;
+        }
+        if (s_streaming)
+        {
+            /* Cycling the alternate under a running stream would strand the
+             * in-flight transfers; stop, wake, and let the caller play. */
+            uac2_stop();
+        }
+        const esp_err_t we = dac_wake();
+
+        printf("uac2: wake -> %s\n", esp_err_to_name(we));
+        return we == ESP_OK ? 0 : 1;
+    }
     if (argc >= 2 && strcmp(argv[1], "open") == 0)
     {
         printf("uac2: open %s\n", uac2_open() ? "ok" : "failed");
@@ -1777,6 +2010,18 @@ static int cmd_uac2(tdsh_session_t *session, int argc, char **argv)
     printf("streaming=%d dev=%d clock=%u iface=%u alt=%u ep=0x%02X mps=%u\n",
            s_streaming ? 1 : 0, s_dev ? 1 : 0, s_clock_id, s_as_iface, s_as_alt,
            s_ep_addr, s_ep_mps);
+    /* opened and claimed are what `uac2 play` depends on; dma/int are the pools
+     * the claim draws from, and the reason a boot-time open can fail (USB-005). */
+    printf("opened=%d claimed=%d xfers=%d\n", s_opened ? 1 : 0, s_claimed ? 1 : 0, s_nxfers);
+    /* What the last open attempt saw: the two numbers that decide whether the
+     * claim is attempted at all, and whether it was refused for them. */
+    printf("last open: dma free=%lu largest=%lu%s\n", (unsigned long)s_att_free,
+           (unsigned long)s_att_largest, s_att_refused ? " REFUSED" : "");
+    printf("dma=%u/%u int=%u/%u\n",
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     printf("frames=%lu errors=%lu underruns=%lu short=%lu missed=%lu last=%d%s\n",
            (unsigned long)f, (unsigned long)e, (unsigned long)u, (unsigned long)s_short,
            (unsigned long)m, s_last_status, s_gone ? " GONE" : "");
@@ -1794,7 +2039,7 @@ static int cmd_uac2(tdsh_session_t *session, int argc, char **argv)
 
 static const tdsh_command_t s_uac2_cmd = {
     "uac2",
-    "uac2 [open|start|stop|tone|vol [0-100]|ev|fu [set]|play <file.wav>|play stop]",
+    "uac2 [open|wake|start|stop|tone|vol [0-100]|ev|fu [set]|play <file.wav>|play stop]",
     "USB audio DAC: status, a test tone, or a WAV file from the card",
     cmd_uac2,
     TDSH_CMD_INTERACTIVE,

@@ -21,4 +21,10 @@ bool usbhost_installed(void);
  * has to be taken first (reference USB-005). */
 void usbhost_boot(void);
 
+/* True once the TinyDesk Shell's task exists (board_shell_task_ready(), called
+ * by the shell bridge after xTaskCreate). The USB audio worker waits on this
+ * before its first open, so the open cannot contend with the shell's 24 KB
+ * stack allocation. */
+bool usbhost_shell_ready(void);
+
 #endif
