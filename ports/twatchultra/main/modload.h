@@ -70,20 +70,19 @@ typedef int32_t (*modload_entry_t)(int32_t a, int32_t b, uint32_t heap_free,
                                    uint32_t heap_largest);
 
 /*
- * A RESULT RECORD WRITTEN TO FLASH, because the display mirror cannot be
- * trusted to report it.
+ * A RESULT RECORD, written to a file rather than to the partition.
  *
- * The USB/BLE console carries only CHANGED cells of the desktop, replayed into
- * a grid: a capture attaches after the boot repaint, so the grid is incomplete,
- * and a window with focus eats the keystrokes meant for the Terminal. Reading a
- * one-line result through that is possible but it has cost more time than the
- * experiment itself.
+ * The display mirror cannot be trusted to report a one-line answer (it sends
+ * only CHANGED cells, and a restored window holds focus at boot). Writing into
+ * `modules` itself worked but consumed the last 4 KB sector of the partition
+ * and needed an unmap first, because esp_partition_write() refuses a mapped
+ * region. A file on littlefs has neither problem, and the PC can extract the
+ * partition and mount it with littlefs-python.
  *
- * So the test writes its verdict into the last 4 KB sector of the `modules`
- * partition and the PC reads it back with esptool. That path involves no
- * display, no focus, no delta stream, and no timing.
+ * NOTE the path: littlefs is mounted at "/fs" in the POSIX VFS
+ * (TDSH_MOUNT_POINT) and the SHELL presents that as "/". Ordinary C sees
+ * /fs/root/... . A path of "/root/..." silently fails.
  */
-#define MODLOAD_RESULT_OFFSET   (0x200000 - 0x1000)     /* last sector */
 #define MODLOAD_RESULT_MAGIC    0x524C5453U             /* "STLR" */
 
 typedef struct
@@ -119,16 +118,6 @@ bool modload_read_header(modload_header_t *h);
  * instruction bus, and a data load through that address faults (coredump,
  * LoadStoreErrorCause). Entry offsets are relative to this base. */
 const void *modload_inst_base(void);
-
-/*
- * Run the experiment once, at boot, and write the result to flash.
- *
- * This exists only for a diagnostic build: the display mirror cannot reliably
- * report a one-line result (see the note above), so a boot-time run with a
- * flash-backed verdict removes the operator and the console from the loop
- * entirely. It is not called in a normal build.
- */
-void modload_selftest_call(void);
 
 /*
  * The self-test, as a shell command:

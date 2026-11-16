@@ -15,10 +15,6 @@ idf_component_register(
 )
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Wextra -Werror)
 
-# DIAGNOSTIC: run the `modules` partition experiment once at boot, so its result
-# lands in flash instead of having to survive the display mirror. Remove this
-# line once the question it asks has been answered.
-target_compile_definitions(${COMPONENT_LIB} PRIVATE MODTEST_AT_BOOT=1)
 
 # Its own update feed: this image draws to a QSPI AMOLED, and the esp32s3
 # image would replace it with one that talks to a UART.

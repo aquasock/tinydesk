@@ -144,7 +144,11 @@ static bool in_irom(const void *p)
  */
 static void write_result_file(const modload_result_t *r)
 {
-    static const char *paths[] = { "/root/modresult.txt", "/modresult.txt" };
+    /* TDSH_MOUNT_POINT is "/fs": littlefs lives at /fs in the POSIX VFS and the
+     * SHELL presents that as "/". A path of "/root/..." therefore fails from
+     * ordinary C -- the process sees /fs/root/... . This cost a wrong handoff
+     * note claiming the mount point was "/" and not /fs. */
+    static const char *paths[] = { "/fs/root/modresult.txt", "/fs/modresult.txt" };
 
     for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++)
     {
@@ -164,80 +168,6 @@ static void write_result_file(const modload_result_t *r)
     ESP_LOGE(TAG, "could not write the result file");
 }
 
-/* Persist the verdict where the PC can read it. See the header for why. */
-static void write_result(const modload_result_t *r)
-{
-    const esp_partition_t *p = esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
-                                                        MODLOAD_PART_SUBTYPE,
-                                                        MODLOAD_PART_LABEL);
-
-    if (!p)
-        return;
-
-    esp_err_t err = esp_partition_erase_range(p, MODLOAD_RESULT_OFFSET, 0x1000);
-
-    if (err == ESP_OK)
-        err = esp_partition_write(p, MODLOAD_RESULT_OFFSET, r, sizeof(*r));
-
-    if (err != ESP_OK)
-        ESP_LOGE(TAG, "result write failed: %s", esp_err_to_name(err));
-}
-
-void modload_selftest_call(void)
-{
-    char why[96] = "";
-    const void *base = NULL;
-    size_t size = 0;
-    modload_result_t res = { .magic = MODLOAD_RESULT_MAGIC };
-
-    if (!modload_map(&base, &size, why, sizeof(why)))
-    {
-        ESP_LOGE(TAG, "%s", why);
-        res.ret = 0xFFFFFFFFu;
-        write_result_file(&res);
-        return;
-    }
-
-    res.data_base = (uint32_t)(uintptr_t)base;
-    res.inst_base = (uint32_t)(uintptr_t)modload_inst_base();
-    (void)size;
-    res.heap_free = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    res.heap_largest = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-
-    /* The header comes through esp_partition_read(), NOT through the mapped
-     * pointer: see the note at the top of this file. */
-    modload_header_t hdr = {0};
-    const modload_header_t *h = &hdr;
-
-    modload_read_header(&hdr);
-    ESP_LOGI(TAG, "blob magic 0x%08lx abi %lu size %lu entry +0x%lx",
-             (unsigned long)h->magic, (unsigned long)h->abi_version,
-             (unsigned long)h->size, (unsigned long)h->entry_offset);
-
-    if (h->magic == MODLOAD_MAGIC && h->abi_version == MODLOAD_ABI_VERSION &&
-        h->entry_offset < size)
-    {
-        const modload_entry_t fn =
-            (modload_entry_t)((const uint8_t *)res.inst_base + h->entry_offset);
-
-        res.entry = (uint32_t)(uintptr_t)fn;
-        res.called = 1;
-        res.ret = (uint32_t)fn(6, 7, res.heap_free, res.heap_largest);
-        ESP_LOGI(TAG, "entry %p returned %ld", (void *)fn, (long)res.ret);
-    }
-    else
-    {
-        res.ret = 0xFFFFFFFEu;      /* no usable blob */
-    }
-
-    /* UNMAP BEFORE WRITING. esp_partition_write() refuses a region that is
-     * currently mapped, which is why the first attempt at this left the result
-     * sector erased and looked like the test had never run. */
-    modload_unmap();
-    write_result(&res);
-    write_result_file(&res);
-}
-
 static int cmd_modtest(tdsh_session_t *session, int argc, char **argv)
 {
     (void)session;
@@ -253,7 +183,6 @@ static int cmd_modtest(tdsh_session_t *session, int argc, char **argv)
     {
         printf("modtest: %s\n", why);
         res.ret = 0xFFFFFFFFu;              /* mmap refused */
-        write_result(&res);
         return 1;
     }
 
@@ -329,14 +258,15 @@ static int cmd_modtest(tdsh_session_t *session, int argc, char **argv)
 
     res.ret = (uint32_t)r;
 
-    /* The result sector lives inside the mapped partition, and
-     * esp_partition_write() refuses a mapped region. */
     modload_unmap();
-    write_result(&res);
 
     /* 6*7 = 42 is the expected answer and proves the arguments arrived. */
-    printf("modtest: returned %ld (record written to modules+0x%X)\n", (long)r,
-           MODLOAD_RESULT_OFFSET);
+    printf("modtest: returned %ld\n", (long)r);
+
+    /* Persist it as well: printf goes to a display this bench cannot read
+     * reliably, while the file can be extracted from flash and mounted. */
+    write_result_file(&res);
+
     return r == 42 ? 0 : 1;
 }
 
