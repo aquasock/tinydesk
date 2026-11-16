@@ -5,7 +5,7 @@
 include("${CMAKE_CURRENT_LIST_DIR}/../../esp_idf/app/app.cmake")
 
 idf_component_register(
-    SRCS "link_twatch.c" "display.c" "touch.c" "pusher.c" "pwrkey.c" "charge.c" "nfc.c" "nfc_scan.cpp" "gps.c" "nmea.c" "ts_convert.c" "power.c" "rtc.c" "haptic.c" "sound.c" "wav.c" "font8x16.c" "sdpaths.c" "gamepad.c" "statusbar.c" "usbdiag.c" "bleuart.c" "uac2.c" "usbhost.c" "music.c" "musicdec.cpp" "tama.c" "tama_ui.c" "nes.c" "pmbench.c" "gbcbench.c" "gb.c" "pm.c" ${TD_ESP_APP_SRCS}
+    SRCS "link_twatch.c" "display.c" "touch.c" "pusher.c" "pwrkey.c" "charge.c" "nfc.c" "nfc_scan.cpp" "gps.c" "nmea.c" "ts_convert.c" "power.c" "rtc.c" "haptic.c" "sound.c" "wav.c" "font8x16.c" "sdpaths.c" "gamepad.c" "statusbar.c" "usbdiag.c" "bleuart.c" "uac2.c" "usbhost.c" "music.c" "musicdec.cpp" "modload.c" "tama.c" "tama_ui.c" "nes.c" "pmbench.c" "gbcbench.c" "gb.c" "pm.c" ${TD_ESP_APP_SRCS}
     EMBED_TXTFILES "${TD_BOARD_BUILTIN_CONF}"
     INCLUDE_DIRS "." "${TD_ESP_APP_DIR}"
     LDFRAGMENTS "extram.lf"
@@ -14,6 +14,11 @@ idf_component_register(
              esp_driver_i2s esp_driver_uart esp_driver_usb_serial_jtag
 )
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Wextra -Werror)
+
+# DIAGNOSTIC: run the `modules` partition experiment once at boot, so its result
+# lands in flash instead of having to survive the display mirror. Remove this
+# line once the question it asks has been answered.
+target_compile_definitions(${COMPONENT_LIB} PRIVATE MODTEST_AT_BOOT=1)
 
 # Its own update feed: this image draws to a QSPI AMOLED, and the esp32s3
 # image would replace it with one that talks to a UART.

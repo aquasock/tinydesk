@@ -1,0 +1,143 @@
+/*
+ * modload.h - load and call code from the `modules` flash partition.
+ *
+ * THE IDEA. Xtensa executes from flash natively: every instruction ESP-IDF runs
+ * is already XIP-mapped through the MMU. So a blob in a raw flash partition can
+ * be mapped as INSTRUCTIONS with esp_partition_mmap() and called directly, and
+ * loading it costs no internal SRAM -- which is the pool this board is short of
+ * (about 18 KB free with the desktop running).
+ *
+ * WHY IT MATTERS. The app image has ~27 KB of headroom in ota_1 and the FLAC
+ * decoder already cost 31.7 KB of it, so a second codec cannot be added inline
+ * at all. A 2 MB `modules` partition exists at 0xE00000 for exactly this.
+ *
+ * WHAT IS UNPROVEN, AND WHAT THIS FILE IS FOR. Two things have to be true
+ * before a codec can live there:
+ *
+ *   1. esp_partition_mmap() must hand back an address this CPU can execute from.
+ *   2. Code linked for that address must be callable across the Xtensa windowed
+ *      ABI -- the caller's window rotation, the blob's own literals, and any
+ *      call the blob makes must all survive crossing a partition boundary.
+ *
+ * Both are answered by one small experiment, and it must be cheap: if either is
+ * false the whole design is dead and the partition should be given back to
+ * `storage`. So this header starts with a self-test that maps the partition,
+ * reports the address, and calls a blob's entry point if one is present.
+ *
+ * THE ADDRESS PROBLEM. A blob linked with absolute literals (which is what
+ * -mlongcalls produces, and what this toolchain does by default) needs a KNOWN
+ * load address. The mmap address is not documented as fixed, so it is MEASURED
+ * first and the blob is linked for what was measured. That makes the address a
+ * build-time constant that must be re-measured whenever the partition table
+ * moves -- recorded here rather than assumed.
+ */
+#ifndef TWATCH_MODLOAD_H
+#define TWATCH_MODLOAD_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+/*
+ * Blob header, at offset 0 of the partition. A blob that does not start with
+ * this magic is not one, so the self-test can tell "empty partition" from
+ * "something is here and it will not load".
+ */
+#define MODLOAD_MAGIC   0x4D4F444CU     /* "MODL", little-endian */
+
+typedef struct
+{
+    uint32_t magic;
+    uint32_t abi_version;       /* must equal MODLOAD_ABI_VERSION */
+    uint32_t size;              /* bytes the blob occupies, for bounds checks */
+    uint32_t entry_offset;      /* from the start of the mapped region */
+    char name[24];
+} modload_header_t;
+
+/* Bump when the calling convention or the header changes. A blob built for a
+ * different version is refused rather than called. */
+#define MODLOAD_ABI_VERSION 1
+
+/*
+ * The blob's entry point. Plain int32_t in and out on purpose: a struct or a
+ * float would make the test partly a test of argument passing, and the first
+ * question is only whether control transfers at all.
+ *
+ * `heap_free`/`heap_largest` are passed in so the blob can be checked for
+ * actually seeing this board's memory rather than a stale or bogus view.
+ */
+typedef int32_t (*modload_entry_t)(int32_t a, int32_t b, uint32_t heap_free,
+                                   uint32_t heap_largest);
+
+/*
+ * A RESULT RECORD WRITTEN TO FLASH, because the display mirror cannot be
+ * trusted to report it.
+ *
+ * The USB/BLE console carries only CHANGED cells of the desktop, replayed into
+ * a grid: a capture attaches after the boot repaint, so the grid is incomplete,
+ * and a window with focus eats the keystrokes meant for the Terminal. Reading a
+ * one-line result through that is possible but it has cost more time than the
+ * experiment itself.
+ *
+ * So the test writes its verdict into the last 4 KB sector of the `modules`
+ * partition and the PC reads it back with esptool. That path involves no
+ * display, no focus, no delta stream, and no timing.
+ */
+#define MODLOAD_RESULT_OFFSET   (0x200000 - 0x1000)     /* last sector */
+#define MODLOAD_RESULT_MAGIC    0x524C5453U             /* "STLR" */
+
+typedef struct
+{
+    uint32_t magic;
+    uint32_t data_base;         /* where the bytes are readable */
+    uint32_t inst_base;         /* where the bytes are executable */
+    uint32_t entry;             /* inst_base + entry_offset */
+    uint32_t ret;               /* what the blob returned */
+    uint32_t heap_free;
+    uint32_t heap_largest;
+    uint32_t called;            /* 1 when the entry point was invoked */
+} modload_result_t;
+
+/* Map the modules partition as instructions. Returns false with a reason in
+ * `why` when the partition is missing or mmap fails. */
+bool modload_map(const void **base, size_t *size, char *why, size_t why_len);
+
+/* Undo modload_map(). */
+void modload_unmap(void);
+
+/*
+ * Read the blob header through the DATA path.
+ *
+ * This is not a convenience: the mapped pointer is in the INSTRUCTION window,
+ * where a data load faults (coredump, LoadStoreErrorCause at 0x42ae0014). The
+ * header must come from esp_partition_read().
+ */
+bool modload_read_header(modload_header_t *h);
+
+/* The address the bytes are EXECUTABLE from, which is not the address they are
+ * readable from. Measured: the ESP32-S3 maps flash instructions on the
+ * instruction bus, and a data load through that address faults (coredump,
+ * LoadStoreErrorCause). Entry offsets are relative to this base. */
+const void *modload_inst_base(void);
+
+/*
+ * Run the experiment once, at boot, and write the result to flash.
+ *
+ * This exists only for a diagnostic build: the display mirror cannot reliably
+ * report a one-line result (see the note above), so a boot-time run with a
+ * flash-backed verdict removes the operator and the console from the loop
+ * entirely. It is not called in a normal build.
+ */
+void modload_selftest_call(void);
+
+/*
+ * The self-test, as a shell command:
+ *
+ *   modtest          map, report the address, describe what is there
+ *   modtest call     additionally call the blob's entry point
+ *
+ * Reports the measured address, which is what a blob must be linked for.
+ */
+bool modload_register_command(void);
+
+#endif

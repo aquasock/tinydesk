@@ -26,6 +26,7 @@
 #include "sdpaths.h"
 #include "usbdiag.h"
 #include "bleuart.h"
+#include "modload.h"
 #include "music.h"
 #include "uac2.h"
 #include "usbhost.h"
@@ -572,6 +573,17 @@ bool link_init(void)
 
     if (!music_register_command())
         ESP_LOGW(TAG, "music command did not register");
+
+    if (!modload_register_command())
+        ESP_LOGW(TAG, "modtest command did not register");
+
+    /* DIAGNOSTIC BUILD ONLY: run the module experiment once at boot and leave
+     * the verdict in flash, so the result does not have to survive the display
+     * mirror. Remove with the define in CMakeLists when the question is
+     * answered. */
+#ifdef MODTEST_AT_BOOT
+    modload_selftest_call();
+#endif
 
     /* The USB-C port's saved role (board keys usb.host, usb.dac), applied now:
      * after the board keys are loaded, and before anything has opened a file on
