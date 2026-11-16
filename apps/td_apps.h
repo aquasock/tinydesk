@@ -298,6 +298,9 @@ void td_clipboard_clear(void);
 /* Open the Date & time window (also opened by clicking the clock). */
 void td_datetime_open(void);
 
+/* The USB page of Settings (usbset.c); does nothing without td_sysinfo()->usb. */
+void td_usb_settings_open(void);
+
 /* Date and time of a UTC moment in the user's zone and formats
  * ("02-11-2026 18:05"); "" for 0. */
 void td_date_time(int64_t utc, char *buf, int cap);

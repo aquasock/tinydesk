@@ -42,6 +42,11 @@ Terminal window. The core is portable C11; ports exist for ESP32 boards
   pair them in the Bluetooth app or with `bt`; they reconnect by themselves.
 * SSH at boot on the ESP32 boards (`ssh.autostart = 1`), once root's password has
   been changed: the server starts by itself instead of being started from the shell.
+* On the T-Watch Ultra, the USB-C port's role in Settings -> USB...: Normal
+  (the PC's console and flashing) or OTG host (`usb.host = 1`), and in host mode
+  a USB-C audio DAC (`usb.dac = 1`), opened by itself when plugged in; both
+  apply at restart. Its second display can be a Bluetooth LE serial link
+  (`display2.transport = ble`) instead of a UART.
 * Kiosk mode: one Python app on the whole screen instead of the desktop
   (`kiosk.app`), for operator panels; root's password leaves it.
 * Two displays (Settings -> Displays): the board's own link, Telnet

@@ -61,6 +61,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "usb/usb_host.h"
+#include "usbhost.h"
 
 static const char *TAG = "uac2";
 
@@ -148,7 +149,6 @@ static const char *TAG = "uac2";
 static usb_host_client_handle_t s_client;
 static usb_device_handle_t s_dev;
 static uint8_t s_dev_addr;
-static bool s_host_installed;
 
 /* Discovered from the device's own descriptors. */
 static uint8_t s_ac_iface;      /* AudioControl interface: addresses its entities */
@@ -214,7 +214,6 @@ static volatile bool s_gone;            /* the DAC was unplugged mid-stream */
 static volatile uint32_t s_missed;      /* packets the controller reported SKIPPED */
 static volatile int s_last_status = -1;
 static TaskHandle_t s_task;             /* the client's event loop */
-static TaskHandle_t s_lib_task;         /* the host library's event loop */
 static SemaphoreHandle_t s_ctrl_done;   /* a control transfer has completed */
 
 /* How long uac2_open() waits for the DAC to attach and enumerate after the host
@@ -223,6 +222,44 @@ static SemaphoreHandle_t s_ctrl_done;   /* a control transfer has completed */
 
 static void on_client_event(const usb_host_client_event_msg_t *msg, void *arg);
 static void note_start_err(const char *step, esp_err_t err);
+
+/* AUTOMATIC MODE (usb.dac = 1 in OTG host mode): a worker opens the DAC when it
+ * is plugged in and forgets it when it goes, so nothing has to type `uac2 open`.
+ * The client's event callback only wakes the worker -- opening a device is a
+ * library call the client task must stay free to service. */
+static TaskHandle_t s_worker;
+static char s_product[40];      /* the DAC's product string, for the USB page */
+
+/*
+ * A DMA RESERVE FOR THE CLAIM. Claiming the streaming interface allocates two
+ * 512-byte, 512-aligned descriptor lists in DMA-capable RAM, and IDF 5.3.1
+ * PANICS when it cannot (reference USB-005). A DAC plugged in after a file has
+ * been opened on the SD card -- which takes DMA RAM of its own -- would hit that.
+ * So two blocks of exactly that shape are taken at boot and freed immediately
+ * before the claim, leaving holes the claim's own allocation fits. Re-taken when
+ * a DAC is unplugged and its pipe released. Sized from IDF 5.3.1:
+ * XFER_LIST_LEN_ISOC 64 descriptors x 8 bytes, USB_DWC_QTD_LIST_MEM_ALIGN 512.
+ */
+#define UAC2_RESERVE_N      2
+#define UAC2_RESERVE_BYTES  512
+static void *s_reserve[UAC2_RESERVE_N];
+
+static void reserve_take(void)
+{
+    for (int i = 0; i < UAC2_RESERVE_N; i++)
+        if (!s_reserve[i])
+            s_reserve[i] = heap_caps_aligned_alloc(UAC2_RESERVE_BYTES, UAC2_RESERVE_BYTES,
+                                                   MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+}
+
+static void reserve_release(void)
+{
+    for (int i = 0; i < UAC2_RESERVE_N; i++)
+    {
+        heap_caps_free(s_reserve[i]);
+        s_reserve[i] = NULL;
+    }
+}
 
 /* ---------------------------------------------------------------- helpers */
 
@@ -813,7 +850,8 @@ static void xfer_done(usb_transfer_t *t)
  * THE TWO EVENT LOOPS IDF REQUIRES, AND WHY NEITHER IS OPTIONAL.
  *
  * The host LIBRARY processes attach, enumeration and detach only inside
- * usb_host_lib_handle_events(); with nobody calling it a device is never
+ * usb_host_lib_handle_events() -- that loop now lives in usbhost.c, the one
+ * owner of the host stack; with nobody calling it a device is never
  * enumerated, and usb_host_device_addr_list_fill() stays empty. That is exactly
  * what the first version showed on hardware: `uac2` reported dev=0 with the DAC
  * plugged in, while `usbdiag` -- which does run this loop -- enumerated it.
@@ -825,20 +863,6 @@ static void xfer_done(usb_transfer_t *t)
  * run on this task. The first version had an idle task here and assumed the
  * controller drove the rotation by itself; it does not.
  */
-static void lib_task(void *arg)
-{
-    (void)arg;
-
-    for (;;)
-    {
-        uint32_t flags = 0;
-
-        usb_host_lib_handle_events(portMAX_DELAY, &flags);
-        if (flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS)
-            usb_host_device_free_all();
-    }
-}
-
 static void client_task(void *arg)
 {
     (void)arg;
@@ -875,6 +899,9 @@ static void forget_gone_device(void)
         usb_host_device_close(s_client, s_dev);
         s_dev = NULL;
     }
+    s_product[0] = '\0';
+    if (s_worker)
+        reserve_take();     /* the next DAC's claim will need it again */
 
     if (s_ring)
     {
@@ -889,39 +916,10 @@ static void forget_gone_device(void)
     ESP_LOGW(TAG, "DAC was unplugged; state cleared");
 }
 
-bool uac2_open(void)
+/* The control semaphore, the client and its event task: everything that has to
+ * exist before a DAC can be seen, whether opened by hand or automatically. */
+static bool client_setup(void)
 {
-    forget_gone_device();
-
-    if (s_dev)
-        return true;
-
-    if (!s_host_installed)
-    {
-        /* LEVEL3: WiFi and BLE hold the level-1 slots, and the install returns
-         * ESP_ERR_NOT_FOUND with LEVEL1. Recorded in the log entry for the
-         * diagnostic that found it. */
-        const usb_host_config_t host = {
-            .skip_phy_setup = false,
-            .intr_flags = ESP_INTR_FLAG_LEVEL3,
-        };
-
-        if (usb_host_install(&host) != ESP_OK)
-        {
-            ESP_LOGE(TAG, "usb_host_install failed");
-            return false;
-        }
-
-        s_host_installed = true;
-    }
-
-    if (!s_lib_task &&
-        xTaskCreate(lib_task, "uac2_lib", 4096, NULL, 4, &s_lib_task) != pdPASS)
-    {
-        ESP_LOGE(TAG, "no host library task");
-        return false;
-    }
-
     if (!s_ctrl_done && !(s_ctrl_done = xSemaphoreCreateBinary()))
         return false;
 
@@ -950,6 +948,46 @@ bool uac2_open(void)
         ESP_LOGE(TAG, "no client task");
         return false;
     }
+
+    return true;
+}
+
+/* The stream's three transfers, allocated once and kept (see
+ * UAC2_XFER_BUF_BYTES). They need no device: it is set at each start. */
+static bool alloc_transfers(void)
+{
+    for (int i = 0; i < UAC2_XFERS; i++)
+    {
+        if (s_xfer[i])
+            continue;
+
+        const esp_err_t aerr = usb_host_transfer_alloc(UAC2_XFER_BUF_BYTES, UAC2_PKTS_PER_XFER,
+                                                       &s_xfer[i]);
+        if (aerr != ESP_OK)
+        {
+            s_xfer[i] = NULL;
+            note_start_err("transfer alloc", aerr);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool uac2_open(void)
+{
+    forget_gone_device();
+
+    if (s_dev)
+        return true;
+
+    /* The host stack belongs to usbhost.c; in Normal mode a manual `uac2 open`
+     * still works as a diagnostic, and installs it (the port is then a host
+     * until the next restart). */
+    if (!usbhost_install())
+        return false;
+
+    if (!client_setup())
+        return false;
 
     /* Find the DAC among the attached devices. A host that has only just been
      * installed has not enumerated anything yet, so look again for a while
@@ -989,6 +1027,23 @@ bool uac2_open(void)
 
         s_dev = dev;
         s_dev_addr = list[i];
+
+        /* The product string, for the USB page: UTF-16LE, ASCII kept. */
+        usb_device_info_t info;
+
+        s_product[0] = '\0';
+        if (usb_host_device_info(dev, &info) == ESP_OK && info.str_desc_product)
+        {
+            const usb_str_desc_t *sd = info.str_desc_product;
+            int n = (sd->bLength - 2) / 2, k = 0;
+
+            for (int j = 0; j < n && k < (int)sizeof(s_product) - 1; j++)
+                if (sd->wData[j] >= 0x20 && sd->wData[j] < 0x7F)
+                    s_product[k++] = (char)sd->wData[j];
+            s_product[k] = '\0';
+        }
+        if (!s_product[0])
+            snprintf(s_product, sizeof(s_product), "%04X:%04X", UAC2_VID, UAC2_PID);
         break;
     }
 
@@ -1014,20 +1069,8 @@ bool uac2_open(void)
     for (int k = 0; k < s_nrates; k++)
         ESP_LOGI(TAG, "  rate %lu", (unsigned long)s_rates[k]);
 
-    for (int i = 0; i < UAC2_XFERS; i++)
-    {
-        if (s_xfer[i])
-            continue;
-
-        const esp_err_t aerr = usb_host_transfer_alloc(UAC2_XFER_BUF_BYTES, UAC2_PKTS_PER_XFER,
-                                                       &s_xfer[i]);
-        if (aerr != ESP_OK)
-        {
-            s_xfer[i] = NULL;
-            note_start_err("transfer alloc at open", aerr);
-            return false;
-        }
-    }
+    if (!alloc_transfers())
+        return false;
 
     /*
      * CLAIM ONCE, HERE, AND HOLD IT. Claiming allocates the pipe and the HCD's
@@ -1041,6 +1084,8 @@ bool uac2_open(void)
      */
     if (!s_claimed)
     {
+        reserve_release();      /* make room exactly where the claim needs it */
+
         const esp_err_t cerr = usb_host_interface_claim(s_client, s_dev, s_as_iface, s_as_alt);
 
         if (cerr != ESP_OK)
@@ -1104,6 +1149,54 @@ static bool rate_ok(uint32_t rate)
         if (s_rates[k] == rate)
             return true;
     return false;
+}
+
+/* The worker: opens the DAC when one appears, forgets it when it goes. One
+ * pass at start covers a DAC that was already plugged in at boot, since a
+ * client only hears NEW_DEV for devices enumerated after it registered. */
+static void worker_task(void *arg)
+{
+    (void)arg;
+
+    for (;;)
+    {
+        if (!s_dev || s_gone)
+            uac2_open();
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        vTaskDelay(pdMS_TO_TICKS(300));     /* let enumeration settle */
+    }
+}
+
+bool uac2_auto_start(void)
+{
+    if (s_worker)
+        return true;
+    if (!usbhost_install() || !client_setup())
+        return false;
+
+    /* Taken now, at boot, before anything opens a file on the SD card: the
+     * stream's transfers, and the reserve the claim will be given. */
+    if (!alloc_transfers())
+        return false;
+    reserve_take();
+
+    if (xTaskCreate(worker_task, "uac2dev", 4096, NULL, 3, &s_worker) != pdPASS)
+    {
+        s_worker = NULL;
+        return false;
+    }
+    ESP_LOGI(TAG, "USB-C DAC: automatic (opens when plugged in)");
+    return true;
+}
+
+bool uac2_attached(void)
+{
+    return s_dev && !s_gone && s_claimed;
+}
+
+const char *uac2_product(void)
+{
+    return s_product[0] ? s_product : "?";
 }
 
 bool uac2_start(void)
@@ -1270,7 +1363,11 @@ static void on_client_event(const usb_host_client_event_msg_t *msg, void *arg)
     (void)arg;
 
     if (msg->event == USB_HOST_CLIENT_EVENT_NEW_DEV)
+    {
         ESP_LOGI(TAG, "device attached: address %d", (int)msg->new_dev.address);
+        if (s_worker)
+            xTaskNotifyGive(s_worker);
+    }
     else if (msg->event == USB_HOST_CLIENT_EVENT_DEV_GONE)
     {
         /* Only flag it: this runs on the client task, and the teardown (device
@@ -1281,6 +1378,8 @@ static void on_client_event(const usb_host_client_event_msg_t *msg, void *arg)
             s_gone = true;
         }
         ESP_LOGW(TAG, "device gone");
+        if (s_worker)
+            xTaskNotifyGive(s_worker);
     }
 }
 

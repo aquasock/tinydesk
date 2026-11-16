@@ -129,6 +129,7 @@ add_library(tinydesk_apps STATIC
     apps/mqtt.c
     apps/network.c
     apps/gps.c
+    apps/usbset.c
     apps/bluetooth.c
     apps/displays.c
     apps/pyui.c

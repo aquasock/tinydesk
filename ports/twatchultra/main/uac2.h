@@ -14,6 +14,16 @@
 /* Find the DAC and prepare the endpoints. False when it is not attached. */
 bool uac2_open(void);
 
+/* Automatic mode, for OTG host mode with usb.dac = 1 (usbhost.c calls it at
+ * boot): the DAC is opened when it is plugged in and forgotten when it goes. */
+bool uac2_auto_start(void);
+
+/* True while a DAC is open and ready to stream. */
+bool uac2_attached(void);
+
+/* Its product string, for the USB page ("?" before one has been seen). */
+const char *uac2_product(void);
+
 /* Claim the interface, set the rate and bring the isochronous stream up, at
  * 48 kHz. */
 bool uac2_start(void);

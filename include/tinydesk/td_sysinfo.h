@@ -358,6 +358,43 @@ typedef struct
     bool (*set_time)(void);
 } td_gps_ops_t;
 
+    /* --------------------------------------------------------- USB-C port */
+
+/*
+ * The USB-C port's role, for the USB page in Settings: NORMAL (the PC sees the
+ * board -- its console, flashing) or OTG HOST (the board drives USB devices
+ * plugged into it). On a board whose one port does both, the two exclude each
+ * other: while it is a host the PC cannot see the board at all, and getting
+ * back means a restart. So the role is SAVED here and APPLIED at the next
+ * restart, and the page shows both what is saved and what is running.
+ *
+ * In host mode the board may support several device classes -- a USB-C audio
+ * DAC first, a game controller later -- each enabled separately; a class that
+ * is enabled is opened by the port when its device is plugged in.
+ *
+ * Every call returns at once. Device-wide, not per user: this is a property of
+ * the hardware, not of who is logged in. NULL in td_sysinfo_t on a board with
+ * no switchable port, and Settings then shows no USB page.
+ */
+typedef struct
+{
+    bool (*host_saved)(void);          /* the role the next restart applies */
+    bool (*host_running)(void);        /* the role in effect now */
+    bool (*set_host)(bool host);       /* save the role; false if refused */
+
+        /* Device classes for host mode, 0..devices()-1. */
+    int (*devices)(void);
+    const char *(*device_name)(int i);           /* "USB-C DAC" */
+    bool (*device_enabled)(int i);               /* saved setting */
+    bool (*set_device_enabled)(int i, bool on);  /* save; applies at restart */
+
+        /* One short line on what is attached now, e.g. "USB-C DAC: KM-HIFI-384KHZ"
+     * or "nothing attached"; written to out, at most cap bytes. */
+    void (*status)(char *out, int cap);
+
+    void (*restart)(void);             /* apply the saved role now */
+} td_usb_ops_t;
+
     /* ------------------------------------------------------------ Bluetooth */
 
     /* Bluetooth keyboards and mice, for the Bluetooth app and the bt command.
@@ -757,6 +794,10 @@ typedef struct
      * NULL on a board with no way to make a noise, and the BEL is then simply
      * ignored, which is what every terminal does when it has no bell. */
     void (*bell)(void);
+
+        /* Optional: the USB-C port's role and host-mode devices (the USB page in
+     * Settings). NULL on a board without a switchable port; see td_usb_ops_t. */
+    const td_usb_ops_t *usb;
 } td_sysinfo_t;
 
     /* Install / read the port's sysinfo (never NULL; unset members are NULL). */

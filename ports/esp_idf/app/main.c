@@ -406,6 +406,13 @@ __attribute__((weak)) const td_gps_ops_t *board_gps_ops(void)
     return NULL;
 }
 
+/* The USB-C port's role and host-mode devices, for the USB page in Settings.
+ * NULL by default: a board whose port cannot switch shows no page. */
+__attribute__((weak)) const td_usb_ops_t *board_usb_ops(void)
+{
+    return NULL;
+}
+
   /* What a BEL means on this board. The weak default does nothing, so a board
  * with no speaker ignores BEL the way every terminal does. */
 __attribute__((weak)) void board_bell(void)
@@ -933,6 +940,7 @@ void app_main(void)
 #endif
     s_info.bt = bt_hid_start();                 /* Bluetooth keyboards and mice (bt.enable = 1) */
     s_info.gps = board_gps_ops();               /* the GPS app, where the board has a receiver */
+    s_info.usb = board_usb_ops();               /* the USB page in Settings, where the port can switch */
     s_info.mouse = hid_input_mouse_ops();       /* the Mouse and Keyboard apps, when either is on */
     s_info.keyboard = hid_input_keyboard_ops();
 

@@ -27,6 +27,7 @@
 #include "usbdiag.h"
 #include "bleuart.h"
 #include "uac2.h"
+#include "usbhost.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -567,6 +568,13 @@ bool link_init(void)
 
     if (!uac2_register_command())
         ESP_LOGW(TAG, "uac2 command did not register");
+
+    /* The USB-C port's saved role (board keys usb.host, usb.dac), applied now:
+     * after the board keys are loaded, and before anything has opened a file on
+     * the SD card, because the USB audio stream's DMA memory has to be taken
+     * first (reference USB-005). In OTG host mode the PC stops seeing the board
+     * from this point; `board set usb.host 0` and `reboot` over BLE undo it. */
+    usbhost_boot();
 
     if (!bleuart_register_command())
         ESP_LOGW(TAG, "bleuart command did not register");

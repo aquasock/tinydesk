@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -162,6 +163,14 @@ static void backend_resize(void *ctx, int cols, int rows)
     s_cols = cols;
 }
 
+/* Called immediately before the shell's task is created, so a board that had
+ * to hold internal RAM for it (one whose boot takes memory before the shell
+ * exists) can release it at the last moment, with nothing in between to take
+ * it. The default does nothing. */
+__attribute__((weak)) void board_shell_task_prepare(void)
+{
+}
+
 static int backend_start(void *ctx, int cols, int rows)
 {
     (void)ctx;
@@ -176,9 +185,12 @@ static int backend_start(void *ctx, int cols, int rows)
     s_out_lock = xSemaphoreCreateMutex();
     if (!s_in || !s_out || !s_out_lock)
         return -1;
+    board_shell_task_prepare();
     if (xTaskCreate(shell_task, "tdsh", TDSH_SHELL_TASK_STACK, NULL, SHELL_PRIORITY, NULL) != pdPASS)
     {
-        ESP_LOGE(TAG, "cannot create the shell task");
+        ESP_LOGE(TAG, "cannot create the shell task (%u-byte stack; internal largest %u)",
+                 (unsigned)TDSH_SHELL_TASK_STACK,
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
         return -1;
     }
     s_started = true;

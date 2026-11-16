@@ -5,6 +5,7 @@ console.tx
 console.uart
 display2.baud
 display2.rx
+display2.transport
 display2.tx
 display2.uart
 gps.pps

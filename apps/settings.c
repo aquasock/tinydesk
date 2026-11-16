@@ -415,6 +415,13 @@ static void on_update(td_widget_t *w, void *user)
     td_app_launch("Software Update");
 }
 
+static void on_usb(td_widget_t *w, void *user)
+{
+    (void)w;
+    (void)user;
+    td_usb_settings_open();
+}
+
 static void on_datetime(td_widget_t *w, void *user)
 {
     (void)w;
@@ -498,6 +505,8 @@ static void launch(void)
         td_button(s_win, 13, 17, "Displays...", on_displays, NULL);      /* 13..27 */
         if (td_sysinfo()->bt)
             td_button(s_win, 0, 18, "Bluetooth...", on_bluetooth, NULL);
+        if (td_sysinfo()->usb)
+            td_button(s_win, 16, 18, "USB...", on_usb, NULL);             /* 16..23 */
     }
     else
     {
@@ -507,6 +516,8 @@ static void launch(void)
         td_button(s_win, 24, 17, "Displays...", on_displays, NULL);
         if (td_sysinfo()->bt)
             td_button(s_win, 1, 18, "Bluetooth...", on_bluetooth, NULL);
+        if (td_sysinfo()->usb)
+            td_button(s_win, 18, 18, "USB...", on_usb, NULL);
     }
     td_button(s_win, 1, -1, "Close", on_close_btn, NULL);
     /* "Close" is 9 columns at x1, so the status starts at 11 or it runs into
