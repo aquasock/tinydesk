@@ -88,6 +88,18 @@ static volatile uint32_t s_short;
 static volatile uint32_t s_h_magic, s_h_ready;
 static volatile int32_t s_h_rate, s_h_ch, s_h_bits, s_h_last;
 static volatile uint32_t s_h_consumed, s_h_calls;
+
+/*
+ * THE STATE BLOCK, WHILE A TRACK IS PLAYING.
+ *
+ * The handle is copied into the s_h_* fields when the task ENDS, because it is
+ * freed then. That left the status command reporting magic 00000000, rate 0,
+ * ch 0 for the whole duration of a track that was playing perfectly -- a status
+ * line that reads like a failure. Keeping the pointer lets a running track
+ * report what the decoder actually parsed; it is cleared before the block is
+ * freed, so a finished track reads the copy as before.
+ */
+static const void *s_state_live;
 static char s_msg[160];   /* long enough for the loader's mismatch explanation */
 
 static void set_msg(const char *m) { snprintf(s_msg, sizeof(s_msg), "%s", m); }
@@ -193,6 +205,9 @@ static void play_task(void *arg)
         s_state = 3;
         goto cleanup;
     }
+
+    /* Readable by the status command from here on; cleared before the free. */
+    s_state_live = state;
 
     size_t have = 0;
     bool started = false;
@@ -347,6 +362,7 @@ static void play_task(void *arg)
     dump_state(state, MODFLAC_STATE_BYTES);
 
 cleanup:
+    s_state_live = NULL;
     if (in) heap_caps_free(in);
     if (out) heap_caps_free(out);
     if (pcm) heap_caps_free(pcm);
@@ -406,13 +422,38 @@ static int cmd_modflac(tdsh_session_t *session, int argc, char **argv)
                    s_state == 1 ? "playing" : (s_state == 2 ? "done" : "error"),
                    (unsigned long)s_frames, (unsigned long)s_errors,
                    (unsigned long)s_short, s_msg[0] ? ": " : "", s_msg);
-            /* The module handle, which is what says WHY a decode failed. */
+            /*
+             * The module handle, which is what says WHY a decode failed -- and
+             * what it actually parsed when one is working. While a track runs it
+             * is read from the block itself; the s_h_* copy is only filled in
+             * when the task ends and the block is freed.
+             */
+            uint32_t w_magic = s_h_magic, w_ready = s_h_ready, w_calls = s_h_calls;
+            int32_t w_rate = s_h_rate, w_ch = s_h_ch, w_bits = s_h_bits;
+            int32_t w_last = s_h_last;
+            uint32_t w_consumed = s_h_consumed;
+            const void *live = s_state_live;
+
+            if (live)
+            {
+                const uint32_t *w = (const uint32_t *)live;
+
+                w_magic = w[MODH_WORD_MAGIC];
+                w_ready = w[MODH_WORD_READY];
+                w_rate = (int32_t)w[MODH_WORD_RATE];
+                w_ch = (int32_t)w[MODH_WORD_CH];
+                w_bits = (int32_t)w[MODH_WORD_BITS];
+                w_last = (int32_t)w[MODH_WORD_LAST];
+                w_consumed = w[MODH_WORD_CONSUMED];
+                w_calls = w[MODH_WORD_CALLS];
+            }
+
             printf("handle: magic %08lx ready %lu rate %ld ch %ld bits %ld\n",
-                   (unsigned long)s_h_magic, (unsigned long)s_h_ready,
-                   (long)s_h_rate, (long)s_h_ch, (long)s_h_bits);
+                   (unsigned long)w_magic, (unsigned long)w_ready, (long)w_rate,
+                   (long)w_ch, (long)w_bits);
             printf("        last %ld consumed %lu in-calls %lu, %lu decode calls\n",
-                   (long)s_h_last, (unsigned long)s_h_consumed,
-                   (unsigned long)s_h_calls, (unsigned long)s_calls);
+                   (long)w_last, (unsigned long)w_consumed, (unsigned long)w_calls,
+                   (unsigned long)s_calls);
         }
         return 0;
     }
