@@ -673,33 +673,142 @@ static void hw_vol_probe(void)
     s_hw_vol = s_vol_max > s_vol_min;
 }
 
-/* Apply s_vol_pct: on the DAC when it has a volume control (samples at unity),
- * by scaling the samples otherwise. Percent is amplitude, so 50 is -6 dB, and
- * 0 mutes. */
+/*
+ * THE VOLUME IS OURS, IT IS UNIFORM IN dB, AND THE DAC IS HELD FLAT.
+ *
+ * WHY THE DAC'S OWN VOLUME IS NOT USED. It accepts every value and reports it
+ * back correctly -- measured across the whole range: 10% reads -20.00 dB,
+ * 25% -12.04, 50% -6.01, 100% 0.00, all echoed exactly by GET_CUR -- and the
+ * output does not follow. At -20 dB the operator heard what 50% sounded like.
+ * A control that reports a number it does not honour cannot be trusted for
+ * anything, so the Feature Unit is set to 0 dB and unmuted ONCE (dac_flat) and
+ * never touched again; all attenuation happens in the samples. That is also how
+ * a USB DAC is normally driven: the host owns the volume, the device is a
+ * fixed-gain output. (Reference USB-006.)
+ *
+ * WHY LINEAR IN dB AND NOT A POWER LAW. The first attempt used the psychoacoustic
+ * "half as loud is -10 dB" rule, gain = L^1.66096. Measured, it was exact to
+ * 0.02 dB -- and the operator rejected it by ear: "the taper is better but can
+ * be more aggressive", and it felt inverted. That is the correct reading of the
+ * SHAPE, not of the accuracy. A power law is accurate at exactly one point and
+ * wrong everywhere else: 10 dB of the 33 dB total sits in the first tenth of
+ * travel and only 1.7 dB in the last tenth, so the bottom is dramatic and the
+ * top is nearly dead.
+ *
+ * A volume control should move the same number of decibels per unit of travel.
+ * Linear in dB also lands where the ear expects: over a 36 dB range, 50% is
+ * -18.00 dB, within a decibel of a 15A audio-taper potentiometer (-17.7 dB at
+ * half rotation). The operator's own reference preamp turned out to be
+ * near-linear-amplitude with 42 percent dead travel at the top, which is what
+ * made it feel wrong in the opposite direction.
+ *
+ * WHAT VLC DOES, AND WHAT WAS TAKEN FROM IT. VLC's software mixer cubes the
+ * GAIN (modules/audio_output/volume.h, "Cubic mapping from software volume to
+ * amplification factor"), and the comment there says every volume-capable
+ * plugin must match it. Its Qt dial is not a 0..1 control: qt-max-volume
+ * defaults to 125 (range 60..300), so unity sits at 80 percent of travel and
+ * the last 20 percent is OVERDRIVE. Three things follow, and all three are
+ * used here:
+ *
+ *   1. VLC and this curve AGREE AT THE MIDPOINT of the usable range: cubic
+ *      reaches -18.1 dB at the factor-0.5 point and this curve is -18.00 dB at
+ *      50 percent. Two independent routes to the same number, which is why the
+ *      operator remembered "-18ish" from consumer gear.
+ *   2. THEY DISAGREE IN SHAPE, and the shape is what was rejected by ear. Cubic
+ *      is front-loaded: 18 dB of the trip happens in the first tenth of travel
+ *      and 2.7 dB in the last tenth, reaching -60 dB by 10 percent. That is the
+ *      "steep at the bottom, dead at the top" complaint this cycle started
+ *      from. Linear in dB spends 3.6 dB on every tenth instead.
+ *   3. VLC CANNOT BE COPIED WHOLE, because it overdrives. This board's 100
+ *      percent is already digital full scale, so a boost above it clips in the
+ *      samples. Only the sub-unity portion of VLC's law is usable here, and that
+ *      portion is exactly the bottom-heavy part described above.
+ *
+ * So the midpoint is VLC's; the even spacing is not. Recorded rather than
+ * quietly diverged from, since "VLC does it this way" is a reasonable thing for
+ * a future agent to check.
+ *
+ * THE RANGE. 36 dB is chosen so that the bottom of the travel is -36 dB: quiet
+ * but still audible on headphones, and 6 times the resolution per step that a
+ * 60 dB range would give. One percent of travel is 0.36 dB, comfortably below
+ * the ~1 dB step the ear resolves, so the control is smooth everywhere.
+ *
+ * RESOLUTION AT THE BOTTOM, stated honestly: at 10 percent the gain is 0.063,
+ * so a full-scale sample becomes 2069 of 32767 -- about 11 effective bits of
+ * the source's 16. Measured at the DAC's line output, the curve is correct to
+ * 0.02 dB, so this is a noise-floor matter and not a loudness one. The DAC
+ * offers S24 (alt 2) and S32 (alt 3) alternates that would remove it entirely
+ * if a later cycle wants headroom down there.
+ */
+#define UAC2_VOL_RANGE_DB   36.0f
+
+/* The attenuation for a percentage, in 1/256 dB: linear in dB, full scale at
+ * 100 percent and -UAC2_VOL_RANGE_DB at 0 percent. */
+static int32_t vol_db256(int pct)
+{
+    if (pct <= 0)
+        return (int32_t)(-UAC2_VOL_RANGE_DB * 256.0f);
+    if (pct >= 100)
+        return 0;
+
+    return (int32_t)lroundf(-UAC2_VOL_RANGE_DB * 256.0f * (1.0f - (float)pct / 100.0f));
+}
+
+/* Compute the sample gain from s_vol_pct. Nothing is written to the device. */
 static void apply_volume(void)
 {
-    if (!s_hw_vol)
+    if (s_vol_pct <= 0)
     {
-        s_gain_q15 = (int32_t)s_vol_pct * 32768 / 100;
+        s_gain_q15 = 0;
+        s_vol_db256 = (int16_t)vol_db256(0);
+        return;
+    }
+    if (s_vol_pct >= 100)
+    {
+        s_gain_q15 = 32768;             /* unity: skip the multiply entirely */
+        s_vol_db256 = 0;
         return;
     }
 
-    s_gain_q15 = 32768;
+    /* gain = 10^(dB/20), dB from vol_db256 in 1/256 units. */
+    const float db = (float)vol_db256(s_vol_pct) / 256.0f;
+    int32_t q = (int32_t)lroundf(powf(10.0f, db / 20.0f) * 32768.0f);
 
-    uint8_t m = s_vol_pct == 0 ? 1 : 0;
-    int32_t db = s_vol_pct == 0 ? s_vol_min
-                                : (int32_t)lroundf(20.0f * log10f(s_vol_pct / 100.0f) * 256.0f);
+    if (q < 1)
+        q = 1;                          /* not mute by rounding */
+    if (q > 32768)
+        q = 32768;
+    s_gain_q15 = q;
+    s_vol_db256 = (int16_t)vol_db256(s_vol_pct);
+}
 
-    if (db < s_vol_min)
-        db = s_vol_min;
-    if (db > s_vol_max)
-        db = s_vol_max;
-    s_vol_db256 = (int16_t)db;
+/*
+ * Hold the DAC at unity: unmuted, 0 dB, on every channel it answers for.
+ *
+ * Sent on every channel and every Feature Unit rather than only the playback
+ * one, because this dongle answers on some and STALLs on others (channel 0 of
+ * the playback unit refuses MUTE, channels 1 and 2 accept volume), and a STALL
+ * here is reported and ignored -- what matters is that nothing is left
+ * attenuating the stream behind our back. Called at open and again after every
+ * dac_wake(), since the alt-setting cycle may reset the device's state.
+ */
+static void dac_flat(void)
+{
+    if (!s_dev)
+        return;
 
-    uint8_t v[2] = { (uint8_t)(db & 0xFF), (uint8_t)((db >> 8) & 0xFF) };
+    for (int u = 0; u < s_nfu; u++)
+    {
+        for (uint8_t cn = 0; cn < 3; cn++)
+        {
+            uint8_t m = 0, v[2] = { 0, 0 };   /* unmuted, 0 dB */
 
-    fu_set(s_play_fu, UAC2_FU_MUTE, 0, &m, 1);
-    fu_set(s_play_fu, UAC2_FU_VOLUME, 0, v, 2);
+            fu_set(s_fu_id[u], UAC2_FU_MUTE, cn, &m, 1);
+            fu_set(s_fu_id[u], UAC2_FU_VOLUME, cn, v, 2);
+        }
+    }
+    ESP_LOGI(TAG, "DAC held at 0 dB; volume is applied to the samples (%d%%, %d.%02d dB)",
+             s_vol_pct, s_vol_db256 / 256, (s_vol_db256 < 0 ? -s_vol_db256 : s_vol_db256) % 256 * 100 / 256);
 }
 
 static esp_err_t get_rates(void)
@@ -1202,7 +1311,8 @@ static bool open_locked(void)
         return false;
     }
 
-    hw_vol_probe();
+    hw_vol_probe();             /* diagnostic only: reports what the DAC offers */
+    dac_flat();                 /* hold it at 0 dB; attenuation is ours */
     apply_volume();
     ESP_LOGI(TAG, "volume: %s, playback FU %u, range %d..%d /256 dB", s_hw_vol ? "DAC" : "software",
              s_play_fu, s_vol_min, s_vol_max);
@@ -1342,6 +1452,11 @@ bool uac2_auto_start(void)
     if (s_worker)
         return true;
 
+    /* The gain must match s_vol_pct before a DAC is ever opened: `uac2` reports
+     * it, and a stream that started without an open would use the initial
+     * unity. apply_volume() writes no device registers, so this is free. */
+    apply_volume();
+
     if (!usbhost_install() || !client_setup())
         return false;
 
@@ -1429,6 +1544,7 @@ static esp_err_t dac_wake(void)
     const esp_err_t err = set_alt(s_as_iface, s_as_alt);   /* and back up */
 
     vTaskDelay(pdMS_TO_TICKS(20));
+    dac_flat();                 /* the cycle may reset the device's own volume */
     apply_volume();
     return err;
 }
@@ -1822,7 +1938,7 @@ done:
         fclose(f);
     s_play_stop = false;
     s_play_task = NULL;
-    vTaskDelete(NULL);
+    vTaskDeleteWithCaps(NULL);      /* created with xTaskCreateWithCaps */
 }
 
 static int cmd_play(const char *path)
@@ -1843,7 +1959,13 @@ static int cmd_play(const char *path)
     snprintf(s_play_path, sizeof(s_play_path), "%s", path);
 
     s_play_stop = false;
-    if (xTaskCreate(play_task, "uac2play", UAC2_PLAY_STACK, s_play_path, 4, &s_play_task) != pdPASS)
+    /* PSRAM stack, like usb_lib, the client and the worker: this task is 4 KB
+     * of internal RAM otherwise, and it is the last one here that was still
+     * taking it. It reads the card through FATFS over the SD card's SPI bus,
+     * which never disables the flash cache, so the rule that a PSRAM-stack task
+     * must not touch a flash API is kept. */
+    if (xTaskCreateWithCaps(play_task, "uac2play", UAC2_PLAY_STACK, s_play_path, 4, &s_play_task,
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS)
     {
         s_play_task = NULL;
         printf("uac2: no task\n");
@@ -1893,11 +2015,17 @@ static int cmd_uac2(tdsh_session_t *session, int argc, char **argv)
             if (s_dev)
                 apply_volume();
         }
-        if (s_hw_vol)
-            printf("uac2: vol %d%% = DAC %d.%02d dB\n", s_vol_pct, s_vol_db256 / 256,
-                   (s_vol_db256 < 0 ? -s_vol_db256 : s_vol_db256) % 256 * 100 / 256);
+        /* Ours, not the DAC's, and perceptual: the percentage is loudness, so
+         * 50 is -10 dB. The DAC stays at 0 dB (see apply_volume). */
+        if (s_vol_pct == 0)
+            printf("uac2: vol 0%% (muted)\n");
         else
-            printf("uac2: vol %d%% (software)\n", s_vol_pct);
+        {
+            const int32_t db = vol_db256(s_vol_pct);
+
+            printf("uac2: vol %d%% = %ld.%02ld dB on the samples\n", s_vol_pct,
+                   (long)(db / 256), (long)((db < 0 ? -db : db) % 256 * 100 / 256));
+        }
         return 0;
     }
 
@@ -2025,9 +2153,21 @@ static int cmd_uac2(tdsh_session_t *session, int argc, char **argv)
     printf("frames=%lu errors=%lu underruns=%lu short=%lu missed=%lu last=%d%s\n",
            (unsigned long)f, (unsigned long)e, (unsigned long)u, (unsigned long)s_short,
            (unsigned long)m, s_last_status, s_gone ? " GONE" : "");
-    printf("rate=%lu vol=%d%%%s play: %s\n", (unsigned long)s_rate, s_vol_pct,
-           s_hw_vol ? "(DAC)" : "(sw)",
-           s_play_task ? "running" : (s_play_msg[0] ? s_play_msg : "idle"));
+    {
+        /* Computed from the percent on the spot: s_vol_db256 is only filled in by
+         * apply_volume(), which does not run before the first open, and a status
+         * line that says 50% is 0.00 dB is worse than no number at all. */
+        const int32_t db = vol_db256(s_vol_pct);
+
+        if (s_vol_pct <= 0)
+            printf("rate=%lu vol=0%% (muted) play: %s\n", (unsigned long)s_rate,
+                   s_play_task ? "running" : (s_play_msg[0] ? s_play_msg : "idle"));
+        else
+            printf("rate=%lu vol=%d%% (%ld.%02ld dB) play: %s\n", (unsigned long)s_rate,
+                   s_vol_pct, (long)(db / 256),
+                   (long)((db < 0 ? -db : db) % 256 * 100 / 256),
+                   s_play_task ? "running" : (s_play_msg[0] ? s_play_msg : "idle"));
+    }
     if (s_start_err[0])
         printf("start err: %s\n", s_start_err);
     printf("rates:");
