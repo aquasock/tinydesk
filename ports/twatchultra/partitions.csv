@@ -17,4 +17,23 @@ ota_1,      app,  ota_1,    0x310000, 0x2F0000,
 # with the console compiled out, this is the only way a panic reports itself.
 coredump,   data, coredump, 0x600000, 0x10000,
 otadata,    data, ota,      0x610000, 0x2000,
-storage,    data, littlefs, 0x620000, 0x9E0000,
+storage,    data, littlefs, 0x620000, 0x7E0000,
+# A raw, executable partition for decoder and codec blobs: memory-mapped as
+# INSTRUCTIONS with esp_partition_mmap(), so the code runs from flash and costs
+# no internal SRAM at load. Xtensa executes from flash natively -- every
+# instruction ESP-IDF runs is XIP-mapped -- so a blob here is no different from
+# the app's own text, except that the app does not have to contain it.
+#
+# WHY IT EXISTS. The app image has ~27 KB left in ota_1 and one FLAC decoder
+# already cost 31.7 KB of it, so a second codec does not fit in the app at all.
+# This partition is the room: 2 MB against 704 KB for all eleven Rockbox
+# codecs, measured.
+#
+# SUBTYPE 0x40 is the first application-defined data subtype; ESP-IDF reserves
+# 0x00-0x3F. Find it with esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
+# 0x40, "modules").
+#
+# UNPROVEN: nothing loads from here yet. The open question is whether the codec
+# blobs can be linked position-independently at this address and called across
+# the Xtensa windowed ABI. The partition costs nothing while it is empty.
+modules,    data, 0x40,     0xE00000, 0x200000,
