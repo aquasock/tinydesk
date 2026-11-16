@@ -14,8 +14,14 @@
 /* Find the DAC and prepare the endpoints. False when it is not attached. */
 bool uac2_open(void);
 
-/* Claim the interface, set the rate and bring the isochronous stream up. */
+/* Claim the interface, set the rate and bring the isochronous stream up, at
+ * 48 kHz. */
 bool uac2_start(void);
+
+/* As uac2_start(), at `rate`, which must be in the clock's RANGE list. A stream
+ * already running at another rate is stopped and restarted, and whatever was
+ * queued for the old rate is discarded. */
+bool uac2_start_rate(uint32_t rate);
 
 /* Stop the stream and release the interface. */
 void uac2_stop(void);
@@ -32,7 +38,7 @@ int uac2_write(const uint8_t *pcm, int len);
  * by the sink, which can never fall behind it. len must not exceed the ring. */
 int uac2_write_wait(const uint8_t *pcm, int len, uint32_t timeout_ms);
 
-/* The rate this driver asks the device for. */
+/* The rate the stream is running at. */
 uint32_t uac2_rate(void);
 
 void uac2_stats(uint32_t *frames, uint32_t *errors, uint32_t *underruns,
