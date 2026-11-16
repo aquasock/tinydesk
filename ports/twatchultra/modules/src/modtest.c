@@ -32,10 +32,12 @@
 __attribute__((section(".modheader"), used))
 const modload_header_t mod_header = {
     .magic = MODLOAD_MAGIC,
-    .abi_version = MODHOST_ABI_VERSION,
+    .abi_version = MODLOAD_ABI_VERSION,
     .size = 0,                      /* patched after linking */
     .entry_offset = 0,              /* patched after linking */
     .name = "modapi",
+    .linked_inst = 0,               /* patched after linking */
+    .linked_data = 0,               /* patched after linking */
 };
 
 /* The table is fetched by the shim at a build-time-derived address; this is the

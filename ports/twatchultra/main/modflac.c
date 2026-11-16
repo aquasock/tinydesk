@@ -45,6 +45,24 @@ __attribute__((unused)) static const char *TAG = "modflac";
 /* The decoder object lives in here. It is a few hundred bytes; the buffers it
  * allocates for its own work come through the host table and go to PSRAM. */
 #define MODFLAC_STATE_BYTES 4096
+
+/*
+ * THE MODULE'S HANDLE, AS WORD OFFSETS.
+ *
+ * `flac_handle_t` in modules/src/flacmod.cpp is the authority on this layout --
+ * it is the module's own state and the module is what writes it. These offsets
+ * exist because the firmware needs to read the stream rate before it opens the
+ * amplifier, and because the status command reports the rest. Named once here
+ * so the two places that decode the handle cannot drift apart.
+ */
+#define MODH_WORD_MAGIC   0
+#define MODH_WORD_READY   1
+#define MODH_WORD_RATE    2
+#define MODH_WORD_CH      3
+#define MODH_WORD_BITS    4
+#define MODH_WORD_LAST    5
+#define MODH_WORD_CONSUMED 6
+#define MODH_WORD_CALLS   7
 #define MODFLAC_WRITE_MS    1000
 #define MODFLAC_STACK       8192
 #define MODFLAC_PRIO        3
@@ -56,6 +74,13 @@ static volatile int s_state;
 static volatile uint32_t s_frames;
 static volatile uint32_t s_calls;
 static volatile int32_t s_verdict;
+/* The two figures `music` used to report from its own loop, kept because they
+ * are the ones that diagnose a bad output path: a decode ERROR means the module
+ * rejected the stream, a SHORT WRITE means the I2S DMA stopped taking samples
+ * and audio was lost. Both look like "no sound" from the outside and neither
+ * does from these counters. */
+static volatile uint32_t s_errors;
+static volatile uint32_t s_short;
 
 /* The module handle's first words, copied out before the block is freed so the
  * status command can explain a failure without a diagnostic file. The console
@@ -63,7 +88,7 @@ static volatile int32_t s_verdict;
 static volatile uint32_t s_h_magic, s_h_ready;
 static volatile int32_t s_h_rate, s_h_ch, s_h_bits, s_h_last;
 static volatile uint32_t s_h_consumed, s_h_calls;
-static char s_msg[64];
+static char s_msg[160];   /* long enough for the loader's mismatch explanation */
 
 static void set_msg(const char *m) { snprintf(s_msg, sizeof(s_msg), "%s", m); }
 
@@ -93,16 +118,17 @@ static void dump_state(const void *state, size_t size)
     fprintf(f, "frames=%lu\ncalls=%lu\nverdict=%ld\nmsg=%s\n",
             (unsigned long)s_frames, (unsigned long)s_calls, (long)s_verdict, s_msg);
 
-    /* The first two words of the module's handle: its magic and ready flag. */
-    if (state && size >= 8)
+    /* The module's handle, at the offsets flacmod.cpp writes it. */
+    if (state && size >= 8 * sizeof(uint32_t))
     {
         const uint32_t *w = (const uint32_t *)state;
 
-        fprintf(f, "handle_magic=%08lx ready=%lu\n", (unsigned long)w[0],
-                (unsigned long)w[1]);
+        fprintf(f, "handle_magic=%08lx ready=%lu\n",
+                (unsigned long)w[MODH_WORD_MAGIC], (unsigned long)w[MODH_WORD_READY]);
         fprintf(f, "rate=%ld ch=%ld bits=%ld last=%ld consumed=%lu n=%lu\n",
-                (long)(int32_t)w[2], (long)(int32_t)w[3], (long)(int32_t)w[4],
-                (long)(int32_t)w[5], (unsigned long)w[6], (unsigned long)w[7]);
+                (long)(int32_t)w[MODH_WORD_RATE], (long)(int32_t)w[MODH_WORD_CH],
+                (long)(int32_t)w[MODH_WORD_BITS], (long)(int32_t)w[MODH_WORD_LAST],
+                (unsigned long)w[MODH_WORD_CONSUMED], (unsigned long)w[MODH_WORD_CALLS]);
     }
     fclose(f);
 }
@@ -124,7 +150,10 @@ static void play_task(void *arg)
      */
     if (!modload_ready())
     {
-        set_msg("no module mapped at boot");
+        /* The loader knows exactly why -- an empty partition and a blob built
+         * for a different mapping are different problems, so report its reason
+         * rather than a generic one. */
+        set_msg(modload_why());
         s_state = 3;
         goto done;
     }
@@ -218,11 +247,31 @@ static void play_task(void *arg)
                     continue;
                 }
 
-                /* We do not have the rate through modcall_t yet -- use the file's
-                 * own STREAMINFO via the decoder is not exposed, so start at the
-                 * common case and let a wrong rate be audible rather than
-                 * silent. */
-                if (!sound_stream_open(44100))
+                /*
+                 * THE RATE COMES FROM THE FILE, NOT FROM A CONSTANT. The module
+                 * wrote it into its handle when it parsed STREAMINFO, which is
+                 * the OK-with-no-samples call just above -- so by the time a
+                 * call returns samples, the true rate is here. Opening at a
+                 * hard-coded 44100 made every 48 kHz file play sharp by a
+                 * semitone and a half, which sounds like a decoder bug and is
+                 * not one.
+                 */
+                const int32_t rate = ((const int32_t *)state)[MODH_WORD_RATE];
+
+                /* A rate outside what the I2S clock can divide sensibly means
+                 * the handle was not what we think it was; the common case is a
+                 * better guess than a clock that will not lock. */
+                if (rate < 8000 || rate > 96000)
+                {
+                    set_msg("odd stream rate, assuming 44100");
+                    if (!sound_stream_open(44100))
+                    {
+                        set_msg("no amplifier");
+                        s_state = 3;
+                        break;
+                    }
+                }
+                else if (!sound_stream_open(rate))
                 {
                     set_msg("no amplifier");
                     s_state = 3;
@@ -242,6 +291,8 @@ static void play_task(void *arg)
                                                                   MODFLAC_WRITE_MS);
 
                 s_frames += (uint32_t)got;
+                if (got < frames)
+                    s_short++;
             }
         }
         else if (r == MODCALL_NEED_INPUT)
@@ -265,6 +316,7 @@ static void play_task(void *arg)
         }
         else
         {
+            s_errors++;
             if (++consecutive_errors > 8)
             {
                 set_msg("decode error");
@@ -283,14 +335,14 @@ static void play_task(void *arg)
     {
         const uint32_t *w = (const uint32_t *)state;
 
-        s_h_magic = w[0];
-        s_h_ready = w[1];
-        s_h_rate = (int32_t)w[2];
-        s_h_ch = (int32_t)w[3];
-        s_h_bits = (int32_t)w[4];
-        s_h_last = (int32_t)w[5];
-        s_h_consumed = w[6];
-        s_h_calls = w[7];
+        s_h_magic = w[MODH_WORD_MAGIC];
+        s_h_ready = w[MODH_WORD_READY];
+        s_h_rate = (int32_t)w[MODH_WORD_RATE];
+        s_h_ch = (int32_t)w[MODH_WORD_CH];
+        s_h_bits = (int32_t)w[MODH_WORD_BITS];
+        s_h_last = (int32_t)w[MODH_WORD_LAST];
+        s_h_consumed = w[MODH_WORD_CONSUMED];
+        s_h_calls = w[MODH_WORD_CALLS];
     }
     dump_state(state, MODFLAC_STATE_BYTES);
 
@@ -319,6 +371,8 @@ static bool start(const char *path)
     s_frames = 0;
     s_calls = 0;
     s_verdict = 0;
+    s_errors = 0;
+    s_short = 0;
     set_msg("");
 
     if (xTaskCreateWithCaps(task_entry, "modflac", MODFLAC_STACK, NULL, MODFLAC_PRIO, &s_task,
@@ -338,48 +392,67 @@ static int cmd_modflac(tdsh_session_t *session, int argc, char **argv)
     if (argc >= 2 && strcmp(argv[1], "stop") == 0)
     {
         s_stop = true;
-        printf("modflac: stopping\n");
+        printf("music: stopping\n");
         return 0;
     }
 
     if (argc < 2)
     {
-        printf("modflac <file.flac> | modflac stop\n");
+        printf("music <file.flac> | music stop\n");
         if (s_task || s_state >= 2)
         {
-            printf("state %s, %lu frames, %lu calls, verdict %ld%s%s\n",
+            printf("state %s, %lu frames, %lu errors, %lu short writes"
+                   "%s%s\n",
                    s_state == 1 ? "playing" : (s_state == 2 ? "done" : "error"),
-                   (unsigned long)s_frames, (unsigned long)s_calls, (long)s_verdict,
-                   s_msg[0] ? ": " : "", s_msg);
+                   (unsigned long)s_frames, (unsigned long)s_errors,
+                   (unsigned long)s_short, s_msg[0] ? ": " : "", s_msg);
             /* The module handle, which is what says WHY a decode failed. */
             printf("handle: magic %08lx ready %lu rate %ld ch %ld bits %ld\n",
                    (unsigned long)s_h_magic, (unsigned long)s_h_ready,
                    (long)s_h_rate, (long)s_h_ch, (long)s_h_bits);
-            printf("        last %ld consumed %lu in-calls %lu\n",
+            printf("        last %ld consumed %lu in-calls %lu, %lu decode calls\n",
                    (long)s_h_last, (unsigned long)s_h_consumed,
-                   (unsigned long)s_h_calls);
+                   (unsigned long)s_h_calls, (unsigned long)s_calls);
         }
         return 0;
     }
 
     if (!start(argv[1]))
     {
-        printf("modflac: cannot start\n");
+        printf("music: cannot start\n");
         return 1;
     }
-    printf("modflac: decoding %s through the module\n", argv[1]);
+    printf("music: playing %s\n", argv[1]);
     return 0;
 }
 
+/*
+ * TWO NAMES, ONE PLAYER. `music` is the user-facing command and `modflac` is
+ * kept as its alias because every log entry, script and habit in this project
+ * refers to it, and because when something goes wrong it is useful to have a
+ * name that says "this is the path that goes through the partition". Before
+ * this they were two separate implementations of the same loop -- music.c with
+ * the decoder linked in, modflac.c with it in flash -- which is why the app
+ * carried both copies.
+ */
 static const tdsh_command_t s_modflac_cmd = {
+    "music",
+    "music <file.flac> | music stop",
+    "Play a FLAC through the decoder in the modules partition",
+    cmd_modflac,
+    TDSH_CMD_INTERACTIVE,
+};
+
+static const tdsh_command_t s_modflac_alias_cmd = {
     "modflac",
     "modflac <file.flac> | modflac stop",
-    "Play a FLAC using the decoder in the modules partition",
+    "Alias of `music`, naming the modules partition it decodes from",
     cmd_modflac,
     TDSH_CMD_INTERACTIVE,
 };
 
 bool modflac_register_command(void)
 {
-    return tdsh_register_command(&s_modflac_cmd) == 0;
+    return tdsh_register_command(&s_modflac_cmd) == 0 &&
+           tdsh_register_command(&s_modflac_alias_cmd) == 0;
 }

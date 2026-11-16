@@ -122,16 +122,38 @@ static modload_header_t s_hdr;
 static bool s_prepared;
 static void *s_entry;
 
+/*
+ * WHY A PREPARE FAILED, RETAINED.
+ *
+ * The caller passes a buffer, but the failure is usually wanted much later -- by
+ * `music` when the user finally asks for a track, not by the boot task that knew.
+ * Without keeping it the only report was "no module mapped at boot", which is
+ * true and useless: it does not distinguish an empty partition from a blob
+ * linked for a different mapping, and those need different fixes.
+ */
+static char s_why[128];
+
+const char *modload_why(void)
+{
+    return s_why[0] ? s_why : "module not prepared";
+}
+
 bool modload_prepare(char *why, size_t why_len)
 {
     if (s_prepared)
         return true;
 
+    /* Every exit below that fails leaves the reason in s_why. */
+    s_why[0] = '\0';
+
     const void *base = NULL;
     size_t size = 0;
 
     if (!modload_map(&base, &size, why, why_len))
+    {
+        snprintf(s_why, sizeof(s_why), "%s", why);
         return false;
+    }
 
     /* Map the data side too. It has to happen HERE, on the boot task: mapping
      * disables the flash cache, so a PSRAM-stack task cannot do it. */
@@ -158,14 +180,49 @@ bool modload_prepare(char *why, size_t why_len)
 
     modload_read_header(&s_hdr);
 
-    if (s_hdr.magic != MODLOAD_MAGIC || s_hdr.abi_version != MODHOST_ABI_VERSION ||
+    if (s_hdr.magic != MODLOAD_MAGIC || s_hdr.abi_version != MODLOAD_ABI_VERSION ||
         s_hdr.entry_offset >= size)
     {
-        snprintf(why, why_len, "no usable module (magic 0x%08lx abi %lu)",
-                 (unsigned long)s_hdr.magic, (unsigned long)s_hdr.abi_version);
+        snprintf(why, why_len, "no usable module (magic 0x%08lx abi %lu, want %u)",
+                 (unsigned long)s_hdr.magic, (unsigned long)s_hdr.abi_version,
+                 (unsigned)MODLOAD_ABI_VERSION);
+        snprintf(s_why, sizeof(s_why), "%s", why);
         s_prepared = false;
         s_entry = NULL;
         return false;
+    }
+
+    /*
+     * REFUSE A BLOB LINKED FOR A DIFFERENT MAPPING.
+     *
+     * Both windows are runtime-chosen and both move when the app image changes
+     * size, so a module built against the previous pair is not merely stale, it
+     * is wrong in a way that does not crash: .text still runs from the entry
+     * offset, and the damage appears only when a constant is read -- 64 KB off,
+     * from the wrong place in the data window.
+     *
+     * Measured cost of not checking: the first real track played nothing and the
+     * decoder reported "bad magic number" on two files that were fine. One line
+     * here replaces that hunt.
+     */
+    {
+        const uint32_t live_inst = (uint32_t)(uintptr_t)modload_inst_base();
+        const uint32_t live_data = (uint32_t)(uintptr_t)s_data_base;
+
+        if (s_hdr.linked_inst != live_inst || s_hdr.linked_data != live_data)
+        {
+            snprintf(why, why_len,
+                     "module linked for inst %08lx data %08lx, mapped at %08lx %08lx"
+                     " -- rebuild it: make -C modules flac",
+                     (unsigned long)s_hdr.linked_inst,
+                     (unsigned long)s_hdr.linked_data, (unsigned long)live_inst,
+                     (unsigned long)live_data);
+            snprintf(s_why, sizeof(s_why), "%s", why);
+            ESP_LOGE(TAG, "%s", why);
+            s_prepared = false;
+            s_entry = NULL;
+            return false;
+        }
     }
 
     s_entry = (void *)((const uint8_t *)modload_inst_base() + s_hdr.entry_offset);

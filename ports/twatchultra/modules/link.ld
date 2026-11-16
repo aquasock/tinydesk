@@ -2,8 +2,13 @@
  * Linker script for a module: everything at the address esp_partition_mmap()
  * hands back for the `modules` partition.
  *
- * 0x42ae0000 is MEASURED, not assumed -- `modtest` on the watch reports it, and
- * it must be re-measured if the partition table or the flash layout changes.
+ * MODTEXT_AT AND MODDATA_AT ARE BOTH MEASURED, never assumed. The firmware
+ * maps both partitions at boot and writes what the MMU gave it to
+ * /root/modaddr.txt; modules/moddata.at holds that answer and the Makefile
+ * passes both here as --defsym. They are NOT stable across app rebuilds: the
+ * pairing 0x42ae0000/0x3cbe0000 became 0x42ad0000/0x3cbd0000 when the app image
+ * changed size, and a blob linked for the old pair read its .rodata 64 KB off,
+ * which surfaced only as "bad magic number" from the decoder.
  * It is in the ESP32-S3's instruction address window (0x42000000..0x43ffffff),
  * which is what makes the blob fetchable rather than merely readable.
  *
@@ -14,7 +19,7 @@ ENTRY(mod_entry)
 
 SECTIONS
 {
-    . = 0x42ae0000;
+    . = MODTEXT_AT;
 
     .modheader : ALIGN(4)
     {

@@ -29,7 +29,6 @@
 #include "modflac.h"
 #include "modhost.h"
 #include "modload.h"
-#include "music.h"
 #include "uac2.h"
 #include "usbhost.h"
 
@@ -573,14 +572,13 @@ bool link_init(void)
     if (!uac2_register_command())
         ESP_LOGW(TAG, "uac2 command did not register");
 
-    if (!music_register_command())
-        ESP_LOGW(TAG, "music command did not register");
-
     if (!modload_register_command())
         ESP_LOGW(TAG, "modtest command did not register");
 
+    /* Registers BOTH `music` and its alias `modflac`: one player, and the
+     * decode happens out of the modules partition. */
     if (!modflac_register_command())
-        ESP_LOGW(TAG, "modflac command did not register");
+        ESP_LOGW(TAG, "music/modflac command did not register");
 
     /* Map the `modules` partition HERE, on the boot task, whose stack is in
      * internal RAM. esp_partition_mmap() disables the flash cache, and PSRAM is

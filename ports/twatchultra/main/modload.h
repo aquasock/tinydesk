@@ -52,11 +52,33 @@ typedef struct
     uint32_t size;              /* bytes the blob occupies, for bounds checks */
     uint32_t entry_offset;      /* from the start of the mapped region */
     char name[24];
+
+    /*
+     * THE ADDRESSES THE BLOB WAS LINKED FOR, so the loader can refuse to call
+     * a module built against a different mapping.
+     *
+     * A blob's literals are absolute: .text is linked at the instruction
+     * window's base and .rodata at the data window's. Both come from the MMU at
+     * boot and BOTH MOVE when the app image changes size -- measured, not
+     * hypothetical: 0x42ae0000/0x3cbe0000 became 0x42ad0000/0x3cbd0000 when the
+     * inline decoder was removed from the app.
+     *
+     * A stale pair does not crash. .text still runs, because the entry point is
+     * reached by offset from whatever base is live, and the failure only shows
+     * up the first time the module reads a constant -- as
+     * FLAC_DECODER_ERROR_BAD_MAGIC_NUMBER, because micro-flac compares the
+     * input's first four bytes against a MAGIC_BYTES table that lives in
+     * .rodata. Silent garbage, indistinguishable from a corrupt file.
+     *
+     * Checking here turns that into one line in the boot log.
+     */
+    uint32_t linked_inst;
+    uint32_t linked_data;
 } modload_header_t;
 
 /* Bump when the calling convention or the header changes. A blob built for a
  * different version is refused rather than called. */
-#define MODLOAD_ABI_VERSION 1
+#define MODLOAD_ABI_VERSION 2
 
 /*
  * The blob's entry point. Plain int32_t in and out on purpose: a struct or a
@@ -144,6 +166,16 @@ bool modload_prepare(char *why, size_t why_len);
  * panic is not a retry.
  */
 bool modload_ready(void);
+
+/*
+ * Why modload_prepare() failed, or "module not prepared" if it never ran.
+ *
+ * Retained rather than left in the boot caller's buffer, because the failure is
+ * reported by whichever command needs the module -- and the difference between
+ * "the partition is empty" and "the blob was linked for a different mapping" is
+ * the difference between flashing a module and rebuilding one.
+ */
+const char *modload_why(void);
 
 /* The label and subtype of the data-side partition. A module's `.rodata` is
  * linked at whatever address this partition maps to; see modules/link.ld. */

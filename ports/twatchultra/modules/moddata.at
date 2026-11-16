@@ -1,2 +1,17 @@
-inst=0x42ae0000
-data=0x3cbe0000
+# Addresses the MMU gave for the two module partitions.
+#
+# COPIED FROM THE WATCH, never typed. modload_prepare() rewrites
+# /root/modaddr.txt at every boot, and both addresses move when the app image
+# changes size -- 0x42ae0000/0x3cbe0000 became 0x42ad0000/0x3cbd0000 when the
+# inline FLAC decoder was removed.
+#
+# Refresh with:
+#
+#     cd ports/twatchultra/modules && make modaddr
+#
+# which reads the file off the board and rewrites this one. A blob is only valid
+# for the app build that produced these numbers: the loader compares them against
+# the live mapping and refuses to call a mismatch, so a stale value is a log line
+# rather than a decoder reading garbage.
+inst=0x42ad0000
+data=0x3cbd0000

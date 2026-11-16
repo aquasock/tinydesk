@@ -32,10 +32,12 @@
 __attribute__((section(".modheader"), used))
 const modload_header_t mod_header = {
     .magic = MODLOAD_MAGIC,
-    .abi_version = MODHOST_ABI_VERSION,
+    .abi_version = MODLOAD_ABI_VERSION,
     .size = 0,                  /* patched after linking */
     .entry_offset = 0,          /* patched after linking */
     .name = "flac",
+    .linked_inst = 0,           /* patched after linking */
+    .linked_data = 0,           /* patched after linking */
 };
 
 static const modhost_t *host(void)

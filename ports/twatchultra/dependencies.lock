@@ -41,7 +41,6 @@ dependencies:
     component_hash: aafc0c1c742c38a8c382bbf758217a00da2d8ab19d2642731031d6b79c1b87e0
     dependencies:
     - name: idf
-      registry_url: https://components.espressif.com
       require: private
       version: '>=4.2'
     source:
@@ -62,6 +61,6 @@ direct_dependencies:
 - joltwallet/littlefs
 - sahlberg/libsmb2
 - wolfssl/wolfssl
-manifest_hash: 01026be2f548fd90b576fb9f052b92ddab4ee67a6f9326cec3d27ac7a44c7771
+manifest_hash: 17312e7a2cab1c03cd462fe7df188864575eac3bc82dfe1459e650f5921f58e3
 target: esp32s3
 version: 2.0.0

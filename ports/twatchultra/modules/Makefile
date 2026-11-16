@@ -33,10 +33,17 @@ MODADDR_H := $(BUILD)/modaddr.h
 # and these are what the LINK consumes.
 MODBSS_AT      := $(shell $(NM) $(APP_ELF) 2>/dev/null | awk '$$3=="g_modbss"{print "0x"$$1}')
 
-# Where the MMU mapped the `moddata` partition, as the firmware published it in
-# /root/modaddr.txt at boot. Absolute and runtime-determined, so it is read from
-# that file rather than calculated. Re-run `make modaddr` after any change that
-# moves a mapping.
+# WHERE THE MMU PUT THE TWO PARTITIONS. Both are runtime-determined, both move
+# when the app image changes size, and moddata.at is the single place they are
+# recorded -- copied from the watch's /root/modaddr.txt, which modload_prepare()
+# rewrites at every boot.
+#
+# Measured drift, and the reason these are not constants: adding the inline FLAC
+# decoder gave 0x42ae0000/0x3cbe0000, and removing it gave
+# 0x42ad0000/0x3cbd0000. A blob linked for the first pair still EXECUTED against
+# the second and read its .rodata 64 KB off, which reached the user as "bad
+# magic number" on two files that were perfectly good.
+MODTEXT_AT     := $(shell sed -n 's/^inst=//p' $(MODULES)/moddata.at 2>/dev/null)
 MODDATA_AT     := $(shell sed -n 's/^data=//p' $(MODULES)/moddata.at 2>/dev/null)
 
 MF      := $(abspath $(MODULES)/../components/micro-flac)
@@ -82,10 +89,11 @@ FLAC_CXXFLAGS := $(FLAC_CFLAGS) -fno-exceptions -fno-rtti -fno-threadsafe-static
                  -include $(MODULES)/src/flacmalloc.h
 
 LDFLAGS := -nostdlib -T $(MODULES)/link.ld -Wl,--build-id=none \
-           -Wl,--defsym=MODBSS_AT=$(MODBSS_AT) -Wl,--defsym=MODDATA_AT=$(MODDATA_AT) \
+           -Wl,--defsym=MODTEXT_AT=$(MODTEXT_AT) -Wl,--defsym=MODBSS_AT=$(MODBSS_AT) \
+           -Wl,--defsym=MODDATA_AT=$(MODDATA_AT) \
            -Wl,-Map=$(BUILD)/mod.map
 
-.PHONY: all clean flash size check flac
+.PHONY: all clean flash size check flac modaddr
 
 all: $(BIN)
 
@@ -116,15 +124,25 @@ $(BUILD)/flac.bin: $(BUILD)/flacmod.o $(BUILD)/modshim.o \
 	$(OBJCOPY) -O binary --only-section=.modheader --only-section=.text $(BUILD)/flac.elf $@
 	$(OBJCOPY) -O binary --only-section=.rodata $(BUILD)/flac.elf $(BUILD)/flac.data.bin
 	@$(NM) $(BUILD)/flac.elf > $(BUILD)/flac.nm
-	@python3 $(MODULES)/patch_header.py $@ "$$(cat $(BUILD)/flac.nm)"
+	@python3 $(MODULES)/patch_header.py $@ "$$(cat $(BUILD)/flac.nm)" $(MODTEXT_AT) $(MODDATA_AT)
 	@printf 'blob: %s (%s bytes) + data %s (%s bytes)\n' "$@" "$$(stat -c %s $@)" \
 		"$(BUILD)/flac.data.bin" "$$(stat -c %s $(BUILD)/flac.data.bin)"
+
+# Re-read the two mapping addresses off the board and rewrite moddata.at.
+#
+# Needed after ANY change that alters the app image size: both mmap addresses move
+# when it does, and a blob linked for the old pair still executes while reading
+# its constants from the wrong place. A couple of minutes, and it cannot be
+# silently wrong the way a typed address can.
+modaddr:
+	@python3 $(MODULES)/read_modaddr.py -o $(MODULES)/moddata.at
 
 # Fail before compiling anything if the app has not been built, or if its
 # table symbol moved out of the image.
 check:
 	@test -f $(APP_ELF) || { echo "modules: build the app first ($(APP_ELF) missing)"; exit 1; }
-	@test -n "$(MODDATA_AT)" || { echo "modules: moddata.at missing -- it needs 'inst=..' and 'data=..' from the watch's /root/modaddr.txt"; exit 1; }
+	@test -n "$(MODDATA_AT)" && test -n "$(MODTEXT_AT)" || { echo "modules: moddata.at missing -- it needs 'inst=..' and 'data=..' copied from the watch's /root/modaddr.txt"; exit 1; }
+	@test -f $(MODULES)/moddata.at || { echo "modules: moddata.at gone"; exit 1; }
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -143,10 +161,16 @@ $(BUILD)/modshim.o: $(MODULES)/src/modshim.c $(MODADDR_H) | $(BUILD)
 $(ELF): $(BUILD)/modtest.o $(BUILD)/modshim.o $(MODULES)/link.ld
 	$(CXX) $(LDFLAGS) -o $@ $(BUILD)/modtest.o $(BUILD)/modshim.o -lgcc
 
+# --only-section, for the same reason the FLAC blob needs it: .rodata is linked
+# into the DATA window at a LOWER address than .text, so a plain `objcopy -O
+# binary` starts the file at .rodata and the header is not at offset 0. The
+# symptom was "patch_header: bad magic 0x75646f6d" -- the bytes of the word
+# "module" from a string literal.
 $(BIN): $(ELF)
-	$(OBJCOPY) -O binary $< $@
+	$(OBJCOPY) -O binary --only-section=.modheader --only-section=.text $< $@
+	$(OBJCOPY) -O binary --only-section=.rodata $< $(BUILD)/modtest.data.bin
 	@$(NM) $< > $(BUILD)/modtest.nm
-	@python3 $(MODULES)/patch_header.py $@ "$$(cat $(BUILD)/modtest.nm)"
+	@python3 $(MODULES)/patch_header.py $@ "$$(cat $(BUILD)/modtest.nm)" $(MODTEXT_AT) $(MODDATA_AT)
 	@printf 'blob: %s (%s bytes)\n' "$@" "$$(stat -c %s $@)"
 	@$(NM) $< | grep -E ' (mod_header|mod_entry)$$' || true
 
