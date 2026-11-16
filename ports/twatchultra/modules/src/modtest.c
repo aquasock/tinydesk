@@ -1,56 +1,105 @@
 /*
- * The smallest possible module: prove that code in the `modules` partition can
- * be mapped as instructions and CALLED across a partition boundary.
+ * The module-API test: prove a blob can reach the firmware THROUGH A TABLE.
  *
- * Everything in this file exists to answer a question, so each part is
- * separable when something fails:
+ * The earlier test proved a blob could be mapped and called; it passed only
+ * integers, because the question then was whether control transfers at all.
+ * This one asks the harder question that decides whether a real codec can live
+ * here: can a blob ALLOCATE MEMORY and COPY through it, from read-only flash,
+ * with no libc and no bound symbols?
  *
- *   - arguments arrive        -> return a * b
- *   - a loop runs             -> sum 1..10 must be 55
- *   - an internal call works  -> mul() is a separate function
- *   - the caller's own state  -> heap_free/heap_largest must be non-zero and
- *                                sane, which they would not be if the blob were
- *                                reading from a stale or bogus view
+ * Each step is separable, so a failure names itself:
  *
- * Nothing here touches libc, a global with an initialiser, or any symbol
- * outside this file. Every one of those would drag in a relocation the blob
- * cannot resolve, and the point of the test is to fail for the INTERESTING
- * reason if it fails at all.
+ *   ret  1  the host table could not be read (bad MODHOST_PTR_AT, or the app
+ *           that built this blob is not the app running it)
+ *   ret  2  the table is present but a function pointer is null
+ *   ret  3  malloc through the table returned nothing
+ *   ret  4  memcpy through the table copied the wrong bytes
+ *   ret  5  the caller's buffer could not be reached
+ *   ret 42  every step worked
+ *
+ * NOTHING HERE TOUCHES LIBC, an initialised global, or a symbol outside itself.
+ * The blob has no writable .bss -- link.ld discards it, because the partition is
+ * read-only flash and there is no loader to zero it -- so there is no static
+ * state anywhere in this file.
  */
 
+#include "modhost.h"
+
+/* The header magic and layout are the loader's contract; modload.h owns them. */
 #include "modload.h"
 
-/* Placed at offset 0 of the partition by the linker script, so a loader finds
- * it before it knows anything else about the blob. */
+/* Placed at offset 0 by link.ld so a loader can read the magic first. */
 __attribute__((section(".modheader"), used))
 const modload_header_t mod_header = {
     .magic = MODLOAD_MAGIC,
-    .abi_version = MODLOAD_ABI_VERSION,
-    .size = 0,                  /* patched by the build, see Makefile */
-    .entry_offset = 0,          /* patched by the build */
-    .name = "modtest",
+    .abi_version = MODHOST_ABI_VERSION,
+    .size = 0,                      /* patched after linking */
+    .entry_offset = 0,              /* patched after linking */
+    .name = "modapi",
 };
 
-static int mul(int a, int b)
+/* The table is fetched by the shim at a build-time-derived address; this is the
+ * same one dereference, repeated here so a failure is a return code, not a
+ * crash. */
+static const modhost_t *host(void)
 {
-    return a * b;
+    return *(const modhost_t *const volatile *)(uintptr_t)MODHOST_PTR_AT;
 }
 
-int32_t mod_entry(int32_t a, int32_t b, uint32_t heap_free, uint32_t heap_largest);
+int32_t mod_entry(modcall_t *call);
 
-int32_t mod_entry(int32_t a, int32_t b, uint32_t heap_free, uint32_t heap_largest)
+int32_t mod_entry(modcall_t *call)
 {
-    int32_t sum = 0;
+    const modhost_t *h = host();
 
-    for (int i = 1; i <= 10; i++)
-        sum += i;
+    if (!h || h->abi_version != MODHOST_ABI_VERSION)
+        return 1;
 
-    if (sum != 55)
-        return -1;              /* the loop, or the stack, is not working */
-    if (heap_free == 0 || heap_largest == 0)
-        return -2;              /* the arguments did not arrive */
-    if (heap_largest > heap_free)
-        return -3;              /* the figures are nonsense */
+    if (!h->malloc || !h->free || !h->memcpy || !h->memset)
+        return 2;
 
-    return mul(a, b);           /* 6 x 7 = 42, through an internal call */
+    /* ALLOCATE through the firmware, which knows this board's memory map and
+     * can reach PSRAM. A blob cannot call malloc directly and must not try. */
+    unsigned char *buf = (unsigned char *)h->malloc(64);
+
+    if (!buf)
+        return 3;
+
+    h->memset(buf, 0, 64);
+
+    for (int i = 0; i < 32; i++)
+        buf[i] = (unsigned char)(i * 3 + 7);
+
+    unsigned char check[32];
+    h->memcpy(check, buf, 32);
+
+    for (int i = 0; i < 32; i++)
+    {
+        if (check[i] != (unsigned char)(i * 3 + 7))
+        {
+            h->free(buf);
+            return 4;
+        }
+    }
+
+    /* The caller's own buffers must be reachable: this is what a decoder will
+     * actually be handed. */
+    if (!call || !call->pcm || call->pcm_capacity < 4)
+    {
+        h->free(buf);
+        return 5;
+    }
+
+    call->pcm[0] = (int32_t)buf[0];
+    call->pcm[1] = (int32_t)buf[1];
+    call->pcm[2] = (int32_t)h->abi_version;
+    call->pcm[3] = (int32_t)(uintptr_t)h;
+
+    if (call->pcm_samples)
+        *call->pcm_samples = 4;
+    if (call->consumed)
+        *call->consumed = 0;
+
+    h->free(buf);
+    return 42;
 }

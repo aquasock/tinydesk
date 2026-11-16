@@ -4,6 +4,7 @@
  * See modload.h for why this exists. This file is deliberately small: it is an
  * experiment, and the whole point is that a negative result is cheap.
  */
+#include "modhost.h"
 #include "modload.h"
 
 #include <stdio.h>
@@ -240,31 +241,46 @@ static int cmd_modtest(tdsh_session_t *session, int argc, char **argv)
 
     /* The entry is an offset into the BLOB, so it is added to the INSTRUCTION
      * mapping's base, not the data one. */
-    const modload_entry_t fn =
-        (modload_entry_t)((const uint8_t *)modload_inst_base() + h->entry_offset);
+    const mod_entry_fn fn =
+        (mod_entry_fn)((const uint8_t *)modload_inst_base() + h->entry_offset);
 
-    /* THE ACTUAL EXPERIMENT. A function pointer call across a partition
-     * boundary: the compiler emits a CALL8 with its window rotation, and the
-     * blob's own literals must be correct for the address it was mapped at. */
-    printf("modtest: calling %p(6, 7, %lu, %lu)\n", (void *)fn,
-           (unsigned long)hf, (unsigned long)hl);
+    /* A REAL CALL WITH REAL BUFFERS. The blob is asked to allocate through the
+     * API table, copy through it, and write into a caller-owned PCM buffer --
+     * which is exactly the shape a decoder will be given. */
+    int32_t pcm[8] = { 0 };
+    modcall_t call = {
+        .in = NULL,
+        .in_len = 0,
+        .consumed = NULL,
+        .pcm = pcm,
+        .pcm_capacity = 8,
+        .pcm_samples = NULL,
+    };
+    size_t used = 0, samples = 0;
+
+    call.consumed = &used;
+    call.pcm_samples = &samples;
+
+    printf("modtest: calling %p(&call)\n", (void *)fn);
+
+    const int32_t r = fn(&call);
 
     res.entry = (uint32_t)(uintptr_t)fn;
     res.heap_free = hf;
     res.heap_largest = hl;
     res.called = 1;
-
-    const int32_t r = fn(6, 7, hf, hl);
-
     res.ret = (uint32_t)r;
 
     modload_unmap();
 
-    /* 6*7 = 42 is the expected answer and proves the arguments arrived. */
+    /* 42 means every step of the API-table round trip worked. The pcm[] values
+     * it left behind are the evidence: a pattern byte, the ABI it saw, and a
+     * pointer that must lie inside this firmware's RAM. */
     printf("modtest: returned %ld\n", (long)r);
+    if (r == 42)
+        printf("  api ok: pcm[2]=%ld (abi) pcm[3]=0x%lx\n", (long)pcm[2],
+               (unsigned long)pcm[3]);
 
-    /* Persist it as well: printf goes to a display this bench cannot read
-     * reliably, while the file can be extracted from flash and mounted. */
     write_result_file(&res);
 
     return r == 42 ? 0 : 1;

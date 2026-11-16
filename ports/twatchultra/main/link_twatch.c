@@ -26,6 +26,7 @@
 #include "sdpaths.h"
 #include "usbdiag.h"
 #include "bleuart.h"
+#include "modhost.h"
 #include "modload.h"
 #include "music.h"
 #include "uac2.h"
@@ -576,6 +577,17 @@ bool link_init(void)
 
     if (!modload_register_command())
         ESP_LOGW(TAG, "modtest command did not register");
+
+    /* Take the module API table once at boot. This is also what keeps its
+     * published pointer in the image: `--gc-sections` collects a section
+     * nothing references, and a blob build needs the symbol's ADDRESS. */
+    {
+        const modhost_t *host = modhost_table();
+
+        ESP_LOGI(TAG, "module API v%lu ready (%s)",
+                 (unsigned long)(host ? host->abi_version : 0),
+                 (host && host->malloc && host->memcpy) ? "populated" : "EMPTY");
+    }
 
     /* DIAGNOSTIC BUILD ONLY: run the module experiment once at boot and leave
      * the verdict in flash, so the result does not have to survive the display
