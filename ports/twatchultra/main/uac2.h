@@ -23,9 +23,14 @@ void uac2_stop(void);
 /* True while the isochronous endpoint is running. */
 bool uac2_ready(void);
 
-/* Feed interleaved S16 stereo at uac2_rate(). Returns bytes accepted; may be
- * short when the ring is full, which is a drop rather than a block. */
+/* Feed interleaved S16 stereo at uac2_rate(). Returns len when the chunk was
+ * queued and 0 when the ring is full: a drop rather than a block, all or
+ * nothing. For a frame loop that must never stall. */
 int uac2_write(const uint8_t *pcm, int len);
+
+/* As uac2_write(), but waits up to timeout_ms for ring space: a producer paced
+ * by the sink, which can never fall behind it. len must not exceed the ring. */
+int uac2_write_wait(const uint8_t *pcm, int len, uint32_t timeout_ms);
 
 /* The rate this driver asks the device for. */
 uint32_t uac2_rate(void);

@@ -93,9 +93,18 @@ static const char *TAG = "uac2";
 #define UAC2_FRAME_BYTES    (UAC2_RATE / 1000 * UAC2_CHANNELS * UAC2_BYTES_PER_SAMPLE)  /* 192 */
 
 /* Frames of audio carried per transfer, and how many transfers may be in flight.
- * 16 frames is 16 ms; three in flight gives 48 ms of slack, which is what absorbs
- * a scheduler hiccup from the display or an emulator without an underrun. */
-#define UAC2_PKTS_PER_XFER  16
+ * 8 frames is 8 ms; three in flight gives 24 ms of slack.
+ *
+ * WHY 8 AND NOT 16. At 16 packets per transfer the DAC's line output, captured
+ * on a PC, carried a discontinuity at every transfer boundary -- 440 Hz test
+ * tone sidebands at +/- n x 62.5 Hz, -36 dB each, a few samples' phase step
+ * every 16 ms -- and it stayed exactly that bad after the ring was proven to
+ * deliver every sample (short=0 underruns=0). So the glitch is at the URB
+ * boundary in the host path, not in this driver's buffering, and its mechanism
+ * is NOT established. At 8 the operator heard the tone as clean; that build's
+ * line-in captures came back empty, so 8 is accepted by ear, not by
+ * measurement, and a capture at 8 is still owed. */
+#define UAC2_PKTS_PER_XFER  8
 #define UAC2_XFERS          3
 #define UAC2_XFER_BYTES     (UAC2_FRAME_BYTES * UAC2_PKTS_PER_XFER)
 #define UAC2_RING_BYTES     (UAC2_FRAME_BYTES * 96)     /* 96 ms of PCM */
@@ -121,7 +130,9 @@ static usb_transfer_t *s_xfer[UAC2_XFERS];
 static volatile bool s_streaming;
 static volatile uint32_t s_frames_sent;
 static volatile uint32_t s_xfer_errors;
-static volatile uint32_t s_underruns;
+static volatile uint32_t s_underruns;   /* transfers sent as pure silence */
+static volatile uint32_t s_short;       /* transfers part-filled, the rest silence */
+static volatile bool s_gone;            /* the DAC was unplugged mid-stream */
 static volatile uint32_t s_missed;      /* packets the controller reported SKIPPED */
 static volatile int s_last_status = -1;
 static TaskHandle_t s_task;             /* the client's event loop */
@@ -482,32 +493,56 @@ static void xfer_done(usb_transfer_t *t)
         if (t->isoc_packet_desc[p].status == USB_TRANSFER_STATUS_SKIPPED)
             s_missed++;
 
+    /* The DAC was unplugged. Resubmitting would only fail again, so the stream
+     * stops here and uac2_open() tears the rest down from the shell, where a
+     * device close is safe; the transfer itself is complete and can be freed. */
+    if (t->status == USB_TRANSFER_STATUS_NO_DEVICE)
+    {
+        s_streaming = false;
+        s_gone = true;
+        return;
+    }
+
     if (!s_streaming)
         return;
 
     /*
-     * REFILL FROM THE RING; PLAY SILENCE IF THERE IS NOT ENOUGH.
+     * REFILL FROM THE RING; PLAY SILENCE ONLY FOR WHAT IS TRULY MISSING.
      *
      * An underrun must produce sound, not a stall: isochronous transfers cannot
-     * be paused without the device glitching, so a short read is padded with
-     * zeros and counted. Counting it matters -- a silent underrun and a working
-     * stream sound identical on a first listen, and only the counter separates
-     * them.
+     * be paused without the device glitching, so whatever the ring cannot supply
+     * is zeros. Two things about that were wrong, and together they were the
+     * "scratchy" tone. xRingbufferReceiveUpTo() on a byte buffer stops at the
+     * ring's wrap point, so ONE call can return less than the ring holds -- a
+     * second call is needed to take the rest. And a fill that came up a few
+     * bytes short was padded silently, because only an EMPTY ring was counted.
+     * Measured from the DAC's line out: a few zero samples were inserted every
+     * 16 ms transfer, phase steps of ~0.18 rad at 440 Hz, heard as 440 +/- n x
+     * 62.5 Hz sidebands at -37 dB each, while `underruns` read zero during the
+     * tone. Every short fill is now counted, as `short`.
      */
-    size_t got = 0;
-    uint8_t *pcm = xRingbufferReceiveUpTo(s_ring, &got, 0, UAC2_XFER_BYTES);
+    size_t filled = 0;
 
-    if (pcm)
+    while (filled < UAC2_XFER_BYTES)
     {
-        memcpy(t->data_buffer, pcm, got);
+        size_t got = 0;
+        uint8_t *pcm = xRingbufferReceiveUpTo(s_ring, &got, 0, UAC2_XFER_BYTES - filled);
+
+        if (!pcm)
+            break;
+
+        memcpy(t->data_buffer + filled, pcm, got);
         vRingbufferReturnItem(s_ring, pcm);
+        filled += got;
     }
 
-    if (got < UAC2_XFER_BYTES)
+    if (filled < UAC2_XFER_BYTES)
     {
-        memset(t->data_buffer + got, 0, UAC2_XFER_BYTES - got);
-        if (got == 0)
+        memset(t->data_buffer + filled, 0, UAC2_XFER_BYTES - filled);
+        if (filled == 0)
             s_underruns++;
+        else
+            s_short++;
     }
 
     for (int p = 0; p < UAC2_PKTS_PER_XFER; p++)
@@ -561,8 +596,55 @@ static void client_task(void *arg)
 
 /* ------------------------------------------------------------------ public */
 
+/*
+ * Forget a DAC that was unplugged, so the next open can find it again.
+ *
+ * Run from the shell task, never from the client task's callbacks: closing a
+ * device is a library call that the client task must be free to service. Before
+ * this existed an unplug left s_dev pointing at a dead device and `streaming=1`,
+ * every later write went into a ring nothing drained, and only a reboot
+ * recovered -- which is how a line-in capture came back silent on 2026-11-15.
+ */
+static void forget_gone_device(void)
+{
+    if (!s_gone)
+        return;
+
+    s_streaming = false;
+
+    for (int i = 0; i < UAC2_XFERS; i++)
+    {
+        /* A transfer still in flight cannot be freed; leaking it is safer than
+         * handing the stack a dangling URB, and after NO_DEVICE none should be. */
+        if (s_xfer[i] && usb_host_transfer_free(s_xfer[i]) != ESP_OK)
+            ESP_LOGW(TAG, "transfer %d still in flight; leaked", i);
+        s_xfer[i] = NULL;
+    }
+
+    if (s_dev)
+    {
+        usb_host_interface_release(s_client, s_dev, s_as_iface);   /* may fail: gone */
+        usb_host_device_close(s_client, s_dev);
+        s_dev = NULL;
+    }
+
+    if (s_ring)
+    {
+        size_t got = 0;
+        void *p;
+
+        while ((p = xRingbufferReceiveUpTo(s_ring, &got, 0, UAC2_RING_BYTES)) != NULL)
+            vRingbufferReturnItem(s_ring, p);
+    }
+
+    s_gone = false;
+    ESP_LOGW(TAG, "DAC was unplugged; state cleared");
+}
+
 bool uac2_open(void)
 {
+    forget_gone_device();
+
     if (s_dev)
         return true;
 
@@ -700,7 +782,7 @@ bool uac2_open(void)
 
 bool uac2_start(void)
 {
-    if (!s_dev && !uac2_open())
+    if ((s_gone || !s_dev) && !uac2_open())
         return false;
 
     if (s_streaming)
@@ -796,10 +878,21 @@ int uac2_write(const uint8_t *pcm, int len)
     /* Non-blocking: the emulators call this from their own frame loop, and an
      * emulator that blocks on audio stops emulating. A full ring means the sink
      * is behind; dropping the newest samples is what a watched buffer would do
-     * anyway, and it cannot deadlock the guest. */
-    const size_t n = xRingbufferSend(s_ring, pcm, (size_t)len, 0);
+     * anyway, and it cannot deadlock the guest.
+     *
+     * xRingbufferSend() returns pdTRUE/pdFALSE, not a count, and is
+     * all-or-nothing on a byte buffer (reference TOL-004); this used to return
+     * the flag, i.e. 1. */
+    return xRingbufferSend(s_ring, pcm, (size_t)len, 0) == pdTRUE ? len : 0;
+}
 
-    return (int)n;
+int uac2_write_wait(const uint8_t *pcm, int len, uint32_t timeout_ms)
+{
+    if (!s_streaming || !s_ring || !pcm || len <= 0)
+        return 0;
+
+    return xRingbufferSend(s_ring, pcm, (size_t)len, pdMS_TO_TICKS(timeout_ms)) == pdTRUE
+               ? len : 0;
 }
 
 uint32_t uac2_rate(void)
@@ -828,7 +921,16 @@ static void on_client_event(const usb_host_client_event_msg_t *msg, void *arg)
     if (msg->event == USB_HOST_CLIENT_EVENT_NEW_DEV)
         ESP_LOGI(TAG, "device attached: address %d", (int)msg->new_dev.address);
     else if (msg->event == USB_HOST_CLIENT_EVENT_DEV_GONE)
+    {
+        /* Only flag it: this runs on the client task, and the teardown (device
+         * close) belongs to the shell side -- see forget_gone_device(). */
+        if (s_dev && msg->dev_gone.dev_hdl == s_dev)
+        {
+            s_streaming = false;
+            s_gone = true;
+        }
         ESP_LOGW(TAG, "device gone");
+    }
 }
 
 
@@ -857,10 +959,17 @@ static int cmd_uac2(tdsh_session_t *session, int argc, char **argv)
         }
 
         /* Two seconds of 440 Hz stereo. A sine is used rather than silence so an
-         * audience can tell success from a wiring fault by ear. */
+         * audience can tell success from a wiring fault by ear.
+         *
+         * PACED BY THE SINK, NOT BY A CLOCK. This used to write 2 ms of audio and
+         * then sleep 2 ms, which with the sine arithmetic on top ran slightly
+         * slower than the DAC drains, so the ring kept running a few samples
+         * short of a transfer. Blocking on ring space keeps it full: the
+         * producer can never fall behind, and the counters below prove it. */
         const int rate = (int)uac2_rate();
         const int total = rate * 2;             /* 2 seconds of frames */
         static float phase;
+        const uint32_t short0 = s_short, under0 = s_underruns;
 
         for (int i = 0; i < total; i += 96)
         {
@@ -878,15 +987,22 @@ static int cmd_uac2(tdsh_session_t *session, int argc, char **argv)
                 buf[k * 2 + 1] = (int16_t)v;
             }
 
-            uac2_write((const uint8_t *)buf, sizeof(buf));
-
-            /* Pace the fill at roughly real time so the ring does not simply
-             * absorb two seconds and then starve. */
-            vTaskDelay(pdMS_TO_TICKS(2));
+            /* The ring holds 96 ms; 200 ms without room means the stream died. */
+            if (uac2_write_wait((const uint8_t *)buf, sizeof(buf), 200) != (int)sizeof(buf))
+            {
+                printf("uac2: the stream stopped taking samples%s\n",
+                       s_gone ? " (DAC unplugged)" : "");
+                return 1;
+            }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(500));
-        printf("uac2: tone done\n");
+        /* Counted up to the last write: after it the ring drains and the stream
+         * goes back to silence, which is correct and not a fault of the tone. */
+        const uint32_t short1 = s_short - short0, under1 = s_underruns - under0;
+
+        vTaskDelay(pdMS_TO_TICKS(200));         /* let the ring drain */
+        printf("uac2: tone done, short=%lu underruns=%lu while writing\n",
+               (unsigned long)short1, (unsigned long)under1);
         return 0;
     }
 
@@ -912,9 +1028,9 @@ static int cmd_uac2(tdsh_session_t *session, int argc, char **argv)
     printf("streaming=%d dev=%d clock=%u iface=%u alt=%u ep=0x%02X mps=%u\n",
            s_streaming ? 1 : 0, s_dev ? 1 : 0, s_clock_id, s_as_iface, s_as_alt,
            s_ep_addr, s_ep_mps);
-    printf("frames=%lu errors=%lu underruns=%lu missed=%lu last=%d\n",
-           (unsigned long)f, (unsigned long)e, (unsigned long)u,
-           (unsigned long)m, s_last_status);
+    printf("frames=%lu errors=%lu underruns=%lu short=%lu missed=%lu last=%d%s\n",
+           (unsigned long)f, (unsigned long)e, (unsigned long)u, (unsigned long)s_short,
+           (unsigned long)m, s_last_status, s_gone ? " GONE" : "");
     printf("rates:");
     for (int i = 0; i < s_nrates; i++)
         printf(" %lu", (unsigned long)s_rates[i]);
