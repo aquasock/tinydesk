@@ -26,6 +26,7 @@
 #include "sdpaths.h"
 #include "usbdiag.h"
 #include "bleuart.h"
+#include "music.h"
 #include "uac2.h"
 #include "usbhost.h"
 
@@ -568,6 +569,9 @@ bool link_init(void)
 
     if (!uac2_register_command())
         ESP_LOGW(TAG, "uac2 command did not register");
+
+    if (!music_register_command())
+        ESP_LOGW(TAG, "music command did not register");
 
     /* The USB-C port's saved role (board keys usb.host, usb.dac), applied now:
      * after the board keys are loaded, and before anything has opened a file on

@@ -92,4 +92,19 @@ void sound_stream_close(void);
 /* Frames dropped since the stream opened, for a status line. */
 uint32_t sound_stream_dropped(void);
 
+/*
+ * Interleaved stereo, BLOCKING, for a player with its own task.
+ *
+ * sound_stream_write() takes mono and never waits, because its caller is an
+ * emulator frame loop that cannot afford a stall and can tolerate a dropped
+ * tick. A music player is the reverse: nothing else to do, and a dropped
+ * sample is an audible click. This waits for the I2S DMA instead, which paces
+ * the decoder to the output rate for free, and takes stereo so channel
+ * separation reaches the amplifier (which mixes (L+R)/2 itself).
+ *
+ * Returns the frames accepted; a short count means the channel stopped
+ * draining, not ordinary backpressure.
+ */
+size_t sound_stream_write_stereo_wait(const int16_t *stereo, int frames, uint32_t timeout_ms);
+
 #endif

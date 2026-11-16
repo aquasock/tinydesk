@@ -619,6 +619,54 @@ size_t sound_stream_write(const int16_t *mono, int frames)
     return got;
 }
 
+/*
+ * A BLOCKING STEREO WRITE, for a player that owns its task.
+ *
+ * sound_stream_write() above drops samples rather than waiting, because its
+ * caller is an emulator frame loop with a millisecond of slack. A music player
+ * is the opposite case: it has its own task, nothing else to do, and a dropped
+ * sample is an audible click in a track someone is listening to. So this one
+ * waits for the DMA, which paces the decoder to the output rate for free --
+ * the ring absorbs SD stalls and the write blocks when it is full.
+ *
+ * STEREO IN, BOTH SLOTS. Unlike sound_stream_write() this takes interleaved
+ * stereo and writes it straight through; a decoder produces stereo and
+ * downmixing it here would throw away the only channel separation the amp can
+ * carry. The MAX98357A mixes (L+R)/2 internally, so a stereo source reaches it
+ * correctly.
+ *
+ * Returns the frames accepted. A short count means the timeout expired, which
+ * happens when the audio output has stopped (no amp, or the I2S channel was
+ * torn down) rather than under ordinary load.
+ */
+size_t sound_stream_write_stereo_wait(const int16_t *stereo, int frames, uint32_t timeout_ms)
+{
+    if (!s_stream_open || !s_tx || !stereo || frames <= 0)
+        return 0;
+
+    int done = 0;
+
+    while (done < frames)
+    {
+        int chunk = frames - done;
+
+        if (chunk > STREAM_FRAMES)
+            chunk = STREAM_FRAMES;
+
+        size_t wrote = 0;
+        const size_t want = (size_t)chunk * 2 * sizeof(int16_t);
+        const esp_err_t err = i2s_channel_write(s_tx, stereo + (size_t)done * 2, want, &wrote,
+                                                pdMS_TO_TICKS(timeout_ms));
+
+        done += (int)(wrote / (2 * sizeof(int16_t)));
+
+        if (err != ESP_OK && wrote == 0)
+            break;              /* the channel is not draining */
+    }
+
+    return (size_t)done;
+}
+
 void sound_stream_close(void)
 {
     if (!s_stream_open)

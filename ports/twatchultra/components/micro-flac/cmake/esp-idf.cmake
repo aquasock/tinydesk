@@ -1,0 +1,68 @@
+# cmake/esp-idf.cmake
+# ESP-IDF specific build configuration for microFLAC
+
+if(__flac_esp_idf_defined)
+    return()
+endif()
+set(__flac_esp_idf_defined TRUE)
+
+function(flac_configure_esp_idf COMPONENT_LIB COMPONENT_DIR)
+    # Disable assert() in production builds to avoid overhead in hot paths
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE NDEBUG)
+
+    # Set optimization and warning flags
+    target_compile_options(${COMPONENT_LIB} PRIVATE
+        -O2
+        -Wall
+        -Wextra
+        -Wshadow
+        -Wconversion
+        -Wsign-conversion
+        -Wdouble-promotion
+        -Wimplicit-fallthrough
+        # Any function not declared in a header must be static; keeps
+        # -Wunused-function able to see dead internal functions. Clang and GCC
+        # spell the C++ variant of this check differently.
+        $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wmissing-prototypes>
+        $<$<CXX_COMPILER_ID:GNU>:-Wmissing-declarations>
+        # C++-only (guards against ever mixing in a C source): require
+        # static_cast/reinterpret_cast over C-style casts
+        $<$<COMPILE_LANGUAGE:CXX>:-Wold-style-cast>
+    )
+
+    # Configure memory allocation preference based on Kconfig
+    if(CONFIG_MICRO_FLAC_PREFER_PSRAM)
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE MICRO_FLAC_MEMORY_PREFER_PSRAM)
+    elseif(CONFIG_MICRO_FLAC_PREFER_INTERNAL)
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE MICRO_FLAC_MEMORY_PREFER_INTERNAL)
+    elseif(CONFIG_MICRO_FLAC_PSRAM_ONLY)
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE MICRO_FLAC_MEMORY_PSRAM_ONLY)
+    elseif(CONFIG_MICRO_FLAC_INTERNAL_ONLY)
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE MICRO_FLAC_MEMORY_INTERNAL_ONLY)
+    endif()
+
+    # Disable Xtensa assembly if the Kconfig option is off
+    if(NOT CONFIG_MICRO_FLAC_ENABLE_XTENSA_ASM)
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE MICRO_FLAC_DISABLE_XTENSA_ASM)
+    endif()
+
+    # Disable Ogg FLAC support if the Kconfig option is off
+    if(NOT CONFIG_MICRO_FLAC_ENABLE_OGG)
+        target_compile_definitions(${COMPONENT_LIB} PUBLIC MICRO_FLAC_DISABLE_OGG)
+    endif()
+
+    # Compile encoder features out if their Kconfig options are off. PUBLIC:
+    # flac_encoder.h reads them (FLACEncoder::LPC_AVAILABLE,
+    # MAX_LPC_BITS_PER_SAMPLE and RICE_PARTITIONS_AVAILABLE).
+    if(NOT CONFIG_MICRO_FLAC_ENCODER_ENABLE_LPC)
+        target_compile_definitions(${COMPONENT_LIB} PUBLIC MICRO_FLAC_ENCODER_DISABLE_LPC)
+    endif()
+    if(NOT CONFIG_MICRO_FLAC_ENCODER_ENABLE_RICE_PARTITIONS)
+        target_compile_definitions(${COMPONENT_LIB} PUBLIC MICRO_FLAC_ENCODER_DISABLE_RICE_PARTITIONS)
+    endif()
+
+    # C++ standard
+    target_compile_features(${COMPONENT_LIB} PUBLIC cxx_std_14)
+
+    message(STATUS "microFLAC: Building for ESP-IDF target ${IDF_TARGET}")
+endfunction()

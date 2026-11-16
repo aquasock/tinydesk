@@ -171,6 +171,7 @@ without a rebuild. See
 | --- | --- | --- |
 | **tinydesk** (this one) | the desktop, apps, ports and tools | MIT |
 | [**tinydesk-shell**](https://github.com/tinydesk-project/tinydesk-shell) | TinyDesk Shell (`tdsh`): the shell, its ESP-IDF services and host port; included here as the submodule `third_party/tdsh` | MIT, with third-party parts under their own licences |
+| [**micro-flac**](https://github.com/esphome-libs/micro-flac) | FLAC decoder and encoder for ESP32, with Xtensa assembly and PSRAM allocation; vendored in `ports/twatchultra/components/micro-flac` (v0.3.0) | Apache-2.0, plus its `micro-ogg-demuxer` submodule (MIT) |
 
 ## Licence
 
@@ -190,6 +191,13 @@ console font Uni2-VGA16 by Dmitry Bolkhovityanov (MIT), in
 `apps/pyui_font.c`. The CrowPanel's larger LCD fonts are made from
 Terminus Font by Dimitar Toshkov Zhekov (SIL Open Font License 1.1,
 [`ports/crowpanel7/main/OFL-Terminus.txt`](ports/crowpanel7/main/OFL-Terminus.txt)).
+FLAC decoding on the T-Watch Ultra uses [micro-flac](https://github.com/esphome-libs/micro-flac)
+(Apache-2.0, Copyright 2026 Kevin Ahrendt), vendored unmodified in
+`ports/twatchultra/components/micro-flac` with its provenance in
+`README.vendored.md` beside it; the `micro-ogg-demuxer` it bundles for the
+Ogg-FLAC container is MIT. Rockbox's FLAC decoder was measured first and not
+used: it reserves about 190 KB of internal SRAM statically, against roughly
+18 KB free on this board.
 
 ## Contributing
 

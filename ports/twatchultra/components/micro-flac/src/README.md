@@ -1,0 +1,240 @@
+# microFLAC - Internal Architecture
+
+Internal documentation for developers working on the decoder and encoder internals. For the public API and usage guide, see the [root README](../README.md).
+
+## Origins
+
+Based on [Nayuki's Simple FLAC Implementation](https://www.nayuki.io/res/simple-flac-implementation/) and [Mike Hansen's C++ FLAC decoder port](https://github.com/synesthesiam/flac-decoder), rewritten and extensively optimized for embedded systems.
+
+## File Organization
+
+Files are named for the FLAC concept they handle. A concept both directions touch keeps both in one file pair (`frame_header` parses and writes); a direction-specific one says which only where the name alone would be ambiguous (`lpc` restores, `lpc_analysis` designs). Each class file holds its own pipeline.
+
+### Public API
+
+- `include/micro_flac/flac_decoder.h` - `FLACDecoder`, `FLACStreamInfo`, `FLACMetadataBlock`, result codes
+- `include/micro_flac/flac_encoder.h` - `FLACEncoder`, `FLACEncoderOptions`, result codes
+- `include/micro_flac/pcm_format.h` - `PcmFormat`, the packed PCM layout the encoder reads
+
+### Shared
+
+- `flac_format.h` - Every RFC 9639 constant: code tables, subframe types, channel assignments, field widths and limits (except the CRC lookup tables in `crc.cpp` and the few values the public headers expose)
+- `frame_header.h` / `frame_header.cpp` - Parsing (`compute_frame_header_length()`, `parse_frame_header()`) and writing (`select_sample_rate_code()`, `select_bits_per_sample_code()`, `write_frame_header()`)
+- `pcm_packing.h` / `pcm_packing.cpp` - Packing decoded samples to interleaved PCM (`write_samples()`, see [Output](#output)) and unpacking the encoder's input (`unpack_channel()`, `unpack_stereo()`, `unpack_mid()`, `unpack_side()`, `unpack_sample()`, and the 4-byte `unpack_channel32()`, `unpack_stereo32()`, `unpack_mid32()` and `unpack_side32()`)
+- `bit_reader.h` / `bit_writer.h` - Header-only MSB-first bit-stream primitives on stack-local state (`BitReaderLocal`, `BitWriterLocal`), including Rice codes. Header-only so `FLAC_ALWAYS_INLINE` is honored at every call site
+- `crc.h` / `crc.cpp` - CRC-8 and CRC-16 lookup tables and functions
+
+### Decoder
+
+- `flac_decoder.cpp` - State machine, container detection, header/metadata parsing, subframe and residual decoding
+- `decorrelation.h` / `decorrelation.cpp` - `apply_channel_decorrelation()` for the LEFT_SIDE, RIGHT_SIDE, and MID_SIDE joint stereo modes
+- `lpc.h` / `lpc.cpp` - Overflow detection and 32-bit/64-bit LPC restoration
+- `xtensa/lpc_xtensa.h`, `xtensa/lpc_32_xtensa.S`, `xtensa/lpc_64_xtensa.S` - LPC restoration in Xtensa assembly (ESP32 and ESP32-S3 only)
+
+### Encoder
+
+- `flac_encoder.cpp` - `FLACEncoder`: stream header, frame assembly, the two-pass predictor and stereo-assignment selection, and subframe encoding (see [Encoding](#encoding) below)
+- `subframe_coding.h` / `subframe_coding.cpp` - What the subframe coders share: `PackedSignal` (a subframe's signal, read from the packed input a chunk at a time), Pass A's `ChannelAnalysis`, the fixed predictors' difference cascade, Rice code estimation and emission, Pass B's size bound, and the subframe header writers
+- `rice_partitions.h` / `rice_partitions.cpp` - Rice partitioning (see [Rice partitioning](#rice-partitioning) below); compiled out with `MICRO_FLAC_ENCODER_DISABLE_RICE_PARTITIONS`
+- `lpc_analysis.h` / `lpc_analysis.cpp` - LPC analysis on `int32_t` sample arrays: windowed autocorrelation, predictor design, and the residual kernel, all in integer arithmetic (see [LPC Subframes](#lpc-subframes) below). Nothing here knows about `PackedSignal` or the bitstream
+
+### Utilities
+
+- `alloc.h` - Memory allocation macros (`FLAC_MALLOC` / `FLAC_FREE`) with ESP-IDF PSRAM support
+- `compiler.h` - Compiler hints (optimization, inlining, branch prediction, aliasing) and bit buffer constants
+- `wrapping_arithmetic.h` - uint32_t-based wrapping arithmetic helpers (`wadd32`, `wsub32`, `wshl32`, `wshr32`, `u32`) for FLAC's modulo-2^bps semantics
+
+## Decode State Machine
+
+The decoder uses a multi-level state machine that makes all parsing resumable across `decode()` calls, enabling streaming with arbitrarily small input buffers.
+
+### Top-Level Phases (`DecodePhase`)
+
+```text
+DETECT_CONTAINER ──→ HEADER ──→ AUDIO ──→ DONE
+```
+
+- **DETECT_CONTAINER**: Accumulates the first 4 bytes to identify `"fLaC"` (native FLAC) or `"OggS"` (Ogg FLAC), then delegates to the appropriate decode path
+- **HEADER**: Parses STREAMINFO and other metadata blocks. Returns `HEADER_READY` when complete
+- **AUDIO**: Decodes frames until end of stream
+- **DONE**: Terminal state, always returns `END_OF_STREAM`
+
+### Container Paths
+
+```text
+                    ┌─────────────────────┐
+                    │  Container Detect    │
+                    │  (first 4 bytes)     │
+                    └──────────┬──────────┘
+                               │
+                ┌──────────────┴──────────────┐
+                │                             │
+                ▼                             ▼
+       ┌────────────────┐           ┌─────────────────┐
+       │  decode_native │           │   decode_ogg    │
+       │  ("fLaC")      │           │   ("OggS")      │
+       └────────┬───────┘           └────────┬────────┘
+                │                            │
+                │                   ┌────────┴────────┐
+                │                   │  Ogg Demuxer    │
+                │                   │  (strips pages, │
+                │                   │   BOS prefix)   │
+                │                   └────────┬────────┘
+                │                            │
+                └──────────┬─────────────────┘
+                           │
+                           ▼
+                  ┌────────────────┐
+                  │ Header/Frame   │
+                  │ Parsing        │
+                  │ (shared path)  │
+                  └────────────────┘
+```
+
+The Ogg path uses `micro_ogg::OggDemuxer` to strip Ogg page framing and the 9-byte BOS prefix (`0x7F "FLAC" 0x01 ...`), then delegates the raw FLAC data to `decode_native` for the actual header/frame parsing.
+
+### Frame Decode Stages (`FrameDecodeStage`)
+
+```text
+IDLE ──→ FRAME_HEADER ──→ SUBFRAME ──→ FRAME_FOOTER ──→ IDLE
+```
+
+Each stage is resumable. The decoder saves its position and returns `NEED_MORE_DATA` if the input is exhausted mid-stage.
+
+- **FRAME_HEADER**: Accumulates header bytes, then delegates to `parse_frame_header()` (in `frame_header.cpp`) for parsing and validation
+- **SUBFRAME**: Decodes all channels' subframes (constant, verbatim, fixed, LPC + residuals)
+- **FRAME_FOOTER**: Reads CRC-16 and validates frame integrity
+
+### Subframe Decode Stages (`SubframeDecodeStage`)
+
+```text
+SUBFRAME_HEADER ──→ SUBFRAME_CONSTANT
+                  │  SUBFRAME_VERBATIM
+                  │  SUBFRAME_WARMUP ──→ LPC_PARAMS ──→ RESIDUAL_HEADER
+                  │                  └──→ RESIDUAL_HEADER
+                  │
+                  └──→ RESIDUAL_HEADER ──→ RESIDUAL_PARTITION_PARAM ──→ RESIDUAL_SAMPLES
+                                                                     └→ RESIDUAL_ESCAPE_BITS ──→ RESIDUAL_SAMPLES
+```
+
+Subframe types:
+
+- **Constant**: Single value repeated for entire block
+- **Verbatim**: Raw uncompressed samples
+- **Fixed**: Fixed-order linear prediction (orders 0-4)
+- **LPC**: Arbitrary-order linear prediction with encoded coefficients
+
+After all subframes are decoded, channel decorrelation is applied via `apply_channel_decorrelation()` (in `decorrelation.cpp`) for mid-side, left-side, or right-side stereo, followed by CRC-16 validation of the frame.
+
+## Encoding
+
+`FLACEncoder` has no state machine and never buffers input or allocates. `encode()` consumes exactly one block from the caller's buffer and writes one frame, or consumes nothing (`FLAC_ENCODER_NEED_MORE_DATA`); `finish()` writes the remainder as a shorter final frame. Between calls it carries only the stream's bookkeeping: the frame number (the stream is fixed-blocksize), the sample count, and the frame-size range the finished STREAMINFO reports. The constructor validates and precomputes, and every public call reports its verdict.
+
+### Chunked Unpacking
+
+Every format takes the same path. The input is unpacked `CHUNK_SAMPLES` (256) samples per channel at a time into `chunk_`, a 2 KB buffer inside the object, and every pass works on those chunks. A walk over one signal reads it through `PackedSignal`: `unpack_channel()` reads one channel, and `unpack_mid()`/`unpack_side()` derive mid or side straight from the packed stereo input in one pass (`pcm_packing.cpp`). Stereo Pass A instead unpacks left and right once per chunk (`unpack_stereo()`) and derives mid and side in place. The stereo search's joint walk also unpacks with `unpack_stereo()`, but never forms mid or side: their autocorrelations follow from left's, right's and their windowed sum's. One chunk layout means one instantiation of the per-order code for every format, with no block-sized buffer. 4-byte samples (25-32 bit streams) unpack through functions of their own (`unpack_*32()`), which form mid and side in 64 bits: a call inside the 1-3 byte unpack functions would cost their loops registers. The cost is unpacking the input again for each walk over a subframe: on the ESP32-S3, 16-bit stereo encodes 5-7% slower with fixed predictors and about 1% slower with LPC than a dedicated path that read `int16_t` in place, which cost 38 KB of flash. Chunks of 512 samples would be under 1% faster than 256, for 2 KB more per object. The scan, the cascade and the Rice writer are tuned against Xtensa's register budget; check the disassembly of `scan_range()`, `write_subframe()` and the unpack loops after changing them.
+
+### Two-Pass Algorithm
+
+Fixed-predictor residuals are computed as a running difference cascade: the order-o residual is the o-th difference of the signal, the same values as the fixed-predictor polynomials with one subtraction per order and no multiplies.
+
+- **Pass A (analysis)**: `scan_range()` walks each candidate signal once (mono or each channel; for stereo, left, right, mid and side), summing `|e_o|` for orders 0-4 in one loop. A constant signal shows up as a zero order-1 sum. `estimate_rice_bits()` prices each order at the better of two Rice parameters, and the cheapest wins, capped at VERBATIM's size. For stereo, `choose_stereo_plan()` picks the cheapest of the four channel assignments, with side coded one bit deeper. The loop accumulates 32-bit partial sums, spilled at intervals proven overflow-free for the depth (`sum_chunk_samples()`); builds defining `MICRO_FLAC_CHECK_SCAN_SUMS` check that proof at run time.
+- **Pass A in 64 bits** (streams of 25-32 bits): residuals outgrow the 32-bit cascade (32-bit stereo's side is 33 bits, and its order-4 residuals reach 2^36), and RFC 9639 §9.2.7.3 requires every Rice-coded residual to stay below 2^31 in magnitude, falling back to VERBATIM when no predictor keeps it there. `scan64()` runs the cascade in `int64_t`, summing each order's magnitudes and also ORing them; the OR is below 2^31 exactly when every residual is. Wasted bits shift both right, so the check stays exact after `finish_analysis64()` rescales it, and `finish_analysis()` then chooses among the orders in range only, or marks the signal VERBATIM. These frames take `encode_frame64()`, which shares Pass B. The 64-bit code has no speed target and sits in `FLAC_COLD_SECTION`, apart from the hot functions: emitted among them, it moved them into conflicting instruction-cache sets on the ESP32-S3.
+- **Pass B (emission)**: `write_subframe()` writes each chosen signal's subframe in one walk, at Pass A's Rice parameter. There is no exact cost pass. Since `zigzag(r) <= 2|r|`, a subframe's exact size is at most Pass A's estimate plus half a bit per residual (`fixed_subframe_bits_bound()`). When that bound is below VERBATIM's size, FIXED is written and the bound proves the output capacity once for the unchecked `write_rice_block()`. Otherwise the residuals are priced exactly and VERBATIM is written unless FIXED is strictly smaller. Never writing a subframe larger than VERBATIM is what makes `get_max_output_bytes()` a hard bound. Pass B's cascade stays in 32 bits for every depth: it subtracts modulo 2^32, so a residual that fits `int32_t` comes out exact even when lower orders overflow or the signal itself is a 33-bit side unpacked to its low 32 bits. Only the samples written raw (warmup, CONSTANT and VERBATIM) need a 33-bit side's top bit, and read it again from the input.
+
+### LPC Subframes
+
+With `FLACEncoderOptions::lpc`, Pass B also tries linear prediction on each subframe it writes, in streams of up to 24 bits (`MAX_LPC_BITS_PER_SAMPLE`); deeper streams use the fixed predictors only. Pass A is unchanged, so the stereo assignment still comes from the fixed predictors unless the stereo search below is on. An attempt walks the signal three times:
+
+1. **Autocorrelation and design** (`lpc_analysis.cpp`). Each piece is windowed with Tukey(0.5), libFLAC's default, and correlated two lags at a time (one on the wide path). `lpc_design()` normalizes the autocorrelation, runs the Schur recursion in fixed point, picks the order by libFLAC's error estimate, steps up to direct-form coefficients and quantizes them. On the narrow path the precision is capped so the residual dot product stays in `int32_t`.
+2. **Pricing**. `lpc_residual_sum()` sums the residual magnitudes, which price the candidate with the same `estimate_rice_bits()` as Pass A. A residual of 2^23 or more (2^30 on the wide path) rejects LPC for the subframe.
+3. **Emission**, if LPC is estimated smaller than FIXED. The same size bound applies, so the capacity is again proven once per subframe.
+
+Everything is integer arithmetic, so output is identical on every platform and needs no FPU, within about 0.02% of a double-precision design. Only the three walks read the signal; the kernels, pricing and header writer are shared and out of line.
+
+**Stereo search** (`FLACEncoderOptions::lpc_stereo_search`). The assignment cheapest with fixed predictors is often not the one cheapest with LPC. The search designs LPC for all four candidates first and chooses from each one's better estimate, then hands the chosen two designs to Pass B. One walk over left and right (`LpcStereoAutocorrelation`) yields all four autocorrelations, since mid's and side's follow exactly from left's, right's and their windowed sum's: (a + b)(c + d) + (a - b)(c - d) = 2(ac + bd).
+
+**Wide path** (every subframe of a 17-24 bit stream). The 32-bit kernels cannot carry a 25-bit side channel, and deep, oversampled audio needs a more precise design: its high-order reflection coefficients sit within a hair of 1, where the direct-form coefficients are very sensitive to rounding. The wide path windows to 24 bits with Q31 taper weights, normalizes R[0] near 2^45, carries reflection coefficients in Q40 (64x64-bit products from 32-bit halves, no `__int128`), and computes residuals in 64 bits. Its code stays out of the narrow functions' loops (`autocorrelation_update_wide()` is out of line), which would otherwise lose registers to it.
+
+### Rice Partitioning
+
+With `FLACEncoderOptions::max_rice_partition_order`, a subframe's residuals may be split into 2^p partitions, each with its own Rice parameter (RFC 9639 §9.2.7). It is chosen after the predictor, in Pass B (or, for the stereo search's LPC candidates, when the search prices them): one walk sums the residual magnitudes per leaf partition at the highest order allowed, and `choose_partitions()` prices every order from those sums, merging neighbors bottom-up. The size bound holds partition by partition. A subframe that does not split takes the single-partition code, so with partitioning off every other option runs unchanged. Subframes deeper than 25 bits sum their leaves in 64 bits (`add_leaf_residuals64()`), since each residual may reach 2^31 - 1.
+
+### Wasted Bits
+
+With `FLACEncoderOptions::wasted_bits`, a subframe whose samples all end in the same k zero bits is coded k bits shallower (RFC 9639 §9.2.2). Pass A finds k as the trailing zeros of the OR of each candidate's samples. Every residual of the shifted signal is the original's divided by 2^k, so the sums are rescaled rather than rescanned, and Pass B folds the shift into the unpacking. Mid is detected from its own samples: when left and right share k wasted bits, mid may keep only k - 1, because the decoder rebuilds mid's dropped low bit from side's. The unary count in the subframe header is the same for every coding of a signal, so the estimates leave it out and only the capacity checks add it.
+
+### Compile-Time Switches
+
+`MICRO_FLAC_ENCODER_DISABLE_LPC` and `MICRO_FLAC_ENCODER_DISABLE_RICE_PARTITIONS` (Kconfig `MICRO_FLAC_ENCODER_ENABLE_*`, host CMake options of the same names) each compile a feature out. Options for a missing feature are validated and then ignored. They are PUBLIC definitions because `flac_encoder.h` reads them: it reports them (`FLACEncoder::LPC_AVAILABLE`, `RICE_PARTITIONS_AVAILABLE`, `MAX_LPC_BITS_PER_SAMPLE`). Neither switch changes the class layout.
+
+### Bit Writer Design
+
+`bit_writer.h` mirrors `bit_reader.h`: stack-local state (`BitWriterLocal`) the compiler can keep in registers, and header-only `FLAC_ALWAYS_INLINE` functions on it. `write_rice()` writes a whole code with one OR and shift when it fits the accumulator, and `write_zeros()` stores long unary runs as whole zero bytes. Residuals go through `write_rice_block()`, which skips every bounds check once the caller has proven the capacity, keeps the writer state in locals, and drains bytes only when the next code does not fit. Its output is identical to a `write_rice()` loop, which `test_bit_writer` checks.
+
+CRC is not computed inside the writer. `write_frame_header()` runs `calculate_crc8()` over the header bytes it writes directly, and `close_frame()` runs `update_crc16()` once over the finished frame.
+
+## Optimizations
+
+### Bitstream Reading
+
+The bit-stream primitives live in `bit_reader.h` as header-only `FLAC_ALWAYS_INLINE` functions operating on a `BitReaderLocal` stack struct. Hoisting bit-reader state into a local struct lets the compiler keep it in registers across hot loops, avoiding aliasing-induced spills through the decoder's member fields.
+
+The decoder uses a platform-sized bit buffer: 64-bit on host/64-bit platforms (refilled 8 bytes at a time) and 32-bit on ESP32/32-bit platforms (refilled 4 bytes at a time). This avoids unnecessary 64-bit arithmetic on embedded targets while reducing refill frequency on desktop.
+
+### LPC Accumulator Type Selection
+
+The public `restore_lpc()` function dispatches to a specialized implementation based on overflow analysis and buffer type:
+
+1. **Overflow Detection** (`can_use_lpc_32bit()`):
+   - Analyzes sample depth, LPC coefficients, order, and quantization shift
+   - Calculates maximum possible values before and after shift
+   - Determines if 32-bit arithmetic will overflow
+
+2. **32-bit Fast Path** (`restore_lpc_32bit()`):
+   - Dispatched by `restore_lpc()` when overflow is impossible (most 16-bit audio)
+   - ~2x faster on ESP32-S3
+   - C++ implementation uses unrolled loops for orders 1-12
+   - Xtensa assembly implementation with loop unrolling for orders 1-12
+
+3. **64-bit Safe Path** (`restore_lpc_64bit()`):
+   - Dispatched by `restore_lpc()` when 32-bit arithmetic may overflow
+   - Used for high-resolution audio (e.g., 24-bit) with large coefficients
+   - Prevents overflow in all valid FLAC streams
+   - C++ implementation uses unrolled loops for orders 1-12
+   - Xtensa assembly implementation uses MULL/MULSH instructions on ESP32 with loop unrolling for orders 1-12
+
+4. **33-bit MID_SIDE Path** (`restore_lpc()` with `int64_t*` buffer):
+   - Dispatched via the `int64_t*` overload of `restore_lpc()`
+   - Used for the side channel in MID_SIDE stereo when the output sample depth is 32 bits
+   - Side channel samples can be up to 33 bits wide, requiring `int64_t` buffers
+   - Always uses 64-bit accumulation (no Xtensa assembly dispatch)
+
+### Output
+
+Output packing converts the internal planar 32-bit representation to interleaved PCM in the user's output buffer. The implementation is in `pcm_packing.cpp` with optimized fast paths dispatched by `write_samples()`:
+
+**Native output mode** (bytes per sample matches bit depth):
+
+- **16-bit mono**: Pointer-cast to `int16_t*`, 4-sample unrolled loop
+- **16-bit stereo**: Pointer-cast to `int16_t*`, 4-sample unrolled loop
+- **24-bit stereo, 4-byte aligned**: Two frames packed into three `uint32_t` stores
+- **24-bit stereo**: Byte-by-byte little-endian packing, 2-sample unrolled loop
+- **General fallback**: Handles all other bit depths and channel counts (non-byte-aligned with LSB zero-padding)
+
+Native output is little-endian on every host. The `int16_t` and `uint32_t` paths store native words, so `write_samples()` takes them only on little-endian targets (`FLAC_LITTLE_ENDIAN`, compiler.h); big-endian targets use the byte-by-byte paths. The encoder's unpacking does the same in reverse: its 16-bit loads, aligned 24-bit word reads and 32-bit `memcpy` loads are little-endian only, and big-endian targets read bytes.
+
+**32-bit output mode** (all samples left-justified to 32 bits):
+
+- **32-bit mono**: Pointer-cast to `int32_t*`, shift in place
+- **32-bit stereo**: Pointer-cast to `int32_t*`, shift-and-interleave
+- **32-bit general**: Handles arbitrary channel counts
+
+32-bit output is native `int32_t` values (only the `int32_t*` `decode()` overload uses it), so it is in the host's byte order.
+
+## References
+
+- [FLAC Format Specification](https://xiph.org/flac/format.html)
+- [Nayuki's Simple FLAC Implementation](https://www.nayuki.io/res/simple-flac-implementation/)
+- [Mike Hansen's C++ FLAC decoder port](https://github.com/synesthesiam/flac-decoder)
+- [Xtensa ISA Reference](https://www.cadence.com/content/dam/cadence-www/global/en_US/documents/tools/ip/tensilica-ip/isa-summary.pdf)
