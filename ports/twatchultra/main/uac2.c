@@ -900,8 +900,13 @@ static void forget_gone_device(void)
         s_dev = NULL;
     }
     s_product[0] = '\0';
-    if (s_worker)
-        reserve_take();     /* the next DAC's claim will need it again */
+    /*
+     * NO reserve_take() here. It used to re-take the claim's block as soon as the
+     * device went away, which left DMA-capable RAM held across the re-enumeration
+     * that follows a re-plug -- the very window that panics in device_alloc()
+     * when the pool is empty. uac2_open() takes it again before the next claim,
+     * which is the only place it is needed.
+     */
 
     if (s_ring)
     {
@@ -1069,6 +1074,14 @@ bool uac2_open(void)
     for (int k = 0; k < s_nrates; k++)
         ESP_LOGI(TAG, "  rate %lu", (unsigned long)s_rates[k]);
 
+    /*
+     * The reserve is taken HERE and not at boot: it exists to be held while the
+     * control requests above run and released at the claim, so the claim finds a
+     * contiguous block nothing else has taken -- not to sit in the pool while a
+     * device is still enumerating, which starves enumeration itself.
+     */
+    reserve_take();
+
     if (!alloc_transfers())
         return false;
 
@@ -1174,12 +1187,29 @@ bool uac2_auto_start(void)
     if (!usbhost_install() || !client_setup())
         return false;
 
-    /* Taken now, at boot, before anything opens a file on the SD card: the
-     * stream's transfers, and the reserve the claim will be given. */
-    if (!alloc_transfers())
-        return false;
-    reserve_take();
-
+    /*
+     * NOTHING IS ALLOCATED HERE, and that is the fix for a boot loop.
+     *
+     * This used to take the stream's transfers and the claim's reserve at boot,
+     * on the reasoning that the DMA memory has to be taken before anything opens
+     * a file on the SD card (USB-005). With a DAC already plugged in it did the
+     * opposite of what was wanted: enumeration runs in the USB library's own
+     * task the moment the host stack is installed, and ENUMERATION NEEDS
+     * DMA-CAPABLE INTERNAL RAM TOO -- device_alloc() allocates the default
+     * control pipe, whose descriptor list is 3 qtds and asserts when it cannot
+     * (hcd_dwc.c:1059, the same assert as the claim).
+     *
+     * 3 x 1536 transfers plus 2 x 512 reserve is 5632 bytes, and on this board
+     * in OTG mode internal RAM is down to about 8 KB free with the shell's
+     * 24 KB stack block held, so the pool was empty by the time a device
+     * attached. The coredump named it: task 'usb_lib', hub.c root_port_handle_
+     * events -> usbh_devs_add -> device_alloc -> hcd_pipe_alloc -> assert.
+     * Boot, desktop, reset, for ever -- and unplugging the DAC was the only way
+     * out, because the reset happens before any command can run.
+     *
+     * The allocation belongs in uac2_open(), which runs once a device is
+     * present, after enumeration and still before any file is opened.
+     */
     if (xTaskCreate(worker_task, "uac2dev", 4096, NULL, 3, &s_worker) != pdPASS)
     {
         s_worker = NULL;

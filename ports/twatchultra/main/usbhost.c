@@ -106,13 +106,21 @@ static bool key_set(const char *key, bool on)
 
 /* Internal RAM at a point in the boot, for the Log Viewer: OTG mode takes its
  * memory before the shell exists, and the shell's 24 KB task is the first
- * thing to notice when there is not enough left. */
+ * thing to notice when there is not enough left.
+ *
+ * SHORT AND DMA-FIRST ON PURPOSE. The Log Viewer keeps 128 lines and cuts each
+ * at 38 columns, so the previous "before USB: internal free N, largest N, DMA
+ * largest N" lost the only number that mattered -- entry 20 recorded that the
+ * boot's heap figures were lost exactly this way. DMA-capable internal RAM is
+ * the scarce pool that enumeration and the claim both draw from, so it leads.
+ */
 static void heap_note(const char *when)
 {
-    ESP_LOGI(TAG, "%s: internal free %u, largest %u, DMA largest %u", when,
+    ESP_LOGI(TAG, "%s dma=%u/%u int=%u/%u", when,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 }
 
 /*
@@ -135,7 +143,7 @@ void board_shell_task_prepare(void)
         return;
     heap_caps_free(s_shell_hold);
     s_shell_hold = NULL;
-    heap_note("shell hole released");
+    heap_note("hole-free");
 }
 
 void usbhost_boot(void)
@@ -145,7 +153,7 @@ void usbhost_boot(void)
         return;
 
     ESP_LOGI(TAG, "OTG host mode (usb.host = 1): the PC will not see this board");
-    heap_note("before USB");
+    heap_note("pre-USB");
 
     s_shell_hold = heap_caps_malloc(USBHOST_SHELL_HOLD, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!s_shell_hold)
@@ -154,7 +162,7 @@ void usbhost_boot(void)
     if (usbhost_install() && key_on("usb.dac") && !uac2_auto_start())
         ESP_LOGW(TAG, "USB-C DAC support did not start");
 
-    heap_note("after USB");
+    heap_note("post-USB");
 }
 
 /* ---------------------------------------------------------- td_usb_ops_t */
