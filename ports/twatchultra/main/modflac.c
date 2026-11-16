@@ -56,6 +56,13 @@ static volatile int s_state;
 static volatile uint32_t s_frames;
 static volatile uint32_t s_calls;
 static volatile int32_t s_verdict;
+
+/* The module handle's first words, copied out before the block is freed so the
+ * status command can explain a failure without a diagnostic file. The console
+ * works now, which is cheaper than any file. */
+static volatile uint32_t s_h_magic, s_h_ready;
+static volatile int32_t s_h_rate, s_h_ch, s_h_bits, s_h_last;
+static volatile uint32_t s_h_consumed, s_h_calls;
 static char s_msg[64];
 
 static void set_msg(const char *m) { snprintf(s_msg, sizeof(s_msg), "%s", m); }
@@ -271,6 +278,20 @@ static void play_task(void *arg)
         s_state = s_stop ? 0 : 2;
     if (started)
         sound_stream_close();
+    /* Copy the handle out before it is freed: the status command reports these,
+     * and they are what explain a decode that returned an error. */
+    {
+        const uint32_t *w = (const uint32_t *)state;
+
+        s_h_magic = w[0];
+        s_h_ready = w[1];
+        s_h_rate = (int32_t)w[2];
+        s_h_ch = (int32_t)w[3];
+        s_h_bits = (int32_t)w[4];
+        s_h_last = (int32_t)w[5];
+        s_h_consumed = w[6];
+        s_h_calls = w[7];
+    }
     dump_state(state, MODFLAC_STATE_BYTES);
 
 cleanup:
@@ -325,10 +346,19 @@ static int cmd_modflac(tdsh_session_t *session, int argc, char **argv)
     {
         printf("modflac <file.flac> | modflac stop\n");
         if (s_task || s_state >= 2)
+        {
             printf("state %s, %lu frames, %lu calls, verdict %ld%s%s\n",
                    s_state == 1 ? "playing" : (s_state == 2 ? "done" : "error"),
                    (unsigned long)s_frames, (unsigned long)s_calls, (long)s_verdict,
                    s_msg[0] ? ": " : "", s_msg);
+            /* The module handle, which is what says WHY a decode failed. */
+            printf("handle: magic %08lx ready %lu rate %ld ch %ld bits %ld\n",
+                   (unsigned long)s_h_magic, (unsigned long)s_h_ready,
+                   (long)s_h_rate, (long)s_h_ch, (long)s_h_bits);
+            printf("        last %ld consumed %lu in-calls %lu\n",
+                   (long)s_h_last, (unsigned long)s_h_consumed,
+                   (unsigned long)s_h_calls);
+        }
         return 0;
     }
 

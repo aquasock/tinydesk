@@ -19,13 +19,18 @@ BUILD   ?= $(MODULES)/build
 PORT    := $(abspath $(MODULES)/..)
 APP_ELF := $(PORT)/build/tinydesk.elf
 
-# The address of the firmware's published API-table pointer, read out of the
-# app's own ELF. DERIVED, never typed: a stale address here links a blob that
-# dereferences garbage the first time it allocates.
-MODHOST_PTR_AT := $(shell $(NM) $(APP_ELF) 2>/dev/null | awk '$$3=="g_modhost_ptr"{print "0x"$$1}')
+# Addresses come from a GENERATED HEADER, not -D flags.
+#
+# A -D does not make an object depend on its VALUE: when the app was rebuilt and
+# the table moved 0x3c27b8fc -> 0x3c27ba74, make reused the stale flacmod.o, the
+# blob linked against the old address, and the module's host() read garbage --
+# surfacing only as a verdict of -1. modaddr.h is a prerequisite of every module
+# object, so a moved address forces a rebuild.
+MODADDR_H := $(BUILD)/modaddr.h
 
-# Where the firmware lends modules their .bss. Derived the same way, and for the
-# same reason: a stale address here would have the module zeroing the wrong RAM.
+# The linker needs these as --defsym symbols too. They are read from nm as well
+# as the header: the header is what makes OBJECTS rebuild when an address moves,
+# and these are what the LINK consumes.
 MODBSS_AT      := $(shell $(NM) $(APP_ELF) 2>/dev/null | awk '$$3=="g_modbss"{print "0x"$$1}')
 
 # Where the MMU mapped the `moddata` partition, as the firmware published it in
@@ -67,7 +72,7 @@ BIN     := $(BUILD)/modtest.bin
 # -std=gnu++17, -fno-rtti and -fno-threadsafe-statics on C input.
 CFLAGS := -mlongcalls -mtext-section-literals -fno-builtin -fno-pic \
           -Os -Wall -Wextra -Werror \
-          -DMODHOST_PTR_AT=$(MODHOST_PTR_AT) \
+          -include $(MODADDR_H) \
           -I$(MAIN)
 
 CXXFLAGS := $(CFLAGS) -fno-exceptions -fno-rtti -fno-threadsafe-statics -std=gnu++17
@@ -87,10 +92,10 @@ all: $(BIN)
 # The FLAC decoder as a module.
 flac: $(BUILD)/flac.bin
 
-$(BUILD)/flacmod.o: $(MODULES)/src/flacmod.cpp | $(BUILD) check
+$(BUILD)/flacmod.o: $(MODULES)/src/flacmod.cpp $(MODADDR_H) | $(BUILD)
 	$(CXX) $(FLAC_CXXFLAGS) -I$(MAIN) -c $< -o $@
 
-$(BUILD)/flac_%.o: $(MF)/src/%.cpp | $(BUILD)
+$(BUILD)/flac_%.o: $(MF)/src/%.cpp $(MODADDR_H) | $(BUILD)
 	$(CXX) $(FLAC_CXXFLAGS) -c $< -o $@
 
 # Both LPC widths: the decoder references the 64-bit path whether or not a
@@ -119,19 +124,20 @@ $(BUILD)/flac.bin: $(BUILD)/flacmod.o $(BUILD)/modshim.o \
 # table symbol moved out of the image.
 check:
 	@test -f $(APP_ELF) || { echo "modules: build the app first ($(APP_ELF) missing)"; exit 1; }
-	@test -n "$(MODHOST_PTR_AT)" || { echo "modules: g_modhost_ptr not in $(APP_ELF)"; exit 1; }
-	@test -n "$(MODBSS_AT)" || { echo "modules: g_modbss not in $(APP_ELF)"; exit 1; }
-	@test -n "$(MODDATA_AT)" || { echo "modules: moddata.at missing -- create it with 'inst=..' and 'data=..' lines from the watch's /root/modaddr.txt"; exit 1; }
-	@echo "modules: table $(MODHOST_PTR_AT), bss $(MODBSS_AT), rodata $(MODDATA_AT)"
+	@test -n "$(MODDATA_AT)" || { echo "modules: moddata.at missing -- it needs 'inst=..' and 'data=..' from the watch's /root/modaddr.txt"; exit 1; }
 
 $(BUILD):
 	mkdir -p $(BUILD)
 
 # The shim is C++ (operator new/delete), the entry is C.
-$(BUILD)/modtest.o: $(SRC) | $(BUILD) check
+$(MODADDR_H): $(APP_ELF) $(MODULES)/gen_addr.py
+	@mkdir -p $(BUILD)
+	@python3 $(MODULES)/gen_addr.py $(APP_ELF) $@
+
+$(BUILD)/modtest.o: $(SRC) $(MODADDR_H) | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD)/modshim.o: $(MODULES)/src/modshim.c | $(BUILD) check
+$(BUILD)/modshim.o: $(MODULES)/src/modshim.c $(MODADDR_H) | $(BUILD)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(ELF): $(BUILD)/modtest.o $(BUILD)/modshim.o $(MODULES)/link.ld
