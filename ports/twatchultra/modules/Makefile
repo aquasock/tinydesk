@@ -28,6 +28,12 @@ MODHOST_PTR_AT := $(shell $(NM) $(APP_ELF) 2>/dev/null | awk '$$3=="g_modhost_pt
 # same reason: a stale address here would have the module zeroing the wrong RAM.
 MODBSS_AT      := $(shell $(NM) $(APP_ELF) 2>/dev/null | awk '$$3=="g_modbss"{print "0x"$$1}')
 
+# Where the MMU mapped the `moddata` partition, as the firmware published it in
+# /root/modaddr.txt at boot. Absolute and runtime-determined, so it is read from
+# that file rather than calculated. Re-run `make modaddr` after any change that
+# moves a mapping.
+MODDATA_AT     := $(shell sed -n 's/^data=//p' $(MODULES)/moddata.at 2>/dev/null)
+
 MF      := $(abspath $(MODULES)/../components/micro-flac)
 XTINC   := $(IDF_PATH)/components/xtensa/esp32s3/include
 
@@ -71,7 +77,8 @@ FLAC_CXXFLAGS := $(FLAC_CFLAGS) -fno-exceptions -fno-rtti -fno-threadsafe-static
                  -include $(MODULES)/src/flacmalloc.h
 
 LDFLAGS := -nostdlib -T $(MODULES)/link.ld -Wl,--build-id=none \
-           -Wl,--defsym=MODBSS_AT=$(MODBSS_AT) -Wl,-Map=$(BUILD)/mod.map
+           -Wl,--defsym=MODBSS_AT=$(MODBSS_AT) -Wl,--defsym=MODDATA_AT=$(MODDATA_AT) \
+           -Wl,-Map=$(BUILD)/mod.map
 
 .PHONY: all clean flash size check flac
 
@@ -98,10 +105,15 @@ $(BUILD)/flac.bin: $(BUILD)/flacmod.o $(BUILD)/modshim.o \
                    $(patsubst $(MF)/src/%.cpp,$(BUILD)/flac_%.o,$(FLAC_SRC)) \
                    $(BUILD)/lpc32.o $(BUILD)/lpc64.o $(MODULES)/link.ld
 	$(CXX) $(LDFLAGS) -o $(BUILD)/flac.elf $(filter %.o,$^) -lgcc
-	$(OBJCOPY) -O binary $(BUILD)/flac.elf $@
+	# TWO BINARIES, because .text and .rodata live in different windows and
+	# therefore different partitions: the code goes to `modules`, the constants
+	# to `moddata`. --only-section keeps them from bleeding into each other.
+	$(OBJCOPY) -O binary --only-section=.modheader --only-section=.text $(BUILD)/flac.elf $@
+	$(OBJCOPY) -O binary --only-section=.rodata $(BUILD)/flac.elf $(BUILD)/flac.data.bin
 	@$(NM) $(BUILD)/flac.elf > $(BUILD)/flac.nm
 	@python3 $(MODULES)/patch_header.py $@ "$$(cat $(BUILD)/flac.nm)"
-	@printf 'blob: %s (%s bytes)\n' "$@" "$$(stat -c %s $@)"
+	@printf 'blob: %s (%s bytes) + data %s (%s bytes)\n' "$@" "$$(stat -c %s $@)" \
+		"$(BUILD)/flac.data.bin" "$$(stat -c %s $(BUILD)/flac.data.bin)"
 
 # Fail before compiling anything if the app has not been built, or if its
 # table symbol moved out of the image.
@@ -109,7 +121,8 @@ check:
 	@test -f $(APP_ELF) || { echo "modules: build the app first ($(APP_ELF) missing)"; exit 1; }
 	@test -n "$(MODHOST_PTR_AT)" || { echo "modules: g_modhost_ptr not in $(APP_ELF)"; exit 1; }
 	@test -n "$(MODBSS_AT)" || { echo "modules: g_modbss not in $(APP_ELF)"; exit 1; }
-	@echo "modules: host API table at $(MODHOST_PTR_AT), bss lent at $(MODBSS_AT)"
+	@test -n "$(MODDATA_AT)" || { echo "modules: moddata.at missing -- create it with 'inst=..' and 'data=..' lines from the watch's /root/modaddr.txt"; exit 1; }
+	@echo "modules: table $(MODHOST_PTR_AT), bss $(MODBSS_AT), rodata $(MODDATA_AT)"
 
 $(BUILD):
 	mkdir -p $(BUILD)

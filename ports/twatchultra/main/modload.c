@@ -51,6 +51,19 @@ static const void *s_inst;
 static esp_partition_mmap_handle_t s_handle_inst;
 static size_t s_size;
 
+/*
+ * THE DATA SIDE. A module's .text is fetched from the instruction window and its
+ * .rodata is read from this one -- they are different partitions because the two
+ * windows cannot serve the same bytes (see partitions.csv and modload.h).
+ */
+static const void *s_data_base;
+static esp_partition_mmap_handle_t s_handle_data;
+
+const void *modload_data_base(void)
+{
+    return s_data_base;
+}
+
 bool modload_map(const void **base, size_t *size, char *why, size_t why_len)
 {
     if (s_inst)
@@ -120,6 +133,29 @@ bool modload_prepare(char *why, size_t why_len)
     if (!modload_map(&base, &size, why, why_len))
         return false;
 
+    /* Map the data side too. It has to happen HERE, on the boot task: mapping
+     * disables the flash cache, so a PSRAM-stack task cannot do it. */
+    const esp_partition_t *dp = esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
+                                                         MODLOAD_DATA_SUBTYPE,
+                                                         MODLOAD_DATA_LABEL);
+
+    if (dp)
+    {
+        const esp_err_t derr = esp_partition_mmap(dp, 0, dp->size, ESP_PARTITION_MMAP_DATA,
+                                                  &s_data_base, &s_handle_data);
+
+        if (derr == ESP_OK)
+            ESP_LOGI(TAG, "'%s' %u B mapped for data at %p", MODLOAD_DATA_LABEL,
+                     (unsigned)dp->size, s_data_base);
+        else
+            ESP_LOGW(TAG, "mmap(DATA) failed: %s", esp_err_to_name(derr));
+    }
+    else
+    {
+        ESP_LOGW(TAG, "no '%s' partition; a module with .rodata cannot run",
+                 MODLOAD_DATA_LABEL);
+    }
+
     modload_read_header(&s_hdr);
 
     if (s_hdr.magic != MODLOAD_MAGIC || s_hdr.abi_version != MODHOST_ABI_VERSION ||
@@ -134,7 +170,31 @@ bool modload_prepare(char *why, size_t why_len)
 
     s_entry = (void *)((const uint8_t *)modload_inst_base() + s_hdr.entry_offset);
     s_prepared = true;
+
+    /*
+     * PUBLISH THE ADDRESSES FOR THE MODULE BUILD.
+     *
+     * A module's .rodata is linked at an absolute address, and that address is
+     * whatever the MMU hands back for the data partition -- knowable only at
+     * runtime. So it is written where the build can read it, and modules/Makefile
+     * picks it up. Typing it by hand would work exactly once.
+     */
+    {
+        FILE *f = fopen("/fs/root/modaddr.txt", "w");
+
+        if (f)
+        {
+            fprintf(f, "inst=%p\ndata=%p\n", modload_inst_base(), s_data_base);
+            fclose(f);
+        }
+    }
+
     return true;
+}
+
+bool modload_ready(void)
+{
+    return s_prepared;
 }
 
 const modload_header_t *modload_header(void)

@@ -133,6 +133,26 @@ bool modload_read_header(modload_header_t *h);
  */
 bool modload_prepare(char *why, size_t why_len);
 
+/*
+ * True when modload_prepare() succeeded. For tasks OTHER than the caller of
+ * modload_prepare(): they must never map, only ask.
+ *
+ * This exists because the distinction was not structural and cost a coredump:
+ * modflac called modload_prepare(), the boot-time call had failed (no module
+ * flashed yet), so it retried the mapping from a PSRAM-stack task and hit
+ * "assert failed: esp_task_stack_is_sane_cache_disabled()". A retry that can
+ * panic is not a retry.
+ */
+bool modload_ready(void);
+
+/* The label and subtype of the data-side partition. A module's `.rodata` is
+ * linked at whatever address this partition maps to; see modules/link.ld. */
+#define MODLOAD_DATA_LABEL   "moddata"
+#define MODLOAD_DATA_SUBTYPE 0x41
+
+/* Where a module's constant data lives once mapped, or NULL. */
+const void *modload_data_base(void);
+
 /* The header read during modload_prepare(). NULL before it succeeds. */
 const modload_header_t *modload_header(void);
 

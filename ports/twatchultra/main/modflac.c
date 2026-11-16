@@ -65,7 +65,21 @@ static void set_msg(const char *m) { snprintf(s_msg, sizeof(s_msg), "%s", m); }
  * at 40 columns. */
 static void dump_state(const void *state, size_t size)
 {
-    FILE *f = fopen("/fs/root/modflac.txt", "w");
+    /*
+     * ON THE SD CARD, NOT ON LITTLEFS, and that is not a preference.
+     *
+     * littlefs lives in the SPI flash partition, so opening a file there calls
+     * esp_flash_read(), which DISABLES THE FLASH CACHE -- and this task's stack
+     * is in PSRAM, which is reached through that cache. The coredump:
+     *
+     *   assert failed: esp_task_stack_is_sane_cache_disabled()
+     *     esp_flash_read(address=0x620F40) <- littlefs <- fopen
+     *
+     * So every task in this port that runs on a PSRAM stack must also stay off
+     * /fs. /sd is the SD card over its own bus and is fine -- `music` reads
+     * audio from there on a PSRAM stack all day.
+     */
+    FILE *f = fopen("/sd/modflac.txt", "w");
 
     if (!f)
         return;
@@ -96,11 +110,14 @@ static void play_task(void *arg)
      * from here panics with "esp_task_stack_is_sane_cache_disabled()". The boot
      * task mapped the partition and read the header already; this takes those.
      */
-    char why[96] = "";
-
-    if (!modload_prepare(why, sizeof(why)))
+    /*
+     * ASK, DO NOT MAP. This task runs on a PSRAM stack, so calling
+     * modload_prepare() here would retry a mapping that disables the flash
+     * cache -- the panic is quoted in modload.h. Only the boot task maps.
+     */
+    if (!modload_ready())
     {
-        set_msg(why);
+        set_msg("no module mapped at boot");
         s_state = 3;
         goto done;
     }

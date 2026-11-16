@@ -590,8 +590,8 @@ bool link_init(void)
         char why[96] = "";
 
         if (modload_prepare(why, sizeof(why)))
-            ESP_LOGI(TAG, "module prepared: '%.20s' entry %p",
-                     modload_header()->name, modload_entry());
+            ESP_LOGI(TAG, "module prepared: '%.20s' entry %p data %p",
+                     modload_header()->name, modload_entry(), modload_data_base());
         else
             ESP_LOGI(TAG, "no module: %s", why);
     }

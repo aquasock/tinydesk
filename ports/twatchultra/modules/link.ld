@@ -23,13 +23,27 @@ SECTIONS
 
     .text : ALIGN(4)
     {
-        *(.literal .literal.* .text .text.*)
+        *(.text .text.*)
     }
 
-    .rodata : ALIGN(4)
+    /*
+     * .RODATA GOES TO A DIFFERENT WINDOW.
+     *
+     * The instruction window serves fetches and nothing else -- a data load from
+     * it faults with exccause 3 (measured at 0x42ae6ff0, inside this very
+     * section, when the decoder read its CRC table). So constant data is linked
+     * into the `moddata` partition, which is mapped as DATA, and MODDATA_AT is
+     * whatever address the MMU handed back for it -- published by the firmware in
+     * /root/modaddr.txt and read by the build.
+     */
+    .rodata MODDATA_AT : ALIGN(4)
     {
         *(.rodata .rodata.*)
+        *(.literal .literal.*)
     }
+
+    /* .text stays in the instruction window, which is what `modules` maps. */
+    /DISCARD/ : { *(.comment) *(.xt.lit .xt.prop .xtensa.info) }
 
     /*
      * .DATA IS DISCARDED; .BSS GOES TO THE FIRMWARE.
@@ -55,7 +69,5 @@ SECTIONS
     /DISCARD/ :
     {
         *(.data .data.*)
-        *(.comment)
-        *(.xt.lit .xt.prop .xtensa.info)
     }
 }

@@ -1,0 +1,10 @@
+Addresses the MMU gave for the two module partitions, read from the watch at
+/root/modaddr.txt (written by modload_prepare() at every boot).
+
+Refresh with:
+
+    esptool read_flash 0x620000 0x7E0000 /tmp/st.img
+    littlefs-python: open /root/modaddr.txt
+
+MODDATA_AT must be right: it is the link address of every module's .rodata, and a
+stale value faults on the first constant read.

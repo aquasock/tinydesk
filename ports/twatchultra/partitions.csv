@@ -36,4 +36,21 @@ storage,    data, littlefs, 0x620000, 0x7E0000,
 # UNPROVEN: nothing loads from here yet. The open question is whether the codec
 # blobs can be linked position-independently at this address and called across
 # the Xtensa windowed ABI. The partition costs nothing while it is empty.
-modules,    data, 0x40,     0xE00000, 0x200000,
+# CODE AND DATA NEED SEPARATE WINDOWS, so `modules` is split in two.
+#
+# Measured three times with three coredumps: the ESP32-S3's flash mmap gives an
+# INSTRUCTION window (0x42000000.., fetch only -- a data load faults with
+# exccause 3) and a DATA window (0x3C000000.., data only -- executing it faults
+# with exccause 2). They are complementary and cannot serve the same bytes. A
+# codec has .text AND .rodata, so it needs two regions.
+#
+# Splitting the partition keeps `storage` untouched, which matters: shrinking a
+# littlefs partition means migrating its contents, and that was done once
+# already (entry 25) with a byte census that nearly caused data loss. Neither
+# half needs to be large -- one FLAC decoder is 28 KB of text and 2 KB of rodata,
+# and all eleven Rockbox codecs are 704 KB.
+#
+# modules  0xE00000 1 MB  .text,  mapped ESP_PARTITION_MMAP_INST
+# moddata  0xF00000 1 MB  .rodata, mapped ESP_PARTITION_MMAP_DATA
+modules,    data, 0x40,     0xE00000, 0x100000,
+moddata,    data, 0x41,     0xF00000, 0x100000,
