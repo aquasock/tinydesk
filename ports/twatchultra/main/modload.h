@@ -113,6 +113,37 @@ void modload_unmap(void);
  */
 bool modload_read_header(modload_header_t *h);
 
+/*
+ * Map the partition and read the blob header ONCE, from a task whose stack is in
+ * INTERNAL RAM.
+ *
+ * THIS IS NOT AN OPTIMISATION, IT IS A HARD REQUIREMENT, and the coredump that
+ * taught it is worth keeping: esp_partition_mmap() calls
+ * spi_flash_mmap(), which disables the flash cache, and PSRAM is reached THROUGH
+ * that cache. A task running on a PSRAM stack therefore cannot map flash at all:
+ *
+ *   assert failed: spi_flash_disable_interrupts_caches_and_other_cpu
+ *   (esp_task_stack_is_sane_cache_disabled())
+ *     spi_flash_mmap <- esp_partition_mmap <- modload_map (task 'modflac')
+ *
+ * Every task in this port that touches USB or audio runs on a PSRAM stack to
+ * save internal RAM, so none of them may call modload_map() first. Call this at
+ * boot instead; afterwards modload_inst_base() and modload_header() answer from
+ * what was cached here.
+ */
+bool modload_prepare(char *why, size_t why_len);
+
+/* The header read during modload_prepare(). NULL before it succeeds. */
+const modload_header_t *modload_header(void);
+
+/* The blob's entry point, computed from the instruction mapping. NULL when no
+ * module is present or the header is unusable. */
+void *modload_entry(void);
+
+/* Zero the writable region lent to modules (`g_modbss`), which is where a
+ * module's .bss is linked. Must run before the first call into a module. */
+void modload_zero_bss(void);
+
 /* The address the bytes are EXECUTABLE from, which is not the address they are
  * readable from. Measured: the ESP32-S3 maps flash instructions on the
  * instruction bus, and a data load through that address faults (coredump,

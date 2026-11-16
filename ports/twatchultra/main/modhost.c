@@ -70,6 +70,31 @@ static const modhost_t s_table = {
 __attribute__((used))
 const modhost_t *const volatile g_modhost_ptr = &s_table;
 
+/*
+ * WRITABLE STATE FOR MODULES.
+ *
+ * A blob executes from read-only flash and has no .bss of its own, but real code
+ * has function-local statics: micro-flac's get_metadata_blocks() holds a static
+ * empty vector, which is 20 bytes of .bss plus a guard variable. There is no
+ * loader to zero a section, so the firmware provides the RAM instead: the
+ * module's link.ld places .bss HERE, and the loader zeroes it before the first
+ * call.
+ *
+ * The size is deliberately small. A module that needs real working memory should
+ * take it from the caller through modcall_t->state, which keeps the demand
+ * visible; this region exists only for the incidental statics a library carries.
+ *
+ * `g_modbss_ptr` and `g_modbss_size` are read out of the ELF by the module build
+ * the same way g_modhost_ptr is, so the address is derived rather than typed.
+ */
+#define MODBSS_BYTES 256
+
+__attribute__((used, aligned(16)))
+uint8_t g_modbss[MODBSS_BYTES] = { 0 };
+
+__attribute__((used))
+uint32_t g_modbss_size = MODBSS_BYTES;
+
 const modhost_t *modhost_table(void)
 {
     /* Reading the published pointer here is what keeps the symbol alive under

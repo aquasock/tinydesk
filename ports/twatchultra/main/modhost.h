@@ -91,6 +91,22 @@ typedef struct
     int32_t *pcm;               /* caller-allocated, interleaved */
     size_t pcm_capacity;        /* samples available in pcm */
     size_t *pcm_samples;        /* out: samples written */
+
+    /*
+     * THE MODULE'S OWN STATE, and the caller allocates it.
+     *
+     * A blob executes from read-only flash and has no .bss, so it cannot keep a
+     * decoder object or even a pointer to one. Rather than pin a fixed address
+     * in the firmware's RAM -- which would be another build-time constant to
+     * keep in step -- the caller hands the module a block and the module places
+     * whatever it needs inside it. That also keeps the cost visible to the
+     * firmware that has to live within the budget.
+     *
+     * `state_size` must be at least what the module asks for; the module
+     * returns MODCALL_ERROR rather than overrunning.
+     */
+    void *state;
+    size_t state_size;
 } modcall_t;
 
 /* Return codes a module entry may give. */

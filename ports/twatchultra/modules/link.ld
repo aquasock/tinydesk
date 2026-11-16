@@ -31,13 +31,30 @@ SECTIONS
         *(.rodata .rodata.*)
     }
 
-    /* A blob has no data or bss: those would need a loader to copy and zero
-     * them, and the whole point is that loading costs nothing. A blob that
-     * needs writable state must ask its caller for a buffer. */
+    /*
+     * .DATA IS DISCARDED; .BSS GOES TO THE FIRMWARE.
+     *
+     * A blob executes from read-only flash, so there is nowhere for initialised
+     * data to live and no loader to copy it -- .data is discarded, and a module
+     * that needs initialised state must construct it at run time.
+     *
+     * .bss is different: real library code carries function-local statics
+     * (micro-flac's get_metadata_blocks() holds a static empty vector, 20 bytes
+     * plus a guard), and those are zero-initialised by definition. The firmware
+     * lends a small region for them -- `g_modbss`, published at a build-derived
+     * address like the API table -- and modload_zero_bss() clears it before the
+     * first call. That is the loader step a blob cannot perform for itself.
+     */
+    .bss MODBSS_AT (NOLOAD) : ALIGN(16)
+    {
+        *(.bss .bss.*)
+        *(.sbss .sbss.*)
+        *(COMMON)
+    }
+
     /DISCARD/ :
     {
         *(.data .data.*)
-        *(.bss .bss.*)
         *(.comment)
         *(.xt.lit .xt.prop .xtensa.info)
     }

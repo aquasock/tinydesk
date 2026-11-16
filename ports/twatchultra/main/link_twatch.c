@@ -26,6 +26,7 @@
 #include "sdpaths.h"
 #include "usbdiag.h"
 #include "bleuart.h"
+#include "modflac.h"
 #include "modhost.h"
 #include "modload.h"
 #include "music.h"
@@ -577,6 +578,23 @@ bool link_init(void)
 
     if (!modload_register_command())
         ESP_LOGW(TAG, "modtest command did not register");
+
+    if (!modflac_register_command())
+        ESP_LOGW(TAG, "modflac command did not register");
+
+    /* Map the `modules` partition HERE, on the boot task, whose stack is in
+     * internal RAM. esp_partition_mmap() disables the flash cache, and PSRAM is
+     * reached through that cache, so a PSRAM-stack task cannot do this: the
+     * coredump that proved it is quoted in modload.h. */
+    {
+        char why[96] = "";
+
+        if (modload_prepare(why, sizeof(why)))
+            ESP_LOGI(TAG, "module prepared: '%.20s' entry %p",
+                     modload_header()->name, modload_entry());
+        else
+            ESP_LOGI(TAG, "no module: %s", why);
+    }
 
     /* Take the module API table once at boot. This is also what keeps its
      * published pointer in the image: `--gc-sections` collects a section

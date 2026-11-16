@@ -104,12 +104,73 @@ bool modload_read_header(modload_header_t *h)
     return esp_partition_read(p, 0, h, sizeof(*h)) == ESP_OK;
 }
 
+/* Cached by modload_prepare(), which must run on an internal-stack task. */
+static modload_header_t s_hdr;
+static bool s_prepared;
+static void *s_entry;
+
+bool modload_prepare(char *why, size_t why_len)
+{
+    if (s_prepared)
+        return true;
+
+    const void *base = NULL;
+    size_t size = 0;
+
+    if (!modload_map(&base, &size, why, why_len))
+        return false;
+
+    modload_read_header(&s_hdr);
+
+    if (s_hdr.magic != MODLOAD_MAGIC || s_hdr.abi_version != MODHOST_ABI_VERSION ||
+        s_hdr.entry_offset >= size)
+    {
+        snprintf(why, why_len, "no usable module (magic 0x%08lx abi %lu)",
+                 (unsigned long)s_hdr.magic, (unsigned long)s_hdr.abi_version);
+        s_prepared = false;
+        s_entry = NULL;
+        return false;
+    }
+
+    s_entry = (void *)((const uint8_t *)modload_inst_base() + s_hdr.entry_offset);
+    s_prepared = true;
+    return true;
+}
+
+const modload_header_t *modload_header(void)
+{
+    return s_prepared ? &s_hdr : NULL;
+}
+
+void *modload_entry(void)
+{
+    return s_entry;
+}
+
 void modload_unmap(void)
 {
     if (s_inst)
         esp_partition_munmap(s_handle_inst);
     s_inst = NULL;
     s_size = 0;
+}
+
+/*
+ * Zero the writable region the firmware lends to modules.
+ *
+ * A blob cannot zero its own .bss -- it executes from read-only flash and no
+ * loader runs -- so its linker script places .bss in `g_modbss`, and this is the
+ * loader step that would normally do the zeroing. Derived from the symbol, not
+ * from a constant, so a change of size cannot be half-applied.
+ */
+extern uint8_t g_modbss[];
+extern uint32_t g_modbss_size;
+
+void modload_zero_bss(void)
+{
+    memset(g_modbss, 0, g_modbss_size);
+    ESP_LOGI(TAG, "module bss zeroed: %lu bytes at %p", (unsigned long)g_modbss_size,
+             (void *)g_modbss);
 }
 
 const void *modload_inst_base(void)
@@ -248,6 +309,7 @@ static int cmd_modtest(tdsh_session_t *session, int argc, char **argv)
      * API table, copy through it, and write into a caller-owned PCM buffer --
      * which is exactly the shape a decoder will be given. */
     int32_t pcm[8] = { 0 };
+    static uint8_t modstate[2048] __attribute__((aligned(8)));   /* caller-owned */
     modcall_t call = {
         .in = NULL,
         .in_len = 0,
@@ -255,11 +317,17 @@ static int cmd_modtest(tdsh_session_t *session, int argc, char **argv)
         .pcm = pcm,
         .pcm_capacity = 8,
         .pcm_samples = NULL,
+        .state = modstate,
+        .state_size = sizeof(modstate),
     };
     size_t used = 0, samples = 0;
 
     call.consumed = &used;
     call.pcm_samples = &samples;
+
+    /* Modules have no writable bss of their own; the firmware lends them one,
+     * and it must be cleared before the first call, exactly as a loader would. */
+    modload_zero_bss();
 
     printf("modtest: calling %p(&call)\n", (void *)fn);
 

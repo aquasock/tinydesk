@@ -38,6 +38,12 @@ static const modhost_t *host(void)
 
 /* ------------------------------------------------------------------ memory */
 
+/* EVERY OVERRIDE BELOW IS extern "C". These names replace libc symbols, so they
+ * must have C linkage: compiled as plain C++ they become _Z6mallocj and the
+ * decoder's calls to malloc() go unresolved. Only operator new/delete are C++
+ * by nature and stay outside this block. */
+extern "C" {
+
 void *malloc(size_t n)
 {
     const modhost_t *h = host();
@@ -53,8 +59,16 @@ void free(void *p)
         h->free(p);
 }
 
+/* micro-flac's FLAC_MALLOC/FLAC_FREE point here (see flacmalloc.h). Routed
+ * through the table like everything else, so a module never names a firmware
+ * symbol. */
+void *modhost_malloc(size_t n) { return malloc(n); }
+void modhost_free(void *p) { free(p); }
+
 /* C++ allocation. The decoder's containers use these, so they must NOT be
  * left to the firmware's libstdc++ -- a blob has no dynamic linker to find it. */
+}   /* extern "C" */
+
 void *operator new(size_t n) { return malloc(n); }
 void *operator new[](size_t n) { return malloc(n); }
 void operator delete(void *p) noexcept { free(p); }
@@ -63,6 +77,8 @@ void operator delete(void *p, size_t) noexcept { free(p); }
 void operator delete[](void *p, size_t) noexcept { free(p); }
 
 /* ------------------------------------------------------------------ memory */
+
+extern "C" {
 
 void *memcpy(void *dst, const void *src, size_t n)
 {
@@ -94,6 +110,13 @@ void *memset(void *dst, int c, size_t n)
         *d++ = (unsigned char)c;
     return dst;
 }
+
+/* ------------------------------------------------------------ bare libc bits */
+
+/* lpc.cpp calls abs() while reconstructing the residual. It is one instruction
+ * on this target, and a module has no libc to borrow it from. */
+int abs(int v) { return v < 0 ? -v : v; }
+long labs(long v) { return v < 0 ? -v : v; }
 
 /* --------------------------------------------------------------- reporting */
 
@@ -156,3 +179,5 @@ void _ZSt17__throw_bad_allocv(void)
     if (h && h->log)
         h->log(0, "module: out of memory");
 }
+
+}   /* extern "C" */
