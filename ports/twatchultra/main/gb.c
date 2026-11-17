@@ -31,6 +31,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -585,7 +586,10 @@ static void gb_task(void *arg)
     }
 
     s_task = NULL;
-    vTaskDelete(NULL);
+    /* The stack came from PSRAM, so the caps-aware delete is required: plain
+     * vTaskDelete() leaves the idle task to free a TCB it did not allocate and
+     * leaks the PSRAM stack. Same trap as the music player's. */
+    vTaskDeleteWithCaps(NULL);
 }
 
 /* --- input --------------------------------------------------------------- */
@@ -1106,8 +1110,24 @@ bool gb_start(const char *rom_path)
         goto fail_gb;
     }
 
-    if (xTaskCreatePinnedToCore(gb_task, "gb", 8192, NULL, 5,
-                                &s_task, 0) != pdPASS)
+    /*
+     * THE GUEST TASK'S STACK COMES FROM PSRAM.
+     *
+     * It was 8 KB of internal DRAM, and that is the pool this board does not
+     * have spare: with the desktop up and a Terminal open, internal free
+     * measured 25,395 bytes with the largest block 9,728, and this allocation
+     * failed with "gb: no guest task" -- the emulator would not start at all
+     * from a shell. PSRAM had 7.7 MB free.
+     *
+     * Safe here for a specific reason rather than by luck: this task runs
+     * gnuboy and nothing else. The cartridge and both frame buffers are PSRAM,
+     * it opens no file, and it maps no partition -- so it never disables the
+     * cache that a PSRAM stack lives behind. The save task, which does write to
+     * /fs, is left on internal RAM deliberately.
+     */
+    if (xTaskCreatePinnedToCoreWithCaps(gb_task, "gb", 8192, NULL, 5,
+                                        &s_task, 0,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS)
     {
         printf("gb: no guest task\n");
         s_run = false;
