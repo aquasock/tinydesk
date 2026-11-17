@@ -43,6 +43,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "sound.h"
@@ -791,7 +792,8 @@ static void pm_task(void *arg)
     }
 
     s_task = NULL;
-    vTaskDelete(NULL);
+    /* The stack came from PSRAM: plain vTaskDelete() would leak it. */
+    vTaskDeleteWithCaps(NULL);
 }
 
 /* --- lifecycle ------------------------------------------------------------- */
@@ -2013,8 +2015,24 @@ bool pmini_start(const char *rom_path)
         goto fail;
     }
 
-    if (xTaskCreatePinnedToCore(pm_task, "pm", PM_STACK, NULL,
-                                PM_PRIO, &s_task, 0) != pdPASS)
+    /*
+     * THE GUEST TASK'S STACK COMES FROM PSRAM, for the same reason the Game
+     * Boy's does (core-log entry 34).
+     *
+     * It was 10,240 bytes of internal DRAM, and with the desktop up and a
+     * Terminal open the largest internal block measured 9,728 -- so this
+     * allocation could not succeed and the emulator reported "pm: no task".
+     *
+     * Safe here for a specific reason: the task runs PokeMini and nothing else.
+     * The cartridge is loaded before it starts (load_rom(), on the caller's
+     * task) and the emulator's state and frame buffers are PSRAM, so this task
+     * opens no file and maps no partition -- it never disables the cache a PSRAM
+     * stack lives behind. The save path reads through a snapshot taken here and
+     * written elsewhere, so it does not put a /fs write on this stack either.
+     */
+    if (xTaskCreatePinnedToCoreWithCaps(pm_task, "pm", PM_STACK, NULL,
+                                        PM_PRIO, &s_task, 0,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS)
     {
         printf("pm: no task\n");
         s_task = NULL;
