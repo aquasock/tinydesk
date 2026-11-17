@@ -13,6 +13,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Declared, not included: this header must stay free of the BHY2 SDK so the
+ * desktop apps can include it without the whole protocol. */
+struct bhy2_dev;
+
 /* Upload the firmware and boot the part if that has not happened yet. False
  * with imu_why() set: no rail, no device, no firmware blob, or the part
  * refused. */
@@ -45,6 +49,10 @@ bool imu_accel(float *x, float *y, float *z, uint32_t *count);
 bool imu_sensor_on(void);
 
 bool imu_register_command(void);
+
+/* The BHY2 device, for companion instruments (klio.c) that speak the same
+ * protocol. NULL until imu_start() succeeds. */
+struct bhy2_dev *imu_dev(void);
 
 /* The table the desktop's IMU app reads (td_imu_ops_t). */
 const td_imu_ops_t *board_imu_ops(void);

@@ -441,6 +441,11 @@ static void on_meta(const struct bhy2_fifo_parse_data_info *info, void *priv)
 
 /* ---------------------------------------------------------- start/stop */
 
+struct bhy2_dev *imu_dev(void)
+{
+    return s_ready ? &s_bhy2 : NULL;
+}
+
 const char *imu_why(void)
 {
     return s_why;
@@ -975,6 +980,104 @@ static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
         return 0;
     }
 
+    /* ------------------------------------------------------- inject ---- */
+
+    /* CAN ARBITRARY IMU DATA BE FED TO THE PART? This is the experiment that
+     * answers it, and it matters because if the answer is yes then a classifier
+     * living on the Fuser core can be trained from a FILE instead of from a
+     * hand -- replaying recorded motion, or synthesising motion that never
+     * happened.
+     *
+     * BHY2 exposes it as two commands: BHY2_CMD_SET_INJECT_MODE with
+     * BHY2_NORMAL_MODE / BHY2_REAL_TIME_INJECTION / BHY2_STEP_BY_STEP_INJECTION,
+     * and BHY2_CMD_INJECT_DATA carrying a payload. THE PAYLOAD LAYOUT IS NOT IN
+     * THE SDK HEADERS -- there is no struct for it anywhere in bhy2_defs.h --
+     * so the layout below (uint16 sensor id, then the sensor's own data fields,
+     * no timestamp) is the documented shape from Bosch's BHI260 datasheet and is
+     * being TESTED here rather than assumed. If injection works, a reading taken
+     * back out of the FIFO will match what went in.
+     *
+     * The test injects a vector that gravity cannot produce -- +2.50 g on z --
+     * so a match cannot be the real sensor agreeing by accident. */
+    if (strcmp(sub, "inject") == 0)
+    {
+        if (!s_ready)
+        {
+            printf("imu: sensor not started\n");
+            return 1;
+        }
+
+        /* The real reading first, for comparison. */
+        (void)imu_accel_enable(50.0f);
+        float rx = 0, ry = 0, rz = 0;
+        uint32_t n = 0;
+        for (int i = 0; i < 40; i++)
+        {
+            vTaskDelay(pdMS_TO_TICKS(25));
+            imu_poll();
+            if (imu_accel(&rx, &ry, &rz, &n))
+                break;
+        }
+        printf("real sensor:   x %+.2f  y %+.2f  z %+.2f g\n", (double)rx,
+               (double)ry, (double)rz);
+
+        /* Now try to feed it a fiction: 2.50 g on z, which is not gravity. */
+        int8_t rc = bhy2_set_data_injection_mode(BHY2_STEP_BY_STEP_INJECTION, &s_bhy2);
+        printf("inject mode:   %s (%d)\n", rc == BHY2_OK ? "step-by-step" : "FAILED", rc);
+        if (rc != BHY2_OK)
+        {
+            printf("\nInjection is refused by this firmware. That is a real answer:\n"
+                   "the command exists in the SDK but the loaded image does not\n"
+                   "accept it, so training from a file needs different firmware.\n");
+            (void)imu_accel_enable(0.0f);
+            return 1;
+        }
+
+        /* uint16 sensor id, then ACC's fields: 3 x int16 at 1/4096 g. */
+        struct __attribute__((packed))
+        {
+            uint16_t sensor_id;
+            int16_t x, y, z;
+        } frame = {.sensor_id = BHY2_SENSOR_ID_ACC,
+                   .x = 0,
+                   .y = 0,
+                   .z = (int16_t)(2.50f * 4096.0f)};
+
+        rc = bhy2_inject_data((const uint8_t *)&frame, sizeof(frame), &s_bhy2);
+        printf("inject data:   %s (%d)\n", rc == BHY2_OK ? "accepted" : "FAILED", rc);
+
+        /* Drain and see what the part reports back. */
+        s_have_accel = false;
+        for (int i = 0; i < 20; i++)
+        {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            imu_poll();
+            if (s_have_accel)
+                break;
+        }
+
+        rc = bhy2_set_data_injection_mode(BHY2_NORMAL_MODE, &s_bhy2);
+        printf("back to normal: %s (%d)\n", rc == BHY2_OK ? "ok" : "FAILED", rc);
+
+        if (s_have_accel)
+        {
+            printf("after inject:  x %+.2f  y %+.2f  z %+.2f g\n", (double)s_ax,
+                   (double)s_ay, (double)s_az);
+            const bool match = fabsf(s_az - 2.50f) < 0.05f;
+            printf("\n%s\n", match
+                   ? "MATCH -- arbitrary data reaches the part. A classifier here\n"
+                     "can be trained from a file, not only from a hand."
+                   : "no match -- the part accepted the command but the reading is\n"
+                     "the real sensor's, so injection did not take effect.");
+            (void)imu_accel_enable(0.0f);
+            return match ? 0 : 1;
+        }
+
+        printf("no sample came back at all.\n");
+        (void)imu_accel_enable(0.0f);
+        return 1;
+    }
+
     if (strcmp(sub, "scan") == 0)
     {
         if (s_present_n < 0)
@@ -1067,7 +1170,7 @@ static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
 
 static const tdsh_command_t s_imu_cmd = {
     "imu",
-    "imu [accel|rate|scan|stop]",
+    "imu [accel|rate|scan|inject|stop]",
     "The BHI260AP: uploads its firmware on first use, then shows acceleration",
     cmd_imu,
     TDSH_CMD_INTERACTIVE,

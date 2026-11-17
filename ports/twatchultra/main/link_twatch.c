@@ -43,6 +43,7 @@
 #include "touch.h"
 #include "memdiag.h"
 #include "imu.h"
+#include "klio.h"
 #include "pusher.h"
 #include "pwrkey.h"
 #include "charge.h"
@@ -675,6 +676,9 @@ bool link_init(void)
 
     if (!imu_register_command())
         ESP_LOGW(TAG, "imu command did not register");
+
+    if (!klio_register_command())
+        ESP_LOGW(TAG, "klio command did not register");
 
     charge_report(NULL);
 
