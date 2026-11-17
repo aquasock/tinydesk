@@ -67,9 +67,20 @@ static const char *TAG = "imu";
  * size, so a read never straddles a page boundary in an interesting way. */
 #define IMU_FW_CHUNK   4096
 
-/* How much FIFO to drain per poll. The part's FIFO is a few hundred bytes and
- * 100 Hz on one sensor fills it slowly. */
-#define IMU_FIFO_MAX   512
+/* How much FIFO to drain at once, AND THIS BEING TOO SMALL IS A HANG.
+ *
+ * The SDK's drain loop is: while (remain_length) { read(buffer_size - read_length);
+ * parse; }. When the part holds more than the buffer, `buffer_size - read_length`
+ * reaches 0, the read returns 0 bytes, remain_length does not change, and the
+ * loop never terminates -- with the shell task inside it, so Ctrl+C cannot
+ * reach it either.
+ *
+ * 512 bytes is 13 bytes/sample x 39 samples: less than half a second at 100 Hz.
+ * Any polling gap longer than that wedges the board. 2048 bytes is 1.5 s of
+ * headroom, and the drain loop below empties the FIFO in bounded passes as a
+ * second guard. */
+#define IMU_FIFO_MAX   2048
+#define IMU_DRAIN_PASSES 4
 
 typedef struct
 {
@@ -94,6 +105,7 @@ static uint8_t s_fifo[IMU_FIFO_MAX];
 static volatile bool s_have_accel;
 static float s_ax, s_ay, s_az;
 static uint32_t s_accel_count;
+
 
 /* The sensor ids the loaded firmware carries, as a compact "3 61 63 ..." string.
  * Built once and kept, because it is the answer to "why did nothing happen" and
@@ -634,13 +646,12 @@ bool imu_accel_enable(float hz)
     {
         uint8_t ist = 0;
         if (bhy2_get_interrupt_status(&ist, &s_bhy2) == BHY2_OK)
-            ESP_LOGI(TAG, "before cfg: int status %02x (status-ready %s)", ist,
-                     (ist & BHY2_IST_MASK_STATUS) ? "set" : "CLEAR");
+            ESP_LOGD(TAG, "before cfg: int status %02x", ist);
     }
     const int64_t tc = esp_timer_get_time();
-    ESP_LOGI(TAG, "configuring accel at %.0f Hz...", (double)hz);
+    ESP_LOGD(TAG, "configuring accel at %.0f Hz", (double)hz);
     int8_t rc = bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_ACC, hz, 20, &s_bhy2);
-    ESP_LOGI(TAG, "cfg returned %d after %d ms", rc,
+    ESP_LOGD(TAG, "cfg returned %d after %d ms", rc,
              (int)((esp_timer_get_time() - tc) / 1000));
     if (rc != BHY2_OK)
     {
@@ -667,20 +678,27 @@ bool imu_poll(void)
     if (!s_ready || !s_sensor_on)
         return false;
 
-    /* DRAIN EVERY TIME, WITHOUT ASKING PERMISSION FIRST.
+    /* There used to be an interrupt-status gate here, returning early unless the
+     * WAKEUP bits were set. It discarded data two ways: the accelerometer is
+     * routed to the NON-wakeup FIFO, and the part interrupts on a watermark, so
+     * trusting a stale bit let the FIFO overflow. The stall it was written for
+     * was the missing async-status-channel control, fixed above. One bug does not
+     * justify a filter that drops samples. */
+    /* ONE DRAIN PER POLL, WHICH IS THE SHAPE THAT WAS VERIFIED. Two attempts to
+     * be cleverer than this both wedged the shell task:
      *
-     * There used to be a check here -- read the interrupt status and return
-     * early when it says nothing is waiting -- on the theory that an idle poll
-     * should cost one transaction. It cost correctness instead: the part raises
-     * its interrupt on a FIFO WATERMARK, so between interrupts twenty-odd
-     * samples accumulate, and a gate that trusts a stale status bit lets the
-     * FIFO fill until it overflows ("meta 12 fifo overflow" on the console) and
-     * silently drops data. bhy2_get_and_process_fifo() already reads the status
-     * itself and drains both channels, so the honest thing is to call it.
+     *   - reading the FIFO length first to gate the drain let a backlog build
+     *     until the SDK's own loop could not make progress;
+     *   - draining in bounded passes still handed the SDK a FIFO larger than
+     *     the work buffer, and its loop reads into `buffer_size - read_length`,
+     *     so at the end it issues a zero-length read, `remain_length` never
+     *     changes, and it spins for ever.
      *
-     * The hang the gate was written for was a different bug: the missing
-     * async-status-channel control, fixed above. One bug does not justify a
-     * filter that discards data. */
+     * A single call with a 2 KB buffer covers 1.5 s of 100 Hz data, and the
+     * sensor is turned OFF when a command or window stops reading, so a backlog
+     * has nowhere to come from. Nothing here should be "improved" without
+     * reproducing this test first: run a command twice in a row and then type
+     * at the prompt. */
     return bhy2_get_and_process_fifo(s_fifo, sizeof(s_fifo), &s_bhy2) == BHY2_OK;
 }
 
@@ -763,9 +781,22 @@ static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
         }
         const int64_t dt = esp_timer_get_time() - t0;
         const uint32_t got = s_accel_count - before;
-        printf("%lu samples in %d ms (%d polls) = %.1f Hz\n",
-               (unsigned long)got, (int)(dt / 1000), polls,
-               got * 1000000.0 / (double)dt);
+        printf("%.1f Hz  (%lu samples / %d ms, %d polls)\n",
+               got * 1000000.0 / (double)dt, (unsigned long)got,
+               (int)(dt / 1000), polls);
+
+        /* THE RATIO THAT SETTLES IT. An accelerometer packet is 6 bytes of
+         * payload plus a sensor id and a timestamp, so samples can never exceed
+         * bytes/7. If the sample count is larger than the bytes the part said
+         * were waiting, the parser is re-reading the same bytes -- which also
+         * explains identical values repeated many times in a row. */
+
+        /* STOP THE SENSOR WHEN NOTHING IS READING IT. A part left streaming into
+         * a FIFO nobody drains builds a backlog at 13 bytes per sample -- a
+         * minute of that is 78 KB, far past any buffer, and the next command to
+         * touch it is the one that wedges. The window polls continuously while
+         * it is open; a one-shot command must leave the part quiet. */
+        (void)imu_accel_enable(0.0f);
         return 0;
     }
 
@@ -844,6 +875,7 @@ static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
         printf("  x %+6.2f   y %+6.2f   z %+6.2f\n", x, y, z);
     }
     printf("%lu samples so far\n", (unsigned long)n);
+    (void)imu_accel_enable(0.0f);      /* leave the part quiet; see `imu rate` */
     return 0;
 }
 
