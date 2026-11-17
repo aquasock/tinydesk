@@ -47,6 +47,7 @@
 #include "bhy2.h"
 #include "bhy2_defs.h"
 #include "bhy2_hif.h"
+#include "bhy2_klio_defs.h"
 #include "tinydesk/td_sysinfo.h"
 #include "imu.h"
 #include "power.h"
@@ -898,6 +899,54 @@ bool imu_orientation(float *heading, float *pitch, float *roll)
 
 /* ------------------------------------------------------------- the command */
 
+/* Inject one payload shape and report whether the reading moved to it.
+ *
+ * Three sends because a single packet may be dropped; NORMAL mode afterwards
+ * because a part left in an injection mode is in an unknown state for the next
+ * test. The success test is the value itself, not the return code: the return
+ * code was 0 for a shape that did nothing, which is exactly why this measures
+ * the reading instead of trusting the API. */
+static bool try_inject(const char *name, const uint8_t *payload, uint16_t len,
+                       enum bhy2_data_inj_mode mode, float bx, float by, float *bz)
+{
+    int8_t rc = bhy2_set_data_injection_mode(mode, imu_dev());
+    if (rc != BHY2_OK)
+    {
+        printf("  %-22s mode refused (%d)\n", name, rc);
+        return false;
+    }
+
+    bool accepted = false;
+    for (int i = 0; i < 3; i++)
+    {
+        rc = bhy2_inject_data(payload, len, imu_dev());
+        if (rc != BHY2_OK)
+            break;
+        accepted = true;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    float x = 0, y = 0, z = 0;
+    uint32_t n = 0;
+    for (int i = 0; i < 30; i++)
+    {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        imu_poll();
+    }
+    const bool got = imu_accel(&x, &y, &z, &n);
+
+    (void)bhy2_set_data_injection_mode(BHY2_NORMAL_MODE, imu_dev());
+
+    const bool landed = got && fabsf(z - 2.50f) < 0.12f;
+    printf("  %-22s %-9s z %+6.2f%s\n", name, accepted ? "accepted" : "refused",
+           got ? (double)z : (double)*bz, landed ? "   <-- LANDED" : "");
+    (void)bx;
+    (void)by;
+    if (landed)
+        *bz = z;
+    return landed;
+}
+
 static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
 {
     (void)session;
@@ -982,22 +1031,28 @@ static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
 
     /* ------------------------------------------------------- inject ---- */
 
-    /* CAN ARBITRARY IMU DATA BE FED TO THE PART? This is the experiment that
-     * answers it, and it matters because if the answer is yes then a classifier
-     * living on the Fuser core can be trained from a FILE instead of from a
-     * hand -- replaying recorded motion, or synthesising motion that never
-     * happened.
+    /* CAN ARBITRARY IMU DATA BE FED TO THE PART, OR ONLY THE SENSOR'S OWN?
      *
-     * BHY2 exposes it as two commands: BHY2_CMD_SET_INJECT_MODE with
-     * BHY2_NORMAL_MODE / BHY2_REAL_TIME_INJECTION / BHY2_STEP_BY_STEP_INJECTION,
-     * and BHY2_CMD_INJECT_DATA carrying a payload. THE PAYLOAD LAYOUT IS NOT IN
-     * THE SDK HEADERS -- there is no struct for it anywhere in bhy2_defs.h --
-     * so the layout below (uint16 sensor id, then the sensor's own data fields,
-     * no timestamp) is the documented shape from Bosch's BHI260 datasheet and is
-     * being TESTED here rather than assumed. If injection works, a reading taken
-     * back out of the FIFO will match what went in.
+     * This is the question behind treating the BHI260AP as a general-purpose
+     * accelerator rather than a gesture toy: if the host can push a stream of
+     * samples at it, then a classifier on the Fuser core can be trained from a
+     * FILE -- recorded motion, or synthesised motion that never happened --
+     * instead of only from a hand.
      *
-     * The test injects a vector that gravity cannot produce -- +2.50 g on z --
+     * THE SDK EXPOSES THE COMMANDS AND DOCUMENTS NO PAYLOAD. bhy2_defs.h has
+     * BHY2_CMD_SET_INJECT_MODE and BHY2_CMD_INJECT_DATA, three modes, and no
+     * struct describing what to send. An earlier attempt sent 8 bytes (a uint16
+     * sensor id and three int16 in 1/4096 g) and the part ACCEPTED the command
+     * and ignored the data -- which is what a payload of the wrong length looks
+     * like when the firmware validates loosely rather than refusing.
+     *
+     * SO THIS SWEEPS THE SHAPES THAT ARE PLAUSIBLE, in one run rather than one
+     * per flash: the 8-byte short form that failed before, the 28-byte FLOAT
+     * form the algorithm's own log frame uses (timestamp, accel[3], gyro[3]),
+     * the same with a sensor-id prefix, a timestamped short form, and the
+     * wakeup accelerometer in case KLIO consumes that flavour.
+     *
+     * THE TEST VALUE IS +2.50 g ON Z, which gravity cannot physically produce,
      * so a match cannot be the real sensor agreeing by accident. */
     if (strcmp(sub, "inject") == 0)
     {
@@ -1006,76 +1061,99 @@ static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
             printf("imu: sensor not started\n");
             return 1;
         }
-
-        /* The real reading first, for comparison. */
         (void)imu_accel_enable(50.0f);
-        float rx = 0, ry = 0, rz = 0;
-        uint32_t n = 0;
-        for (int i = 0; i < 40; i++)
+
+        float bx = 0, by = 0, bz = 0;
+        uint32_t bn = 0;
+        for (int i = 0; i < 40 && !imu_accel(&bx, &by, &bz, &bn); i++)
         {
             vTaskDelay(pdMS_TO_TICKS(25));
             imu_poll();
-            if (imu_accel(&rx, &ry, &rz, &n))
-                break;
         }
-        printf("real sensor:   x %+.2f  y %+.2f  z %+.2f g\n", (double)rx,
-               (double)ry, (double)rz);
+        printf("baseline z %+.2f g; injecting +2.50 g\n\n", (double)bz);
 
-        /* Now try to feed it a fiction: 2.50 g on z, which is not gravity. */
-        int8_t rc = bhy2_set_data_injection_mode(BHY2_STEP_BY_STEP_INJECTION, &s_bhy2);
-        printf("inject mode:   %s (%d)\n", rc == BHY2_OK ? "step-by-step" : "FAILED", rc);
-        if (rc != BHY2_OK)
+        int landed = 0;
+        int tried = 0;
+
+        /* ---- the 28-byte float frame, exactly as the algorithm sees it ---- */
         {
-            printf("\nInjection is refused by this firmware. That is a real answer:\n"
-                   "the command exists in the SDK but the loaded image does not\n"
-                   "accept it, so training from a file needs different firmware.\n");
-            (void)imu_accel_enable(0.0f);
-            return 1;
-        }
+            float tmp[7] = {0.0f, 0.0f, 0.0f, 2.50f, 0.0f, 0.0f, 0.0f};
+            uint8_t pay[28];
+            memcpy(pay, tmp, sizeof(pay));
 
-        /* uint16 sensor id, then ACC's fields: 3 x int16 at 1/4096 g. */
-        struct __attribute__((packed))
-        {
-            uint16_t sensor_id;
-            int16_t x, y, z;
-        } frame = {.sensor_id = BHY2_SENSOR_ID_ACC,
-                   .x = 0,
-                   .y = 0,
-                   .z = (int16_t)(2.50f * 4096.0f)};
+            tried++;
+            if (try_inject("28B float frame", pay, sizeof(pay),
+                           BHY2_STEP_BY_STEP_INJECTION, bx, by, &bz))
+                landed++;
 
-        rc = bhy2_inject_data((const uint8_t *)&frame, sizeof(frame), &s_bhy2);
-        printf("inject data:   %s (%d)\n", rc == BHY2_OK ? "accepted" : "FAILED", rc);
-
-        /* Drain and see what the part reports back. */
-        s_have_accel = false;
-        for (int i = 0; i < 20; i++)
-        {
-            vTaskDelay(pdMS_TO_TICKS(20));
-            imu_poll();
-            if (s_have_accel)
-                break;
+            /* The same 28 bytes behind a uint16 sensor id: KLIO_LOG. */
+            uint8_t pay30[30];
+            pay30[0] = (uint8_t)(BHY2_SENSOR_ID_KLIO_LOG & 0xFF);
+            pay30[1] = 0;
+            memcpy(pay30 + 2, pay, sizeof(pay));
+            tried++;
+            if (try_inject("30B id+float frame", pay30, sizeof(pay30),
+                           BHY2_STEP_BY_STEP_INJECTION, bx, by, &bz))
+                landed++;
         }
 
-        rc = bhy2_set_data_injection_mode(BHY2_NORMAL_MODE, &s_bhy2);
-        printf("back to normal: %s (%d)\n", rc == BHY2_OK ? "ok" : "FAILED", rc);
-
-        if (s_have_accel)
+        /* ---- the short forms ---- */
         {
-            printf("after inject:  x %+.2f  y %+.2f  z %+.2f g\n", (double)s_ax,
-                   (double)s_ay, (double)s_az);
-            const bool match = fabsf(s_az - 2.50f) < 0.05f;
-            printf("\n%s\n", match
-                   ? "MATCH -- arbitrary data reaches the part. A classifier here\n"
-                     "can be trained from a file, not only from a hand."
-                   : "no match -- the part accepted the command but the reading is\n"
-                     "the real sensor's, so injection did not take effect.");
-            (void)imu_accel_enable(0.0f);
-            return match ? 0 : 1;
+            uint8_t p8[8] = {0};
+            uint16_t id = BHY2_SENSOR_ID_ACC;
+            int16_t v[3] = {0, 0, (int16_t)(2.50f * 4096.0f)};
+            memcpy(p8, &id, 2);
+            memcpy(p8 + 2, v, 6);
+            tried++;
+            if (try_inject("8B id+i16 (recheck)", p8, sizeof(p8),
+                           BHY2_STEP_BY_STEP_INJECTION, bx, by, &bz))
+                landed++;
+
+            uint8_t p10[10];
+            uint16_t ts = 0;
+            memcpy(p10, &id, 2);
+            memcpy(p10 + 2, &ts, 2);
+            memcpy(p10 + 4, v, 6);
+            tried++;
+            if (try_inject("10B id+ts+i16", p10, sizeof(p10),
+                           BHY2_STEP_BY_STEP_INJECTION, bx, by, &bz))
+                landed++;
+
+            uint8_t p8w[8];
+            id = BHY2_SENSOR_ID_ACC_WU;
+            memcpy(p8w, &id, 2);
+            memcpy(p8w + 2, v, 6);
+            tried++;
+            if (try_inject("8B ACC_WU+i16", p8w, sizeof(p8w),
+                           BHY2_STEP_BY_STEP_INJECTION, bx, by, &bz))
+                landed++;
         }
 
-        printf("no sample came back at all.\n");
+        /* ---- and the plausible winner again, in real-time mode ---- */
+        {
+            float tmp[7] = {0.0f, 0.0f, 0.0f, 2.50f, 0.0f, 0.0f, 0.0f};
+            uint8_t pay[28];
+            memcpy(pay, tmp, sizeof(pay));
+            tried++;
+            if (try_inject("28B float, real-time", pay, sizeof(pay),
+                           BHY2_REAL_TIME_INJECTION, bx, by, &bz))
+                landed++;
+        }
+
+        printf("\n%d of %d shapes landed.\n", landed, tried);
+        if (landed)
+            printf("ARBITRARY DATA REACHES THE PART -- a classifier here can be\n"
+                   "trained from a file, not only from a hand.\n");
+        else
+            printf("None landed. Either this firmware refuses injection despite\n"
+                   "accepting the commands, or the payload needs a field none of\n"
+                   "these shapes has. `meta 11 sensor error` in the log would\n"
+                   "mean the shape was parsed and rejected; silence means it was\n"
+                   "dropped before that.\n");
+
+        (void)bhy2_set_data_injection_mode(BHY2_NORMAL_MODE, &s_bhy2);
         (void)imu_accel_enable(0.0f);
-        return 1;
+        return landed ? 0 : 1;
     }
 
     if (strcmp(sub, "scan") == 0)
