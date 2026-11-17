@@ -41,6 +41,7 @@
 #include "power.h"
 #include "rtc.h"
 #include "touch.h"
+#include "memdiag.h"
 #include "pusher.h"
 #include "pwrkey.h"
 #include "charge.h"
@@ -667,6 +668,9 @@ bool link_init(void)
 
     if (!touch_register_command())
         ESP_LOGW(TAG, "touchdump command did not register");
+
+    if (!memdiag_register_command())
+        ESP_LOGW(TAG, "mem command did not register");
 
     charge_report(NULL);
 
