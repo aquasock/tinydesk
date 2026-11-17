@@ -209,14 +209,19 @@ bool modload_prepare(char *why, size_t why_len)
         const uint32_t live_inst = (uint32_t)(uintptr_t)modload_inst_base();
         const uint32_t live_data = (uint32_t)(uintptr_t)s_data_base;
 
-        if (s_hdr.linked_inst != live_inst || s_hdr.linked_data != live_data)
+        const uint32_t live_host = (uint32_t)(uintptr_t)&g_modhost_ptr;
+        const bool host_stale = s_hdr.linked_host != live_host;
+
+        if (s_hdr.linked_inst != live_inst || s_hdr.linked_data != live_data ||
+            host_stale)
         {
             snprintf(why, why_len,
-                     "module linked for inst %08lx data %08lx, mapped at %08lx %08lx"
-                     " -- rebuild it: make -C modules flac",
+                     "module linked for inst %08lx data %08lx host %08lx, live"
+                     " %08lx %08lx %08lx -- rebuild it: make modaddr && make flac",
                      (unsigned long)s_hdr.linked_inst,
-                     (unsigned long)s_hdr.linked_data, (unsigned long)live_inst,
-                     (unsigned long)live_data);
+                     (unsigned long)s_hdr.linked_data, (unsigned long)s_hdr.linked_host,
+                     (unsigned long)live_inst, (unsigned long)live_data,
+                     (unsigned long)live_host);
             snprintf(s_why, sizeof(s_why), "%s", why);
             ESP_LOGE(TAG, "%s", why);
             s_prepared = false;

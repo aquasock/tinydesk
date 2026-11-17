@@ -45,6 +45,9 @@ MODBSS_AT      := $(shell $(NM) $(APP_ELF) 2>/dev/null | awk '$$3=="g_modbss"{pr
 # magic number" on two files that were perfectly good.
 MODTEXT_AT     := $(shell sed -n 's/^inst=//p' $(MODULES)/moddata.at 2>/dev/null)
 MODDATA_AT     := $(shell sed -n 's/^data=//p' $(MODULES)/moddata.at 2>/dev/null)
+# The API table's address, which is the third thing that moves when the app is
+# rebuilt. Recorded in the blob header so the loader can refuse a stale one.
+
 
 MF      := $(abspath $(MODULES)/../components/micro-flac)
 XTINC   := $(IDF_PATH)/components/xtensa/esp32s3/include
@@ -124,7 +127,7 @@ $(BUILD)/flac.bin: $(BUILD)/flacmod.o $(BUILD)/modshim.o \
 	$(OBJCOPY) -O binary --only-section=.modheader --only-section=.text $(BUILD)/flac.elf $@
 	$(OBJCOPY) -O binary --only-section=.rodata $(BUILD)/flac.elf $(BUILD)/flac.data.bin
 	@$(NM) $(BUILD)/flac.elf > $(BUILD)/flac.nm
-	@python3 $(MODULES)/patch_header.py $@ "$$(cat $(BUILD)/flac.nm)" $(MODTEXT_AT) $(MODDATA_AT)
+	@python3 $(MODULES)/patch_header.py $@ "$$(cat $(BUILD)/flac.nm)" $(MODTEXT_AT) $(MODDATA_AT) $(MODADDR_H)
 	@printf 'blob: %s (%s bytes) + data %s (%s bytes)\n' "$@" "$$(stat -c %s $@)" \
 		"$(BUILD)/flac.data.bin" "$$(stat -c %s $(BUILD)/flac.data.bin)"
 
@@ -170,7 +173,7 @@ $(BIN): $(ELF)
 	$(OBJCOPY) -O binary --only-section=.modheader --only-section=.text $< $@
 	$(OBJCOPY) -O binary --only-section=.rodata $< $(BUILD)/modtest.data.bin
 	@$(NM) $< > $(BUILD)/modtest.nm
-	@python3 $(MODULES)/patch_header.py $@ "$$(cat $(BUILD)/modtest.nm)" $(MODTEXT_AT) $(MODDATA_AT)
+	@python3 $(MODULES)/patch_header.py $@ "$$(cat $(BUILD)/modtest.nm)" $(MODTEXT_AT) $(MODDATA_AT) $(MODADDR_H)
 	@printf 'blob: %s (%s bytes)\n' "$@" "$$(stat -c %s $@)"
 	@$(NM) $< | grep -E ' (mod_header|mod_entry)$$' || true
 

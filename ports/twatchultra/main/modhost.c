@@ -20,13 +20,61 @@
 
 static const char *TAG = "modhost";
 
-static void *h_malloc(size_t n) { return malloc(n); }
-static void h_free(void *p) { free(p); }
+/*
+ * LIVE ACCOUNTING, because a module's leak is invisible from the outside.
+ *
+ * The decoder's working buffer is allocated through this table, and a missing
+ * teardown cost 41 KB of PSRAM per track before it showed up as a player that
+ * died after four or five songs. Counting what the module asks for and what it
+ * gives back turns that into a number per track.
+ *
+ * heap_caps_get_allocated_size() is what makes it exact: free() takes a pointer
+ * and no length, so the length has to be recovered from the heap.
+ */
+static size_t s_live_blocks;
+static size_t s_live_bytes;
+
+size_t modhost_live_bytes(void) { return s_live_bytes; }
+size_t modhost_live_blocks(void) { return s_live_blocks; }
+
+static void account_add(void *p)
+{
+    if (!p)
+        return;
+    s_live_blocks++;
+    s_live_bytes += heap_caps_get_allocated_size(p);
+}
+
+static void account_del(void *p)
+{
+    if (!p)
+        return;
+    s_live_bytes -= heap_caps_get_allocated_size(p);
+    if (s_live_blocks)
+        s_live_blocks--;
+}
+
+static void *h_malloc(size_t n)
+{
+    void *p = malloc(n);
+
+    account_add(p);
+    return p;
+}
+
+static void h_free(void *p)
+{
+    account_del(p);
+    free(p);
+}
 
 static void *h_malloc_prefer_psram(size_t n)
 {
-    return heap_caps_malloc_prefer(n, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
-                                   MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    void *p = heap_caps_malloc_prefer(n, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
+                                      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+
+    account_add(p);
+    return p;
 }
 
 static void *h_memcpy(void *d, const void *s, size_t n) { return memcpy(d, s, n); }

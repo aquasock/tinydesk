@@ -289,6 +289,28 @@ void sound_stop(void)
     s_stop = true;
 }
 
+/*
+ * WHY THE LAST STREAM OPEN FAILED, in words.
+ *
+ * "no amplifier" was the message for four different faults -- no channel, a
+ * failed clock reconfig, a failed slot reconfig, a failed enable, a failed
+ * allocation -- and after they started happening on the fifth track of a
+ * session there was no way to tell which. Every failure below records the
+ * exact call and its esp_err_t name, and the player puts that string in its
+ * status line instead of a generic one.
+ */
+static char s_open_err[64] = "";
+
+const char *sound_stream_error(void)
+{
+    return s_open_err[0] ? s_open_err : "no amplifier";
+}
+
+static void open_err(const char *what, esp_err_t err)
+{
+    snprintf(s_open_err, sizeof(s_open_err), "%s: %s", what, esp_err_to_name(err));
+}
+
 static bool set_std(uint32_t rate, bool stereo)
 {
     i2s_std_clk_config_t clk = I2S_STD_CLK_DEFAULT_CONFIG(rate);
@@ -297,18 +319,40 @@ static bool set_std(uint32_t rate, bool stereo)
                                                                           : I2S_SLOT_MODE_MONO);
 
     if (!s_tx)
+    {
+        snprintf(s_open_err, sizeof(s_open_err), "no i2s channel");
         return false;
+    }
 
     /* The channel must be stopped before either is changed, or the change is
      * ignored -- the API says so and a silent no-op here would play the whole
      * file at the wrong rate. */
-    if (i2s_channel_disable(s_tx) != ESP_OK)
+    esp_err_t err = i2s_channel_disable(s_tx);
+
+    if (err != ESP_OK)
+    {
+        open_err("disable", err);
         return false;
-    if (i2s_channel_reconfig_std_clock(s_tx, &clk) != ESP_OK)
+    }
+    err = i2s_channel_reconfig_std_clock(s_tx, &clk);
+    if (err != ESP_OK)
+    {
+        open_err("clock", err);
         return false;
-    if (i2s_channel_reconfig_std_slot(s_tx, &slot) != ESP_OK)
+    }
+    err = i2s_channel_reconfig_std_slot(s_tx, &slot);
+    if (err != ESP_OK)
+    {
+        open_err("slot", err);
         return false;
-    return i2s_channel_enable(s_tx) == ESP_OK;
+    }
+    err = i2s_channel_enable(s_tx);
+    if (err != ESP_OK)
+    {
+        open_err("enable", err);
+        return false;
+    }
+    return true;
 }
 
 /* Write one buffer, retrying on timeout rather than dropping it: a dropped
@@ -561,12 +605,19 @@ static int16_t *s_stream;         /* PSRAM: touched once per frame, not per samp
 static bool s_stream_open;
 static volatile uint32_t s_stream_drops;
 
+
+
 bool sound_stream_open(int rate)
 {
+    s_open_err[0] = '\0';
+
     if (!s_tried && !sound_init())
         return false;
     if (!s_tx)
+    {
+        snprintf(s_open_err, sizeof(s_open_err), "no channel after init");
         return false;
+    }
 
     /* The rate comes from the generator, not from a constant: MinxAudio.h fixes
      * its output at MINX_AUDIOFREQ 44100 and a mismatch here is a pitch shift of
@@ -580,7 +631,10 @@ bool sound_stream_open(int rate)
         s_stream = (int16_t *)heap_caps_malloc(STREAM_FRAMES * 2 * sizeof(int16_t),
                                                MALLOC_CAP_SPIRAM);
         if (!s_stream)
+        {
+            snprintf(s_open_err, sizeof(s_open_err), "no PSRAM for the stream buffer");
             return false;
+        }
     }
 
     s_stream_drops = 0;

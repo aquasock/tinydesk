@@ -13,7 +13,12 @@ moddata.at rather than typed in by hand. A stale entry offset is a jump into the
 middle of an instruction; a stale linked pair is worse, because the blob still
 runs and only fails when it reads a constant -- see modload.h.
 
-    patch_header.py <blob> <nm output> <link base> <data base>
+    patch_header.py <blob> <nm output> <link base> <data base> [modaddr.h]
+
+The API-table address is read from modaddr.h HERE, at patch time, because that
+header can be regenerated earlier in the same make run -- a value captured when
+the Makefile was parsed would be the previous build's, which is the stale-pointer
+bug this field exists to catch.
 """
 import struct
 import sys
@@ -39,13 +44,13 @@ blob = bytearray(open(path, "rb").read())
 # Layout of modload_header_t: magic, abi, size, entry_offset, char name[24],
 # then the linked pair. name[] is 24 bytes from offset 16, so the pair follows
 # at 40 and 44 with no padding.
-SIZE_OFF, ENTRY_OFF, LINKED_INST, LINKED_DATA = 8, 12, 40, 44
+SIZE_OFF, ENTRY_OFF, LINKED_INST, LINKED_DATA, LINKED_HOST = 8, 12, 40, 44, 48
 
 magic, abi = struct.unpack_from("<II", blob, 0)
 if magic != 0x4D4F444C:
     sys.exit("patch_header: bad magic 0x%08x at offset 0" % magic)
 
-if len(blob) < LINKED_DATA + 4:
+if len(blob) < LINKED_HOST + 4:
     sys.exit("patch_header: blob is %d bytes, too short to hold the header"
              % len(blob))
 
@@ -55,8 +60,24 @@ if not (0 <= entry_off < len(blob)):
              % (entry, base, len(blob)))
 
 struct.pack_into("<II", blob, SIZE_OFF, len(blob), entry_off)
-struct.pack_into("<II", blob, LINKED_INST, base, data_base)
+host = 0
+
+if len(sys.argv) > 5:
+    try:
+        with open(sys.argv[5]) as f:
+            for line in f:
+                if "MODHOST_PTR_AT" in line:
+                    host = int(line.split()[2].rstrip("ULul"), 0)
+                    break
+    except OSError as e:
+        sys.exit("patch_header: cannot read %s: %s" % (sys.argv[5], e))
+
+if not host:
+    sys.exit("patch_header: MODHOST_PTR_AT missing -- the blob would hold a null"
+             " host pointer, which reads as garbage at the first call")
+struct.pack_into("<III", blob, LINKED_INST, base, data_base, host)
 open(path, "wb").write(blob)
 
 print("patched: size=%d entry_offset=0x%x (mod_entry at 0x%x) "
-      "linked inst=0x%x data=0x%x" % (len(blob), entry_off, entry, base, data_base))
+      "linked inst=0x%x data=0x%x host=0x%x"
+      % (len(blob), entry_off, entry, base, data_base, host))

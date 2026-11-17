@@ -38,6 +38,7 @@ const modload_header_t mod_header = {
     .name = "flac",
     .linked_inst = 0,           /* patched after linking */
     .linked_data = 0,           /* patched after linking */
+    .linked_host = 0,                              /* patched after linking */
 };
 
 static const modhost_t *host(void)
@@ -100,6 +101,28 @@ extern "C" int32_t mod_entry(modcall_t *call)
 
     flac_handle_t *fh = (flac_handle_t *)call->state;
     micro_flac::FLACDecoder *dec;
+
+    /*
+     * TEARDOWN. A call with no input asks us to destroy the decoder and release
+     * what it allocated through the host table.
+     *
+     * WITHOUT THIS THE BUFFERS LEAK ON EVERY TRACK. micro-flac keeps its
+     * working buffers until ~FLACDecoder(), and the caller only ever freed the
+     * state BLOCK it owns, not what lived inside it -- so each track leaked its
+     * buffer, measured at 41 KB of PSRAM and 356 bytes of internal RAM. Four or
+     * five tracks of that, and a later allocation fails.
+     */
+    if (!call->in && call->in_len == 0)
+    {
+        if (fh->magic == FLAC_HANDLE_MAGIC)
+        {
+            dec = (micro_flac::FLACDecoder *)((uint8_t *)fh + sizeof(flac_handle_t));
+            dec->~FLACDecoder();
+            fh->magic = 0;
+            fh->ready = 0;
+        }
+        return MODCALL_OK;
+    }
 
     fh->calls++;
 

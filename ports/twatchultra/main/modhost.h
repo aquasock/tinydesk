@@ -84,6 +84,11 @@ typedef struct
  */
 typedef struct
 {
+    /*
+     * TEARDOWN: in == NULL and in_len == 0 asks the module to destroy what it
+     * built in `state` and release everything it allocated through the table.
+     * The caller frees `state` itself, afterwards. See MODLOAD_ABI_VERSION 3.
+     */
     const uint8_t *in;
     size_t in_len;
     size_t *consumed;           /* out: bytes the module used */
@@ -119,5 +124,24 @@ typedef int32_t (*mod_entry_fn)(modcall_t *call);
 
 /* Firmware side only: filled at boot and pointed at by g_modhost_ptr. */
 const modhost_t *modhost_table(void);
+
+/*
+ * The published table pointer. Its ADDRESS is part of the module build contract
+ * (modules/modaddr.h, derived from this app's ELF), so modload_prepare()
+ * compares the address a blob recorded against this one and refuses a mismatch.
+ */
+extern const modhost_t *const volatile g_modhost_ptr;
+
+/*
+ * Bytes and blocks the module has asked this table for and not yet given back.
+ *
+ * A module cannot be inspected from the outside, and its leak looks like
+ * something else entirely: micro-flac's working buffer is allocated through
+ * this table, and without a teardown it leaked 41 KB of PSRAM per track, which
+ * surfaced as a player that stopped after four or five songs with a misleading
+ * "no amplifier". These two numbers make that visible per track.
+ */
+size_t modhost_live_bytes(void);
+size_t modhost_live_blocks(void);
 
 #endif

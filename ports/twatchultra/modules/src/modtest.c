@@ -38,6 +38,7 @@ const modload_header_t mod_header = {
     .name = "modapi",
     .linked_inst = 0,               /* patched after linking */
     .linked_data = 0,               /* patched after linking */
+    .linked_host = 0,                                  /* patched after linking */
 };
 
 /* The table is fetched by the shim at a build-time-derived address; this is the

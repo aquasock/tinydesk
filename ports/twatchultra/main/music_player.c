@@ -32,6 +32,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 #include "modhost.h"
 #include "modload.h"
@@ -154,6 +155,11 @@ static void play_task(void *arg)
 {
     (void)arg;
 
+    /* Declared up here, not beside the loop: several of the early failure
+     * paths jump to cleanup, and one of them is above the loop. Teardown is
+     * only meaningful after a decoder could have been constructed. */
+    bool teardown_ok = false;
+
     /*
      * NO MAPPING HERE. This task runs on a PSRAM stack, and esp_partition_mmap()
      * disables the flash cache -- which PSRAM is reached through -- so mapping
@@ -243,6 +249,7 @@ static void play_task(void *arg)
 
         const int32_t r = fn(&call);
 
+        teardown_ok = true;
         s_calls++;
         s_verdict = r;
 
@@ -286,14 +293,16 @@ static void play_task(void *arg)
                     set_msg("odd stream rate, assuming 44100");
                     if (!sound_stream_open(44100))
                     {
-                        set_msg("no amplifier");
+                        set_msg(sound_stream_error());
                         s_state = 3;
                         break;
                     }
                 }
                 else if (!sound_stream_open(rate))
                 {
-                    set_msg("no amplifier");
+                    /* The specific call and its error, not a generic message:
+                     * see sound_stream_error(). */
+                    set_msg(sound_stream_error());
                     s_state = 3;
                     break;
                 }
@@ -368,6 +377,22 @@ static void play_task(void *arg)
 
 cleanup:
     s_state_live = NULL;
+
+    /*
+     * TELL THE MODULE TO DESTROY THE DECODER. Its working buffer lives until
+     * ~FLACDecoder() and is allocated through the host table, so freeing only
+     * the state BLOCK here leaks it -- measured at 41 KB of PSRAM per track,
+     * which is what made the player fail after a few tracks. The entry point
+     * with no input is the teardown (MODLOAD_ABI_VERSION 3).
+     */
+    if (state && teardown_ok)
+    {
+        modcall_t bye = {.in = NULL, .in_len = 0, .state = state,
+                         .state_size = MODFLAC_STATE_BYTES};
+
+        (void)fn(&bye);
+    }
+
     if (in) heap_caps_free(in);
     if (out) heap_caps_free(out);
     if (pcm) heap_caps_free(pcm);
@@ -376,7 +401,20 @@ cleanup:
 
 done:
     s_task = NULL;
-    vTaskDelete(NULL);
+    /*
+     * vTaskDeleteWithCaps, NOT vTaskDelete. The contract in idf_additions.h is
+     * explicit: a task created with xTaskCreateWithCaps() "must only be deleted
+     * using vTaskDeleteWithCaps()". Plain vTaskDelete puts the task on the
+     * termination list and the idle task frees the TCB it knows about -- but not
+     * the PSRAM stack this API allocated, and not the caps-aware TCB.
+     *
+     * Measured cost of getting this wrong: 8,196 bytes of PSRAM and 356 bytes
+     * of internal RAM leaked PER TRACK, which is what stopped playback after
+     * four or five songs with the misleading message "no amplifier". The leak
+     * was invisible until the module's allocations were counted separately and
+     * came back clean -- the remaining 8,196/356 was exactly this.
+     */
+    vTaskDeleteWithCaps(NULL);
 }
 
 static void task_entry(void *arg) { play_task(arg); }

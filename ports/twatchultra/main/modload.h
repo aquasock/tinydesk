@@ -74,11 +74,36 @@ typedef struct
      */
     uint32_t linked_inst;
     uint32_t linked_data;
+
+    /*
+     * AND THE ADDRESS OF THE API TABLE THE BLOB WAS BUILT TO CALL.
+     *
+     * This is a THIRD moving address, and it is the one that bit twice.
+     * g_modhost_ptr lives in the app's RAM and moves on nearly every build --
+     * 0x3c26b8c8, 0x3c26b99c, 0x3c26ba78, 0x3c26bb50 across four rebuilds in one
+     * afternoon. A blob holding a stale one does not fault: it reads garbage as
+     * the function table, every call returns MODCALL_ERROR, and the only
+     * symptom is "decode error" in the player.
+     *
+     * The two mmap bases above were already checked; this one was not, which is
+     * why that failure stayed silent.
+     */
+    uint32_t linked_host;
 } modload_header_t;
 
-/* Bump when the calling convention or the header changes. A blob built for a
- * different version is refused rather than called. */
-#define MODLOAD_ABI_VERSION 2
+/*
+ * Bump when the calling convention or the header changes. A blob built for a
+ * different version is refused rather than called.
+ *
+ * 3 adds TEARDOWN: a call with in == NULL and in_len == 0 asks the module to
+ * destroy whatever it constructed in the caller's state block and release the
+ * memory it allocated through the host table. Without it a decoder's working
+ * buffer leaks on every track -- measured at 41 KB of PSRAM per track for
+ * micro-flac, because its buffers live until ~FLACDecoder() and nothing was
+ * calling it. A blob built for 2 does not understand that call and would leak
+ * silently, which is exactly why this is a version bump and not a convention.
+ */
+#define MODLOAD_ABI_VERSION 3
 
 /*
  * The blob's entry point. Plain int32_t in and out on purpose: a struct or a

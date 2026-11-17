@@ -581,10 +581,10 @@ bool link_init(void)
     if (!music_player_register_commands())
         ESP_LOGW(TAG, "music/modflac command did not register");
 
-    /* The Music window: a playlist view onto that same player, in the Start
-     * menu. Registered here rather than with the desktop's own apps because it
-     * is this port's -- it drives the amplifier and the modules partition. */
-    music_ui_register();
+    /* The Music window is registered from board_apps_register(), NOT here:
+     * registration order is start-menu order, and board init runs before the
+     * desktop's own apps, so registering it here put Music at the very top of
+     * the menu. See the hook in ports/esp_idf/app/main.c. */
 
     /* Map the `modules` partition HERE, on the boot task, whose stack is in
      * internal RAM. esp_partition_mmap() disables the flash cache, and PSRAM is
@@ -771,6 +771,19 @@ int link_write(const uint8_t *buf, int len)
         }
     }
     return len;
+}
+
+/*
+ * The port's own apps, registered by the desktop AFTER its built-in ones.
+ *
+ * Registration order is start-menu order. Registering from board init put
+ * Music above Terminal; this hook runs after td_apps_register_all(), so a
+ * board's apps land at the end of the app list, immediately before the
+ * separator and the user's own emulator .tdlink entries.
+ */
+void board_apps_register(void)
+{
+    music_ui_register();
 }
 
 const char *board_platform(void)

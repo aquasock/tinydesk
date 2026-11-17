@@ -93,6 +93,14 @@ void sound_stream_close(void);
 uint32_t sound_stream_dropped(void);
 
 /*
+ * Why the last sound_stream_open() failed, in words: the exact call and its
+ * esp_err_t name. "no amplifier" covered four different faults, and when one
+ * started on the fifth track of a session there was no way to tell which.
+ * Returns "no amplifier" before any attempt.
+ */
+const char *sound_stream_error(void);
+
+/*
  * Interleaved stereo, BLOCKING, for a player with its own task.
  *
  * sound_stream_write() takes mono and never waits, because its caller is an

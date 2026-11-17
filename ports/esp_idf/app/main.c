@@ -772,6 +772,19 @@ __attribute__((weak)) bool board_maintenance_start(void)
     return s_result != 0;
 }
 
+/*
+ * A PORT MAY ADD ITS OWN APPS, AFTER THE BUILT-IN ONES.
+ *
+ * Registration order is start-menu order, so an app registered from a board's
+ * init lands at the TOP of the menu -- above Terminal and Files -- which is
+ * not where a board-specific app belongs. Music on the T-Watch Ultra was first
+ * for exactly that reason. This hook runs after td_apps_register_all(), so a
+ * port's apps sit at the end of the list, next to the user's own entries.
+ *
+ * Weak, so every other board in this tree links unchanged.
+ */
+__attribute__((weak)) void board_apps_register(void) {}
+
 static void ui_task(void *arg)
 {
     (void)arg;
@@ -786,6 +799,7 @@ static void ui_task(void *arg)
     td_canvas_set_allocator(canvas_alloc, heap_caps_free);
 #endif
     td_apps_register_all();
+    board_apps_register();
     td_terminal_set_backend(tdsh_bridge_esp_backend());
     ESP_LOGI(TAG, "desktop %dx%d, UI stack free %u bytes", td_stats()->cols, td_stats()->rows,
              (unsigned)uxTaskGetStackHighWaterMark(NULL));

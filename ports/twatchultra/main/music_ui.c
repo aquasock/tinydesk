@@ -333,20 +333,18 @@ void music_ui_register(void)
 /*
  * DIAGNOSTIC BUILD ONLY, removed with the define in CMakeLists once answered.
  *
- * It drives THE WINDOW'S OWN PATH -- launch(), then the very handlers the Play
- * and Stop buttons call -- and writes what happened to a file. That is
- * deliberate: the display mirror on this board sends only CHANGED cells and has
- * repeatedly attached with an incomplete or stale grid, so "the window drew" is
- * not something it can be asked. A file cannot be misread that way.
+ * It plays and stops a run of tracks, recording PSRAM free and the failure
+ * message after each one, because the operator's report was "the app stopped
+ * playing after 4-5 songs with error: no amplifier". That message came from
+ * sound_stream_open() failing, and there are five different ways for it to
+ * fail -- so this measures rather than guesses, and PSRAM free per iteration
+ * separates a leak (a number falling every time) from a state machine fault
+ * (a number flat until the failure).
  *
- * It runs on the BOOT task, which is why it may write to /fs at all: a
- * PSRAM-stack task may not touch littlefs (esp_flash_read disables the cache
- * PSRAM lives behind), a constraint quoted in modload.h. Creating the window
- * here is safe for the same reason a restored window is: the window manager is
- * static state and td_run() has not started yet, so the window is simply part of
- * the first frame.
+ * It runs on the BOOT task, which is the only place allowed to touch /fs.
  */
-#include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "modhost.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -357,57 +355,71 @@ void music_ui_selftest(void)
     if (!f)
         return;
 
-    /* ---- 1. the window itself -------------------------------------- */
-    launch();
+    /* Where Music sits in the Start menu, and what follows it. Registration
+     * order is menu order, so this is the check that the port's app is at the
+     * END (next to the user's emulator entries) rather than first. */
+    int n_apps = td_app_count();
+    int music_at = -1;
+    char last[32] = "";
 
-    fprintf(f, "window=%d\n", s_win != NULL);
-    fprintf(f, "tracks=%d\n", music_track_count());
-    if (music_track_count() > 0)
+    for (int i = 0; i < n_apps; i++)
     {
-        fprintf(f, "first=%s\n", music_track_name(0));
-        fprintf(f, "last=%s\n", music_track_name(music_track_count() - 1));
+        const td_app_t *a = td_app_get(i);
+
+        if (a && strcmp(a->name, "Music") == 0)
+            music_at = i;
+        if (a && i == n_apps - 1)
+            snprintf(last, sizeof(last), "%s", a->name);
     }
-    fprintf(f, "dir=%s\n", music_tracks_dir());
+    fprintf(f, "apps=%d music_at=%d last_app=[%s]\n", n_apps, music_at, last);
+
+    launch();
+    fprintf(f, "window=%d tracks=%d\n", s_win != NULL, music_track_count());
     fflush(f);
 
-    /* ---- 2. the Play button's handler ------------------------------ */
-    /* Select row 0 the way a click would, then call the handler directly. */
-    if (s_list)
-        td_list_select(s_list, 0);
-    on_play(NULL, NULL);
+    const int k_runs = 8;
 
-    /* Six seconds: long enough for STREAMINFO and for PCM to flow. */
-    for (int i = 0; i < 60; i++)
-        vTaskDelay(pdMS_TO_TICKS(100));
+    for (int i = 0; i < k_runs && i < music_track_count(); i++)
+    {
+        const size_t psram0 = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        const size_t int0 = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        const size_t mod0_b = modhost_live_blocks();
+        const size_t mod0_s = modhost_live_bytes();
 
-    music_status_t st;
+        if (!music_play_index(i))
+        {
+            fprintf(f, "%d REFUSED TO START\n", i);
+            fflush(f);
+            break;
+        }
+        /* Long enough for STREAMINFO and a second of audio. */
+        for (int t = 0; t < 25; t++)
+            vTaskDelay(pdMS_TO_TICKS(100));
 
-    music_status_get(&st);
-    fprintf(f, "play=running:%d state:%d idx:%d frames:%lu rate:%lu secs:%lu err:%lu short:%lu\n",
-            st.running, st.state, st.index, (unsigned long)st.frames,
-            (unsigned long)st.rate, (unsigned long)st.seconds,
-            (unsigned long)st.errors, (unsigned long)st.short_writes);
-    fprintf(f, "now=%s\n", td_widget_text(s_now));
-    fprintf(f, "status=%s\n", td_widget_text(s_status));
-    fflush(f);
+        music_status_t st;
 
-    /* ---- 3. the Stop button's handler ------------------------------ */
-    on_stop(NULL, NULL);
-    for (int i = 0; i < 30; i++)
-        vTaskDelay(pdMS_TO_TICKS(100));
+        music_status_get(&st);
+        fprintf(f, "%d play state=%d frames=%lu err=%lu msg=[%s] mod=%u/%u\n",
+                i, st.state, (unsigned long)st.frames, (unsigned long)st.errors,
+                st.message, (unsigned)modhost_live_blocks(),
+                (unsigned)modhost_live_bytes());
 
-    music_status_get(&st);
-    fprintf(f, "stopped=running:%d state:%d frames:%lu\n", st.running, st.state,
-            (unsigned long)st.frames);
-    fprintf(f, "stopped_now=%s\n", td_widget_text(s_now));
-    fflush(f);
+        music_stop();
+        for (int t = 0; t < 20; t++)
+            vTaskDelay(pdMS_TO_TICKS(100));
 
-    /* ---- 4. the Next button, with nothing playing ------------------- */
-    on_next(NULL, NULL);
-    music_status_get(&st);
-    fprintf(f, "after_next=running:%d sel=%d\n", st.running,
-            s_list ? td_list_selected(s_list) : -99);
+        /* After the task has fully exited: this is where a leak shows. */
+        fprintf(f, "%d done psram %d int %d mod %d/%d\n", i,
+                (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM) - (int)psram0,
+                (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL) - (int)int0,
+                (int)modhost_live_blocks() - (int)mod0_b,
+                (int)modhost_live_bytes() - (int)mod0_s);
+        fflush(f);
+    }
 
+    fprintf(f, "final psram=%u int=%u\n",
+            (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     fclose(f);
 }
 
