@@ -67,4 +67,22 @@ const char *imu_posture(const td_imu_t *r);
 /* The latest orientation in degrees, false until the part has reported one. */
 bool imu_orientation(float *heading, float *pitch, float *roll);
 
+/* ---- data injection, for experiments that feed the part synthetic motion ----
+ *
+ * Not a feature: this exists so klio.c can ask whether a classifier on the
+ * Fuser core will learn from host-supplied samples. The command is present in
+ * this firmware (entry 54); whether the data reaches the ALGORITHMS is the open
+ * question these three calls exist to answer.
+ *
+ * imu_inject_begin() sets read-time or step-by-step mode and puts the async
+ * status bit back, which the SDK's own helper clears and never restores.
+ * imu_inject_frame() writes one BHY2_CMD_INJECT_DATA packet with the payload
+ * exactly as given -- no padding, because a FIFO-format frame is parsed by
+ * walking sensor ids and a trailing zero byte is a byte the part did not send.
+ * imu_inject_end() returns the part to normal mode.
+ */
+bool imu_inject_begin(int mode);
+bool imu_inject_frame(const uint8_t *payload, uint16_t len);
+void imu_inject_end(void);
+
 #endif

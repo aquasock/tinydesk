@@ -27,7 +27,9 @@
  *   - KLIO_PARAM_INPUT_SENSORS says which sensors feed the algorithm; this port
  *     reads it but does not set it, so it reports what the firmware chose
  */
+#include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_log.h"
@@ -61,6 +63,12 @@ typedef struct
 } klio_frame_t;
 
 static klio_frame_t s_last;
+
+/* Per-frame byte trace, off by default. See the note in on_klio(). */
+static bool s_trace = false;
+
+/* Carries the per-cycle cross-axis amount from the generator to the frame. */
+static volatile float s_tilt = 0.1f;
 
 /* The index the engine assigned when it last learnt a pattern, so `detect` can
  * enable exactly that slot rather than guessing. -1 until something is learnt. */
@@ -108,11 +116,19 @@ static void on_klio(const struct bhy2_fifo_parse_data_info *info, void *priv)
      * account for (4 + 6 = 10), so one byte is somewhere unexpected and the
      * recognition index may not be where the struct layout suggests. Printing
      * the whole frame is the only way to place it with evidence. */
-    char hex[3 * 24 + 1];
-    size_t pos = 0;
-    for (size_t i = 0; i < n && pos + 3 < sizeof(hex); i++)
-        pos += (size_t)snprintf(hex + pos, sizeof(hex) - pos, "%02x ", d[i]);
-    ESP_LOGI(TAG, "id %u len %u: %s", (unsigned)info->sensor_id, (unsigned)n, hex);
+    /* AT DEBUG, NOT INFO. At INFO this printed one line per frame -- 50 a
+     * second while learning -- which scrolled the progress lines and the final
+     * verdict off a 26-row terminal. An instrument whose output cannot be read
+     * is not an instrument. `klio trace on` turns it back up when the bytes are
+     * what is in question. */
+    if (s_trace)
+    {
+        char hex[3 * 24 + 1];
+        size_t pos = 0;
+        for (size_t i = 0; i < n && pos + 3 < sizeof(hex); i++)
+            pos += (size_t)snprintf(hex + pos, sizeof(hex) - pos, "%02x ", d[i]);
+        ESP_LOGI(TAG, "id %u len %u: %s", (unsigned)info->sensor_id, (unsigned)n, hex);
+    }
 }
 
 /* ------------------------------------------------------------- helpers */
@@ -295,6 +311,429 @@ static int cmd_klio(tdsh_session_t *session, int argc, char **argv)
                    "part did not see the motion as repetitive enough.\n",
                    (unsigned)s_last.learn_progress);
         return 0;
+    }
+
+    /* ----------------------------------------------------------- trace */
+    if (strcmp(sub, "trace") == 0)
+    {
+        s_trace = !(argc >= 3 && strcmp(argv[2], "off") == 0);
+        printf("frame trace %s\n", s_trace ? "ON (one line per frame)" : "off");
+        return 0;
+    }
+
+    /* -------------------------------------------------- learn from a file */
+    /* CAN THE ENGINE LEARN FROM SAMPLES THE HOST MAKES UP?
+     *
+     * This is the question the operator's whole idea rests on: treat the
+     * BHI260AP as a general-purpose accelerator -- stream x,y,z in, get a
+     * yes/no out -- rather than a gesture toy that only works when a hand moves.
+     *
+     * Entry 54 established the command is present and accepts a payload. It did
+     * NOT establish that the payload reaches the algorithms. This measures the
+     * effect, which is the only test that distinguishes "accepted and used" from
+     * "accepted and dropped": run KLIO's learning mode, inject a repeating
+     * synthetic motion at a steady rate, and watch whether `progress` climbs
+     * with nobody touching the watch.
+     *
+     * THE WATCH MUST BE STILL, and the control run exists because of that. Run
+     * `klio inject 0` first: same loop, same timing, injection off. If progress
+     * moves in the control, the motion is coming from the wearer, not the host,
+     * and nothing below means anything.
+     *
+     * THREE FRAMINGS, because Bosch documents none of them. Each is plausible
+     * and they are cheap to distinguish:
+     *   1  28 bytes of float: accel xyz, gyro xyz, 4-byte timestamp
+     *   2  FIFO format: two 7-byte packets per sample, one per sensor id
+     *   3  id-prefixed floats: the sensor id, a pad byte, then six floats
+     *
+     * WHAT EACH OUTCOME MEANS is printed at the end rather than left to the
+     * reader, because these lines will be read weeks later by someone who was
+     * not here. */
+    if (strcmp(sub, "inject") == 0)
+    {
+        const int shape = argc >= 3 ? atoi(argv[2]) : 0;
+        int seconds = argc >= 4 ? atoi(argv[3]) : 30;
+
+        /* THE MOTION IS ARGUMENTS, NOT CONSTANTS, because the first result was
+         * 20% at one setting and 0% at the next and one sample of that is not
+         * enough to tell a real effect from noise. Sweeping means reflashing
+         * each time otherwise, and a reflash is two minutes of not learning
+         * anything.
+         *
+         *   klio inject 4 30 10 6 50     shape, seconds, 1.0 Hz, 0.6 rad, 50/s
+         *
+         * Frequency and amplitude are in tenths, because the shell's atoi has no
+         * float parser and a tenth of a hertz is finer than anyone needs. */
+        const float hz = argc >= 5 ? (float)atoi(argv[4]) / 10.0f : 1.0f;
+        const float amp = argc >= 6 ? (float)atoi(argv[5]) / 10.0f : 0.6f;
+        int rate = argc >= 7 ? atoi(argv[6]) : 50;
+        const int wave = argc >= 8 ? atoi(argv[7]) : 2;
+        if (hz <= 0.0f || hz > 5.0f || amp <= 0.0f || amp > 2.0f ||
+            rate < 10 || rate > 200 || wave < 1 || wave > 2)
+        {
+            printf("motion: hz 1..50 (tenths), amp 1..20 (tenths), rate 10..200,\n"
+                   "        wave 1 = sine, 2 = gesture (default)\n");
+            return 1;
+        }
+
+        /* A DETERMINISTIC PRNG, because a run has to be repeatable to be
+         * compared with another. Numerical Recipes' LCG: three lines, no
+         * library, same sequence on every build. */
+        uint32_t rng = 0x12345678u + (uint32_t)shape;
+        #define RND() (rng = rng * 1664525u + 1013904223u, \
+                       (float)((rng >> 8) & 0xFFFFFF) / 16777216.0f)
+        if (shape < 0 || shape > 4)
+        {
+            printf("klio inject <shape> [seconds]\n");
+            printf("  0 control, no injection\n");
+            printf("  1 floats + timestamp (28 B)\n");
+            printf("  2 FIFO events, inject ids 55/58 -- Bosch's dinject framing\n");
+            printf("  3 id-prefixed floats\n");
+            printf("  4 FIFO events, corrected driver ids 76/79\n");
+            return 1;
+        }
+        if (seconds < 5 || seconds > 120)
+            seconds = 30;
+
+        bhy2_klio_sensor_state_t st = {
+            .learning_enabled = 1,
+            .learning_reset = 1,
+            .recognition_enabled = 0,
+            .recognition_reset = 0,
+        };
+
+        (void)imu_stream_on(100.0f);
+        (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_GYRO, 100.0f, 20, imu_dev());
+        (void)bhy2_register_fifo_parse_callback(BHY2_SENSOR_ID_KLIO, on_klio, NULL,
+                                                imu_dev());
+        (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_KLIO, 50.0f, 20, imu_dev());
+
+        memset((void *)&s_last, 0, sizeof(s_last));
+        s_last.learn_index = -1;
+        s_last.recog_index = 255;
+        const uint32_t frames_before = s_last.frames;
+
+        /* STEP-BY-STEP FOR THE FIFO FRAMINGS, REAL-TIME FOR THE OTHERS.
+         *
+         * Bosch's own tool replays a recorded log in STEP-BY-STEP mode and never
+         * uses real-time for a file -- dmode s, dinject, dmode n. Real-time is
+         * for a host that can keep up with the sensor's configured rate. Both
+         * are tried because which one the algorithms accept is exactly what is
+         * unknown. */
+        if (shape)
+        {
+            const int mode = (shape == 2 || shape == 4) ? BHY2_STEP_BY_STEP_INJECTION
+                                                        : BHY2_REAL_TIME_INJECTION;
+            if (!imu_inject_begin(mode))
+            {
+                printf("klio: the part refused injection mode\n");
+                return 1;
+            }
+        }
+
+        say_rc("learning on", bhy2_klio_set_state(&st, imu_dev()));
+
+        printf("\n%s, %d s", shape ? "INJECTING" : "CONTROL (no injection)", seconds);
+        if (shape)
+            printf(": %.1f Hz, %.1f rad, %d samples/s", (double)hz, (double)amp, rate);
+        printf("\n");
+        printf("the watch must be STILL.\n\n");
+
+        /* The motion: theta = 0.6 sin(2 pi f t) about the Y axis, so
+         * acceleration is gravity rotated by theta and the gyro reads dtheta/dt.
+         * The shape matters more than the scale -- KLIO matches envelopes. */
+        /* TUNED ONCE, FROM THE FIRST RESULT. At 1 Hz and 0.6 rad the run reached
+         * 20% and fell back to 0 -- progress moved, so injected data does reach
+         * the algorithm, but the motion was not repeatable enough for the engine
+         * to lock on. Slower and larger is what a human gesture looks like: half
+         * a hertz at a radian of swing is a deliberate wrist rock rather than a
+         * wobble.
+         *
+         * 100 samples a second, matching the sensors' configured rate, because
+         * in step-by-step mode the part processes what it is given and a rate
+         * mismatch is a rhythm mismatch. */
+        const int step_ms = 1000 / rate;
+        const int steps = seconds * 1000 / step_ms;
+        uint32_t sent = 0;
+
+        int last_pct = -1;
+        int peak_pct = 0;
+        int8_t learnt = -1;
+
+        FILE *trace = fopen("/fs/root/klio.txt", "w");
+        if (trace)
+            fprintf(trace, "klio inject shape %d, %d s, %.1f Hz, %.1f rad,"
+                           " %d/s, wave %d%s\n",
+                    shape, seconds, (double)hz, (double)amp, rate, wave,
+                    shape ? "" : "  (CONTROL)");
+
+        for (int i = 0; i < steps; i++)
+        {
+            if (shape)
+            {
+                const float t = (float)i * step_ms / 1000.0f;
+                float theta = 0.0f, dtheta = 0.0f;
+
+                if (wave == 1)
+                {
+                    /* A PURE SINE, kept only as the control it turned out to
+                     * be. It has no repetition boundary and no variance, so a
+                     * classifier that segments motion into cycles has nothing
+                     * to lock on: peak progress reached 20% once and 0% at every
+                     * setting after that. */
+                    const float w = 2.0f * (float)M_PI * hz;
+                    theta = amp * sinf(w * t);
+                    dtheta = amp * w * cosf(w * t);
+                }
+                else
+                {
+                    /* A GESTURE, which is what this was always supposed to be:
+                     * discrete REPETITIONS separated by rest, not an endless
+                     * wave.
+                     *
+                     * Every part of this exists because a sine lacks it:
+                     *
+                     *   REST. 40% of each cycle is deliberately still. A human
+                     *   gesture ends and the arm comes back down; "one
+                     *   repetition finished" is a fact the engine can only learn
+                     *   if it is in the data.
+                     *
+                     *   AN ATTACK AND A DECAY, not a cosine. The swing out is
+                     *   30% of the cycle and the return is 70%, with a
+                     *   raised-cosine ease on each -- a flick and a settle. A
+                     *   symmetric sine spends equal time in every phase and so
+                     *   has no landmark.
+                     *
+                     *   JITTER. Amplitude +/-8% and period +/-10% per cycle, and
+                     *   noise on every sample. Two identical cycles teach a
+                     *   template that only two identical cycles match; a real
+                     *   hand never repeats exactly, and KLIO's own
+                     *   LEARNING_SIMILARITY_THRESHOLD exists because of that.
+                     *
+                     *   A CROSS-AXIS COMPONENT, because a wrist rock about Y is
+                     *   never purely about Y. */
+                    const float period = 1.0f / hz;
+                    const float cycle = floorf(t / period);
+                    const float phase = (t - cycle * period) / period;   /* 0..1 */
+
+                    /* Per-cycle variation, held constant within a cycle so the
+                     * envelope stays smooth. */
+                    uint32_t save = rng;
+                    rng = 0x12345678u + (uint32_t)(cycle * 2654435761u) + (uint32_t)shape;
+                    /* TIGHT VARIATION, AND THAT IS A MEASUREMENT, NOT A
+                     * PREFERENCE. With +/-10% on the period the run stopped at
+                     * exactly 20% every time -- one repetition of the five the
+                     * engine wants (entry 50 saw progress move 0/20/40/60/80/100).
+                     * A matcher that compares repetitions to a template cannot
+                     * match two cycles that take different amounts of time, so
+                     * the tempo is held nearly exact here and only the amplitude
+                     * and the shape of the swing vary. A person is also more
+                     * repeatable in tempo than in effort. */
+                    const float amp_j = amp * (0.96f + 0.08f * RND());
+                    const float period_j = period * (0.98f + 0.04f * RND());
+                    const float attack = 0.30f + 0.05f * RND();
+                    const float tilt = 0.10f + 0.10f * RND();
+                    rng = save;
+
+                    const float p = (t - cycle * period) / period_j;
+                    const float active = 0.60f;      /* 60% gesture, 40% rest */
+
+                    if (p > 0.0f && p < active)
+                    {
+                        const float u = p / active;   /* 0..1 through the gesture */
+
+                        /* Raised-cosine up to u = attack, then back down. */
+                        float shape_u;
+                        if (u < attack)
+                        {
+                            const float x = u / attack;
+                            shape_u = 0.5f - 0.5f * cosf((float)M_PI * x);
+                        }
+                        else
+                        {
+                            const float x = (u - attack) / (1.0f - attack);
+                            shape_u = 0.5f + 0.5f * cosf((float)M_PI * x);
+                        }
+                        theta = amp_j * shape_u;
+
+                        /* d/dt of that, in rad/s: the derivative of the raised
+                         * cosine, chained through the phase scaling. */
+                        if (u < attack)
+                        {
+                            const float x = u / attack;
+                            dtheta = amp_j * (0.5f * (float)M_PI / attack)
+                                     * sinf((float)M_PI * x) / (active * period_j);
+                        }
+                        else
+                        {
+                            const float x = (u - attack) / (1.0f - attack);
+                            dtheta = -amp_j * (0.5f * (float)M_PI / (1.0f - attack))
+                                     * sinf((float)M_PI * x) / (active * period_j);
+                        }
+                    }
+                    (void)phase;
+
+                    /* Noise, on the signal and not just the reading. A real
+                     * accelerometer is never still, and an engine that expects
+                     * stillness to look like exactly 1.000 g will not recognise
+                     * a human arm. */
+                    theta += (RND() - 0.5f) * 0.01f;
+                    dtheta += (RND() - 0.5f) * 3.0f;      /* deg/s */
+
+                    /* Remembered for the accel below. */
+                    s_tilt = tilt;
+                }
+
+                const float tilt = (wave == 1) ? 0.0f : s_tilt;
+                const float ax = sinf(theta) + tilt * 0.3f;
+                const float az = cosf(theta);
+                const float ay = tilt * sinf(theta) * 0.5f;
+                const float gy = dtheta * 180.0f / (float)M_PI;  /* deg/s */
+
+                uint8_t pkt[56];
+                uint16_t plen = 0;
+
+                if (shape == 1)
+                {
+                    float f[7] = {ax, ay, az, 0.0f, gy, 0.0f, t};
+                    memcpy(pkt, f, sizeof(f));
+                    plen = (uint16_t)sizeof(f);
+                }
+                else if (shape == 2 || shape == 4)
+                {
+                    /* BOSCH'S OWN FRAMING, from BHy2CLI's dinject.c.
+                     *
+                     * A stream of ordinary FIFO events -- a ONE-BYTE event id
+                     * then that event's data -- concatenated into one buffer and
+                     * handed over in a single inject call. Accel and gyro are
+                     * two events, so one sample is 14 bytes.
+                     *
+                     * THE IDS ARE THE POINT. dinject_defs.h names inject ids 55
+                     * (accel) and 58 (gyro), plus driver ids 76 (corrected
+                     * accel) and 79 (corrected gyro). The earlier attempts used
+                     * the ORDINARY sensor ids 4 and 13, which the injection
+                     * handler does not know -- that is why the command was
+                     * accepted and the data went nowhere.
+                     *
+                     * Accel is 1/4096 g per count. Gyro is taken as 1/16 deg/s,
+                     * the usual BHI260 scaling and a guess; KLIO matches motion
+                     * envelopes, so the rhythm carries more than the units. */
+                    const uint8_t acc_id = (shape == 4) ? 76 : 55;
+                    const uint8_t gyr_id = (shape == 4) ? 79 : 58;
+
+                    int16_t a[3] = {(int16_t)(ax * 4096.0f), (int16_t)(ay * 4096.0f),
+                                    (int16_t)(az * 4096.0f)};
+                    int16_t g[3] = {0, (int16_t)(gy * 16.0f), 0};
+
+                    pkt[0] = acc_id;
+                    memcpy(pkt + 1, a, 6);
+                    pkt[7] = gyr_id;
+                    memcpy(pkt + 8, g, 6);
+                    plen = 14;
+                }
+                else
+                {
+                    float f[6] = {ax, ay, az, 0.0f, gy, 0.0f};
+                    pkt[0] = BHY2_SENSOR_ID_ACC;
+                    pkt[1] = 0;
+                    memcpy(pkt + 2, f, sizeof(f));
+                    plen = (uint16_t)(2 + sizeof(f));
+                }
+
+                if (imu_inject_frame(pkt, plen))
+                    sent++;
+
+
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(step_ms));
+            (void)imu_poll();
+
+            /* Every five seconds, not every second: a 20-second run otherwise
+             * prints 20 progress lines and pushes the verdict off a 26-row
+             * terminal. Four lines and the summary is what a reader gets. */
+            if ((i % 500) == 499)
+            {
+                float ax = 0, ay = 0, az = 0;
+                uint32_t n = 0;
+                (void)imu_accel(&ax, &ay, &az, &n);
+                /* TO A FILE, NOT THE SCREEN. The display mirror sends only
+                 * changed cells and this console capture applies them to an
+                 * empty grid, so a scrolling transcript comes back interleaved
+                 * and unreadable -- measured: "progress I20%APframesH626accel".
+                 * The numbers were real and the screen could not show them.
+                 * `cat /root/klio.txt` afterwards reads a clean file. */
+                if (trace)
+                    fprintf(trace, "  %2d s  progress %3u%%%s  frames %lu"
+                                   "  accel %+.2f %+.2f %+.2f\n",
+                            (i + 1) * step_ms / 1000, (unsigned)s_last.learn_progress,
+                            s_last.learn_reason == 1 ? " (interrupted)"
+                            : s_last.learn_reason == 2 ? " (no movement)" : "",
+                            (unsigned long)(s_last.frames - frames_before),
+                            (double)ax, (double)ay, (double)az);
+                if (s_last.learn_progress > peak_pct)
+                    peak_pct = s_last.learn_progress;
+                last_pct = s_last.learn_progress;
+            }
+
+            if (s_last.frames != frames_before && s_last.learn_index >= 0 &&
+                s_last.learn_progress >= 100)
+            {
+                learnt = s_last.learn_index;
+                s_learnt = learnt;
+                break;
+            }
+        }
+
+        bhy2_klio_sensor_state_t off = {0};
+        (void)bhy2_klio_set_state(&off, imu_dev());
+        if (shape)
+            imu_inject_end();
+
+        const uint32_t frames = s_last.frames - frames_before;
+        if (s_last.learn_progress > peak_pct)
+            peak_pct = s_last.learn_progress;
+        printf("\n%lu frames, %lu injected, peak progress %d%% (ended %d%%)\n",
+               (unsigned long)frames, (unsigned long)sent, peak_pct, last_pct);
+        if (trace)
+        {
+            fprintf(trace, "\n%lu frames, %lu injected, peak %d%%, ended %d%%\n",
+                    (unsigned long)frames, (unsigned long)sent, peak_pct, last_pct);
+        }
+
+        if (learnt >= 0)
+        {
+            printf("\nLEARNT from injected data. The classifier saw the host's\n"
+                   "samples and not the accelerometer's. This is the black box\n"
+                   "working.\n");
+        }
+        else if (shape == 0)
+        {
+            printf("\nCONTROL: nothing fed in, and progress did not reach 100.\n"
+                   "That is the baseline the injected runs are measured against.\n");
+        }
+        else if (frames == 0)
+        {
+            printf("\nNo KLIO frames either. Real-time injection appears to have\n"
+                   "taken the algorithm's input away without supplying new data,\n"
+                   "so the framing above is wrong or the mode is not what it says.\n");
+        }
+        else
+        {
+            printf("\nFrames kept coming and progress did not move: the part is\n"
+                   "still running the algorithms on the PHYSICAL sensors, so the\n"
+                   "injected bytes did not reach them in this framing.\n");
+        }
+
+        if (trace)
+        {
+            fprintf(trace, "%s\n", learnt >= 0 ? "LEARNT" : "NOT LEARNT");
+            fclose(trace);
+            printf("\nfull trace: cat /root/klio.txt\n");
+        }
+
+        (void)imu_accel_enable(0.0f);
+        return learnt >= 0 ? 0 : 1;
     }
 
     /* ---------------------------------------------------------- detect */

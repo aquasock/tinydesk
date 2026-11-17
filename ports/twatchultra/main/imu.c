@@ -1150,6 +1150,62 @@ static bool try_inject(const char *name, const uint8_t *payload, uint16_t len,
     return landed;
 }
 
+/* ------------------------------------------------------- injection, exported */
+
+bool imu_inject_begin(int mode)
+{
+    if (!s_ready)
+        return false;
+
+    const int8_t rc = bhy2_set_data_injection_mode((enum bhy2_data_inj_mode)mode,
+                                                   &s_bhy2);
+
+    /* READ THE STATUS ONCE AFTER SWITCHING, which is what Bosch's own host tool
+     * does and comments as "Fix for mode switching not occurring cleanly"
+     * (BHy2CLI, callbacks/bhy2cli_callbacks.c, dmode_callback). The mode command
+     * is fire-and-forget like every other one, so this is the only confirmation
+     * that the part actually changed mode before data starts arriving. */
+    imu_status_ctx_t ctx;
+    status_sync_begin(&ctx);
+    (void)status_read_one(200);
+    status_sync_end(&ctx);
+
+    /* The helper behind that call clears the async status bit and never puts it
+     * back -- every call leaves the part with asynchronous status reporting off
+     * for the rest of the session. Restored here because the caller needs the
+     * normal data FIFO to keep parsing while it injects. */
+    (void)bhy2_set_host_intf_ctrl(BHY2_HIF_CTRL_ASYNC_STATUS_CHANNEL, &s_bhy2);
+
+    return rc == BHY2_OK;
+}
+
+bool imu_inject_frame(const uint8_t *payload, uint16_t len)
+{
+    if (!s_ready || len == 0 || len > 56)
+        return false;
+
+    uint8_t pkt[60] = {0};
+    pkt[0] = (uint8_t)(BHY2_CMD_INJECT_DATA & 0xFF);
+    pkt[1] = (uint8_t)((BHY2_CMD_INJECT_DATA >> 8) & 0xFF);
+    pkt[2] = (uint8_t)(len & 0xFF);
+    pkt[3] = (uint8_t)((len >> 8) & 0xFF);
+    memcpy(pkt + 4, payload, len);
+
+    /* Written exactly as declared. The SDK's own path rounds the length up to a
+     * word and declares the rounded value; for a FIFO-format frame that adds a
+     * byte the part did not send, which the parser then walks into. */
+    return bhy2_set_regs(BHY2_REG_CHAN_CMD, pkt, (uint16_t)(4 + len), &s_bhy2)
+           == BHY2_OK;
+}
+
+void imu_inject_end(void)
+{
+    if (!s_ready)
+        return;
+    (void)bhy2_set_data_injection_mode(BHY2_NORMAL_MODE, &s_bhy2);
+    (void)bhy2_set_host_intf_ctrl(BHY2_HIF_CTRL_ASYNC_STATUS_CHANNEL, &s_bhy2);
+}
+
 static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
 {
     (void)session;
