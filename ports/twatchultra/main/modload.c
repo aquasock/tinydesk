@@ -178,6 +178,32 @@ bool modload_prepare(char *why, size_t why_len)
                  MODLOAD_DATA_LABEL);
     }
 
+    /*
+     * PUBLISH THE ADDRESSES FOR THE MODULE BUILD -- BEFORE ANY REFUSAL.
+     *
+     * THIS ORDER IS LOAD-BEARING AND WAS FOUND THE HARD WAY. The publish used
+     * to sit after the stale-link check, which meant that a stale blob returned
+     * early and never wrote the file that the build reads to make a fresh one:
+     * the guard made itself permanent. The first partition-table change that
+     * moved the data window (entry 43, moddata 0xF00000 -> 0xE00000) produced
+     * exactly that deadlock -- the loader correctly refused, `make modaddr`
+     * happily re-read the OLD pair, and the build regenerated the same wrong
+     * blob.
+     *
+     * So it goes here: everything the values depend on (both mappings) has
+     * happened, nothing that can refuse has run yet. A blob so broken that the
+     * header check rejects it still publishes the addresses that would fix it.
+     */
+    {
+        FILE *f = fopen("/fs/root/modaddr.txt", "w");
+
+        if (f)
+        {
+            fprintf(f, "inst=%p\ndata=%p\n", modload_inst_base(), s_data_base);
+            fclose(f);
+        }
+    }
+
     modload_read_header(&s_hdr);
 
     if (s_hdr.magic != MODLOAD_MAGIC || s_hdr.abi_version != MODLOAD_ABI_VERSION ||
@@ -232,24 +258,6 @@ bool modload_prepare(char *why, size_t why_len)
 
     s_entry = (void *)((const uint8_t *)modload_inst_base() + s_hdr.entry_offset);
     s_prepared = true;
-
-    /*
-     * PUBLISH THE ADDRESSES FOR THE MODULE BUILD.
-     *
-     * A module's .rodata is linked at an absolute address, and that address is
-     * whatever the MMU hands back for the data partition -- knowable only at
-     * runtime. So it is written where the build can read it, and modules/Makefile
-     * picks it up. Typing it by hand would work exactly once.
-     */
-    {
-        FILE *f = fopen("/fs/root/modaddr.txt", "w");
-
-        if (f)
-        {
-            fprintf(f, "inst=%p\ndata=%p\n", modload_inst_base(), s_data_base);
-            fclose(f);
-        }
-    }
 
     return true;
 }

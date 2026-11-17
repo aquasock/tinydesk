@@ -1,91 +1,97 @@
-# tinydesk on the LilyGo T-Watch Ultra (16 MB flash): two equal OTA slots and
-# a 7.9 MB /fs, the same shape as ports/nanoesp32.
+# tinydesk on the LilyGo T-Watch Ultra (16 MB flash): FOUR EQUAL 4 MiB REGIONS.
 #
 # NOTE: this table replaces the watch's stock layout. Read the flash out first
 # if it holds anything that cannot be regenerated -- on this board it does,
 # because the Escapement project keeps a Linux kernel, a rootfs and a home
 # partition in it. `esptool read_flash 0 0x1000000 backup.bin` beforehand.
 #
-# CHANGED 2026-11-17: nvs 24 KB -> 64 KB, and ota_0 shrunk to match ota_1.
-# Both changes were the TinyDesk author's advice on issue 20, and the NVS one
-# was measured before it was taken: the 24 KB region had FIVE of its six pages
-# full or active with one free page, and page sequence numbers of 66/100/101/102
-# -- garbage collection running continuously, no headroom. When NVS runs out,
-# nvs_flash_init() returns ESP_ERR_NVS_NO_FREE_PAGES and app_main() answers with
-# nvs_flash_erase(): every account, saved network and Bluetooth bond, silently.
-# 64 KB is what every other ESP32 port here uses (only crowpanel7 had 0x6000).
+# THE SHAPE, and why it is four regions rather than five partitions:
 #
-# NOTHING ABOVE 0x600000 MOVED. coredump, otadata, storage, modules and moddata
-# keep their addresses, so there was no littlefs migration and no module relink
-# for this change. The price was the two Bluetooth pairings: the new 64 KB NVS
-# covers 0xF000-0x19000, which held phy_init and the old app's first 36 KB, so
-# that region is erased rather than left holding app bytes for NVS to trip over.
-# RF calibration (phy_init) is regenerated on the next boot.
+#   0x000000 - 0x400000   boot, ptable, nvs, phy_init, and ota_0
+#   0x400000 - 0x800000   ota_1, then coredump and otadata in the tail
+#   0x800000 - 0xC00000   storage -- the littlefs the shell calls /
+#   0xC00000 - 0x1000000  modules + moddata -- codecs, executed from flash
 #
-# THE SLOTS ARE EQUAL ON PURPOSE. An update writes whichever slot is not
-# running, so every image must fit the SMALLER one; 3 MB against 3008 KB meant
-# the real budget was the smaller number while looking like the larger. Both are
-# now 0x2F0000 and the app is 0x2e3fc0, so 48 KB is free -- and that is the
-# number that will actually stop a build.
+# Every boundary is on a 4 MiB line, which makes the flash legible at a glance
+# and makes "where does this live" a question with an obvious answer.
 #
-# THE 24 KB AT 0x1A000-0x20000 IS DELIBERATELY UNUSED. Two 0x2F0000 slots that
-# end on the coredump boundary have to start at 0x20000 and 0x310000, and the
-# app's offset stays 64 KB aligned -- which the ESP32-S3 does not strictly need
-# (gen_esp32part.py asks only for 4 KB without secure boot, and the bootloader
-# maps from the aligned base below the image) but which is the layout every other
-# board here uses and is worth 24 KB out of 16 MB to keep conventional.
+# THE TWO SLOTS ARE 0x3E0000, NOT A FULL 4 MiB, AND THAT IS THE ONE PLACE AN
+# EVEN SPLIT CANNOT BE LITERAL. The bootloader, the partition table, NVS and
+# phy_init have to sit at the bottom of the flash, inside region 1, so region 1
+# has 176 KB less usable space than the other three. An update writes whichever
+# slot is NOT running, so both slots must be the same size and that size is the
+# smaller one: 0x400000 - 0x20000 = 0x3E0000. The 56 KB left over in region 2
+# (after coredump and otadata) is unused; making the slots 4 MiB each would need
+# 176 KB more flash than the chip has.
+#
+# REGION 1   bootloader, ptable, nvs, phy_init, ota_0
+# REGION 2   ota_1, coredump, otadata
+# REGION 3   storage
+# REGION 4   modules, moddata
+#
+# THE 24 KB AT 0x1A000-0x20000 IS STILL DELIBERATELY UNUSED: it is the padding
+# that puts ota_0 on a 64 KB boundary, which is what every other board here does
+# even though ESP-IDF needs only 4 KB without secure boot.
+#
+# CHANGED 2026-11-17 (entry 43): from two 0x2F0000 slots / 8064 KB storage /
+# 1+1 MB modules to this. The app slot goes from 45 KB of headroom to 1005 KB,
+# which is the difference between "cannot add an emulator" and "room for two".
+# `storage` halves to 4 MiB and loses nothing: it held 11 directories, 29 files
+# and 23,047 bytes, and the migration was done by extracting the littlefs,
+# rebuilding it at the new size and writing it back -- never by truncation.
+#
+# NVS DID NOT MOVE (0x9000, 64 KB), so the account and both Bluetooth pairings
+# survive this change. coredump and otadata DID move, so a coredump from before
+# this table is at an address the new one does not read.
 #
 # Name,     Type, SubType,  Offset,   Size,
 nvs,        data, nvs,      0x9000,   0x10000,
 phy_init,   data, phy,      0x19000,  0x1000,
-ota_0,      app,  ota_0,    0x20000,  0x2F0000,
-ota_1,      app,  ota_1,    0x310000, 0x2F0000,
-# 64 KB for panic backtraces, carved out below ota_1 rather than from its tail.
-# Because the console is compiled out (CONFIG_ESP_CONSOLE_NONE), this is the only
-# way a panic reports itself. See EMU-021 in the reference.
-coredump,   data, coredump, 0x600000, 0x10000,
-otadata,    data, ota,      0x610000, 0x2000,
-storage,    data, littlefs, 0x620000, 0x7E0000,
+ota_0,      app,  ota_0,    0x20000,  0x3E0000,
+ota_1,      app,  ota_1,    0x400000, 0x3E0000,
+# 64 KB for panic backtraces. Because the console is compiled out
+# (CONFIG_ESP_CONSOLE_NONE), this is the only way a panic reports itself.
+# See EMU-021 in the reference.
+coredump,   data, coredump, 0x7E0000, 0x10000,
+otadata,    data, ota,      0x7F0000, 0x2000,
+storage,    data, littlefs, 0x800000, 0x400000,
 # A raw, executable partition for decoder and codec blobs: memory-mapped as
 # INSTRUCTIONS with esp_partition_mmap(), so the code runs from flash and costs
 # no internal SRAM at load. Xtensa executes from flash natively -- every
 # instruction ESP-IDF runs is XIP-mapped -- so a blob here is no different from
 # the app's own text, except that the app does not have to contain it.
 #
-# WHY IT EXISTS. The app image has ~27 KB left in ota_1 and one FLAC decoder
-# already cost 31.7 KB of it, so a second codec does not fit in the app at all.
-# This partition is the room: 2 MB against 704 KB for all eleven Rockbox
-# codecs, measured.
+# WHY IT EXISTS. The app image once had ~27 KB left and one FLAC decoder already
+# cost 31.7 KB of it, so a second codec did not fit in the app at all. This
+# partition is the room: 2 MB against 704 KB for all eleven Rockbox codecs,
+# measured.
 #
 # SUBTYPE 0x40 is the first application-defined data subtype; ESP-IDF reserves
 # 0x00-0x3F. Find it with esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
 # 0x40, "modules").
 #
 # PROVEN. A FLAC decoder linked at this address is called across the partition
-# boundary and plays audio: 26,685 bytes of .text here and 1,976 of .rodata in
+# boundary and plays audio: 26,725 bytes of .text here and 1,976 of .rodata in
 # `moddata`, measured on a 5:58 track at 0 errors and 0 short writes. The blob
-# is `make flac` in modules/, flashed to 0xE00000.
+# is `make flac` in modules/.
 #
 # THE LINK ADDRESS IS NOT STABLE and this is the trap: both mmap bases move when
 # the app image changes size, and a blob linked for a stale pair still EXECUTES
 # and then reads its constants 64 KB away. `make modaddr` re-reads them from
 # /root/modaddr.txt on the board, and the loader refuses a mismatch rather than
 # calling into one (MOD-002 in the Escapement reference).
-# CODE AND DATA NEED SEPARATE WINDOWS, so `modules` is split in two.
 #
-# Measured three times with three coredumps: the ESP32-S3's flash mmap gives an
-# INSTRUCTION window (0x42000000.., fetch only -- a data load faults with
+# CODE AND DATA NEED SEPARATE WINDOWS, so the 4 MiB of module space is split in
+# two. Measured three times with three coredumps: the ESP32-S3's flash mmap gives
+# an INSTRUCTION window (0x42000000.., fetch only -- a data load faults with
 # exccause 3) and a DATA window (0x3C000000.., data only -- executing it faults
 # with exccause 2). They are complementary and cannot serve the same bytes. A
 # codec has .text AND .rodata, so it needs two regions.
 #
-# Splitting the partition keeps `storage` untouched, which matters: shrinking a
-# littlefs partition means migrating its contents, and that was done once
-# already (entry 25) with a byte census that nearly caused data loss. Neither
-# half needs to be large -- one FLAC decoder is 28 KB of text and 2 KB of rodata,
-# and all eleven Rockbox codecs are 704 KB.
+# 2 MB each is now four times what one codec needs and twice the whole Rockbox
+# set, so a second or third codec has somewhere to go without another table.
 #
-# modules  0xE00000 1 MB  .text,  mapped ESP_PARTITION_MMAP_INST
-# moddata  0xF00000 1 MB  .rodata, mapped ESP_PARTITION_MMAP_DATA
-modules,    data, 0x40,     0xE00000, 0x100000,
-moddata,    data, 0x41,     0xF00000, 0x100000,
+# modules  0xC00000 2 MB  .text,   mapped ESP_PARTITION_MMAP_INST
+# moddata  0xE00000 2 MB  .rodata, mapped ESP_PARTITION_MMAP_DATA
+modules,    data, 0x40,     0xC00000, 0x200000,
+moddata,    data, 0x41,     0xE00000, 0x200000,

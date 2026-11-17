@@ -117,9 +117,16 @@ $(BUILD)/lpc32.o: $(MF)/src/xtensa/lpc_32_xtensa.S | $(BUILD)
 $(BUILD)/lpc64.o: $(MF)/src/xtensa/lpc_64_xtensa.S | $(BUILD)
 	$(CC) $(FLAC_CFLAGS) -c $< -o $@
 
+# moddata.at IS A PREREQUISITE, and it was missing. The two addresses are passed
+# to the link as --defsym values read at Makefile-parse time, so a changed file
+# only relinks if make knows the blob depends on it -- without this, `make modaddr
+# && make flac` updates the file, prints "gen_addr: unchanged", and silently
+# ships the blob linked for the OLD address. That is the same class of stale-
+# address failure the generated header was built to prevent, one layer down.
 $(BUILD)/flac.bin: $(BUILD)/flacmod.o $(BUILD)/modshim.o \
                    $(patsubst $(MF)/src/%.cpp,$(BUILD)/flac_%.o,$(FLAC_SRC)) \
-                   $(BUILD)/lpc32.o $(BUILD)/lpc64.o $(MODULES)/link.ld
+                   $(BUILD)/lpc32.o $(BUILD)/lpc64.o $(MODULES)/link.ld \
+                   $(MODULES)/moddata.at
 	$(CXX) $(LDFLAGS) -o $(BUILD)/flac.elf $(filter %.o,$^) -lgcc
 	# TWO BINARIES, because .text and .rodata live in different windows and
 	# therefore different partitions: the code goes to `modules`, the constants
