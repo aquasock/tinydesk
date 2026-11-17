@@ -31,6 +31,7 @@
  * to whatever callback was registered for that sensor id. So the reading is
  * stashed by the callback and read out by imu_accel().
  */
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -751,14 +752,27 @@ bool imu_accel(float *x, float *y, float *z, uint32_t *count)
  * not: a board whose firmware lacks sensor 69 still shows acceleration. */
 static bool ori_enable(float hz)
 {
-    if (!bhy2_is_sensor_available(BHY2_SENSOR_ID_DEVICE_ORI, &s_bhy2))
-        return false;
-    if (bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_DEVICE_ORI, hz, 20, &s_bhy2) != BHY2_OK)
-        return false;
-    (void)bhy2_register_fifo_parse_callback(BHY2_SENSOR_ID_DEVICE_ORI, on_ori, NULL,
-                                            &s_bhy2);
-    s_ori_on = true;
-    return true;
+    bool any = false;
+
+    /* BOTH ORIENTATION SENSORS, and that is not belt-and-braces. 69 (DEVICE_ORI)
+     * reports ON CHANGE, so a watch lying still produces nothing and the window
+     * shows "--" for ever -- which is what happened. 70 (DEVICE_ORI_WU) is the
+     * wakeup variant and reports continuously. Subscribing to both means a
+     * resting watch still has a heading, and a moving one gets fresh values
+     * from whichever fires. */
+    static const uint8_t ids[] = {BHY2_SENSOR_ID_DEVICE_ORI,
+                                  BHY2_SENSOR_ID_DEVICE_ORI_WU};
+    for (size_t i = 0; i < sizeof(ids) / sizeof(ids[0]); i++)
+    {
+        if (!bhy2_is_sensor_available(ids[i], &s_bhy2))
+            continue;
+        if (bhy2_set_virt_sensor_cfg(ids[i], hz, 20, &s_bhy2) != BHY2_OK)
+            continue;
+        (void)bhy2_register_fifo_parse_callback(ids[i], on_ori, NULL, &s_bhy2);
+        any = true;
+    }
+    s_ori_on = any;
+    return any;
 }
 
 /* START MEANS "STREAMING", NOT MERELY "BOOTED". The first version of this
@@ -791,6 +805,7 @@ static void ops_stop(void)
     if (s_ori_on)
     {
         (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_DEVICE_ORI, 0.0f, 0, &s_bhy2);
+        (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_DEVICE_ORI_WU, 0.0f, 0, &s_bhy2);
         s_ori_on = false;
     }
     imu_stop();
@@ -813,6 +828,24 @@ static bool ops_latest(td_imu_t *out)
     (void)imu_poll();
 
     out->accel_valid = imu_accel(&out->ax, &out->ay, &out->az, &out->accel_samples);
+
+    /* TILT FROM GRAVITY. When the watch is still the accelerometer vector IS
+     * "up", so the angle of each axis off vertical falls straight out of the
+     * components -- no fusion needed, and no magnetometer, which matters because
+     * a magnetometer cannot see heading indoors next to a speaker either.
+     *
+     *   pitch = atan2(-x, sqrt(y^2 + z^2))   nose up/down
+     *   roll  = atan2( y, sqrt(x^2 + z^2))   left/right lean
+     *
+     * The signs are chosen so that tipping the watch away from you reads
+     * positive pitch, which is the convention a pilot would expect. */
+    if (out->accel_valid)
+    {
+        const float rad2deg = 57.2957795f;
+        out->tilt_pitch = atan2f(-out->ax, sqrtf(out->ay * out->ay + out->az * out->az)) * rad2deg;
+        out->tilt_roll = atan2f(out->ay, sqrtf(out->ax * out->ax + out->az * out->az)) * rad2deg;
+        out->tilt_valid = true;
+    }
     out->ori_valid = s_have_ori;
     out->heading = s_heading;
     out->pitch = s_pitch;

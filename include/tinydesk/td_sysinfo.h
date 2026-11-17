@@ -370,8 +370,19 @@ typedef struct
     bool accel_valid;
     float ax, ay, az;          /* g */
 
-    bool ori_valid;           /* the board's firmware offers orientation */
+    bool ori_valid;           /* the firmware computed orientation itself */
     float heading, pitch, roll;   /* degrees */
+
+      /* Tilt derived FROM GRAVITY, always available when accel_valid: the angle
+     * each axis is off vertical. These are what a person means by "which way is
+     * it pointing", and unlike heading they need no magnetometer, so a board
+     * with only an accelerometer can still show them.
+     *
+     * HEADING IS NOT AMONG THEM, and cannot be: rotation about the gravity axis
+     * leaves gravity unchanged, so no accelerometer can see it. A part that
+     * offers the fusion quaternion can, which is what ori_valid is for. */
+    bool tilt_valid;
+    float tilt_pitch, tilt_roll;  /* degrees, -180..180 */
 
     uint32_t accel_samples;   /* since start: a frozen count means a dead link */
     char part[24];            /* "BHI260AP" */

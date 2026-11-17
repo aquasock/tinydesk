@@ -36,7 +36,7 @@
 #define TICK_MS 250
 
 static td_window_t *s_win;
-static td_widget_t *s_part, *s_fw, *s_head, *s_pitch, *s_roll;
+static td_widget_t *s_part, *s_fw, *s_up, *s_head, *s_pitch, *s_roll;
 static td_widget_t *s_ax, *s_ay, *s_az, *s_count, *s_msg;
 
 static char s_reason[64];    /* why the sensor did not start, kept on screen
@@ -51,21 +51,30 @@ static const td_imu_ops_t *imu(void)
 /* One line: heading, or a dash when the part does not compute it. A part with
  * acceleration but no fusion still deserves a window; it just shows fewer
  * numbers. */
-static void set_or_dash(td_widget_t *w, bool valid, const char *fmt, float v)
-{
-    char buf[24];
-    if (valid)
-        snprintf(buf, sizeof(buf), fmt, (double)v);
-    else
-        snprintf(buf, sizeof(buf), "--");
-    td_widget_set_text(w, buf);
-}
-
 static void on_draw(td_window_t *win, int w, int h)
 {
     (void)win;
     const td_theme_t *t = td_theme();
     td_fill(td_rect(0, 0, w, h), ' ', t->win_fg, t->win_bg);
+}
+
+/* WHICH WAY IS UP, IN WORDS.
+ *
+ * Three acceleration numbers answer "which way is up" only for someone willing
+ * to do the trigonometry in their head. A watch has room for the answer instead:
+ * one of six names, chosen by whichever axis the gravity vector points along.
+ * The 0.7 threshold is cos(45 degrees), so the name is the axis that is
+ * dominant rather than merely largest. */
+static const char *up_word(const td_imu_t *r)
+{
+    const float t = 0.70f;
+    if (r->az > t)  return "FACE UP";
+    if (r->az < -t) return "FACE DOWN";
+    if (r->ax > t)  return "EDGE UP";
+    if (r->ax < -t) return "EDGE DOWN";
+    if (r->ay > t)  return "SIDE UP";
+    if (r->ay < -t) return "SIDE DOWN";
+    return "TILTED";
 }
 
 static void on_tick(td_window_t *win)
@@ -105,11 +114,36 @@ static void on_tick(td_window_t *win)
     td_widget_set_text(s_part, r.part[0] ? r.part : "?");
     td_widget_set_text(s_fw, r.version[0] ? r.version : "--");
 
-    set_or_dash(s_head, r.ori_valid, "%.0f", r.heading);
-    set_or_dash(s_pitch, r.ori_valid, "%.0f", r.pitch);
-    set_or_dash(s_roll, r.ori_valid, "%.0f", r.roll);
+    /* The headline: which way the watch is pointing, in words. */
+    td_widget_set_text(s_up, r.accel_valid ? up_word(&r) : "--");
 
     char buf[24];
+    /* Tilt in degrees, from gravity. This is the reading a person expects when
+     * they rotate a watch. */
+    if (r.tilt_valid)
+    {
+        snprintf(buf, sizeof(buf), "%+.0f\xc2\xb0", (double)r.tilt_pitch);
+        td_widget_set_text(s_pitch, buf);
+        snprintf(buf, sizeof(buf), "%+.0f\xc2\xb0", (double)r.tilt_roll);
+        td_widget_set_text(s_roll, buf);
+    }
+    else
+    {
+        td_widget_set_text(s_pitch, "--");
+        td_widget_set_text(s_roll, "--");
+    }
+
+    /* Heading needs the part's fusion; a dash until it reports. */
+    if (r.ori_valid)
+    {
+        snprintf(buf, sizeof(buf), "%.0f\xc2\xb0", (double)r.heading);
+        td_widget_set_text(s_head, buf);
+    }
+    else
+    {
+        td_widget_set_text(s_head, "--");
+    }
+
     if (r.accel_valid)
     {
         snprintf(buf, sizeof(buf), "%+.2f", (double)r.ax);
@@ -155,31 +189,34 @@ static void launch(void)
     if (s_win == NULL)
         return;
 
-    const td_theme_t *t = td_theme();
     int y = 0;
-    (void)t;
 
-    s_part = td_label(s_win, 1, y, 28, "");
+    s_part = td_label(s_win, 1, y, 30, "");
     y += 1;
     s_fw = td_label(s_win, 1, y, 30, "");
     y += 2;
 
-    td_label(s_win, 1, y, 30, "Heading / pitch / roll");
-    y += 1;
-    s_head = td_label(s_win, 1, y, 25, "--");
-    s_pitch = td_label(s_win, 12, y, 25, "--");
-    s_roll = td_label(s_win, 23, y, 25, "--");
+    /* THE HEADLINE. One word beats three numbers for "which way is it pointing",
+     * and it is the thing a person actually wants when they turn their wrist. */
+    s_up = td_label(s_win, 1, y, 30, "--");
     y += 2;
 
-    td_label(s_win, 1, y, 30, "Acceleration, in g");
+    td_label(s_win, 1, y, 30, "Tilt (gravity) / heading");
+    y += 1;
+    s_pitch = td_label(s_win, 1, y, 25, "--");
+    s_roll = td_label(s_win, 10, y, 25, "--");
+    s_head = td_label(s_win, 20, y, 25, "--");
+    y += 2;
+
+    td_label(s_win, 1, y, 30, "x / y / z, in g");
     y += 1;
     s_ax = td_label(s_win, 1, y, 25, "--");
-    s_ay = td_label(s_win, 12, y, 25, "--");
-    s_az = td_label(s_win, 23, y, 25, "--");
+    s_ay = td_label(s_win, 10, y, 25, "--");
+    s_az = td_label(s_win, 20, y, 25, "--");
     y += 2;
 
     td_label(s_win, 1, y, 12, "Samples");
-    s_count = td_label(s_win, 12, y, 20, "0");
+    s_count = td_label(s_win, 10, y, 20, "0");
     y += 1;
 
     s_msg = td_label(s_win, 1, y, IMU_W - 2, "");
