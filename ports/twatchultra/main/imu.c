@@ -95,6 +95,19 @@ static volatile bool s_have_accel;
 static float s_ax, s_ay, s_az;
 static uint32_t s_accel_count;
 
+/* The sensor ids the loaded firmware carries, as a compact "3 61 63 ..." string.
+ * Built once and kept, because it is the answer to "why did nothing happen" and
+ * asking again costs 255 availability queries. */
+static char s_present[160];
+static int s_present_n = -1;
+
+/* Declared here because the firmware bring-up below registers it, and its body
+ * lives with the other FIFO callbacks further down. */
+static void on_meta(const struct bhy2_fifo_parse_data_info *info, void *priv);
+
+/* Fills "3 61 63 ..." with the virtual sensors the loaded firmware carries. */
+static int imu_list_sensors(char *out, size_t cap);
+
 /* ------------------------------------------------------ the BHY2 hooks */
 
 /* BHY2 wants four things from the port: read, write, a microsecond delay, and a
@@ -246,9 +259,6 @@ static bool fw_upload_and_boot(void)
     ESP_LOGI(TAG, "uploading %u bytes of firmware", (unsigned)size);
     const int64_t t0 = esp_timer_get_time();
 
-    /* Status packets on the async channel; the SDK's FIFO parser expects it. */
-    (void)bhy2_set_host_intf_ctrl(BHY2_HIF_CTRL_ASYNC_STATUS_CHANNEL, &s_bhy2);
-
     int8_t rc = bhy2_upload_firmware_to_ram(img, (uint32_t)size, NULL, NULL, &s_bhy2);
     heap_caps_free(img);
 
@@ -272,6 +282,58 @@ static bool fw_upload_and_boot(void)
     }
 
     ESP_LOGI(TAG, "booted in %d ms", (int)((esp_timer_get_time() - t0) / 1000));
+
+    /* THE HIF CONTROL GOES HERE, BEFORE ANY VIRTUAL SENSOR -- and it has to be
+     * AFTER the boot, which is where the vendor puts it
+     * (SensorLib BoschSensorBase, immediately after uploadFirmware and before
+     * getKernelVersion).
+     *
+     * WHY IT MATTERS: status packets are what BHY2's
+     * bhy2_hif_wait_status_ready() polls for, and it retries
+     * BHY2_QUERY_PARAM_STATUS_READY_MAX_RETRY (1000) times at 10 ms -- ten
+     * seconds per command -- before giving up. Without the async status channel
+     * selected, those status bits never arrive, so every command that waits for
+     * one burns its full ten seconds. Setting this first is the difference
+     * between a sensor configuration that takes milliseconds and one that
+     * appears to hang.
+     *
+     * The vendor also reads the control back and complains when the bit did not
+     * take, which is the check reproduced below. */
+    rc = bhy2_set_host_intf_ctrl(BHY2_HIF_CTRL_ASYNC_STATUS_CHANNEL, &s_bhy2);
+    if (rc != BHY2_OK)
+    {
+        snprintf(s_why, sizeof(s_why), "set_host_intf_ctrl failed (%d)", rc);
+        return false;
+    }
+    {
+        uint8_t ctrl = 0;
+        if (bhy2_get_host_intf_ctrl(&ctrl, &s_bhy2) == BHY2_OK)
+        {
+            ESP_LOGI(TAG, "host intf ctrl %02x (async status %s)", ctrl,
+                     (ctrl & BHY2_HIF_CTRL_ASYNC_STATUS_CHANNEL) ? "on" : "OFF");
+            if (!(ctrl & BHY2_HIF_CTRL_ASYNC_STATUS_CHANNEL))
+                ESP_LOGW(TAG, "async status channel did not take");
+        }
+    }
+
+    /* Listen for the part's own verdicts before asking it to do anything.
+     *
+     * TWO ids, because meta events arrive on either the normal (254) or the
+     * wakeup (248) channel depending on the event, and the vendor registers
+     * both -- SensorLib, BoschSensorBase, does exactly this pair. Registering
+     * only the first is why a rejected configuration can look like silence. */
+    (void)bhy2_register_fifo_parse_callback(BHY2_SYS_ID_META_EVENT, on_meta, NULL,
+                                            &s_bhy2);
+    (void)bhy2_register_fifo_parse_callback(BHY2_SYS_ID_META_EVENT_WU, on_meta,
+                                            NULL, &s_bhy2);
+
+    /* POPULATE THE SENSOR BITMAP NOW, ONCE. bhy2_is_sensor_available() reads a
+     * bitmap that bhy2_get_virt_sensor_list() fills; asking before that reports
+     * "no sensors at all", which reads as a firmware that cannot do the job. It
+     * cost a build cycle spent chasing the wrong thing -- the accelerometer was
+     * there the whole time. */
+    s_present_n = imu_list_sensors(s_present, sizeof(s_present));
+    ESP_LOGI(TAG, "%d virtual sensors: %s", s_present_n, s_present);
     return true;
 }
 
@@ -294,6 +356,47 @@ static void on_accel(const struct bhy2_fifo_parse_data_info *info, void *priv)
     s_have_accel = true;
 }
 
+/* META EVENTS ARE THE PART'S ONLY WAY OF SAYING NO. Every BHY2 command comes
+ * back as "accepted"; whether the part then honours it arrives later as a meta
+ * event on the same FIFO, and a rejected configuration looks exactly like an
+ * accepted one unless something listens. Registering this is what turned "cfg
+ * returned 0 and then nothing ever happened" into a readable answer. */
+static void on_meta(const struct bhy2_fifo_parse_data_info *info, void *priv)
+{
+    (void)priv;
+    if (info->data_size < 1)
+        return;
+    const uint8_t ev = info->data_ptr[0];
+    const char *name = "?";
+    switch (ev)
+    {
+    case BHY2_META_EVENT_FLUSH_COMPLETE:        name = "flush complete"; break;
+    case BHY2_META_EVENT_SAMPLE_RATE_CHANGED:   name = "sample rate changed"; break;
+    case BHY2_META_EVENT_POWER_MODE_CHANGED:    name = "power mode changed"; break;
+    case BHY2_META_EVENT_SENSOR_STATUS:         name = "sensor status"; break;
+    case BHY2_META_EVENT_SENSOR_ERROR:          name = "SENSOR ERROR"; break;
+    case BHY2_META_EVENT_FIFO_OVERFLOW:         name = "fifo overflow"; break;
+    case BHY2_META_EVENT_DYNAMIC_RANGE_CHANGED: name = "range changed"; break;
+    case BHY2_META_EVENT_FIFO_WATERMARK:        name = "fifo watermark"; break;
+    case BHY2_META_EVENT_INITIALIZED:           name = "initialised"; break;
+    case BHY2_META_EVENT_RESET:                 name = "reset"; break;
+    case BHY2_META_EVENT_ALGORITHM_EVENTS:      name = "algorithm event"; break;
+    default: break;
+    }
+    /* Routine events (sample rate changed, power mode, the initial handshake)
+     * are DEBUG: they happen once per configuration and then never again, so
+     * putting them at INFO fills the console of anyone who runs the command.
+     * The ones worth seeing by default are the failures. */
+    const bool loud = ev == BHY2_META_EVENT_SENSOR_ERROR ||
+                      ev == BHY2_META_EVENT_FIFO_OVERFLOW;
+    if (loud)
+        ESP_LOGW(TAG, "meta %u (%s) sensor %u", ev, name,
+                 info->data_size > 1 ? info->data_ptr[1] : 0);
+    else
+        ESP_LOGD(TAG, "meta %u (%s) sensor %u", ev, name,
+                 info->data_size > 1 ? info->data_ptr[1] : 0);
+}
+
 /* ---------------------------------------------------------- start/stop */
 
 const char *imu_why(void)
@@ -304,6 +407,42 @@ const char *imu_why(void)
 bool imu_ready(void)
 {
     return s_ready;
+}
+
+/* Fill "3 61 63 ..." with every virtual sensor id the firmware carries. */
+static int imu_list_sensors(char *out, size_t cap)
+{
+    size_t pos = 0;
+    int n = 0;
+
+    if (out && cap)
+        out[0] = '\0';
+
+    /* UPDATE, NOT JUST GET -- and the difference is the whole reason nothing
+     * ever arrived.
+     *
+     * bhy2_get_virt_sensor_list() fills the presence bitmap, which is all that
+     * bhy2_is_sensor_available() needs. bhy2_update_virtual_sensor_list() does
+     * that AND queries each sensor's info to fill dev->event_size[], which is
+     * how the FIFO parser knows how long a packet for a given sensor id is.
+     * Without those sizes it cannot frame anything, so it dispatches nothing:
+     * the sensor is configured, the part streams, the drain succeeds, and zero
+     * samples reach the callbacks -- which is exactly what was observed for two
+     * build cycles.
+     *
+     * The vendor calls both, in this order (SensorLib BoschSensorBase: update,
+     * then get). Reproduced here. */
+    (void)bhy2_update_virtual_sensor_list(&s_bhy2);
+
+    for (int id = 1; id < 255; id++)
+    {
+        if (!bhy2_is_sensor_available((uint8_t)id, &s_bhy2))
+            continue;
+        n++;
+        if (out && pos + 6 < cap)
+            pos += (size_t)snprintf(out + pos, cap - pos, "%s%d", pos ? " " : "", id);
+    }
+    return n;
 }
 
 bool imu_start(void)
@@ -443,7 +582,66 @@ bool imu_accel_enable(float hz)
     if (!s_ready)
         return false;
 
-    int8_t rc = bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_ACC, hz, 0, &s_bhy2);
+    /* ASK THE FIRMWARE WHAT IT HAS BEFORE ASKING IT TO DO ANYTHING. This is the
+     * check the vendor's own `configure()` makes first, and leaving it out cost
+     * a cycle: bhy2_set_virt_sensor_cfg() returns BHY2_OK for a sensor the
+     * uploaded firmware does not carry, and then simply never produces a
+     * sample. The part's FIFO stays empty and nothing anywhere says why.
+     *
+     * It matters here specifically because the firmware image is a CHOICE. KLIO
+     * (121 KB, what this port uploads, and what LilyGo's own watch firmware
+     * uses) and the "shuttle" builds (680 KB, what SensorLib's examples use) do
+     * not carry the same set of virtual sensors. */
+    if (!bhy2_is_sensor_available(BHY2_SENSOR_ID_ACC, &s_bhy2))
+    {
+        /* WHICH FIRMWARE IS LOADED DECIDES THIS, and the answer is not a
+         * detail: the KLIO image this port uploads (121 KB, and what LilyGo's
+         * own watch firmware uses) does NOT carry the accelerometer virtual
+         * sensor, while the "shuttle" builds SensorLib's examples use (680 KB)
+         * do. So enumerate what IS there rather than guessing. */
+        ESP_LOGE(TAG, "this firmware has no accelerometer virtual sensor");
+        s_present_n = imu_list_sensors(s_present, sizeof(s_present));
+        ESP_LOGI(TAG, "%d sensors: %s", s_present_n, s_present);
+        snprintf(s_why, sizeof(s_why),
+                 "the uploaded firmware carries %d virtual sensors, none of them"
+                 " the accelerometer", s_present_n);
+        return false;
+    }
+
+    /* TELL THE PART HOW OFTEN TO HAND OVER DATA, because the default is "when
+     * the FIFO is nearly full". With a default watermark the accelerometer
+     * delivers about 26 samples once a second and nothing in between, which is
+     * useless for a window redrawing at 4 Hz and leaves the FIFO on the edge of
+     * overflowing ("meta 12 fifo overflow"). Both knobs are set here:
+     *
+     *   report latency  20 ms -> the part flushes on its own clock, so samples
+     *                            arrive steadily instead of in a second-long
+     *                            lurch
+     *   FIFO watermark  32 bytes -> interrupts early, so a poll has something to
+     *                            read rather than waiting for a batch
+     *
+     * Reading the API docs: latency is the maximum time data may sit in the
+     * part before being reported, and the watermark is the level that triggers
+     * the interrupt. They are complementary, not alternatives -- latency alone
+     * still leaves a full second of silence if the watermark is high.
+     */
+    (void)bhy2_set_fifo_wmark_wkup(32, &s_bhy2);
+
+    /* Instrumented because this call is where a stall shows up, and a stall
+     * here takes the shell task with it. The interrupt status is read first so
+     * the log says whether the part was signalling before we asked it to do
+     * anything -- BHY2_IST_MASK_STATUS is what the SDK's wait loop polls. */
+    {
+        uint8_t ist = 0;
+        if (bhy2_get_interrupt_status(&ist, &s_bhy2) == BHY2_OK)
+            ESP_LOGI(TAG, "before cfg: int status %02x (status-ready %s)", ist,
+                     (ist & BHY2_IST_MASK_STATUS) ? "set" : "CLEAR");
+    }
+    const int64_t tc = esp_timer_get_time();
+    ESP_LOGI(TAG, "configuring accel at %.0f Hz...", (double)hz);
+    int8_t rc = bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_ACC, hz, 20, &s_bhy2);
+    ESP_LOGI(TAG, "cfg returned %d after %d ms", rc,
+             (int)((esp_timer_get_time() - tc) / 1000));
     if (rc != BHY2_OK)
     {
         ESP_LOGW(TAG, "accelerometer config %s failed (%d)",
@@ -468,6 +666,21 @@ bool imu_poll(void)
 {
     if (!s_ready || !s_sensor_on)
         return false;
+
+    /* DRAIN EVERY TIME, WITHOUT ASKING PERMISSION FIRST.
+     *
+     * There used to be a check here -- read the interrupt status and return
+     * early when it says nothing is waiting -- on the theory that an idle poll
+     * should cost one transaction. It cost correctness instead: the part raises
+     * its interrupt on a FIFO WATERMARK, so between interrupts twenty-odd
+     * samples accumulate, and a gate that trusts a stale status bit lets the
+     * FIFO fill until it overflows ("meta 12 fifo overflow" on the console) and
+     * silently drops data. bhy2_get_and_process_fifo() already reads the status
+     * itself and drains both channels, so the honest thing is to call it.
+     *
+     * The hang the gate was written for was a different bug: the missing
+     * async-status-channel control, fixed above. One bug does not justify a
+     * filter that discards data. */
     return bhy2_get_and_process_fifo(s_fifo, sizeof(s_fifo), &s_bhy2) == BHY2_OK;
 }
 
@@ -490,7 +703,11 @@ bool imu_accel(float *x, float *y, float *z, uint32_t *count)
 static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
 {
     (void)session;
-    const bool stop = argc >= 2 && argv[1][0] == 'x';
+    /* strcmp, not a first letter: "stop" and "scan" both start with 's', and
+     * a first-letter dispatch silently sent `imu scan` to the status branch
+     * for one build cycle. */
+    const char *sub = argc >= 2 ? argv[1] : "";
+    const bool stop = strcmp(sub, "stop") == 0;
 
     if (stop)
     {
@@ -518,7 +735,53 @@ static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
      * own task takes the terminal with it -- Ctrl+C does not reach a command
      * that never returns. So the default path touches nothing that can hang,
      * and the one that can is asked for by name. */
-    if (!(argc >= 2 && argv[1][0] == 'a'))
+    if (strcmp(sub, "rate") == 0)
+    {
+        /* WHAT RATE DOES IT ACTUALLY DELIVER? A burst command cannot answer
+         * that -- it stops at the first sample -- and "it returned a number" is
+         * not the same as "it keeps returning numbers". This polls hard for a
+         * fixed window and reports the count, which is the figure a window
+         * redrawing at 4 Hz needs to know. */
+        if (!s_ready && !imu_start())
+        {
+            printf("imu: %s\n", imu_why());
+            return 1;
+        }
+        if (!s_sensor_on && !imu_accel_enable(100.0f))
+        {
+            printf("imu: could not start the accelerometer\n");
+            return 1;
+        }
+        const uint32_t before = s_accel_count;
+        const int64_t t0 = esp_timer_get_time();
+        int polls = 0;
+        while (esp_timer_get_time() - t0 < 2000000)
+        {
+            imu_poll();
+            polls++;
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+        const int64_t dt = esp_timer_get_time() - t0;
+        const uint32_t got = s_accel_count - before;
+        printf("%lu samples in %d ms (%d polls) = %.1f Hz\n",
+               (unsigned long)got, (int)(dt / 1000), polls,
+               got * 1000000.0 / (double)dt);
+        return 0;
+    }
+
+    if (strcmp(sub, "scan") == 0)
+    {
+        if (s_present_n < 0)
+            s_present_n = imu_list_sensors(s_present, sizeof(s_present));
+        printf("firmware carries %d virtual sensors:\n", s_present_n);
+        printf("  %s\n", s_present);
+        printf("names: 61 pickup-gesture 63 ar 67 wrist-tilt-gesture\n");
+        printf("       69 device-orientation 70 device-ori-wakeup\n");
+        printf("       75 stationary-detect 77 motion-detect\n");
+        return 0;
+    }
+
+    if (strcmp(sub, "accel") != 0)
     {
         printf("accel: %s (use `imu accel` for samples)\n",
                s_sensor_on ? "on" : "off");
@@ -536,12 +799,17 @@ static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
     float x = 0, y = 0, z = 0;
     uint32_t n = 0;
     bool have = false;
+    int polls = 0, fired = 0;
     for (int i = 0; i < 40 && !have; i++)
     {
         vTaskDelay(pdMS_TO_TICKS(25));
-        imu_poll();
+        polls++;
+        if (imu_poll())
+            fired++;
         have = imu_accel(&x, &y, &z, &n);
     }
+    ESP_LOGI(TAG, "%d polls, %d drained, %lu samples", polls, fired,
+             (unsigned long)n);
 
     if (!have)
     {
@@ -549,15 +817,39 @@ static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
         return 1;
     }
 
-    printf("accel  x %+6.2f  y %+6.2f  z %+6.2f g   (%lu samples)\n",
-           x, y, z, (unsigned long)n);
-    printf("       flat on a table, one axis reads about +-1.00\n");
+    /* A BURST, NOT A SNAPSHOT. One reading cannot be distinguished from a
+     * frozen register; five taken as they arrive show that the numbers are
+     * moving, which is the only evidence that means anything from a sensor. */
+    printf("accel, in g (a watch lying flat reads about +1.00 on one axis):\n");
+    printf("  x %+6.2f   y %+6.2f   z %+6.2f\n", x, y, z);
+    for (int i = 0; i < 4; i++)
+    {
+        /* `n` MUST BE REFRESHED INSIDE THIS LOOP. The first version compared the
+         * sample count without ever updating it, so the wait always timed out and
+         * the burst printed one line -- while `imu rate` on the same sensor
+         * measured 97.5 Hz. A stale loop variable is not evidence about the
+         * device. */
+        const int64_t until = esp_timer_get_time() + 400000;
+        const uint32_t before = n;
+        while (esp_timer_get_time() < until)
+        {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            imu_poll();
+            imu_accel(&x, &y, &z, &n);
+            if (n != before)
+                break;
+        }
+        if (n == before)
+            break;          /* nothing new in 400 ms: stop rather than pad */
+        printf("  x %+6.2f   y %+6.2f   z %+6.2f\n", x, y, z);
+    }
+    printf("%lu samples so far\n", (unsigned long)n);
     return 0;
 }
 
 static const tdsh_command_t s_imu_cmd = {
     "imu",
-    "imu [accel|stop]",
+    "imu [accel|rate|scan|stop]",
     "The BHI260AP: uploads its firmware on first use, then shows acceleration",
     cmd_imu,
     TDSH_CMD_INTERACTIVE,
