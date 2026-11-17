@@ -33,6 +33,7 @@
  */
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_heap_caps.h"
@@ -897,34 +898,226 @@ bool imu_orientation(float *heading, float *pitch, float *roll)
     return true;
 }
 
-/* ------------------------------------------------------------- the command */
+/* ------------------------------------------------------- status, at last ---- */
 
-/* Inject one payload shape and report whether the reading moved to it.
+/* WHAT DID THE PART ACTUALLY SAY?
  *
- * Three sends because a single packet may be dropped; NORMAL mode afterwards
- * because a part left in an injection mode is in an unknown state for the next
- * test. The success test is the value itself, not the return code: the return
- * code was 0 for a shape that did nothing, which is exactly why this measures
- * the reading instead of trusting the API. */
-static bool try_inject(const char *name, const uint8_t *payload, uint16_t len,
-                       enum bhy2_data_inj_mode mode, float bx, float by, float *bz)
+ * This is the hole the entry-51 injection test left, and it is structural rather
+ * than a mistake in that test. EVERY BHY2 command on this SDK's command path is
+ * fire-and-forget: bhy2_hif_exec_cmd() writes the packet to CHAN_CMD and returns
+ * BHY2_OK as soon as the I2C write completes. It never waits for the status
+ * response and never reads it. So "accepted" in every message this driver has
+ * printed has meant "the bytes left the ESP32" -- and the verdict that injection
+ * is inert was reached without once asking the part what it thought of the
+ * payload.
+ *
+ * The part answers on a separate channel, and bhy2_defs.h names what it can say:
+ *
+ *   0x04  INJECT_SENSOR_CONF_REQ   "tell me which sensor this data is for"
+ *   0x0f  CMD_ERR                  rejected outright
+ *
+ * Two answers, two completely different futures: 0x04 means injection is alive
+ * and the handshake was simply never implemented on this side; 0x0f means the
+ * handler is compiled out and the only route is our own firmware for the Fuser
+ * core.
+ *
+ * THE SEQUENCE IS BORROWED FROM BOSCH, not invented. bhy2_hif_get_parameter()
+ * is the one path in this SDK that reads a response: it clears the async status
+ * bit, execs the command, waits for BHY2_IST_MASK_STATUS, then pulls the status
+ * FIFO. That is what happens here, and the async bit has to be cleared BEFORE
+ * the command goes out -- with it set, the response is delivered asynchronously
+ * into the data FIFO and a synchronous read finds nothing.
+ *
+ * THE TIMEOUT IS OURS. bhy2_read_status() waits 1000 x 10 ms = ten seconds for a
+ * status that may never come, inside the shell's own task, and a call that
+ * cannot be interrupted takes the terminal with it. So the interrupt-status
+ * register is polled here first, and read_status() is only called once it says
+ * something is waiting.
+ */
+
+/* Name a status code. bhy2_defs.h's list, and the two that matter here. */
+static const char *status_name(uint16_t code)
 {
-    int8_t rc = bhy2_set_data_injection_mode(mode, imu_dev());
-    if (rc != BHY2_OK)
+    switch (code)
     {
-        printf("  %-22s mode refused (%d)\n", name, rc);
+    case BHY2_STATUS_INITIALIZED:            return "initialised";
+    case BHY2_STATUS_DEBUG_OUTPUT:           return "debug output";
+    case BHY2_STATUS_CRASH_DUMP:             return "CRASH DUMP";
+    case BHY2_STATUS_INJECT_SENSOR_CONF_REQ: return "INJECT SENSOR CONF REQ";
+    case BHY2_STATUS_SW_PASS_THRU_RES:       return "passthru result";
+    case BHY2_STATUS_SELF_TEST_RES:          return "self-test result";
+    case BHY2_STATUS_FOC_RES:                return "foc result";
+    case BHY2_STATUS_SYSTEM_ERROR:           return "SYSTEM ERROR";
+    case BHY2_STATUS_SENSOR_ERROR:           return "SENSOR ERROR";
+    case BHY2_STATUS_FLASH_ERASE_COMPLETE:   return "flash erase done";
+    case BHY2_STATUS_FLASH_WRITE_COMPLETE:   return "flash write done";
+    case BHY2_STATUS_FLASH_CONTINUE_UPLOAD:  return "flash upload cont";
+    case BHY2_STATUS_HOST_EV_TIMESTAMP:      return "host timestamp";
+    case BHY2_STATUS_DUT_TEST_RES:           return "dut test result";
+    case BHY2_STATUS_CMD_ERR:                return "CMD ERR";
+    default: break;
+    }
+    if (BHY2_IS_STATUS_GET_PARAM_OUTPUT(code))
+        return "parameter output";
+    return "unrecognised";
+}
+
+/* What the sweep saw, counted rather than printed line by line: the terminal is
+ * 26 rows and a per-exchange transcript scrolls the answer off the top. One line
+ * per shape plus a summary is what actually gets read. */
+#define IMU_STATUS_PAYLOAD 16
+
+static uint16_t s_status_code[8];
+static int      s_status_hits[8];
+static int      s_status_n;
+static int      s_status_total;
+static int      s_status_silent;
+static uint16_t s_last_code;
+static uint8_t  s_last_payload[IMU_STATUS_PAYLOAD];
+static uint32_t s_last_len;
+static bool     s_last_have;
+
+static void status_reset(void)
+{
+    s_status_n = 0;
+    s_status_total = 0;
+    s_status_silent = 0;
+    s_last_have = false;
+    s_last_len = 0;
+}
+
+static void status_tally(uint16_t code)
+{
+    s_status_total++;
+    for (int i = 0; i < s_status_n; i++)
+    {
+        if (s_status_code[i] == code)
+        {
+            s_status_hits[i]++;
+            return;
+        }
+    }
+    if (s_status_n < 8)
+    {
+        s_status_code[s_status_n] = code;
+        s_status_hits[s_status_n] = 1;
+        s_status_n++;
+    }
+}
+
+/* Switch the part to synchronous status and back. */
+typedef struct
+{
+    uint8_t saved_ctrl;
+    bool    was_async;
+} imu_status_ctx_t;
+
+static void status_sync_begin(imu_status_ctx_t *ctx)
+{
+    ctx->saved_ctrl = 0;
+    ctx->was_async = false;
+
+    if (bhy2_get_host_intf_ctrl(&ctx->saved_ctrl, &s_bhy2) != BHY2_OK)
+        return;
+
+    if (ctx->saved_ctrl & BHY2_HIF_CTRL_ASYNC_STATUS_CHANNEL)
+    {
+        ctx->was_async = true;
+        (void)bhy2_set_host_intf_ctrl(
+            (uint8_t)(ctx->saved_ctrl & ~BHY2_HIF_CTRL_ASYNC_STATUS_CHANNEL), &s_bhy2);
+    }
+}
+
+static void status_sync_end(const imu_status_ctx_t *ctx)
+{
+    if (ctx->was_async)
+        (void)bhy2_set_host_intf_ctrl(ctx->saved_ctrl, &s_bhy2);
+}
+
+/* Wait up to `budget_ms` for one status response. Records it; prints nothing.
+ * The caller decides how to say it, because the answer belongs on one line. */
+static bool status_read_one(int budget_ms)
+{
+    const int64_t t0 = esp_timer_get_time();
+    bool ready = false;
+
+    while (esp_timer_get_time() - t0 < (int64_t)budget_ms * 1000)
+    {
+        uint8_t ist = 0;
+        if (bhy2_get_interrupt_status(&ist, &s_bhy2) == BHY2_OK &&
+            (ist & BHY2_IST_MASK_STATUS))
+        {
+            ready = true;
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+
+    if (!ready)
+    {
+        s_status_silent++;
         return false;
     }
 
-    bool accepted = false;
+    uint16_t code = 0;
+    uint32_t got = 0;
+
+    if (bhy2_read_status(&code, s_last_payload, IMU_STATUS_PAYLOAD, &got,
+                         &s_bhy2) != BHY2_OK)
+    {
+        s_status_silent++;
+        return false;
+    }
+
+    s_last_code = code;
+    s_last_len = got > IMU_STATUS_PAYLOAD ? IMU_STATUS_PAYLOAD : got;
+    s_last_have = true;
+    status_tally(code);
+    return true;
+}
+
+/* One shape, one line.
+ *
+ * The previous version printed six lines per shape -- mode rc, three inject rc's,
+ * three status waits -- which is 40 lines of transcript and the terminal holds
+ * 26, so the summary that answers the question scrolled off the top. What is
+ * actually needed is: did the part say anything, and did the value move.
+ *
+ * `status` collapses to "none" when the part said nothing at all, and names the
+ * code (with its payload) when it did. Those two are different answers and the
+ * whole experiment turns on which one this firmware gives. */
+static bool try_inject(const char *name, const uint8_t *payload, uint16_t len,
+                       enum bhy2_data_inj_mode mode, float bx, float by, float *bz)
+{
+    (void)bx;
+    (void)by;
+
+    imu_status_ctx_t ctx;
+    status_sync_begin(&ctx);
+
+    int8_t rc = bhy2_set_data_injection_mode(mode, imu_dev());
+    if (rc != BHY2_OK)
+    {
+        status_sync_end(&ctx);
+        printf("  %-22s mode REFUSED rc %d\n", name, rc);
+        return false;
+    }
+    (void)status_read_one(120);
+
+    int sent = 0;
     for (int i = 0; i < 3; i++)
     {
         rc = bhy2_inject_data(payload, len, imu_dev());
         if (rc != BHY2_OK)
             break;
-        accepted = true;
-        vTaskDelay(pdMS_TO_TICKS(10));
+        sent++;
+        (void)status_read_one(120);
+        vTaskDelay(pdMS_TO_TICKS(8));
     }
+
+    /* Back to async before touching the FIFO: with the bit clear, data events and
+     * status responses share a channel and nothing parses. */
+    status_sync_end(&ctx);
 
     float x = 0, y = 0, z = 0;
     uint32_t n = 0;
@@ -938,10 +1131,20 @@ static bool try_inject(const char *name, const uint8_t *payload, uint16_t len,
     (void)bhy2_set_data_injection_mode(BHY2_NORMAL_MODE, imu_dev());
 
     const bool landed = got && fabsf(z - 2.50f) < 0.12f;
-    printf("  %-22s %-9s z %+6.2f%s\n", name, accepted ? "accepted" : "refused",
-           got ? (double)z : (double)*bz, landed ? "   <-- LANDED" : "");
-    (void)bx;
-    (void)by;
+
+    printf("  %-22s %ux %s z %+5.2f%s\n", name, sent,
+           s_last_have ? "said" : "silent", got ? (double)z : (double)*bz,
+           landed ? "  <-- LANDED" : "");
+
+    if (s_last_have)
+    {
+        printf("      -> 0x%04x %s", (unsigned)s_last_code, status_name(s_last_code));
+        for (uint32_t i = 0; i < s_last_len; i++)
+            printf(" %02x", s_last_payload[i]);
+        printf("\n");
+        s_last_have = false;
+    }
+
     if (landed)
         *bz = z;
     return landed;
@@ -1061,7 +1264,22 @@ static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
             printf("imu: sensor not started\n");
             return 1;
         }
+        /* `imu inject <n>` runs ONE shape. With six shapes in a sweep, a change
+         * in the error register cannot be attributed to any of them; one shape
+         * per run is what makes 0x2e evidence rather than aftermath. */
+        int want = 0;
+        if (argc >= 3)
+        {
+            want = atoi(argv[2]);
+            if (want < 1 || want > 6)
+            {
+                printf("imu inject [1..6]\n");
+                return 1;
+            }
+        }
+
         (void)imu_accel_enable(50.0f);
+        status_reset();
 
         float bx = 0, by = 0, bz = 0;
         uint32_t bn = 0;
@@ -1081,20 +1299,26 @@ static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
             uint8_t pay[28];
             memcpy(pay, tmp, sizeof(pay));
 
-            tried++;
-            if (try_inject("28B float frame", pay, sizeof(pay),
-                           BHY2_STEP_BY_STEP_INJECTION, bx, by, &bz))
-                landed++;
+            if (!want || want == 1)
+            {
+                tried++;
+                if (try_inject("28B float frame", pay, sizeof(pay),
+                               BHY2_STEP_BY_STEP_INJECTION, bx, by, &bz))
+                    landed++;
+            }
 
             /* The same 28 bytes behind a uint16 sensor id: KLIO_LOG. */
             uint8_t pay30[30];
             pay30[0] = (uint8_t)(BHY2_SENSOR_ID_KLIO_LOG & 0xFF);
             pay30[1] = 0;
             memcpy(pay30 + 2, pay, sizeof(pay));
-            tried++;
-            if (try_inject("30B id+float frame", pay30, sizeof(pay30),
-                           BHY2_STEP_BY_STEP_INJECTION, bx, by, &bz))
-                landed++;
+            if (!want || want == 2)
+            {
+                tried++;
+                if (try_inject("30B id+float frame", pay30, sizeof(pay30),
+                               BHY2_STEP_BY_STEP_INJECTION, bx, by, &bz))
+                    landed++;
+            }
         }
 
         /* ---- the short forms ---- */
@@ -1104,29 +1328,38 @@ static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
             int16_t v[3] = {0, 0, (int16_t)(2.50f * 4096.0f)};
             memcpy(p8, &id, 2);
             memcpy(p8 + 2, v, 6);
-            tried++;
-            if (try_inject("8B id+i16 (recheck)", p8, sizeof(p8),
-                           BHY2_STEP_BY_STEP_INJECTION, bx, by, &bz))
-                landed++;
+            if (!want || want == 3)
+            {
+                tried++;
+                if (try_inject("8B id+i16 (recheck)", p8, sizeof(p8),
+                               BHY2_STEP_BY_STEP_INJECTION, bx, by, &bz))
+                    landed++;
+            }
 
             uint8_t p10[10];
             uint16_t ts = 0;
             memcpy(p10, &id, 2);
             memcpy(p10 + 2, &ts, 2);
             memcpy(p10 + 4, v, 6);
-            tried++;
-            if (try_inject("10B id+ts+i16", p10, sizeof(p10),
-                           BHY2_STEP_BY_STEP_INJECTION, bx, by, &bz))
-                landed++;
+            if (!want || want == 4)
+            {
+                tried++;
+                if (try_inject("10B id+ts+i16", p10, sizeof(p10),
+                               BHY2_STEP_BY_STEP_INJECTION, bx, by, &bz))
+                    landed++;
+            }
 
             uint8_t p8w[8];
             id = BHY2_SENSOR_ID_ACC_WU;
             memcpy(p8w, &id, 2);
             memcpy(p8w + 2, v, 6);
-            tried++;
-            if (try_inject("8B ACC_WU+i16", p8w, sizeof(p8w),
-                           BHY2_STEP_BY_STEP_INJECTION, bx, by, &bz))
-                landed++;
+            if (!want || want == 5)
+            {
+                tried++;
+                if (try_inject("8B ACC_WU+i16", p8w, sizeof(p8w),
+                               BHY2_STEP_BY_STEP_INJECTION, bx, by, &bz))
+                    landed++;
+            }
         }
 
         /* ---- and the plausible winner again, in real-time mode ---- */
@@ -1134,26 +1367,356 @@ static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
             float tmp[7] = {0.0f, 0.0f, 0.0f, 2.50f, 0.0f, 0.0f, 0.0f};
             uint8_t pay[28];
             memcpy(pay, tmp, sizeof(pay));
-            tried++;
-            if (try_inject("28B float, real-time", pay, sizeof(pay),
-                           BHY2_REAL_TIME_INJECTION, bx, by, &bz))
-                landed++;
+            if (!want || want == 6)
+            {
+                tried++;
+                if (try_inject("28B float, real-time", pay, sizeof(pay),
+                               BHY2_REAL_TIME_INJECTION, bx, by, &bz))
+                    landed++;
+            }
         }
 
         printf("\n%d of %d shapes landed.\n", landed, tried);
-        if (landed)
-            printf("ARBITRARY DATA REACHES THE PART -- a classifier here can be\n"
-                   "trained from a file, not only from a hand.\n");
-        else
-            printf("None landed. Either this firmware refuses injection despite\n"
-                   "accepting the commands, or the payload needs a field none of\n"
-                   "these shapes has. `meta 11 sensor error` in the log would\n"
-                   "mean the shape was parsed and rejected; silence means it was\n"
-                   "dropped before that.\n");
 
+        /* THE ANSWER THIS EXPERIMENT EXISTS FOR. Entry 51 concluded from the
+         * line above alone, and that line only ever measured whether the value
+         * moved -- it could not tell "refused" from "accepted and ignored". The
+         * status codes separate those, and `s_status_silent` bounds the
+         * conclusion: if the part said nothing at all to six exchanges, then the
+         * commands are not reaching a handler that answers, whatever else is
+         * true. */
+        printf("status channel: %d responses, %d exchanges with no response\n",
+               s_status_total, s_status_silent);
+
+        for (int i = 0; i < s_status_n; i++)
+            printf("  0x%04x %-24s x%d\n", (unsigned)s_status_code[i],
+                   status_name(s_status_code[i]), s_status_hits[i]);
+
+        bool saw_conf_req = false, saw_cmd_err = false;
+        for (int i = 0; i < s_status_n; i++)
+        {
+            if (s_status_code[i] == BHY2_STATUS_INJECT_SENSOR_CONF_REQ)
+                saw_conf_req = true;
+            if (s_status_code[i] == BHY2_STATUS_CMD_ERR)
+                saw_cmd_err = true;
+        }
+
+        if (landed)
+            printf("\nARBITRARY DATA REACHES THE PART -- a classifier here can be\n"
+                   "trained from a file, not only from a hand.\n");
+        else if (saw_conf_req)
+            printf("\nTHE PART ASKED FOR A SENSOR CONFIGURATION (0x0004). Injection\n"
+                   "is ALIVE in this firmware and waiting for a handshake this\n"
+                   "driver never implemented -- it wants to be told which sensor's\n"
+                   "data is being supplied. That is the next thing to build.\n");
+        else if (saw_cmd_err)
+            printf("\nTHE PART ANSWERED CMD ERR (0x000f). Injection is refused, not\n"
+                   "merely ignored, on this firmware. The route to feeding it a\n"
+                   "file is our own code on the Fuser core.\n");
+        else if (s_status_total == 0)
+            printf("\nSILENCE. Six exchanges, no status response at all, and the\n"
+                   "value never moved. The commands are written to CHAN_CMD and\n"
+                   "nothing answers them -- consistent with a firmware built\n"
+                   "without the injection handler, and NOT the same evidence as\n"
+                   "a refusal.\n");
+        else
+            printf("\nNone landed. The statuses above are the whole answer the part\n"
+                   "gave; `meta 11 sensor error` in the log would mean a shape was\n"
+                   "parsed and rejected.\n");
+
+        /* PUT THE INTERFACE BACK. bhy2_hif_set_inject_data_mode() -- the SDK's
+         * own helper behind bhy2_set_data_injection_mode() -- reads the host
+         * interface control register, CLEARS the async status bit, sends the
+         * mode command, and never restores it. Every call to it, including the
+         * NORMAL_MODE one that ends each attempt above, leaves the part with
+         * asynchronous status reporting switched off for the rest of the
+         * session. Measured: reg 0x06 read 0x00 after a sweep, where boot leaves
+         * it at 0x80. That is an SDK defect, not this driver's, and it is
+         * invisible until something depends on async status. */
         (void)bhy2_set_data_injection_mode(BHY2_NORMAL_MODE, &s_bhy2);
+        (void)bhy2_set_host_intf_ctrl(BHY2_HIF_CTRL_ASYNC_STATUS_CHANNEL, &s_bhy2);
         (void)imu_accel_enable(0.0f);
         return landed ? 0 : 1;
+    }
+
+    /* Read the part's own registers. "Dig around in this chip" needs a window
+     * that is not the API: everything above goes through the SDK, and the SDK
+     * is exactly what is in question. These are the documented registers, one
+     * byte each, read straight off the I2C bus. */
+    if (strcmp(sub, "reg") == 0)
+    {
+        if (argc >= 3)
+        {
+            char *end = NULL;
+            const unsigned long a = strtoul(argv[2], &end, 16);
+            if (!end || *end || a > 0x3F)
+            {
+                printf("imu reg <hex 00..3f>\n");
+                return 1;
+            }
+            uint8_t v = 0;
+            const int8_t rc = bhy2_get_regs((uint8_t)a, &v, 1, &s_bhy2);
+            printf("reg 0x%02lx = 0x%02x (%u) rc %d\n", a, v, v, rc);
+            return 0;
+        }
+
+        static const struct { uint8_t addr; const char *name; } regs[] = {
+            {0x1C, "product id"},   {0x1D, "revision id"},  {0x1E, "rom version"},
+            {0x20, "kernel ver"},   {0x22, "user version"}, {0x24, "feature status"},
+            {0x25, "boot status"},  {0x2B, "chip id"},      {0x2D, "int status"},
+            {0x2E, "error value"},  {0x2F, "error aux"},    {0x30, "debug value"},
+            {0x31, "debug state"},  {0x06, "hif ctrl"},     {0x17, "host status"},
+        };
+        for (size_t i = 0; i < sizeof(regs) / sizeof(regs[0]); i++)
+        {
+            uint8_t v = 0;
+            if (bhy2_get_regs(regs[i].addr, &v, 1, &s_bhy2) != BHY2_OK)
+            {
+                printf("  0x%02x %-14s <read failed>\n", regs[i].addr, regs[i].name);
+                continue;
+            }
+            printf("  0x%02x %-14s 0x%02x  %3u\n", regs[i].addr, regs[i].name, v, v);
+        }
+        return 0;
+    }
+
+    /* POSITIVE CONTROL, and the reason it is not optional.
+     *
+     * "The status channel said nothing to 24 commands" is only evidence if the
+     * status channel can be shown to say something at all. bhy2_get_parameter()
+     * is the one call in this SDK that waits for and reads a status response --
+     * exactly the plumbing status_read_one() borrows -- so a parameter read that
+     * returns its payload proves the reading is right, and a parameter read that
+     * hangs or returns nothing would mean the instrument is broken and the
+     * silence above means nothing.
+     *
+     * `imu param 0900` is KLIO's algorithm version string (page 9, id 0), which
+     * is a value that has to come from the part: there is no local copy. */
+    if (strcmp(sub, "param") == 0)
+    {
+        char *end = NULL;
+        const unsigned long id = strtoul(argc >= 3 ? argv[2] : "900", &end, 16);
+        if (!end || *end || id > 0xFFFF)
+        {
+            printf("imu param <hex id>, e.g. 0900 = KLIO algorithm version\n");
+            return 1;
+        }
+
+        uint8_t buf[128] = {0};
+        uint32_t got = 0;
+        const int8_t rc = bhy2_get_parameter((uint16_t)id, buf, sizeof(buf), &got,
+                                             &s_bhy2);
+        printf("param 0x%04lx rc %d, %lu B\n", id, rc, (unsigned long)got);
+        if (rc == BHY2_OK && got)
+        {
+            printf("  hex:");
+            for (uint32_t i = 0; i < got && i < 24; i++)
+                printf(" %02x", buf[i]);
+            printf("\n  str: ");
+            for (uint32_t i = 0; i < got && i < 48; i++)
+                putchar(buf[i] >= 32 && buf[i] < 127 ? buf[i] : '.');
+            printf("\n");
+        }
+        return rc == BHY2_OK ? 0 : 1;
+    }
+
+    /* Send a bare command id, with an optional payload, and then look at the
+     * error register and the status channel.
+     *
+     * WHY. "The part ignores the inject command" and "the part does not know
+     * the inject command" are different claims, and the second one is testable
+     * without knowing anything about injection: send a command id that
+     * certainly does not exist and compare what the part records. If a made-up
+     * id and BHY2_CMD_INJECT_DATA leave the same error, the command is simply
+     * not in this firmware. If they differ, injection is a real command being
+     * rejected for a stated reason, and the reason is worth chasing.
+     *
+     *   imu cmd ffee            a command id that cannot exist
+     *   imu cmd 0008            BHY2_CMD_INJECT_DATA, no payload
+     *   imu cmd 0008 00000000   the same with a four-byte payload
+     */
+    if (strcmp(sub, "cmd") == 0)
+    {
+        char *end = NULL;
+        const unsigned long id = strtoul(argc >= 3 ? argv[2] : "ffee", &end, 16);
+        if (!end || *end || id > 0xFFFF)
+        {
+            printf("imu cmd <hex id> [payload hex]\n");
+            return 1;
+        }
+
+        uint8_t pkt[64] = {0};
+        uint16_t plen = 0;
+
+        if (argc >= 4)
+        {
+            const char *h = argv[3];
+            size_t n = strlen(h);
+            if (n % 2 || n / 2 > 60)
+            {
+                printf("payload must be an even number of hex digits, <= 60\n");
+                return 1;
+            }
+            for (size_t i = 0; i < n; i += 2)
+            {
+                char b[3] = {h[i], h[i + 1], 0};
+                pkt[4 + plen++] = (uint8_t)strtoul(b, NULL, 16);
+            }
+        }
+
+        pkt[0] = (uint8_t)(id & 0xFF);
+        pkt[1] = (uint8_t)((id >> 8) & 0xFF);
+        pkt[2] = (uint8_t)(plen & 0xFF);
+        pkt[3] = (uint8_t)((plen >> 8) & 0xFF);
+
+        uint8_t err_before = 0, err_after = 0, hif = 0;
+        (void)bhy2_get_regs(BHY2_REG_ERROR_VALUE, &err_before, 1, &s_bhy2);
+
+        /* Async status OFF for the exchange, exactly as the sweep does, so a
+         * status response lands somewhere it can be read. */
+        imu_status_ctx_t ctx;
+        status_reset();
+        status_sync_begin(&ctx);
+
+        const int8_t rc = bhy2_set_regs(BHY2_REG_CHAN_CMD, pkt, 4 + plen, &s_bhy2);
+        const bool said = status_read_one(200);
+        status_sync_end(&ctx);
+
+        (void)bhy2_get_regs(BHY2_REG_ERROR_VALUE, &err_after, 1, &s_bhy2);
+        (void)bhy2_get_regs(BHY2_REG_HOST_INTERFACE_CTRL, &hif, 1, &s_bhy2);
+
+        printf("cmd 0x%04lx +%u B  write rc %d\n", id, (unsigned)plen, rc);
+        printf("  error 0x%02x -> 0x%02x   status %s", err_before, err_after,
+               said ? "said" : "silent");
+        if (said)
+        {
+            printf(" 0x%04x %s", (unsigned)s_last_code, status_name(s_last_code));
+            for (uint32_t i = 0; i < s_last_len; i++)
+                printf(" %02x", s_last_payload[i]);
+        }
+        printf("\nhif ctrl 0x%02x%s\n", hif,
+               (hif & BHY2_HIF_CTRL_ASYNC_STATUS_CHANNEL) ? " (async restored)"
+                                                          : " (ASYNC OFF!)");
+        return 0;
+    }
+
+    /* Raw bytes off an I2C register, including the FIFO channels. "Dig around in
+     * this chip" needs one window that goes under the SDK entirely: if the API
+     * says nothing is there, this says whether the bytes are really absent or
+     * whether the layer above is swallowing them.
+     *
+     *   0x03 status FIFO   0x02 non-wakeup FIFO   0x01 wakeup FIFO
+     *   0x2D int status    0x2E error value       0x31 debug state */
+    if (strcmp(sub, "raw") == 0)
+    {
+        char *end = NULL;
+        const unsigned long a = strtoul(argc >= 3 ? argv[2] : "2d", &end, 16);
+        if (!end || *end || a > 0x3F)
+        {
+            printf("imu raw <hex reg> [len], e.g. 2d = int status\n");
+            return 1;
+        }
+        int len = 16;
+        if (argc >= 4)
+        {
+            len = atoi(argv[3]);
+            if (len < 1 || len > 60)
+                len = 16;
+        }
+
+        /*
+         * THE FIFO CHANNELS ARE NOT PLAIN REGISTERS AND A BLIND READ WEDGES THE
+         * BUS. Measured the expensive way: `imu raw 02 16` against an empty
+         * non-wakeup FIFO hung the shell task and the board needed a hard reset.
+         *
+         * The protocol is Bosch's, from bhy2_hif_get_status_fifo(): read FOUR
+         * bytes and they are a header -- a 16-bit status code (or FIFO byte
+         * count, depending on the channel) and a 16-bit count of the bytes that
+         * remain. Only then is a second read of exactly that length legal. A
+         * read of 16 bytes when the part has 0 to give leaves the transaction
+         * unfinished.
+         *
+         * So channels 0x01, 0x02 and 0x03 are read as header-then-payload, and
+         * everything else as a plain register.
+         */
+        const bool is_fifo = (a == BHY2_REG_CHAN_FIFO_W ||
+                              a == BHY2_REG_CHAN_FIFO_NW ||
+                              a == BHY2_REG_CHAN_STATUS);
+
+        if (is_fifo)
+        {
+            uint8_t hdr[4] = {0};
+            const BHY2_INTF_RET_TYPE hrc = bus_read((uint8_t)a, hdr, 4,
+                                                    s_bhy2.hif.intf_ptr);
+            const uint16_t word = (uint16_t)(hdr[0] | (hdr[1] << 8));
+            uint32_t remain = (uint32_t)(hdr[2] | (hdr[3] << 8));
+
+            printf("fifo 0x%02lx hdr rc %d: %s %u, %lu B waiting\n", a, (int)hrc,
+                   a == BHY2_REG_CHAN_STATUS ? "code" : "word",
+                   (unsigned)word, (unsigned long)remain);
+
+            if (remain == 0)
+            {
+                printf("  empty -- nothing queued\n");
+                return 0;
+            }
+
+            if (remain > (uint32_t)len)
+                remain = (uint32_t)len;
+
+            uint8_t buf[60] = {0};
+            const BHY2_INTF_RET_TYPE rc = bus_read((uint8_t)a, buf, remain,
+                                                   s_bhy2.hif.intf_ptr);
+            printf("  read rc %d\n", (int)rc);
+            for (uint32_t i = 0; i < remain; i++)
+            {
+                if (i % 16 == 0)
+                    printf("  %02x:", (unsigned)i);
+                printf(" %02x", buf[i]);
+                if (i % 16 == 15)
+                    printf("\n");
+            }
+            printf("\n");
+            return 0;
+        }
+
+        uint8_t buf[60] = {0};
+        const BHY2_INTF_RET_TYPE rc = bus_read((uint8_t)a, buf, (uint32_t)len,
+                                               s_bhy2.hif.intf_ptr);
+        printf("raw reg 0x%02lx x%d rc %d\n", a, len, (int)rc);
+        for (int i = 0; i < len; i++)
+        {
+            if (i % 16 == 0)
+                printf("  %02x:", i);
+            printf(" %02x", buf[i]);
+            if (i % 16 == 15)
+                printf("\n");
+        }
+        printf("\n");
+        return 0;
+    }
+
+    /* Listen to the status channel with nothing else going on. The same
+     * synchronous read the injection probe uses, available on its own so a
+     * question about the part does not have to be wrapped in an experiment. */
+    if (strcmp(sub, "status") == 0)
+    {
+        imu_status_ctx_t ctx;
+        status_reset();
+        status_sync_begin(&ctx);
+        const bool got = status_read_one(400);
+        status_sync_end(&ctx);
+        if (!got)
+        {
+            printf("nothing waiting. A quiet part is the normal state; a code here\n"
+                   "means something in the firmware wants the host's attention.\n");
+            return 1;
+        }
+        printf("0x%04x %s", (unsigned)s_last_code, status_name(s_last_code));
+        for (uint32_t i = 0; i < s_last_len; i++)
+            printf(" %02x", s_last_payload[i]);
+        printf("\n");
+        return 0;
     }
 
     if (strcmp(sub, "scan") == 0)
