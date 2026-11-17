@@ -13,7 +13,7 @@ ota_0,      app,  ota_0,    0x10000,  0x300000,
 ota_1,      app,  ota_1,    0x310000, 0x2F0000,
 # 64 KB carved out of ota_1's tail for panic backtraces. ota_1 holds the
 # inactive A/B slot and has never been used here (no update feed), and the
-# app is 0x2d5750 so 0x2F0000 still fits it. See EMU-021 in the reference:
+# app is 0x2e3090 so 0x2F0000 still fits it. See EMU-021 in the reference:
 # with the console compiled out, this is the only way a panic reports itself.
 coredump,   data, coredump, 0x600000, 0x10000,
 otadata,    data, ota,      0x610000, 0x2000,
@@ -33,9 +33,16 @@ storage,    data, littlefs, 0x620000, 0x7E0000,
 # 0x00-0x3F. Find it with esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
 # 0x40, "modules").
 #
-# UNPROVEN: nothing loads from here yet. The open question is whether the codec
-# blobs can be linked position-independently at this address and called across
-# the Xtensa windowed ABI. The partition costs nothing while it is empty.
+# PROVEN. A FLAC decoder linked at this address is called across the partition
+# boundary and plays audio: 26,685 bytes of .text here and 1,976 of .rodata in
+# `moddata`, measured on a 5:58 track at 0 errors and 0 short writes. The blob
+# is `make flac` in modules/, flashed to 0xE00000.
+#
+# THE LINK ADDRESS IS NOT STABLE and this is the trap: both mmap bases move when
+# the app image changes size, and a blob linked for a stale pair still EXECUTES
+# and then reads its constants 64 KB away. `make modaddr` re-reads them from
+# /root/modaddr.txt on the board, and the loader refuses a mismatch rather than
+# calling into one (MOD-002 in the Escapement reference).
 # CODE AND DATA NEED SEPARATE WINDOWS, so `modules` is split in two.
 #
 # Measured three times with three coredumps: the ESP32-S3's flash mmap gives an
