@@ -97,8 +97,18 @@ static void show_status(void)
         char t[12];
 
         fmt_time(t, sizeof(t), st.seconds);
-        snprintf(line, sizeof(line), "%s  %s  %lu Hz", t,
-                 st.state == 1 ? "playing" : "stopping", (unsigned long)st.rate);
+        /*
+         * The rate is 0 between pressing Play and the decoder parsing
+         * STREAMINFO -- a few hundred milliseconds. Printing "0 Hz" there is a
+         * number that is not true, so the field is left out until it is known
+         * rather than shown wrong and corrected half a second later.
+         */
+        if (st.rate)
+            snprintf(line, sizeof(line), "%s  %s  %lu Hz", t,
+                     st.state == 1 ? "playing" : "stopping", (unsigned long)st.rate);
+        else
+            snprintf(line, sizeof(line), "%s  %s", t,
+                     st.state == 1 ? "playing" : "stopping");
         td_widget_printf(s_now, "%s", music_track_name(st.index));
         td_widget_printf(s_status, "%s", line);
     }
@@ -323,15 +333,18 @@ void music_ui_register(void)
 /*
  * DIAGNOSTIC BUILD ONLY, removed with the define in CMakeLists once answered.
  *
- * Runs the window's own path -- scan, then play_index on the first row -- and
- * writes what happened to a file, because the result must not have to survive
- * the display mirror or a focused window. This is the method the reference
- * records as the only reliable one on this board: no display, no focus, no
- * timing.
+ * It drives THE WINDOW'S OWN PATH -- launch(), then the very handlers the Play
+ * and Stop buttons call -- and writes what happened to a file. That is
+ * deliberate: the display mirror on this board sends only CHANGED cells and has
+ * repeatedly attached with an incomplete or stale grid, so "the window drew" is
+ * not something it can be asked. A file cannot be misread that way.
  *
  * It runs on the BOOT task, which is why it may write to /fs at all: a
- * PSRAM-stack task may not touch littlefs (the cache it lives behind is
- * disabled by esp_flash_read), and that constraint is quoted in modload.h.
+ * PSRAM-stack task may not touch littlefs (esp_flash_read disables the cache
+ * PSRAM lives behind), a constraint quoted in modload.h. Creating the window
+ * here is safe for the same reason a restored window is: the window manager is
+ * static state and td_run() has not started yet, so the window is simply part of
+ * the first frame.
  */
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -344,46 +357,57 @@ void music_ui_selftest(void)
     if (!f)
         return;
 
-    const int n = music_tracks_scan(k_dirs[0]);
+    /* ---- 1. the window itself -------------------------------------- */
+    launch();
 
-    fprintf(f, "scan=%d\n", n);
-    for (int i = 0; i < n && i < 3; i++)
-        fprintf(f, "track%d=%s\n", i, music_track_name(i));
-    if (n > 0)
-        fprintf(f, "last=%s\n", music_track_name(n - 1));
-
-    const char *path = n > 0 ? music_track_path(0) : NULL;
-
-    fprintf(f, "path=%s\n", path ? path : "(none)");
+    fprintf(f, "window=%d\n", s_win != NULL);
+    fprintf(f, "tracks=%d\n", music_track_count());
+    if (music_track_count() > 0)
+    {
+        fprintf(f, "first=%s\n", music_track_name(0));
+        fprintf(f, "last=%s\n", music_track_name(music_track_count() - 1));
+    }
+    fprintf(f, "dir=%s\n", music_tracks_dir());
     fflush(f);
 
-    if (!path || !music_play_index(0))
-    {
-        fprintf(f, "play=refused\n");
-        fclose(f);
-        return;
-    }
+    /* ---- 2. the Play button's handler ------------------------------ */
+    /* Select row 0 the way a click would, then call the handler directly. */
+    if (s_list)
+        td_list_select(s_list, 0);
+    on_play(NULL, NULL);
 
-    /* Six seconds: long enough for STREAMINFO to parse and PCM to flow. */
+    /* Six seconds: long enough for STREAMINFO and for PCM to flow. */
     for (int i = 0; i < 60; i++)
         vTaskDelay(pdMS_TO_TICKS(100));
 
     music_status_t st;
 
     music_status_get(&st);
-    fprintf(f, "play=running:%d state:%d frames:%lu rate:%lu secs:%lu err:%lu short:%lu\n",
-            st.running, st.state, (unsigned long)st.frames, (unsigned long)st.rate,
-            (unsigned long)st.seconds, (unsigned long)st.errors,
-            (unsigned long)st.short_writes);
-    fprintf(f, "msg=%s\n", st.message);
+    fprintf(f, "play=running:%d state:%d idx:%d frames:%lu rate:%lu secs:%lu err:%lu short:%lu\n",
+            st.running, st.state, st.index, (unsigned long)st.frames,
+            (unsigned long)st.rate, (unsigned long)st.seconds,
+            (unsigned long)st.errors, (unsigned long)st.short_writes);
+    fprintf(f, "now=%s\n", td_widget_text(s_now));
+    fprintf(f, "status=%s\n", td_widget_text(s_status));
+    fflush(f);
 
-    music_stop();
-    for (int i = 0; i < 20; i++)
+    /* ---- 3. the Stop button's handler ------------------------------ */
+    on_stop(NULL, NULL);
+    for (int i = 0; i < 30; i++)
         vTaskDelay(pdMS_TO_TICKS(100));
 
     music_status_get(&st);
     fprintf(f, "stopped=running:%d state:%d frames:%lu\n", st.running, st.state,
             (unsigned long)st.frames);
+    fprintf(f, "stopped_now=%s\n", td_widget_text(s_now));
+    fflush(f);
+
+    /* ---- 4. the Next button, with nothing playing ------------------- */
+    on_next(NULL, NULL);
+    music_status_get(&st);
+    fprintf(f, "after_next=running:%d sel=%d\n", st.running,
+            s_list ? td_list_selected(s_list) : -99);
+
     fclose(f);
 }
 
