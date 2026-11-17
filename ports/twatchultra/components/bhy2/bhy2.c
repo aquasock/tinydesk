@@ -1714,6 +1714,31 @@ static int8_t parse_fifo(enum bhy2_fifo_type source, struct bhy2_fifo_buffer *fi
             default:
                 rslt = get_callback_info(tmp_sensor_id, &info, dev);
                 rslt = check_return_value(rslt);
+
+                /*
+                 * A SENSOR ID WITH NO KNOWN EVENT SIZE MAKES THIS LOOP RUN FOR
+                 * EVER, AND THAT IS NOT HYPOTHETICAL.
+                 *
+                 * event_size[] is filled by bhy2_update_virtual_sensor_list();
+                 * an id the firmware emits but the host never enumerated has 0
+                 * there. get_buffer_status(read_pos, 0) is then satisfied for
+                 * ever and `read_pos += 0` below never advances, so this for
+                 * loop spins inside the caller's task with no I2C traffic and no
+                 * output -- indistinguishable from a hang, and it cost several
+                 * hard resets in this port (entry 56).
+                 *
+                 * One byte of progress is the only thing that can be done with
+                 * a packet whose length is unknown: the id is consumed, the
+                 * rest of the buffer is still parsed, and the caller gets on
+                 * with its life. Losing one unparseable event beats losing the
+                 * whole board.
+                 */
+                if (dev->event_size[tmp_sensor_id] == 0)
+                {
+                    fifo_p->read_pos += 1;
+                    break;
+                }
+
                 rslt = get_buffer_status(fifo_p, dev->event_size[tmp_sensor_id], &status); /*lint !e838 suppressing
                                                                                             * previously assigned value
                                                                                             * not used info */

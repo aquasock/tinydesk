@@ -64,6 +64,64 @@ status afterwards. **`boot 38` is a good boot** (`iface-ready verify-done
 no-flash`); **`boot 78` with `err 14` is a rejected image** — which is exactly
 what the BHI360 image does, see below.
 
+
+## THE ARCHITECTURE, AND IT IS THE POINT (entry 57)
+
+**A DataInject image is an algorithm PLUS injection — not an accelerometer faker.**
+This is what Bosch's own example does and it took a while to see:
+
+```
+examples/swim/swim_data_injection/swim_data_injection.c
+  #define CUSTOM_SENSOR_ID  BHY2_SENSOR_ID_SWIM        /* 114, an ALGORITHM */
+  firmware/bhi260ap_swim/DataInject_nobsx.fw           /* a DIFFERENT folder */
+```
+
+They inject a recorded motion log and read the **algorithm's** output. Injected
+data replaces the algorithm's *input*; the algorithm then runs on it. Feeding a
+physical sensor's output is not what this family is for, which is why
+`bhi260ap/DataInject.fw` — whose only sensors are 4 and 6 — accepted data and
+emitted a constant payload no matter what was sent.
+
+Measured on the glass, all three images:
+
+```
+bhi260ap/DataInject.fw       95,960 B   booted   sensors 4 6          <- no algorithm
+bhi260ap_swim/DataInject_nobsx.fw 104,700 B  booted  sensors 3 8 12 17 **114**
+bhi260ap_klio/...            123,696 B  booted   sensors ... 112 127  <- no injection
+```
+
+**`DataInject_SWIM.fw` in this directory is the one that carries an algorithm
+(114, SWIM) and boots on this board.** It is the proof that the pipeline the
+operator wants exists on this silicon: host sine in, algorithm consumes it,
+answer out.
+
+**There is no public KLIO + DataInject image.** Bosch publishes KLIO
+(`bhi260ap_klio/`, learning and recognition, no injection) and separately
+injection builds carrying SWIM or nothing. Combining them is a toolchain build,
+not a download.
+
+### What the feeder established before stopping
+
+`imu feed` now injects and round-trips without wedging — 199 to 299 events out
+for 200 to 300 injections, **exactly one event per injection**, which shows the
+part pacing itself off host data. The *values* never came through: every payload
+decoded as `00 08 00 01 00 00 00` regardless of input, and identically for event
+ids 4, 55 and 76. That is consistent with the image having no algorithm to
+consume them.
+
+### Three instrument bugs fixed on the way, each of which had cost a hard reset
+
+1. **`bhy2.c parse_fifo()` span for ever on a sensor id with `event_size == 0`** —
+   `read_pos += 0` never advances, no I2C traffic, no output, indistinguishable
+   from a hang. Now skips one byte. This is the wedge that killed `imu feed` and
+   every `imu raw` before it.
+2. **`imu raw` read a 4-byte header from data FIFOs**, which have a 2-byte
+   length; only the status channel has the 4-byte header. That reported an empty
+   FIFO as "251 bytes waiting" and dumped zeros.
+3. **`imu raw` capped partial FIFO reads**, desynchronising the stream for every
+   later read (a header went on to claim 64,768 bytes). It now refuses rather
+   than reads short.
+
 ## The BHI360 images do NOT work — measured, not assumed
 
 Bosch ships `firmware/bhi360/bosch_data_inject_bhi360.h` and BHy2CLI targets the

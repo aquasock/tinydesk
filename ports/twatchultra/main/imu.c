@@ -109,6 +109,17 @@ static uint8_t s_fifo[IMU_FIFO_MAX];
 /* The most recent acceleration, written by the callback and read by
  * imu_accel(). Single producer (this task) and single consumer, so a plain
  * volatile pair of flags is enough; there is no second task polling the part. */
+/* The last raw payload the parser handed to on_accel, for instruments that need
+ * to see the bytes rather than the interpretation. */
+static uint8_t s_accel_raw[8];
+static volatile uint8_t s_accel_raw_len;
+
+/* The first few payloads verbatim, with their reported sizes, so an off-by-one
+ * in the event size shows up as a sequence rather than a single sample. */
+static uint8_t s_first[5][9];
+static volatile uint8_t s_first_len[5];
+static volatile int s_first_n;
+
 static volatile bool s_have_accel;
 static float s_ax, s_ay, s_az;
 static uint32_t s_accel_count;
@@ -369,6 +380,18 @@ static void on_accel(const struct bhy2_fifo_parse_data_info *info, void *priv)
         return;
     int16_t s[3];
     memcpy(s, info->data_ptr, 6);
+    memcpy(s_accel_raw, info->data_ptr,
+           info->data_size < sizeof(s_accel_raw) ? info->data_size
+                                                 : sizeof(s_accel_raw));
+    s_accel_raw_len = info->data_size < sizeof(s_accel_raw)
+                          ? (uint8_t)info->data_size : (uint8_t)sizeof(s_accel_raw);
+    if (s_first_n < 5)
+    {
+        const int k = s_first_n++;
+        uint8_t n2 = info->data_size < 9 ? (uint8_t)info->data_size : 9;
+        s_first_len[k] = n2;
+        memcpy(s_first[k], info->data_ptr, n2);
+    }
     s_ax = s[0] / 4096.0f;
     s_ay = s[1] / 4096.0f;
     s_az = s[2] / 4096.0f;
@@ -660,7 +683,7 @@ static void boot_status_report(const char *when)
  * what the callback saw. If the returned range matches the injected amplitude
  * then the part really is consuming host data, which is the whole premise.
  */
-static int cmd_imu_feed(int seconds, float hz, float amp)
+static int cmd_imu_feed(int seconds, float hz, float amp, int mode, int ev_id)
 {
     if (!s_ready && !imu_start())
     {
@@ -668,16 +691,22 @@ static int cmd_imu_feed(int seconds, float hz, float amp)
         return 1;
     }
 
-    printf("feeding a %.2f Hz sine, %.2f g amplitude, 50 samples/s for %d s\n",
-           (double)hz, (double)amp, seconds);
+    printf("feeding a %.2f Hz sine, %.2f g amplitude, 50 samples/s for %d s,"
+           " event id %d\n", (double)hz, (double)amp, seconds, ev_id);
     printf("injected values are round-tripped through the part's own parser.\n\n");
 
-    /* 1. step-by-step, and confirm the mode really changed like Bosch does. */
-    if (!imu_inject_begin(BHY2_STEP_BY_STEP_INJECTION))
+    /* 1. the injection mode, and confirm it really changed like Bosch does.
+     * The two modes are not interchangeable and which one substitutes values is
+     * an open question, so it is an argument rather than a constant. */
+    const int inj = (mode == 1) ? BHY2_REAL_TIME_INJECTION
+                                : BHY2_STEP_BY_STEP_INJECTION;
+    if (!imu_inject_begin(inj))
     {
-        printf("imu: the part refused step-by-step injection mode\n");
+        printf("imu: the part refused injection mode %d\n", inj);
         return 1;
     }
+    printf("  injection mode: %s\n",
+           inj == BHY2_REAL_TIME_INJECTION ? "real-time" : "step-by-step");
 
     /* 2. CONFIGURE THE SENSOR. This is the step whose absence made injection
      * look dead: the part needs to know a virtual sensor exists before it will
@@ -685,16 +714,32 @@ static int cmd_imu_feed(int seconds, float hz, float amp)
     const int8_t cfg = bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_ACC, 50.0f, 20,
                                                 &s_bhy2);
     printf("  configure accel @50 Hz: %d\n", cfg);
+    printf("  event_size: acc_raw %u  acc %u  acc_wu %u  (id + payload)\n",
+           (unsigned)s_bhy2.event_size[BHY2_SENSOR_ID_ACC_RAW],
+           (unsigned)s_bhy2.event_size[BHY2_SENSOR_ID_ACC],
+           (unsigned)s_bhy2.event_size[BHY2_SENSOR_ID_ACC_WU]);
     (void)bhy2_register_fifo_parse_callback(BHY2_SENSOR_ID_ACC, on_accel, NULL,
                                             &s_bhy2);
     s_sensor_on = true;      /* so imu_poll() drains */
 
-    /* 3. drain whatever the configuration produced. */
-    for (int i = 0; i < 20; i++)
+    /* 3. DRAIN, THEN FLUSH. The part boots with a backlog already queued (a
+     * measured 251 bytes on the DataInject image), and leaving it there makes
+     * the round trip below impossible to interpret -- a sample read back could
+     * be a leftover rather than an injected one. Bosch's own example drains the
+     * status FIFO before injecting for the same reason; flushing the data FIFO
+     * is the stronger version and is what makes "0 samples arrived" mean
+     * something. */
+    for (int i = 0; i < 10; i++)
     {
         vTaskDelay(pdMS_TO_TICKS(10));
         (void)imu_poll();
     }
+    const int8_t flushed = bhy2_clear_fifo(0xFF, &s_bhy2);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    (void)imu_poll();
+    printf("  flush fifo: %d, %lu samples before\n", flushed,
+           (unsigned long)s_accel_count);
+
     s_have_accel = false;
     const uint32_t before = s_accel_count;
 
@@ -722,16 +767,35 @@ static int cmd_imu_feed(int seconds, float hz, float amp)
         stamp[5] = 0;
         ts += (uint32_t)(step_ms * 1000);      /* microseconds */
 
-        /* 5. one accelerometer event: id, then three little-endian int16 in
-         * 1/4096 g. */
-        uint8_t ev[7];
-        ev[0] = BHY2_SENSOR_ID_ACC;
+        /* 5. ONE EVENT, WITH THE LENGTH THE PART ITSELF DECLARES.
+         *
+         * A BHy2 accelerometer event is the sensor id plus three int16, which is
+         * 7 bytes -- but on the DataInject image the part reports
+         * `event_size[4] == 7`, i.e. id + SEVEN. Injecting id + 6 is one byte
+         * short of the descriptor, and the part then emits events of its own
+         * choosing rather than the ones supplied: 145 to 299 of them arrived
+         * back for 150 to 300 injections, and every payload decoded as
+         * `00 08 00 01 00 00 00`, which is not an acceleration at all.
+         *
+         * So the length comes from the part, not from what BHy2 usually means
+         * by an accelerometer. If it says 7, seven bytes go in. */
+        uint8_t ev[9] = {0};
+        const uint8_t payload = s_bhy2.event_size[BHY2_SENSOR_ID_ACC]
+                                    ? (uint8_t)(s_bhy2.event_size[BHY2_SENSOR_ID_ACC] - 1)
+                                    : 6;
+        /* THE EVENT ID IS AN ARGUMENT BECAUSE THERE ARE TWO CANDIDATES AND NO
+         * DOCUMENTATION SETTLES IT. The virtual sensor is 4; Bosch's
+         * dinject_defs.h names ACCEL_INJECT_ID 55 and ACC_COR_INJECT_DRIVER_ID
+         * 76, and on the DataInject image those are plausibly what the handler
+         * expects even though the OUTPUT is still reported against sensor 4. */
+        ev[0] = (uint8_t)ev_id;
         memcpy(ev + 1, &xq, 2);
         memcpy(ev + 3, &yq, 2);
         memcpy(ev + 5, &zq, 2);
+        const uint16_t evlen = (uint16_t)(1 + payload);
 
         if (imu_inject_frame(stamp, sizeof(stamp)) &&
-            imu_inject_frame(ev, sizeof(ev)))
+            imu_inject_frame(ev, evlen))
             sent++;
 
         /* 6. drain so the parser sees it. */
@@ -765,6 +829,13 @@ static int cmd_imu_feed(int seconds, float hz, float amp)
 
     printf("z range seen: %+.2f .. %+.2f g   (injected peak %+.2f)\n",
            (double)lo, (double)hi, (double)amp);
+    for (int k = 0; k < s_first_n; k++)
+    {
+        printf("first[%d] %u B:", k, (unsigned)s_first_len[k]);
+        for (uint8_t i = 0; i < s_first_len[k]; i++)
+            printf(" %02x", s_first[k][i]);
+        printf("\n");
+    }
     printf("%s\n", (hi > 0.5f * amp && lo < -0.5f * amp)
                    ? "THE SINE ARRIVED. Host-generated data is being consumed by\n"
                      "the part and read back out of its own FIFO."
@@ -1453,9 +1524,12 @@ static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
         const int secs = argc >= 3 ? atoi(argv[2]) : 10;
         const float fhz = argc >= 4 ? (float)atof(argv[3]) : 1.0f;
         const float amp = argc >= 5 ? (float)atof(argv[4]) : 0.5f;
+        const int md = argc >= 6 ? atoi(argv[5]) : 2;
+        const int eid = argc >= 7 ? atoi(argv[6]) : 4;
         return cmd_imu_feed(secs < 1 ? 1 : (secs > 120 ? 120 : secs),
                             fhz <= 0.0f ? 1.0f : fhz,
-                            amp <= 0.0f ? 0.5f : amp);
+                            amp <= 0.0f ? 0.5f : amp,
+                            md == 1 ? 1 : 2, eid < 0 ? 4 : eid);
     }
 
     if (!s_ready)
@@ -2057,8 +2131,8 @@ static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
         if (argc >= 4)
         {
             len = atoi(argv[3]);
-            if (len < 1 || len > 60)
-                len = 16;
+            if (len < 1 || len > 255)
+                len = 250;
         }
 
         /*
@@ -2082,15 +2156,35 @@ static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
 
         if (is_fifo)
         {
+            /* THE TWO KINDS OF FIFO HAVE DIFFERENT HEADERS and reading four
+             * bytes from a data FIFO takes two payload bytes as if they were a
+             * length -- which is exactly how a 0-byte FIFO came to be reported
+             * as 251 bytes waiting, and how a dump of it came back all zeros.
+             *
+             *   status channel 0x03: 4 bytes -- 16-bit status code, then length
+             *   wakeup 0x01 (and 0x02):  2 bytes -- 16-bit byte count only
+             *
+             * bhy2_hif_get_fifo() reads two; bhy2_hif_get_status_fifo() reads
+             * four. This follows each. */
+            const bool is_status_chan = (a == BHY2_REG_CHAN_STATUS);
             uint8_t hdr[4] = {0};
-            const BHY2_INTF_RET_TYPE hrc = bus_read((uint8_t)a, hdr, 4,
-                                                    s_bhy2.hif.intf_ptr);
-            const uint16_t word = (uint16_t)(hdr[0] | (hdr[1] << 8));
-            uint32_t remain = (uint32_t)(hdr[2] | (hdr[3] << 8));
+            const BHY2_INTF_RET_TYPE hrc =
+                bus_read((uint8_t)a, hdr, is_status_chan ? 4 : 2, s_bhy2.hif.intf_ptr);
 
-            printf("fifo 0x%02lx hdr rc %d: %s %u, %lu B waiting\n", a, (int)hrc,
-                   a == BHY2_REG_CHAN_STATUS ? "code" : "word",
-                   (unsigned)word, (unsigned long)remain);
+            uint16_t word = 0;
+            uint32_t remain = 0;
+            if (is_status_chan)
+            {
+                word = (uint16_t)(hdr[0] | (hdr[1] << 8));
+                remain = (uint32_t)(hdr[2] | (hdr[3] << 8));
+            }
+            else
+            {
+                remain = (uint32_t)(hdr[0] | (hdr[1] << 8));
+            }
+
+            printf("fifo 0x%02lx hdr rc %d: %s%lu B waiting\n", a, (int)hrc,
+                   is_status_chan ? "" : "", (unsigned long)remain);
 
             if (remain == 0)
             {
@@ -2098,10 +2192,22 @@ static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
                 return 0;
             }
 
+            /* NEVER READ A PARTIAL FIFO. The count in the header is a promise
+             * about how many bytes the next read will consume; taking fewer
+             * leaves the rest queued and every later read starts mid-packet.
+             * Measured the hard way: after one capped read the header went on to
+             * report 64,768 bytes waiting, which is nonsense and was this. So a
+             * FIFO larger than the buffer is reported and NOT read. */
             if (remain > (uint32_t)len)
-                remain = (uint32_t)len;
+            {
+                printf("  %lu B waiting, more than the %d-byte buffer -- not read\n"
+                       "  (a partial read desynchronises the stream)\n",
+                       (unsigned long)remain, len);
+                return 0;
+            }
 
-            uint8_t buf[60] = {0};
+            static uint8_t buf[256];
+            memset(buf, 0, sizeof(buf));
             const BHY2_INTF_RET_TYPE rc = bus_read((uint8_t)a, buf, remain,
                                                    s_bhy2.hif.intf_ptr);
             printf("  read rc %d\n", (int)rc);
