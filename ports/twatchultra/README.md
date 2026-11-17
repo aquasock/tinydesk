@@ -69,26 +69,54 @@ and nothing else, because the abort happens before anything can report it.
 
 ## The partition table replaces the stock layout
 
-This watch normally runs something else entirely. `partitions.csv` here is the
-`ports/nanoesp32` shape — two equal OTA slots and a 7.9 MB `/fs` — and flashing
-it overwrites whatever occupied those offsets. Read the flash out first if it
-holds anything that cannot be regenerated:
+This watch normally runs something else entirely. `partitions.csv` here splits
+the 16 MB into four equal 4 MiB regions — two app slots, a 4 MB `/fs`, and 4 MB
+for executable codec blobs — and flashing it overwrites whatever occupied those
+offsets. Read the flash out first if it holds anything that cannot be
+regenerated:
 
 ```
 esptool --port /dev/ttyACM0 --before usb_reset read_flash 0 0x1000000 backup.bin
 ```
 
 ```
-nvs        0x9000    64K     settings, accounts, WiFi, Bluetooth bonds
-phy_init   0x19000    4K     RF calibration, regenerated when erased
-ota_0      0x20000    3008K  the running app (48 KB free)
-ota_1      0x310000   3008K  the update target — the real size budget
-coredump   0x600000   64K     panic backtraces, the only report without a console
-otadata    0x610000    8K
-storage    0x620000 8064K    littlefs, the shell's `/`
-modules    0xE00000    1M     codec blobs, mapped as INSTRUCTIONS
-moddata    0xF00000    1M     their .rodata, mapped as DATA
+region 1  0x000000 - 0x400000
+  nvs        0x0009000    64K    settings, accounts, WiFi, Bluetooth bonds
+  phy_init   0x0019000     4K    RF calibration, regenerated when erased
+  ota_0      0x0020000  3968K    the running app (1005 KB free)
+region 2  0x400000 - 0x800000
+  ota_1      0x0400000  3968K    the update target -- the real size budget
+  coredump   0x07e0000    64K    panic backtraces; no console, so this is it
+  otadata    0x07f0000     8K
+region 3  0x800000 - 0xC00000
+  storage    0x0800000     4M    littlefs, the shell's /
+region 4  0xC00000 - 0x1000000
+  modules    0x0C00000     2M    codec blobs, mapped as INSTRUCTIONS
+  moddata    0x0E00000     2M    their .rodata, mapped as DATA
 ```
+
+**Four equal 4 MiB regions**, so where something lives is answerable at a glance.
+
+**The slots are 3968 KB, not 4 MiB, and that is the one place an even split
+cannot be literal.** The bootloader, partition table, NVS and phy_init have to
+sit inside region 1, so it has 176 KB less usable space than the other three --
+and both slots must be the same size, because an update writes whichever one is
+not running. 4+4+4+4 would need 176 KB more flash than the chip has. The 56 KB
+left in region 2 after coredump and otadata is unused.
+
+**NVS is 64 KB because 24 KB ran out of headroom.** Measured on the hardware in
+November 2026: the old 24 KB region had five of its six pages full or active,
+420 of 756 entry slots used and page sequence numbers of 66/100/101/102, so
+garbage collection never stopped. What happens at the end of that is silent --
+`nvs_flash_init()` returns `ESP_ERR_NVS_NO_FREE_PAGES` and `app_main()` answers
+with `nvs_flash_erase()`, which deletes every account, saved network and
+Bluetooth bond without saying anything. The TinyDesk author flagged this on
+issue 20; every other ESP32 port here already gave NVS 64 KB.
+
+**storage halved on 2026-11-17 and lost nothing**: it held 11 directories, 29
+files and 23,047 bytes. The migration extracted the littlefs, rebuilt it at the
+new size and wrote every file back, verified by SHA-256 of all 29. Shrinking a
+littlefs partition by truncating it is how data is lost; see entry 25.
 
 **The two slots are equal because a smaller one is the real limit.** An update
 writes whichever slot is not running, so an image has to fit the smaller of the
