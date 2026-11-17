@@ -257,16 +257,18 @@ static bool on_screen(const char *text, int *row)
 static td_window_t *s_win;
 static td_rect_t s_c;
 
-/* The window's layout: three rows per slot starting at row 4, so the buttons
- * are two rows into each slot at 4 + 3 * slot + 2, and they start at column 1
+/* The window's layout: three rows per slot starting at row 3, so the buttons
+ * are two rows into each slot at 3 + 3 * slot + 2, and they start at column 1
  * rather than the value column -- Pair..., Off/On and Forget at columns 1, 13
- * and 21. The scan's own Pair sits on row 21, which is SCAN_Y + LIST_ROWS + 2
- * (14 + 5 + 2) with three slots and the scan header above it. */
+ * and 21. The scan's own buttons are on the row above the message line, which
+ * in this test's window is two rows from the bottom; the app anchors them to
+ * the client's height rather than to a fixed row, so the test reads the same
+ * number from the client rect instead of repeating it. */
 static void press_slot(int slot, int column)
 {
-    click(s_c.x + column + 1, s_c.y + 6 + slot * 3);
+    click(s_c.x + column + 1, s_c.y + 5 + slot * 3);
 }
-#define SCAN_PAIR_ROW 21
+static int s_scan_btn_row;             /* set from the client rect below */
 #define PAIR_BTN      1
 #define TOGGLE_BTN    13
 #define FORGET_BTN    21
@@ -283,7 +285,11 @@ static void set_slot(int i, bool paired, bool ready, bool reconnects, uint8_t a0
     s->reconnects = reconnects;
     s->paired_addr[0] = a0;
     s->addr[0] = a0;
-    snprintf(s->paired_name, sizeof(s->paired_name), "%s", i == 0 ? "Logi K950" : "Logi M750");
+    snprintf(s->paired_name, sizeof(s->paired_name), "%s",
+             i == 0   ? "Logi K950"
+             : i == 1 ? "Logi M750"
+                      : i == 3 ? "Xbox Wireless Controller"
+                               : "Combo");
 }
 
 static td_bt_device_t dev(td_bt_kind_t kind, const char *name, int rssi, uint8_t a0)
@@ -328,6 +334,7 @@ int main(void)
     s_win = td_win_focused();
     assert(s_win != NULL);
     s_c = td_win_client(s_win);
+    s_scan_btn_row = s_c.h - 2;
     tick();
     assert(on_screen("off; a scan starts it", NULL));
     assert(on_screen("loaded from the card", NULL));
@@ -395,12 +402,89 @@ int main(void)
     assert(r_mouse < r_kbd && r_kbd < r_pad && r_pad < r_tv);
     assert(!on_screen("(no name)", NULL));
 
-    /* Pairing over a different paired device asks to replace it. */
-    click(s_c.x + 2, s_c.y + SCAN_PAIR_ROW);
+        /* Pairing over a different paired device asks to replace it. */
+    click(s_c.x + 2, s_c.y + s_scan_btn_row);
     assert(td_win_focused() != s_win && on_screen("Pairing this one", NULL));
     key(TD_KEY_ENTER);
     assert(s_pairs == 1 && s_last_slot == 1 && s_last_dev.addr[0] == 5);
     assert(!on_screen("Pair a mouse", NULL));   /* back to the slots */
+
+    /* A GAMEPAD GOES TO THE CONTROLLER SLOT AND NOWHERE ELSE. The bug this
+     * slot exists for: a controller that advertises the HID service without a
+     * keyboard appearance was just another "other HID device", so it appeared
+     * in the keyboard slot's list and pairing it there took the keyboard's
+     * place. Offered here to the controller, and then to the mouse, where it
+     * must not appear. */
+    assert(on_screen("Controller", NULL));
+    s_info.scan_ms_left = 0;
+    press_slot(3, PAIR_BTN);
+    assert(s_scans == 2);
+    s_info.scan_ms_left = 6000;
+    tick();
+    assert(on_screen("Pair a controller", NULL));
+    s_devs[0] = dev(TD_BT_KIND_GAMEPAD, "Xbox Controller", -45, 7);
+    s_devs[1] = dev(TD_BT_KIND_KEYBOARD, "Some keyboard", -60, 3);
+    s_ndevs = 2;
+    s_info.scan_ms_left = 0;
+    job_done("2 device(s) found");
+    tick();
+    assert(on_screen("2 found", NULL));
+    assert(on_screen("Xbox Controller", NULL));
+
+    /* The same gamepad offered to the mouse: not in its list. */
+    s_info.scan_ms_left = 0;
+    press_slot(1, PAIR_BTN);
+    assert(s_scans == 3);
+    s_info.scan_ms_left = 6000;
+    tick();
+    job_done("2 device(s) found");
+    tick();
+    assert(on_screen("1 found", NULL));
+    assert(!on_screen("Xbox Controller", NULL));
+
+    /* THE WATCH'S OWN GEOMETRY, and the reason this last: it rebuilds the
+     * terminal at another size. Four slots at three rows each is one row more
+     * than the fixed rows this window used to assume, and on the glass the
+     * client is 23 rows (26, less the taskbar, less the frame and title bar).
+     * The scan section is anchored to the bottom because of that, so the check
+     * is that it lands UNDER the slots and that the last slot's button -- the
+     * one that would fall off -- still works. */
+    td_win_close(s_win);
+    s_reply = "\x1b[26;40R";
+    td_init(&s_hal);
+    td_buffer_init(&s_screen, 40, 26);
+    s_info.message[0] = '\0';
+    assert(td_app_launch("Bluetooth"));
+    s_win = td_win_focused();
+    assert(s_win != NULL);
+    s_c = td_win_client(s_win);
+    s_scan_btn_row = s_c.h - 2;
+    tick();
+    assert(s_c.h == 23);
+    assert(on_screen("Controller", NULL));
+    assert(s_scan_btn_row > 5 + 3 * (TD_BT_SLOTS - 1));
+    const int scans_before = s_scans;
+    press_slot(TD_BT_SLOTS - 1, PAIR_BTN);
+    assert(s_scans == scans_before + 1);
+    tick();
+    assert(on_screen("Pair a controller", NULL));
+
+    /* AND ONE ROW TIGHTER: the title bar setting at Large takes another row,
+     * leaving 22. The scan section gives up a list row rather than overlapping
+     * the slots, which is the whole reason its rows are counted. */
+    td_win_close(s_win);
+    td_wm_set_window_size(TD_UI_LARGE);
+    assert(td_app_launch("Bluetooth"));
+    s_win = td_win_focused();
+    s_c = td_win_client(s_win);
+    s_scan_btn_row = s_c.h - 2;
+    tick();
+    assert(s_c.h == 22);
+    assert(s_scan_btn_row > 5 + 3 * (TD_BT_SLOTS - 1));
+    assert(td_app_launch("Bluetooth"));   /* already open: focuses it */
+    const int scans_before2 = s_scans;
+    press_slot(TD_BT_SLOTS - 1, PAIR_BTN);
+    assert(s_scans == scans_before2 + 1);
 
     printf("test_bluetooth: PASS\n");
     return 0;

@@ -13,8 +13,8 @@
  * boot format (modifiers, reserved, six keys), mice in their own format from
  * the report map, so the wheel works.
  *
- * Pairings live in three slots (keyboard, mouse, combo): the slot list in
- * NVS ("bt"/"slots"), the keys in NimBLE's own store (NVS). The radio starts
+ * Pairings live in four slots (keyboard, mouse, combo, controller): the slot
+ * list in NVS ("bt"/"slots"), the keys in NimBLE's own store (NVS). The radio starts
  * on the first scan, or at start when a slot has a device that reconnects;
  * then a light background scan (30 ms every 0.5 s) waits for those devices
  * to wake up and connects them.
@@ -88,14 +88,26 @@ typedef struct
 
 static saved_slot_t s_slots[TD_BT_SLOTS];
 
+/* A stored blob is read whatever length it has, as long as it is a whole
+ * number of slots and no longer than the array: the controller slot was added
+ * to four after this format had already been written to boards holding three,
+ * and requiring sizeof(s_slots) would have thrown those pairings away on the
+ * first boot of the new firmware -- silently, since the slots would simply
+ * read as empty. The slots keep their indices, because the new one was
+ * appended, so the old blob is a prefix of the new one and only the tail has
+ * to be cleared. */
 static void slots_load(void)
 {
     nvs_handle_t h;
     size_t n = sizeof(s_slots);
+    memset(s_slots, 0, sizeof(s_slots));
     if (nvs_open("bt", NVS_READONLY, &h) == ESP_OK)
     {
-        if (nvs_get_blob(h, "slots", s_slots, &n) != ESP_OK || n != sizeof(s_slots))
+        if (nvs_get_blob(h, "slots", s_slots, &n) != ESP_OK || n > sizeof(s_slots) ||
+            n % sizeof(saved_slot_t) != 0)
             memset(s_slots, 0, sizeof(s_slots));
+        else
+            memset((char *)s_slots + n, 0, sizeof(s_slots) - n);
         nvs_close(h);
     }
 }
@@ -654,6 +666,11 @@ static void add_found(const struct ble_gap_disc_desc *d)
             kind = TD_BT_KIND_KEYBOARD;
         else if (f.appearance == 0x03C2)
             kind = TD_BT_KIND_MOUSE;
+        /* 0x03C3 joystick, 0x03C4 gamepad: what an Xbox or DualSense
+         * controller advertises. Without this they fell through to the
+         * generic HID case below and were offered to the keyboard slot. */
+        else if (f.appearance == 0x03C3 || f.appearance == 0x03C4)
+            kind = TD_BT_KIND_GAMEPAD;
         else if ((f.appearance & 0xFFC0) == 0x03C0 && kind == TD_BT_KIND_OTHER)
             kind = TD_BT_KIND_HID;
     }
@@ -1100,14 +1117,35 @@ static bool ops_pair(int slot, const td_bt_device_t *dev)
         conn_t *old = conn_by_slot(slot);
         if (old && old->handle != BLE_HS_CONN_HANDLE_NONE)
             ble_gap_terminate(old->handle, BLE_ERR_REM_USER_CONN_TERM);
+        /* The same device paired into a different slot MOVES: its old slot is
+         * cleared, so it cannot later reconnect into two places at once. The
+         * bond in NimBLE's store is deliberately kept -- that is the pairing
+         * this new slot is about to use, and deleting it would force the device
+         * back into pairing mode. This is how a controller already sitting in
+         * the keyboard slot gets to the controller slot, which has no way to
+         * identify it from storage alone: a saved slot holds an address and a
+         * name, never the kind of device it was. */
+        bool moved = false;
+        for (int i = 0; i < TD_BT_SLOTS; i++)
+        {
+            if (i == slot || !s_slots[i].used || memcmp(s_slots[i].addr, dev->addr, 6))
+                continue;
+            conn_t *c = conn_by_slot(i);
+            if (c && c->handle != BLE_HS_CONN_HANDLE_NONE)
+                ble_gap_terminate(c->handle, BLE_ERR_REM_USER_CONN_TERM);
+            memset(&s_slots[i], 0, sizeof(s_slots[i]));
+            moved = true;
+        }
         if (s_slots[slot].used && memcmp(s_slots[slot].addr, dev->addr, 6))
         {
             ble_addr_t a = {.type = s_slots[slot].addr_type};
             memcpy(a.val, s_slots[slot].addr, 6);
             ble_store_util_delete_peer(&a);
             memset(&s_slots[slot], 0, sizeof(s_slots[slot]));
-            slots_save();
+            moved = true;
         }
+        if (moved)
+            slots_save();
         ble_addr_t a = {.type = dev->addr_type};
         memcpy(a.val, dev->addr, 6);
         s_failed = false;

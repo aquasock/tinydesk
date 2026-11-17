@@ -852,12 +852,13 @@ static int cmd_modbus(tdsh_session_t *session, int argc, char **argv)
 
 /* -------------------------------------------------------------- bt */
 
-/* Bluetooth keyboards and mice through the port's td_bt_ops_t (the same
- * table the Bluetooth app uses). Every call there returns at once; this
- * command waits for the outcome, and Ctrl+C stops the waiting (the work
+/* Bluetooth keyboards, mice and controllers through the port's td_bt_ops_t
+ * (the same table the Bluetooth app uses). Every call there returns at once;
+ * this command waits for the outcome, and Ctrl+C stops the waiting (the work
  * goes on in the background, the app shows it). */
 
-static const char *const s_bt_slots[TD_BT_SLOTS] = {"keyboard", "mouse", "combo"};
+static const char *const s_bt_slots[TD_BT_SLOTS] = {"keyboard", "mouse", "combo",
+                                                    "controller"};
 
 static int bt_slot(const char *s)
 {
@@ -875,6 +876,7 @@ static void bt_addr(char *out, size_t n, const uint8_t a[TD_BT_ADDR_LEN])
 static const char *bt_kind(td_bt_kind_t k)
 {
     return k == TD_BT_KIND_KEYBOARD ? "keyboard" : k == TD_BT_KIND_MOUSE ? "mouse"
+                                               : k == TD_BT_KIND_GAMEPAD ? "controller"
                                                : k == TD_BT_KIND_HID     ? "HID"
                                                                          : "other";
 }
@@ -1030,12 +1032,13 @@ static int cmd_bt(tdsh_session_t *session, int argc, char **argv)
     else
     {
         printf("usage:\n"
-               "  bt [status]                     the radio and the keyboard, mouse and combo slots\n"
+               "  bt [status]                     the radio and the keyboard, mouse, combo\n"
+               "                                  and controller slots\n"
                "  bt scan                         list devices in pairing mode (numbered)\n"
                "  bt pair <slot> <number>         pair one from the last scan into a slot\n"
                "  bt off <slot> | bt on <slot>    stop or start using a paired device\n"
                "  bt forget <slot>                delete a slot's pairing\n"
-               "slot: keyboard, mouse or combo. The Bluetooth app does the same.\n");
+               "slot: keyboard, mouse, combo or controller. The Bluetooth app does the same.\n");
         rc = 2;
     }
     free(st);

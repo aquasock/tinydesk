@@ -62,14 +62,21 @@ typedef struct
 
 static saved_slot_t s_slots[TD_BT_SLOTS];
 
+/* A blob of any whole number of slots is accepted, so a board that stored
+ * three (before the controller slot existed) keeps its pairings: the new slot
+ * was appended, so the old blob is a prefix of this array. */
 static void slots_load(void)
 {
     nvs_handle_t h;
     size_t n = sizeof(s_slots);
+    memset(s_slots, 0, sizeof(s_slots));
     if (nvs_open("bt", NVS_READONLY, &h) == ESP_OK)
     {
-        if (nvs_get_blob(h, "slots_bd", s_slots, &n) != ESP_OK || n != sizeof(s_slots))
+        if (nvs_get_blob(h, "slots_bd", s_slots, &n) != ESP_OK || n > sizeof(s_slots) ||
+            n % sizeof(saved_slot_t) != 0)
             memset(s_slots, 0, sizeof(s_slots));
+        else
+            memset((char *)s_slots + n, 0, sizeof(s_slots) - n);
         nvs_close(h);
     }
 }
@@ -336,8 +343,11 @@ static void ble_result(const struct ble_scan_result_evt_param *r)
     if (a && len == 2)
     {
         uint16_t app = (uint16_t)(a[0] | a[1] << 8);
-        d->kind = app == 0x03C1 ? TD_BT_KIND_KEYBOARD : app == 0x03C2 ? TD_BT_KIND_MOUSE
-                                                                      : d->kind;
+        /* 0x03C3 joystick, 0x03C4 gamepad: the controller slot's devices. */
+        d->kind = app == 0x03C1   ? TD_BT_KIND_KEYBOARD
+                  : app == 0x03C2 ? TD_BT_KIND_MOUSE
+                  : app == 0x03C3 || app == 0x03C4 ? TD_BT_KIND_GAMEPAD
+                                                   : d->kind;
     }
 }
 

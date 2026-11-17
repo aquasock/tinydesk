@@ -401,16 +401,24 @@ typedef struct
  * The shape comes from aquasock's TinyTang port (tinydesk issue #7) and has
  * td_net_ops_t's contract: every call returns at once, slow work runs in
  * the background, and its outcome shows up in status(). Paired devices
- * live in slots: one keyboard, one mouse, and one combo (keyboard and
- * pointer in one device). Their keys and clicks reach the desktop through
- * the port's normal input path, as a terminal's would. Addresses are least
- * significant byte first. */
+ * live in slots: one keyboard, one mouse, one combo (keyboard and pointer
+ * in one device), and one controller (a gamepad). Their keys, clicks and
+ * sticks reach the desktop through the port's normal input path, as a
+ * terminal's would. Addresses are least significant byte first.
+ *
+ * The controller slot exists because a gamepad used to have nowhere to go
+ * but the keyboard slot, which then held the keyboard's place: the scan list
+ * offered any HID device to any slot, and a controller advertising the HID
+ * service but no keyboard appearance is exactly that. A device whose
+ * appearance says joystick or gamepad now has a slot of its own to belong
+ * to, and the other slots do not offer it. */
 enum
 {
     TD_BT_SLOT_KEYBOARD = 0,
     TD_BT_SLOT_MOUSE = 1,
     TD_BT_SLOT_COMBO = 2,
-    TD_BT_SLOTS = 3
+    TD_BT_SLOT_CONTROLLER = 3,
+    TD_BT_SLOTS = 4
 };
 #define TD_BT_NAME_LEN    24
 #define TD_BT_ADDR_LEN    6
@@ -467,7 +475,8 @@ typedef enum
     TD_BT_KIND_OTHER,            /* gave a name but advertises no HID service */
     TD_BT_KIND_HID,              /* advertises the HID service */
     TD_BT_KIND_KEYBOARD,         /* HID appearance: keyboard */
-    TD_BT_KIND_MOUSE             /* HID appearance: mouse */
+    TD_BT_KIND_MOUSE,            /* HID appearance: mouse */
+    TD_BT_KIND_GAMEPAD           /* HID appearance: joystick or gamepad */
 } td_bt_kind_t;
 
     /* One device the last scan found. */

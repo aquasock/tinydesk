@@ -95,7 +95,10 @@ CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
 CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
 # CONFIG_BT_NIMBLE_ROLE_PERIPHERAL is not set
 # CONFIG_BT_NIMBLE_ROLE_BROADCASTER is not set
-CONFIG_BT_NIMBLE_MAX_CONNECTIONS=3
+# Four slots (keyboard, mouse, combo, controller) can each hold one device, so
+# the controller needs a fourth connection. NimBLE's own memory comes from PSRAM
+# on this board (MEM_ALLOC_MODE_EXTERNAL below), so this costs no internal RAM.
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=4
 CONFIG_BT_NIMBLE_MAX_BONDS=6
 CONFIG_BT_NIMBLE_NVS_PERSIST=y
 CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING=y

@@ -1,6 +1,6 @@
 /*
- * bluetooth.c - the Bluetooth window: the radio, and the keyboard, mouse and
- * combo slots. Written by aquasock for the TinyTang port (MIT,
+ * bluetooth.c - the Bluetooth window: the radio, and the keyboard, mouse,
+ * combo and controller slots. Written by aquasock for the TinyTang port (MIT,
  * https://github.com/aquasock/TinyTang, tinydesk issue #7) and taken into
  * TinyDesk with its interface, td_bt_ops_t (td_sysinfo.h).
  *
@@ -30,14 +30,30 @@ static const td_bt_ops_t *bt(void)
 #define WIN_W     72
 #define WIN_H     34
 #define TICK_MS   250
-#define COL       11     /* where values start, after the headings */
+/* Where values start, after the headings. 11 was one short: "Controller" is
+ * ten characters, so its value began hard against it and the row read
+ * "Controlleridle, not paired". */
+#define COL       12
 /* Each slot is THREE rows: state and device on one line, the last event under
  * it, and the three buttons under that. It was four rows on a five-row stride,
  * and on a 40x26 window that pushed the scan section -- the reason anyone opens
- * this window -- off the bottom of the glass. */
-#define SLOT_Y(i) (4 + (i)*3)
-#define SCAN_Y    14
-#define LIST_ROWS 5
+ * this window -- off the bottom of the glass.
+ *
+ * THE ROWS ARE NOW COUNTED, NOT ASSUMED. Four slots at three rows each is one
+ * more than the old fixed rows left room for on the watch, where the desktop is
+ * 26 rows: the window asks for 34 and is clamped to 25 (the taskbar takes one),
+ * so the client is 23 rows with the default one-row title bar -- measured on
+ * the glass, not calculated -- and 22 with the title bar set to Large. Fixed
+ * rows would put the scan buttons on top of the message line. So the slots stay
+ * top-anchored at row 3 and the scan section is anchored to the BOTTOM instead:
+ * its list takes whatever is left between the two, four rows at 23 and three at
+ * 22. */
+#define SLOT_Y(i) (3 + (i)*3)
+
+/* Set from the window's real client height in launch(): the row the scan
+ * section's label sits above, and how many rows its list has. */
+static int s_scan_y, s_list_rows;
+#define LIST_ROWS_MAX 8
 
 static td_window_t *s_win;
 static td_bt_status_t s_info;
@@ -67,12 +83,15 @@ static enum
 static int s_act_slot;
 static int s_act_device;
 
-static const char *const s_slot_names[TD_BT_SLOTS] = {"Keyboard", "Mouse", "Combo"};
-static const char *const s_slot_lower[TD_BT_SLOTS] = {"keyboard", "mouse", "combo"};
+static const char *const s_slot_names[TD_BT_SLOTS] = {"Keyboard", "Mouse", "Combo",
+                                                       "Controller"};
+static const char *const s_slot_lower[TD_BT_SLOTS] = {"keyboard", "mouse", "combo",
+                                                      "controller"};
 static const td_bt_kind_t s_slot_kind[TD_BT_SLOTS] = {
     TD_BT_KIND_KEYBOARD,
     TD_BT_KIND_MOUSE,
     TD_BT_KIND_HID,
+    TD_BT_KIND_GAMEPAD,
 };
 
 static void note(const char *text)
@@ -96,6 +115,8 @@ static const char *kind_name(td_bt_kind_t k)
         return "mouse";
     case TD_BT_KIND_HID:
         return "HID";
+    case TD_BT_KIND_GAMEPAD:
+        return "controller";
     default:
         return "other";
     }
@@ -105,7 +126,14 @@ static const char *kind_name(td_bt_kind_t k)
 
 /* The devices worth offering for `slot`: its own kind first, then other HID
  * devices, then anything else that gave a name -- as `pair <name>` allows a
- * device that does not advertise its kind -- each strongest first. */
+ * device that does not advertise its kind -- each strongest first.
+ *
+ * A GAMEPAD IS OFFERED ONLY TO THE CONTROLLER SLOT. That is the whole point of
+ * the slot: a controller advertising the HID service without a keyboard
+ * appearance is otherwise a perfectly ordinary "other HID device", so it turned
+ * up in the keyboard slot's list, and pairing it there took the keyboard's
+ * place. Excluding it here is what stops that from happening again rather than
+ * only providing somewhere else to put it. */
 static void collect(int slot)
 {
     td_bt_device_t all[TD_BT_MAX_DEVICES];
@@ -119,6 +147,8 @@ static void collect(int slot)
             const bool mine = d->kind == s_slot_kind[slot];
             const bool hid = !mine && d->kind != TD_BT_KIND_OTHER;
             const bool named = d->kind == TD_BT_KIND_OTHER && d->name[0] != '\0';
+            if (d->kind == TD_BT_KIND_GAMEPAD && slot != TD_BT_SLOT_CONTROLLER)
+                continue;
             if ((pass == 0 && mine) || (pass == 1 && hid) || (pass == 2 && named))
             {
                 s_found[s_found_count++] = *d;
@@ -443,14 +473,14 @@ static void on_draw(td_window_t *win, int w, int h)
     switch (s_info.radio)
     {
     case TD_BT_RADIO_OFF:
-        row(1, w, "Radio", "off; a scan starts it", t->dim);
+        row(0, w, "Radio", "off; a scan starts it", t->dim);
         break;
     case TD_BT_RADIO_STARTING:
-        row(1, w, "Radio", "starting", t->win_fg);
+        row(0, w, "Radio", "starting", t->win_fg);
         break;
     case TD_BT_RADIO_FAILED:
         snprintf(line, sizeof(line), "failed to start (%d)", s_info.enable_error);
-        row(1, w, "Radio", line, t->win_fg);
+        row(0, w, "Radio", line, t->win_fg);
         break;
     case TD_BT_RADIO_UP:
         if (s_info.stack_heap)
@@ -462,16 +492,16 @@ static void on_draw(td_window_t *win, int w, int h)
         {
             snprintf(line, sizeof(line), "up");
         }
-        row(1, w, "Radio", line, t->win_fg);
+        row(0, w, "Radio", line, t->win_fg);
         break;
     }
     if (s_info.pairings != NULL)
     {
-        row(2, w, "Pairings", s_info.pairings, t->win_fg);
+        row(1, w, "Pairings", s_info.pairings, t->win_fg);
     }
     if (s_info.wifi_exclusive)
     {
-        row(3, w, "Wi-Fi", "off while Bluetooth runs (this board cannot do both)", t->dim);
+        row(2, w, "Wi-Fi", "off while Bluetooth runs (this board cannot do both)", t->dim);
     }
 
     for (int i = 0; i < TD_BT_SLOTS; i++)
@@ -483,7 +513,7 @@ static void on_draw(td_window_t *win, int w, int h)
     {
         snprintf(line, sizeof(line), "Pair a %s: pairing mode",
                  s_slot_lower[s_scan_slot]);
-        td_text(1, SCAN_Y - 1, line, t->win_fg, t->win_bg, TD_BOLD);
+        td_text(1, s_scan_y - 1, line, t->win_fg, t->win_bg, TD_BOLD);
         if (s_scan_pending)
         {
             snprintf(line, sizeof(line), "Listening... %lu s",
@@ -498,7 +528,7 @@ static void on_draw(td_window_t *win, int w, int h)
             snprintf(line, sizeof(line), "%d found; pick one, press Pair",
                      s_found_count);
         }
-        td_textn(1, SCAN_Y, line, w - 2, t->win_fg, t->win_bg, 0);
+        td_textn(1, s_scan_y, line, w - 2, t->win_fg, t->win_bg, 0);
     }
 
     /* The bottom line: a job's progress or outcome, else the window's note. */
@@ -587,6 +617,19 @@ static void launch(void)
     }
     note(NULL);
 
+    /* The scan section from the window's real height: label above the list,
+     * list, then the buttons two rows above the message line at h - 1. See
+     * SLOT_Y for why this is counted rather than fixed. */
+    const td_rect_t c = td_win_client(s_win);
+    /* +4: the last slot's buttons are two rows into it, and the label needs
+     * the row under them. */
+    s_scan_y = SLOT_Y(TD_BT_SLOTS - 1) + 4;
+    s_list_rows = c.h - 2 - (s_scan_y + 1);
+    if (s_list_rows < 1)
+        s_list_rows = 1;
+    if (s_list_rows > LIST_ROWS_MAX)
+        s_list_rows = LIST_ROWS_MAX;
+
     for (int i = 0; i < TD_BT_SLOTS; i++)
     {
         const int y = SLOT_Y(i) + 2;
@@ -597,11 +640,12 @@ static void launch(void)
         s_toggle[i] = td_button(s_win, 13, y, "Off", on_toggle, (void *)(intptr_t)i);
         s_forget[i] = td_button(s_win, 21, y, "Forget", on_forget, (void *)(intptr_t)i);
     }
-    s_list = td_list(s_win, td_rect(0, SCAN_Y + 1, -1, LIST_ROWS), get_item, on_pick, NULL);
-    s_scroll = td_scrollbar(s_win, -1, SCAN_Y + 1, LIST_ROWS, s_list);
-    s_pick = td_button(s_win, 1, SCAN_Y + LIST_ROWS + 2, "Pair", on_pick, NULL);
-    s_rescan = td_button(s_win, 10, SCAN_Y + LIST_ROWS + 2, "Scan again", on_rescan, NULL);
-    s_cancel = td_button(s_win, 25, SCAN_Y + LIST_ROWS + 2, "Cancel", on_cancel, NULL);
+    const int scan_btns = c.h - 2;
+    s_list = td_list(s_win, td_rect(0, s_scan_y + 1, -1, s_list_rows), get_item, on_pick, NULL);
+    s_scroll = td_scrollbar(s_win, -1, s_scan_y + 1, s_list_rows, s_list);
+    s_pick = td_button(s_win, 1, scan_btns, "Pair", on_pick, NULL);
+    s_rescan = td_button(s_win, 10, scan_btns, "Scan again", on_rescan, NULL);
+    s_cancel = td_button(s_win, 25, scan_btns, "Cancel", on_cancel, NULL);
 
     show_scan(false);
     refresh();
