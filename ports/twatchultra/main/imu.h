@@ -52,6 +52,10 @@ const td_imu_ops_t *board_imu_ops(void);
 /* Turn acceleration and orientation on at `hz`. Cheap when already on. */
 bool imu_stream_on(float hz);
 
+/* "FACE UP", "TILT UP" and the rest -- the posture word the window shows, for
+ * any acceleration. "--" when there is no valid reading. */
+const char *imu_posture(const td_imu_t *r);
+
 /* The latest orientation in degrees, false until the part has reported one. */
 bool imu_orientation(float *heading, float *pitch, float *roll);
 

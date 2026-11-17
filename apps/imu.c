@@ -48,33 +48,11 @@ static const td_imu_ops_t *imu(void)
     return td_sysinfo()->imu;
 }
 
-/* One line: heading, or a dash when the part does not compute it. A part with
- * acceleration but no fusion still deserves a window; it just shows fewer
- * numbers. */
 static void on_draw(td_window_t *win, int w, int h)
 {
     (void)win;
     const td_theme_t *t = td_theme();
     td_fill(td_rect(0, 0, w, h), ' ', t->win_fg, t->win_bg);
-}
-
-/* WHICH WAY IS UP, IN WORDS.
- *
- * Three acceleration numbers answer "which way is up" only for someone willing
- * to do the trigonometry in their head. A watch has room for the answer instead:
- * one of six names, chosen by whichever axis the gravity vector points along.
- * The 0.7 threshold is cos(45 degrees), so the name is the axis that is
- * dominant rather than merely largest. */
-static const char *up_word(const td_imu_t *r)
-{
-    const float t = 0.70f;
-    if (r->az > t)  return "FACE UP";
-    if (r->az < -t) return "FACE DOWN";
-    if (r->ax > t)  return "EDGE UP";
-    if (r->ax < -t) return "EDGE DOWN";
-    if (r->ay > t)  return "SIDE UP";
-    if (r->ay < -t) return "SIDE DOWN";
-    return "TILTED";
 }
 
 static void on_tick(td_window_t *win)
@@ -121,7 +99,11 @@ static void on_tick(td_window_t *win)
     td_widget_set_text(s_fw, r.version[0] ? r.version : "--");
 
     /* The headline: which way the watch is pointing, in words. */
-    td_widget_set_text(s_up, r.accel_valid ? up_word(&r) : "--");
+    /* The word comes from the PORT, not from here. Turning acceleration into
+     * "TILT UP" is a data question and belongs with the driver, where the shell
+     * can use the same function -- otherwise the window and `imu accel` can
+     * drift apart on what the watch is doing. */
+    td_widget_set_text(s_up, r.accel_valid ? r.posture : "--");
 
     char buf[24];
     /* Tilt in degrees, from gravity. This is the reading a person expects when

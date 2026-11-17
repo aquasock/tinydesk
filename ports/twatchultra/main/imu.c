@@ -846,6 +846,7 @@ static bool ops_latest(td_imu_t *out)
         out->tilt_roll = atan2f(out->ay, sqrtf(out->ax * out->ax + out->az * out->az)) * rad2deg;
         out->tilt_valid = true;
     }
+    snprintf(out->posture, sizeof(out->posture), "%s", imu_posture(out));
     out->ori_valid = s_have_ori;
     out->heading = s_heading;
     out->pitch = s_pitch;
@@ -1025,6 +1026,17 @@ static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
     /* A BURST, NOT A SNAPSHOT. One reading cannot be distinguished from a
      * frozen register; five taken as they arrive show that the numbers are
      * moving, which is the only evidence that means anything from a sensor. */
+    /* THE SAME WORD THE WINDOW SHOWS, from the same function, so the two cannot
+     * disagree about what the watch is doing. */
+    {
+        td_imu_t post;
+        memset(&post, 0, sizeof(post));
+        post.accel_valid = true;
+        post.ax = x;
+        post.ay = y;
+        post.az = z;
+        printf("posture %s\n", imu_posture(&post));
+    }
     printf("accel, in g (a watch lying flat reads about +1.00 on one axis):\n");
     printf("  x %+6.2f   y %+6.2f   z %+6.2f\n", x, y, z);
     for (int i = 0; i < 4; i++)

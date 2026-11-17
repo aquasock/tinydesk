@@ -434,6 +434,17 @@ if(TD_BUILD_TESTS)
     # Save/Load/Reset. Pure arithmetic over a small set, so the orders a human
     # tester never tries -- arm pressed then released, then the destructive
     # button -- can be walked exhaustively at a desk.
+    # The IMU posture words: a pure function of three floats that decides what a
+    # person reads on the window, so it is swept here rather than by holding a
+    # watch at an angle. Kept in its own file with no ESP-IDF dependencies for
+    # exactly this reason.
+    add_executable(test_imu_posture tests/test_imu_posture.c
+                   ports/twatchultra/main/imu_posture.c)
+    target_include_directories(test_imu_posture PRIVATE ports/twatchultra/main include tests)
+    set_target_properties(test_imu_posture PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+    target_compile_options(test_imu_posture PRIVATE ${TD_WARNINGS})
+    add_test(NAME test_imu_posture COMMAND test_imu_posture)
+
     add_executable(test_tama_ui tests/test_tama_ui.c ports/twatchultra/main/tama_ui.c)
     target_include_directories(test_tama_ui PRIVATE ports/twatchultra/main)
     set_target_properties(test_tama_ui PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)

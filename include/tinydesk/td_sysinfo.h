@@ -384,6 +384,13 @@ typedef struct
     bool tilt_valid;
     float tilt_pitch, tilt_roll;  /* degrees, -180..180 */
 
+      /* "Which way is it pointing", in the words a WEARER would use: FACE UP,
+     * FACE DOWN, TILT UP, TILT DOWN, TILT LEFT, TILT RIGHT, or TILTED. Filled by
+     * the port from the acceleration above, because turning that vector into a
+     * word is a data question and not a drawing one -- and because the shell and
+     * the window should never disagree about what the watch is doing. */
+    char posture[16];
+
     uint32_t accel_samples;   /* since start: a frozen count means a dead link */
     char part[24];            /* "BHI260AP" */
     char version[32];         /* firmware kernel version */
