@@ -26,7 +26,8 @@
 #include "sdpaths.h"
 #include "usbdiag.h"
 #include "bleuart.h"
-#include "modflac.h"
+#include "music_player.h"
+#include "music_ui.h"
 #include "modhost.h"
 #include "modload.h"
 #include "uac2.h"
@@ -577,8 +578,13 @@ bool link_init(void)
 
     /* Registers BOTH `music` and its alias `modflac`: one player, and the
      * decode happens out of the modules partition. */
-    if (!modflac_register_command())
+    if (!music_player_register_commands())
         ESP_LOGW(TAG, "music/modflac command did not register");
+
+    /* The Music window: a playlist view onto that same player, in the Start
+     * menu. Registered here rather than with the desktop's own apps because it
+     * is this port's -- it drives the amplifier and the modules partition. */
+    music_ui_register();
 
     /* Map the `modules` partition HERE, on the boot task, whose stack is in
      * internal RAM. esp_partition_mmap() disables the flash cache, and PSRAM is
@@ -611,6 +617,12 @@ bool link_init(void)
      * answered. */
 #ifdef MODTEST_AT_BOOT
     modload_selftest_call();
+#endif
+
+#ifdef MUSIC_UI_SELFTEST
+    /* DIAGNOSTIC BUILD ONLY: exercise the Music window's scan-and-play path at
+     * boot and leave the answer in /fs/root/musicboot.txt. */
+    music_ui_selftest();
 #endif
 
     /* The USB-C port's saved role (board keys usb.host, usb.dac), applied now:

@@ -1,5 +1,6 @@
 /*
- * modflac.c - play a FLAC file using the decoder in the `modules` partition.
+ * music_player.c - the FLAC player: a playback task, a playlist, and the two
+ * shell commands that drive it (`music` and its alias `modflac`).
  *
  * WHAT THIS PROVES AND WHY IT EXISTS. micro-flac costs 31.7 KB inline in the app,
  * where only ~24 KB of headroom remained. As a module it costs the app image
@@ -21,10 +22,12 @@
  *   2. give it a state block -- the decoder object has no home in read-only
  *      flash, so it is placement-new'd inside a caller-provided buffer.
  */
-#include "modflac.h"
+#include "music_player.h"
 
+#include <dirent.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -35,7 +38,7 @@
 #include "sound.h"
 #include "tdsh.h"
 
-__attribute__((unused)) static const char *TAG = "modflac";
+__attribute__((unused)) static const char *TAG = "music";
 
 #define MODFLAC_IN_BYTES    (16 * 1024)
 /* A FLAC block is at most 4608 frames in this decoder's configuration, and the
@@ -73,6 +76,8 @@ static volatile bool s_stop;
 static volatile int s_state;
 static volatile uint32_t s_frames;
 static volatile uint32_t s_calls;
+/* The playlist entry being played, or -1 when a bare path was given. */
+static volatile int s_index = -1;
 static volatile int32_t s_verdict;
 /* The two figures `music` used to report from its own loop, kept because they
  * are the ones that diagnose a bad output path: a decode ERROR means the module
@@ -376,12 +381,22 @@ done:
 
 static void task_entry(void *arg) { play_task(arg); }
 
-static bool start(const char *path)
+/*
+ * ONE TRACK AT A TIME, AND STOP MEANS STOP.
+ *
+ * Starting while a track is playing is refused rather than queued: the caller
+ * is either a person pressing Play on a row or the shell, and in both cases the
+ * honest answer to "play that now" is to stop this one first. The UI does
+ * exactly that, so the refusal is a guard against a double press rather than a
+ * policy the caller has to work around.
+ */
+static bool start(const char *path, int index)
 {
     if (s_task || strlen(path) >= sizeof(s_path))
         return false;
 
     snprintf(s_path, sizeof(s_path), "%s", path);
+    s_index = index;
     s_stop = false;
     s_state = 1;
     s_frames = 0;
@@ -391,7 +406,7 @@ static bool start(const char *path)
     s_short = 0;
     set_msg("");
 
-    if (xTaskCreateWithCaps(task_entry, "modflac", MODFLAC_STACK, NULL, MODFLAC_PRIO, &s_task,
+    if (xTaskCreateWithCaps(task_entry, "musicplay", MODFLAC_STACK, NULL, MODFLAC_PRIO, &s_task,
                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS)
     {
         s_task = NULL;
@@ -458,7 +473,7 @@ static int cmd_modflac(tdsh_session_t *session, int argc, char **argv)
         return 0;
     }
 
-    if (!start(argv[1]))
+    if (!start(argv[1], -1))
     {
         printf("music: cannot start\n");
         return 1;
@@ -492,7 +507,218 @@ static const tdsh_command_t s_modflac_alias_cmd = {
     TDSH_CMD_INTERACTIVE,
 };
 
-bool modflac_register_command(void)
+/* Stops the task if one is running, then rewrites s_path. Used by both the
+ * playlist and a bare path so there is one place that decides what plays. */
+static bool play(const char *path, int index)
+{
+    if (s_task)
+    {
+        s_stop = true;
+        /* The task clears s_task itself; wait briefly so the next open does not
+         * race the amplifier close. Two frames of audio is enough. */
+        for (int i = 0; i < 200 && s_task; i++)
+            vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    return start(path, index);
+}
+
+/* ------------------------------------------------------------- playlist */
+
+/*
+ * THE NAMES LIVE IN PSRAM, AND THEY HAVE TO.
+ *
+ * 256 entries of 72 bytes is 18 KB, which as a static array would be internal
+ * DRAM -- the pool this board is short of, and the same mistake that once
+ * pushed `ssh start` under its floor when the Tamagotchi's dirty-row tables
+ * were .bss. A static array here would also be paid whether or not anyone opens
+ * the Music window, so the pool is heap-allocated on the first scan.
+ *
+ * The names are what the list shows and what a path is built from: the
+ * directory is stored once, so a track is dir + "/" + name at play time. That
+ * keeps the pool small and means a card whose directory is renamed needs only a
+ * rescan, not 256 paths rewritten.
+ */
+static char *s_names;
+static int s_name_count;
+static char s_dir[128];
+
+/* One entry from readdir: kept when it is a .flac and the pool has room. */
+static bool track_add(const char *name)
+{
+    /* .flac only, case-insensitively: the card has been written from a PC and
+     * from this watch, and a .FLAC that the decoder would play must be listed. */
+    const size_t n = strlen(name);
+    static const char ext[] = ".flac";
+
+    if (n <= sizeof(ext) - 1)
+        return false;
+    if (strcasecmp(name + n - (sizeof(ext) - 1), ext) != 0)
+        return false;
+    if (s_name_count >= MUSIC_TRACK_MAX)
+        return false;
+
+    char *slot = s_names + (size_t)s_name_count * MUSIC_NAME_MAX;
+
+    snprintf(slot, MUSIC_NAME_MAX, "%s", name);
+    s_name_count++;
+    return true;
+}
+
+int music_tracks_scan(const char *dir)
+{
+    if (!dir || !dir[0])
+        return -1;
+
+    if (!s_names)
+    {
+        s_names = heap_caps_malloc((size_t)MUSIC_TRACK_MAX * MUSIC_NAME_MAX,
+                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_names)
+            return -1;
+    }
+
+    /* A scan invalidates the index, so a playing track is stopped first. */
+    if (s_task)
+    {
+        s_stop = true;
+        for (int i = 0; i < 200 && s_task; i++)
+            vTaskDelay(pdMS_TO_TICKS(10));
+        s_index = -1;
+    }
+
+    s_name_count = 0;
+    snprintf(s_dir, sizeof(s_dir), "%s", dir);
+
+    DIR *d = opendir(dir);
+
+    if (!d)
+        return 0;      /* no card, no directory: an empty list, not an error */
+
+    struct dirent *e;
+
+    while ((e = readdir(d)) != NULL)
+        track_add(e->d_name);
+    closedir(d);
+
+    /*
+     * SORTED, because readdir order on FAT is the directory's on-disk order --
+     * which is the order the files were copied, so a card written by an album
+     * ripper lists 01, 10, 11, 02. A playlist is read by a person.
+     *
+     * Insertion sort: 256 entries at most, run once per scan, and it costs no
+     * stack worth measuring.
+     */
+    for (int i = 1; i < s_name_count; i++)
+    {
+        char tmp[MUSIC_NAME_MAX];
+
+        snprintf(tmp, sizeof(tmp), "%s", s_names + (size_t)i * MUSIC_NAME_MAX);
+        int j = i - 1;
+
+        while (j >= 0 && strcasecmp(s_names + (size_t)j * MUSIC_NAME_MAX, tmp) > 0)
+        {
+            memcpy(s_names + (size_t)(j + 1) * MUSIC_NAME_MAX,
+                   s_names + (size_t)j * MUSIC_NAME_MAX, MUSIC_NAME_MAX);
+            j--;
+        }
+        memcpy(s_names + (size_t)(j + 1) * MUSIC_NAME_MAX, tmp, MUSIC_NAME_MAX);
+    }
+
+    return s_name_count;
+}
+
+int music_track_count(void)
+{
+    return s_name_count;
+}
+
+const char *music_track_name(int index)
+{
+    if (!s_names || index < 0 || index >= s_name_count)
+        return "";
+    return s_names + (size_t)index * MUSIC_NAME_MAX;
+}
+
+const char *music_tracks_dir(void)
+{
+    return s_dir;
+}
+
+const char *music_track_path(int index)
+{
+    static char path[sizeof(s_dir) + MUSIC_NAME_MAX + 2];
+
+    if (!s_dir[0] || index < 0 || index >= s_name_count)
+        return NULL;
+
+    snprintf(path, sizeof(path), "%s/%s", s_dir, music_track_name(index));
+    return path;
+}
+
+/* --------------------------------------------------------------- player */
+
+bool music_play_index(int index)
+{
+    const char *path = music_track_path(index);
+
+    if (!path)
+        return false;
+    return play(path, index);
+}
+
+bool music_play_path(const char *path)
+{
+    if (!path || !path[0])
+        return false;
+    return play(path, -1);
+}
+
+void music_stop(void)
+{
+    s_stop = true;
+}
+
+void music_status_get(music_status_t *out)
+{
+    if (!out)
+        return;
+
+    out->running = s_task != NULL;
+    out->state = s_state;
+    out->index = s_index;
+    out->frames = s_frames;
+
+    /*
+     * THE RATE HAS TO COME FROM THE LIVE HANDLE WHILE A TRACK PLAYS.
+     *
+     * s_h_rate is only copied out of the caller-owned state block when the task
+     * ENDS, because that is when the block is freed. Reading it here during
+     * playback gave 0 -- which made the elapsed time 0 as well, so the UI's
+     * clock sat at 00:00 for a whole track. The self-test caught it: frames
+     * 253440 with rate 0 is impossible, and only one of those figures was wrong.
+     */
+    out->rate = (uint32_t)s_h_rate;
+
+    if (s_state_live)
+    {
+        const uint32_t *w = (const uint32_t *)s_state_live;
+
+        /* 0x464C4143 is "FLAC", the magic flacmod.cpp writes into the handle. A
+         * block that is being constructed has not got it yet, and its other
+         * words are garbage. */
+        if (w[MODH_WORD_MAGIC] == 0x464C4143U)
+            out->rate = (uint32_t)w[MODH_WORD_RATE];
+    }
+    /* Frames over rate is the elapsed time, and it is the only clock the
+     * decoder gives: FLAC header durations are not always present and a
+     * progress bar that freezes is worse than no bar. */
+    out->seconds = out->rate ? out->frames / out->rate : 0;
+    out->errors = s_errors;
+    out->short_writes = s_short;
+    out->message = s_msg;
+}
+
+bool music_player_register_commands(void)
 {
     return tdsh_register_command(&s_modflac_cmd) == 0 &&
            tdsh_register_command(&s_modflac_alias_cmd) == 0;
