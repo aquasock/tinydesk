@@ -298,103 +298,117 @@ static int cmd_klio(tdsh_session_t *session, int argc, char **argv)
     }
 
     /* ---------------------------------------------------------- detect */
+    /* ---------------------------------------------------------- detect */
     if (strcmp(sub, "detect") == 0)
     {
-        /* LEARNING STAYS ENABLED, AND THAT IS A DELIBERATE EXPERIMENT.
+        /* THE STEP THAT WAS MISSING, AND WHY NOTHING EVER FIRED.
          *
-         * `klio learn` receives frames (17 of them over a 45 s session) and
-         * `klio detect` receives none at all -- same callback, same sensor id,
-         * only the algorithm state differs. So the suspicion is that this
-         * firmware emits KLIO frames only while the LEARNING half is active,
-         * with the recognition fields piggy-backing on the same frame.
+         * bhy2_klio.h, on read_pattern: "After learning of a new pattern has
+         * been signaled by a sensor data event, CALL THIS FUNCTION TO RETRIEVE
+         * THE LEARNT PATTERN." Learning leaves the pattern inside the algorithm;
+         * it is not in the host's pattern table, and `set_pattern_states(ENABLE)`
+         * was therefore enabling an empty slot. The full lifecycle is:
          *
-         * learning_reset is 0, so this does NOT wipe the patterns that were just
-         * learnt; it only lets the engine keep producing frames. If recognition
-         * starts reporting with learning on, the answer is that both must be
-         * enabled and the SDK's two-state model is not two independent modes. */
-        /* recognition_reset MUST BE 0, and getting this wrong is what made the
-         * first `klio detect` fail with SENSOR ERROR and zero frames.
+         *   learn  -> the engine signals a new pattern
+         *   read_pattern(0)      -> pull it out into host memory
+         *   write_pattern(0)     -> put it in the RECOGNITION table
+         *   set_pattern_states(ENABLE, {0}) -> and turn it on
+         *   recognition
          *
-         * bhy2_klio.h, on the state write: "Writing 1 to the reset fields resets
-         * all internal algorithm state AND REMOVES ANY PATTERNS LOADED FOR
-         * RECOGNITION." Setting it to 1 -- which reads like "reload", the
-         * opposite of what it does -- deleted the pattern that had just been
-         * trained, and the engine then reported meta 11 (SENSOR ERROR) on the
-         * next recognition attempt. The documentation was in the header all
-         * along; the flag's name reads as an action when it means a wipe. */
-        bhy2_klio_sensor_state_t st = {
-            .learning_enabled = 0,
-            .learning_reset = 0,
-            .recognition_enabled = 1,
-            .recognition_reset = 0,
-        };
+         * "only 0 supported now", says the header, which is why the pattern id
+         * here is 0 and not the index the engine reported while learning -- that
+         * index numbers the engine's internal slot, not the recognition table.
+         *
+         * Every step is reported, because each one can refuse and a silent
+         * refusal is what made this look like "recognition just does nothing". */
+        uint32_t drv = 0;
+        if (bhy2_klio_read_reset_driver_status(&drv, imu_dev()) == BHY2_OK)
+            printf("driver status: %lu\n", (unsigned long)drv);
 
-        (void)imu_stream_on(100.0f);      /* same prerequisite as `learn` */
-        (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_GYRO, 100.0f, 20, imu_dev());
+        /* THE RATE IS DELIBERATELY LOWER THAN LEARNING USED, and the reason is
+         * the FIFO. Accel and gyro at 100 Hz each is 26 bytes of packet per
+         * 10 ms -- 2.6 KB a second -- and every setup call below (read_pattern,
+         * write_pattern, set_pattern_states) is several I2C transactions during
+         * which nothing drains. That produced `meta 12 fifo overflow`, which
+         * DROPS DATA, and a dropped KLIO frame during recognition is
+         * indistinguishable from "no match".
+         *
+         * 50 Hz on both halves the byte rate, which is plenty: KLIO works on
+         * motion envelopes, not sample-accurate waveforms. */
+        (void)imu_stream_on(50.0f);
+        (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_GYRO, 50.0f, 20, imu_dev());
+        /* Early interrupts so a drain has something to do rather than waiting
+         * for a batch that the setup calls would overflow. */
+        (void)bhy2_set_fifo_wmark_wkup(32, imu_dev());
+        imu_poll();
+
+        /* 1. Read the learnt pattern out of the engine. The buffer must hold
+         *    the maximum pattern_data (244), not the blob size (157). */
+        static uint8_t pattern[244];
+        uint16_t plen = sizeof(pattern);
+        int8_t rc = bhy2_klio_read_pattern(0, pattern, &plen, imu_dev());
+        imu_poll();
+        printf("read_pattern:  %s (%d), %u bytes\n",
+               rc == BHY2_OK ? "ok" : "FAILED", rc, (unsigned)plen);
+        if (rc != BHY2_OK)
+        {
+            printf("\nNo learnt pattern could be read. Run `klio learn` first --\n"
+                   "and in THIS boot: the firmware is uploaded to RAM at start,\n"
+                   "so the pattern table does not survive a reboot.\n");
+            return 1;
+        }
+
+        /* 2. Write it into the recognition table at index 0. */
+        imu_poll();
+        rc = bhy2_klio_write_pattern(0, pattern, plen, imu_dev());
+        printf("write_pattern: %s (%d)\n", rc == BHY2_OK ? "ok" : "FAILED", rc);
+        if (rc != BHY2_OK)
+            return 1;
+
+        /* 3. Enable it -- a written pattern is disabled by default. */
+        {
+            uint8_t id = 0;
+            imu_poll();
+            rc = bhy2_klio_set_pattern_states(KLIO_PATTERN_STATE_ENABLE, &id, 1,
+                                              imu_dev());
+            printf("enable pattern: %s (%d)\n", rc == BHY2_OK ? "ok" : "FAILED", rc);
+        }
+
+        /* 4. Recognition on, learning OFF (learning would keep re-training and
+         *    never set the recognition half), and NO reset -- the reset fields
+         *    wipe the table that was just written. */
+        {
+            bhy2_klio_sensor_state_t st = {
+                .learning_enabled = 0,
+                .learning_reset = 0,
+                .recognition_enabled = 1,
+                .recognition_reset = 0,
+            };
+            rc = bhy2_klio_set_state(&st, imu_dev());
+            printf("recognition on: %s (%d)\n", rc == BHY2_OK ? "ok" : "FAILED", rc);
+        }
+
         (void)bhy2_register_fifo_parse_callback(BHY2_SENSOR_ID_KLIO, on_klio, NULL,
                                                 imu_dev());
         (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_KLIO, 50.0f, 20, imu_dev());
-        say_rc("recognition on", bhy2_klio_set_state(&st, imu_dev()));
 
-        /* A LEARNT PATTERN IS DISABLED UNTIL SOMETHING ENABLES IT. The SDK says
-         * so about a written pattern -- "After a pattern is written, it is in
-         * disabled state and not used. It must be enabled using
-         * bhy2_klio_set_pattern_states()" -- and a pattern the ENGINE learnt is
-         * in the same state. Enabling every index the firmware allows is
-         * harmless for the ones that hold nothing, and it removes the question
-         * of which one the engine chose. This is why the first `detect` printed
-         * nothing at all: the classifier had a pattern and had been told not to
-         * use it. */
-        {
-            /* ENABLE EXACTLY THE SLOT THAT WAS LEARNT, when we know it. Enabling
-             * every slot was the previous attempt and it is not obviously the
-             * same thing: a slot with no pattern in it may be an error the
-             * engine tolerates silently, or may reset the table. */
-            uint8_t one;
-            uint16_t cnt = 1;
-            int8_t erc;
+        printf("\nperform the trained gesture, repeatedly. Ctrl+C to stop.\n\n");
 
-            if (s_learnt >= 0 && s_learnt < 25)
-            {
-                one = (uint8_t)s_learnt;
-                erc = bhy2_klio_set_pattern_states(KLIO_PATTERN_STATE_ENABLE, &one, 1,
-                                                   imu_dev());
-                printf("enabled pattern %d: %s\n", s_learnt,
-                       erc == BHY2_OK ? "ok" : "refused");
-            }
-            else
-            {
-                uint8_t all[25];
-                for (int i = 0; i < 25; i++)
-                    all[i] = (uint8_t)i;
-                erc = bhy2_klio_set_pattern_states(KLIO_PATTERN_STATE_ENABLE, all, 25,
-                                                   imu_dev());
-                printf("enabled all 25 slots (no learnt index in this boot): %s\n",
-                       erc == BHY2_OK ? "ok" : "refused");
-            }
-            (void)cnt;
-        }
-
-        printf("\nperform the gesture you trained; press Ctrl+C to stop.\n\n");
-
-        /* POLL HARD. 100 Hz of accelerometer plus gyroscope fills the part's FIFO
-         * fast, and the first version of this loop slept 100 ms between drains --
-         * which produced `meta 12 fifo overflow` on the console and, with it,
-         * dropped KLIO frames. 10 ms still leaves the CPU to the shell, and the
-         * drain keeps up. */
+        const uint32_t frames0 = s_last.frames;
         int last_idx = -1;
         float last_count = -1.0f;
-        uint32_t frames0 = s_last.frames;
-        for (int i = 0; i < 3000; i++)          /* 3000 x 10 ms = 30 s */
+        for (int i = 0; i < 12000; i++)         /* 12000 x 5 ms = 60 s */
         {
-            vTaskDelay(pdMS_TO_TICKS(10));
+            vTaskDelay(pdMS_TO_TICKS(5));
             (void)imu_poll();
+            (void)imu_poll();                   /* twice: cheap, and one call
+                                                 * per pass can lag the fill */
 
-            if (s_last.recog_index != 255 &&
+            if (s_last.recog_index != 0xFF &&
                 ((int)s_last.recog_index != last_idx ||
-                 s_last.recog_count > last_count + 0.5f))
+                 s_last.recog_count > last_count + 0.4f))
             {
-                printf("  recognised %u, count %.1f\n",
+                printf("  RECOGNISED pattern %u, count %.1f\n",
                        (unsigned)s_last.recog_index, (double)s_last.recog_count);
                 last_idx = (int)s_last.recog_index;
                 last_count = s_last.recog_count;
@@ -403,10 +417,11 @@ static int cmd_klio(tdsh_session_t *session, int argc, char **argv)
 
         printf("\nframes from the engine: %lu\n",
                (unsigned long)(s_last.frames - frames0));
-        if (s_last.frames == frames0)
-            printf("no KLIO frames at all during recognition -- the engine ran\n"
-                   "but reported nothing, which is a different fault from not\n"
-                   "matching the gesture.\n");
+        if (last_idx < 0)
+            printf("no recognition event. The pattern IS loaded (read/write/enable\n"
+                   "all returned 0), so either the gesture did not match at the\n"
+                   "configured sensitivity, or this firmware only reports a match\n"
+                   "and stays silent otherwise.\n");
         (void)bhy2_klio_set_state(&(bhy2_klio_sensor_state_t){0}, imu_dev());
         (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_KLIO, 0.0f, 0, imu_dev());
         (void)imu_accel_enable(0.0f);
