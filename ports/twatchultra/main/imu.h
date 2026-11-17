@@ -9,6 +9,7 @@
 #define IMU_H
 
 #include <stdbool.h>
+#include "tinydesk/td_sysinfo.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -44,5 +45,14 @@ bool imu_accel(float *x, float *y, float *z, uint32_t *count);
 bool imu_sensor_on(void);
 
 bool imu_register_command(void);
+
+/* The table the desktop's IMU app reads (td_imu_ops_t). */
+const td_imu_ops_t *board_imu_ops(void);
+
+/* Turn acceleration and orientation on at `hz`. Cheap when already on. */
+bool imu_stream_on(float hz);
+
+/* The latest orientation in degrees, false until the part has reported one. */
+bool imu_orientation(float *heading, float *pitch, float *roll);
 
 #endif

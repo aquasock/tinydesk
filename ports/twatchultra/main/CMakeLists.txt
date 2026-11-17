@@ -27,6 +27,9 @@ target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Wextra -Werror)
 # image would replace it with one that talks to a UART.
 target_compile_definitions(${COMPONENT_LIB} PRIVATE TD_UPDATE_BOARD="twatchultra")
 
+# This board has an IMU, so ports/esp_idf/app fills td_sysinfo()->imu.
+target_compile_definitions(${COMPONENT_LIB} PRIVATE TD_BOARD_HAS_IMU=1)
+
 # No terminal-size polling. The desktop asks the terminal for its size once a
 # second because a serial terminal can never report a resize -- but this
 # panel's geometry is fixed at build time, so there is nothing to discover and

@@ -46,6 +46,7 @@
 #include "bhy2.h"
 #include "bhy2_defs.h"
 #include "bhy2_hif.h"
+#include "tinydesk/td_sysinfo.h"
 #include "imu.h"
 #include "power.h"
 
@@ -95,6 +96,9 @@ static struct bhy2_dev s_bhy2;
 static i2c_master_dev_handle_t s_dev;
 static bool s_ready;                 /* firmware uploaded and booted */
 static bool s_sensor_on;
+static bool s_ori_on;
+static volatile bool s_have_ori;
+static float s_heading, s_pitch, s_roll;
 static char s_why[112];
 static char s_version[40];
 static uint8_t s_fifo[IMU_FIFO_MAX];
@@ -116,6 +120,7 @@ static int s_present_n = -1;
 /* Declared here because the firmware bring-up below registers it, and its body
  * lives with the other FIFO callbacks further down. */
 static void on_meta(const struct bhy2_fifo_parse_data_info *info, void *priv);
+static void on_ori(const struct bhy2_fifo_parse_data_info *info, void *priv);
 
 /* Fills "3 61 63 ..." with the virtual sensors the loaded firmware carries. */
 static int imu_list_sensors(char *out, size_t cap);
@@ -366,6 +371,30 @@ static void on_accel(const struct bhy2_fifo_parse_data_info *info, void *priv)
     s_az = s[2] / 4096.0f;
     s_accel_count++;
     s_have_accel = true;
+}
+
+/* ORIENTATION, WHICH IS THE INTERESTING ONE ON A WRIST.
+ *
+ * BHY2_SENSOR_ID_DEVICE_ORI reports quaternion and Euler angles computed ON THE
+ * PART by Bosch's fusion algorithm -- work this board cannot afford to do in
+ * its 26 KB of internal RAM. The payload is quaternion (4 x int16, scaled by
+ * 2^14), then heading, pitch and roll in degrees as int16 scaled by 2^8.
+ *
+ * Sensor 69 (DEVICE_ORI) only reports on change; 70 (DEVICE_ORI_WU) is the
+ * wakeup variant. This subscribes to 69, which is what a window showing "which
+ * way am I facing" wants. */
+static void on_ori(const struct bhy2_fifo_parse_data_info *info, void *priv)
+{
+    (void)priv;
+    if (info->data_size < 14)      /* 8 quaternion + 6 euler */
+        return;
+    int16_t v[7];
+    memcpy(v, info->data_ptr, 14);
+    /* v[0..3] quaternion, v[4] heading, v[5] pitch, v[6] roll. */
+    s_heading = v[4] / 256.0f;
+    s_pitch = v[5] / 256.0f;
+    s_roll = v[6] / 256.0f;
+    s_have_ori = true;
 }
 
 /* META EVENTS ARE THE PART'S ONLY WAY OF SAYING NO. Every BHY2 command comes
@@ -713,6 +742,118 @@ bool imu_accel(float *x, float *y, float *z, uint32_t *count)
     *z = s_az;
     if (count)
         *count = s_accel_count;
+    return true;
+}
+
+/* ------------------------------------------------------- td_imu_ops_t */
+
+/* Turn orientation on too, when the firmware offers it. Silent when it does
+ * not: a board whose firmware lacks sensor 69 still shows acceleration. */
+static bool ori_enable(float hz)
+{
+    if (!bhy2_is_sensor_available(BHY2_SENSOR_ID_DEVICE_ORI, &s_bhy2))
+        return false;
+    if (bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_DEVICE_ORI, hz, 20, &s_bhy2) != BHY2_OK)
+        return false;
+    (void)bhy2_register_fifo_parse_callback(BHY2_SENSOR_ID_DEVICE_ORI, on_ori, NULL,
+                                            &s_bhy2);
+    s_ori_on = true;
+    return true;
+}
+
+/* START MEANS "STREAMING", NOT MERELY "BOOTED". The first version of this
+ * returned as soon as the part was up, and the window then sat on "waiting for
+ * the first sample" for ever: the firmware was running but neither sensor had
+ * been enabled, so nothing ever arrived and no cell ever changed -- which is
+ * indistinguishable from a dead link. Opening the window has to leave the
+ * sensors producing data. */
+static bool ops_start(const char **why)
+{
+    if (!imu_start())
+    {
+        if (why)
+            *why = imu_why();
+        return false;
+    }
+    /* 50 Hz is twice what a 4 Hz window needs and leaves room for a UI that
+     * later wants to watch a tilt more closely. */
+    if (!imu_stream_on(50.0f))
+    {
+        if (why)
+            *why = "the part is up but its sensors would not start";
+        return false;
+    }
+    return true;
+}
+
+static void ops_stop(void)
+{
+    if (s_ori_on)
+    {
+        (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_DEVICE_ORI, 0.0f, 0, &s_bhy2);
+        s_ori_on = false;
+    }
+    imu_stop();
+    s_have_ori = false;
+}
+
+static bool ops_latest(td_imu_t *out)
+{
+    if (!out)
+        return false;
+    memset(out, 0, sizeof(*out));
+
+    /* LATEST MEANS "DRAIN, THEN TELL ME" -- the window has no poll call, and
+     * the first version of this forgot to drain at all. The result was a window
+     * that sat on "waiting for the first sample" while 50 Hz of data piled up in
+     * the part's FIFO: the sensor was running, the readings were there, and
+     * nothing ever asked for them. The contract in td_sysinfo.h says the port
+     * does the work and a window may call this every tick, so the drain belongs
+     * here. */
+    (void)imu_poll();
+
+    out->accel_valid = imu_accel(&out->ax, &out->ay, &out->az, &out->accel_samples);
+    out->ori_valid = s_have_ori;
+    out->heading = s_heading;
+    out->pitch = s_pitch;
+    out->roll = s_roll;
+    snprintf(out->part, sizeof(out->part), "BHI260AP");
+    snprintf(out->version, sizeof(out->version), "%s", s_version);
+    return out->accel_valid || out->ori_valid;
+}
+
+static const td_imu_ops_t s_imu_ops = {
+    .start = ops_start,
+    .stop = ops_stop,
+    .latest = ops_latest,
+};
+
+const td_imu_ops_t *board_imu_ops(void)
+{
+    return &s_imu_ops;
+}
+
+/* Turn both sensors on at the rate the window wants. Called by the window's
+ * tick, so it must be cheap when they are already on. */
+bool imu_stream_on(float hz)
+{
+    if (!s_ready)
+        return false;
+    if (s_sensor_on && s_ori_on)
+        return true;
+    if (!s_sensor_on && !imu_accel_enable(hz))
+        return false;
+    (void)ori_enable(hz);
+    return true;
+}
+
+bool imu_orientation(float *heading, float *pitch, float *roll)
+{
+    if (!s_have_ori)
+        return false;
+    if (heading) *heading = s_heading;
+    if (pitch)   *pitch = s_pitch;
+    if (roll)    *roll = s_roll;
     return true;
 }
 

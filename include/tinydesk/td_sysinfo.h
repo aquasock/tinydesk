@@ -358,6 +358,51 @@ typedef struct
     bool (*set_time)(void);
 } td_gps_ops_t;
 
+    /* ------------------------------------------------------------ the IMU */
+
+/*
+ * One reading, in the units the sensors use. Acceleration in g (a device at
+ * rest reads about 1.00 on whichever axis points down); orientation in degrees
+ * where the part provides it.
+ */
+typedef struct
+{
+    bool accel_valid;
+    float ax, ay, az;          /* g */
+
+    bool ori_valid;           /* the board's firmware offers orientation */
+    float heading, pitch, roll;   /* degrees */
+
+    uint32_t accel_samples;   /* since start: a frozen count means a dead link */
+    char part[24];            /* "BHI260AP" */
+    char version[32];         /* firmware kernel version */
+} td_imu_t;
+
+/*
+ * The inertial sensor, for an app that shows it live. Same contract as
+ * td_gps_ops_t: every call returns at once, the port does the work, and the
+ * window polls.
+ *
+ * START AND STOP ARE A PAIR BECAUSE THE PART IS EXPENSIVE. Bringing up a
+ * BHI260AP means uploading ~121 KB of firmware into it, so start() is lazy --
+ * it does nothing on the second call -- and stop() turns the sensor off so that
+ * a part nobody is reading does not fill its FIFO. A port may keep the firmware
+ * loaded after stop(); this one does.
+ *
+ * NOTHING HERE BLOCKS FOR LONG, deliberately. The firmware upload takes seconds
+ * on the first start(), which is why a window calls start() from its own tick
+ * rather than during launch.
+ */
+typedef struct
+{
+    bool (*start)(const char **why);
+    void (*stop)(void);
+
+      /* Copy the latest reading. False when the sensor is not running or has
+     * not produced a sample yet. Cheap enough for a window's tick. */
+    bool (*latest)(td_imu_t *out);
+} td_imu_ops_t;
+
     /* --------------------------------------------------------- USB-C port */
 
 /*
@@ -796,6 +841,10 @@ typedef struct
      * a build without one, and the app then says so rather than showing an
      * empty window. See td_gps_ops_t above for why start/stop are a pair. */
     const td_gps_ops_t *gps;
+
+        /* Optional: an inertial sensor for the IMU app. NULL on a board with
+     * none, and the app is not registered then. */
+    const td_imu_ops_t *imu;
 
         /* Optional: what a BEL means on this board -- a beep, a flash, nothing.
      * Called when a terminal application receives a BEL in ordinary text, from

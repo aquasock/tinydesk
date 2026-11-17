@@ -786,7 +786,13 @@ __attribute__((weak)) bool board_maintenance_start(void)
  *
  * Weak, so every other board in this tree links unchanged.
  */
+void board_apps_register(void);
+const td_imu_ops_t *board_imu_ops(void);
+
 __attribute__((weak)) void board_apps_register(void) {}
+
+/* Weak too: a port with an inertial sensor returns its table here. */
+__attribute__((weak)) const td_imu_ops_t *board_imu_ops(void) { return NULL; }
 
 static void ui_task(void *arg)
 {
@@ -1015,6 +1021,14 @@ void app_main(void)
 #endif
     s_info.bt = bt_hid_start();                 /* Bluetooth keyboards and mice (bt.enable = 1) */
     s_info.gps = board_gps_ops();               /* the GPS app, where the board has a receiver */
+    /* WEAK, like board_apps_register(): a port with an IMU defines the symbol
+     * and everyone else links against the stub below, which returns NULL and
+     * means the app is not registered. A #define would not cross the component
+     * boundary -- the port's own CMakeLists cannot reach this file. */
+    {
+        const td_imu_ops_t *(*imu_ops)(void) = board_imu_ops;
+        s_info.imu = imu_ops ? imu_ops() : NULL;
+    }
     s_info.usb = board_usb_ops();               /* the USB page in Settings, where the port can switch */
     s_info.mouse = hid_input_mouse_ops();       /* the Mouse and Keyboard apps, when either is on */
     s_info.keyboard = hid_input_keyboard_ops();

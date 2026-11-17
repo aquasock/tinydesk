@@ -20,6 +20,7 @@ idf_component_register(
         "${TD_ROOT}/src/widgets.c"
         "${TD_ROOT}/src/wm.c"
         "${TD_ROOT}/apps/about.c"
+        "${TD_ROOT}/apps/imu.c"
         "${TD_ROOT}/apps/apps.c"
         "${TD_ROOT}/apps/counter.c"
         "${TD_ROOT}/apps/pixels.c"

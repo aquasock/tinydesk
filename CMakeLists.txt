@@ -112,6 +112,7 @@ endif()
 # ---------------------------------------------------------------- apps
 add_library(tinydesk_apps STATIC
     apps/about.c
+    apps/imu.c
     apps/apps.c
     apps/counter.c
     apps/pixels.c
