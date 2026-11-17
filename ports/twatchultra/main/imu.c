@@ -1576,6 +1576,151 @@ static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
         return rc == BHY2_OK ? 0 : 1;
     }
 
+    /* DOES INJECTED DATA EVER APPEAR ON THE SENSOR'S OWN OUTPUT?
+     *
+     * The cheapest question that decides the whole idea, and the one that does
+     * not depend on guessing a framing correctly: inject a value gravity cannot
+     * produce -- +8 g on Z, four times a hand's weight -- and watch the
+     * accelerometer's virtual-sensor output while it is being injected.
+     *
+     * The test is a RANGE, not a reading. The part is asked for a new sample
+     * many times a second and each one is recorded; if any sample anywhere in
+     * the window comes near 8 g then injected bytes reached the virtual sensor,
+     * and the earlier "it does not work" results were a framing problem. If the
+     * range across thousands of samples stays inside the physical sensor's own
+     * envelope, injection does not reach the sensor path at all.
+     *
+     * WHY THIS IS BETTER THAN WATCHING KLIO. KLIO reports progress, which is a
+     * summary: it could stay at zero for a dozen reasons -- rate, threshold,
+     * segmentation. The accelerometer reports the sample itself, so a negative
+     * result here is about the data path and nothing else.
+     *
+     * THE SENSOR RUNS THROUGHOUT, on purpose. For injection to replace a value
+     * the part has to have a virtual sensor to replace it in, so stopping the
+     * accelerometer first would test something else. What is being asked is
+     * whether injection OVERRIDES a configured sensor's output.
+     */
+    if (strcmp(sub, "watch") == 0)
+    {
+        int seconds = argc >= 3 ? atoi(argv[2]) : 15;
+        const int shape = argc >= 4 ? atoi(argv[3]) : 4;
+        if (seconds < 3 || seconds > 120)
+            seconds = 15;
+
+        if (!imu_accel_enable(50.0f))
+        {
+            printf("imu: could not start the accelerometer\n");
+            return 1;
+        }
+
+        /* Baseline first, with nothing injected, so the physical sensor's own
+         * envelope is measured rather than assumed. */
+        float bmin = 99, bmax = -99;
+        const uint32_t n0 = s_accel_count;
+        for (int i = 0; i < 50; i++)
+        {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            (void)imu_poll();
+            float x, y, z;
+            uint32_t n;
+            if (imu_accel(&x, &y, &z, &n))
+            {
+                if (z < bmin) bmin = z;
+                if (z > bmax) bmax = z;
+            }
+        }
+        printf("baseline: z %.2f .. %.2f g over %lu samples\n", (double)bmin,
+               (double)bmax, (unsigned long)(s_accel_count - n0));
+
+        const int mode = (shape == 2 || shape == 4) ? BHY2_STEP_BY_STEP_INJECTION
+                                                   : BHY2_REAL_TIME_INJECTION;
+        if (!imu_inject_begin(mode))
+        {
+            printf("imu: the part refused injection mode\n");
+            (void)imu_accel_enable(0.0f);
+            return 1;
+        }
+
+        /* +8 g on Z: 8 * 4096 = 32768, which is exactly int16 range, so 30000
+         * (7.32 g) is used to stay clear of the clamp. */
+        const uint8_t acc_id = (shape == 4) ? 76 : (shape == 2 ? 55 : 4);
+        int16_t big[3] = {0, 0, 30000};
+        uint8_t pkt[14];
+        uint16_t plen;
+
+        if (shape == 1)
+        {
+            float f[7] = {0.0f, 0.0f, 7.32f, 0.0f, 0.0f, 0.0f, 0.0f};
+            memcpy(pkt, f, sizeof(f));
+            plen = (uint16_t)sizeof(f);
+        }
+        else if (shape == 2 || shape == 4)
+        {
+            pkt[0] = acc_id;
+            memcpy(pkt + 1, big, 6);
+            plen = 7;
+        }
+        else
+        {
+            pkt[0] = 4;
+            pkt[1] = 0;
+            plen = 2;
+        }
+
+        float imin = 99, imax = -99;
+        uint32_t sent = 0, reads = 0;
+        int near = 0;
+        const uint32_t n1 = s_accel_count;
+        const int64_t t0 = esp_timer_get_time();
+
+        while (esp_timer_get_time() - t0 < (int64_t)seconds * 1000000)
+        {
+            if (imu_inject_frame(pkt, plen))
+                sent++;
+
+            /* Poll fast while injecting. The point is to catch the injected
+             * sample in the output, and a slow poll would let it pass between
+             * two reads. */
+            for (int k = 0; k < 3; k++)
+            {
+                vTaskDelay(pdMS_TO_TICKS(5));
+                (void)imu_poll();
+                float x, y, z;
+                uint32_t n;
+                if (imu_accel(&x, &y, &z, &n))
+                {
+                    reads++;
+                    if (z < imin) imin = z;
+                    if (z > imax) imax = z;
+                    if (z > 4.0f) near++;
+                }
+            }
+        }
+
+        imu_inject_end();
+
+        const uint32_t got = s_accel_count - n1;
+        printf("injecting %.2f g on Z for %d s: %lu frames sent\n", 7.32, seconds,
+               (unsigned long)sent);
+        printf("  sensor samples during: %lu\n", (unsigned long)got);
+        printf("  z during injection:    %.2f .. %.2f g  (%lu reads)\n",
+               (double)imin, (double)imax, (unsigned long)reads);
+        printf("  samples above 4 g:     %d\n", near);
+
+        if (near > 0)
+            printf("\nINJECTION REACHES THE VIRTUAL SENSOR OUTPUT. Real.\n");
+        else if (got == 0)
+            printf("\nNo sensor samples either: injection suppressed the sensor\n"
+                   "without replacing it, so the value never appears anywhere.\n");
+        else
+            printf("\nNo sample reached 4 g in %lu frames of +7.32 g injection.\n"
+                   "Injection does not override or feed the virtual sensor.\n",
+                   (unsigned long)got);
+
+        (void)imu_accel_enable(0.0f);
+        return 0;
+    }
+
     /* Send a bare command id, with an optional payload, and then look at the
      * error register and the status channel.
      *
