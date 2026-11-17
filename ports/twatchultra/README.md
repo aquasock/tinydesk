@@ -70,13 +70,44 @@ and nothing else, because the abort happens before anything can report it.
 ## The partition table replaces the stock layout
 
 This watch normally runs something else entirely. `partitions.csv` here is the
-`ports/nanoesp32` shape — two 3 MB OTA slots and a 9.9 MB `/fs` — and flashing
+`ports/nanoesp32` shape — two equal OTA slots and a 7.9 MB `/fs` — and flashing
 it overwrites whatever occupied those offsets. Read the flash out first if it
 holds anything that cannot be regenerated:
 
 ```
 esptool --port /dev/ttyACM0 --before usb_reset read_flash 0 0x1000000 backup.bin
 ```
+
+```
+nvs        0x9000    64K     settings, accounts, WiFi, Bluetooth bonds
+phy_init   0x19000    4K     RF calibration, regenerated when erased
+ota_0      0x20000    3008K  the running app (48 KB free)
+ota_1      0x310000   3008K  the update target — the real size budget
+coredump   0x600000   64K     panic backtraces, the only report without a console
+otadata    0x610000    8K
+storage    0x620000 8064K    littlefs, the shell's `/`
+modules    0xE00000    1M     codec blobs, mapped as INSTRUCTIONS
+moddata    0xF00000    1M     their .rodata, mapped as DATA
+```
+
+**The two slots are equal because a smaller one is the real limit.** An update
+writes whichever slot is not running, so an image has to fit the smaller of the
+two; 3 MB against 3008 KB meant the budget was 3008 KB while the table looked
+like it promised 3 MB.
+
+**NVS is 64 KB because 24 KB ran out of headroom.** Measured on the hardware in
+November 2026: the old 24 KB region had five of its six pages full or active,
+420 of 756 entry slots used and page sequence numbers of 66/100/101/102, so
+garbage collection never stopped. What happens at the end of that is silent —
+`nvs_flash_init()` returns `ESP_ERR_NVS_NO_FREE_PAGES` and `app_main()` answers
+with `nvs_flash_erase()`, which deletes every account, saved network and
+Bluetooth bond without saying anything. The TinyDesk author flagged this on
+issue 20; every other ESP32 port here already gave NVS 64 KB.
+
+**Nothing above 0x600000 moves between layouts**, so changing the two app slots
+and NVS costs no littlefs migration and no module relink. The 24 KB at
+0x1A000-0x20000 is deliberately unused: two 3008 KB slots that end on the
+coredump boundary must start at 0x20000 and 0x310000.
 
 ## Wiring
 

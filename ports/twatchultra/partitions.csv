@@ -1,20 +1,48 @@
-# tinydesk on the LilyGo T-Watch Ultra (16 MB flash): two 3 MB OTA slots and
-# a 9.9 MB /fs, the same shape as ports/nanoesp32.
+# tinydesk on the LilyGo T-Watch Ultra (16 MB flash): two equal OTA slots and
+# a 7.9 MB /fs, the same shape as ports/nanoesp32.
 #
 # NOTE: this table replaces the watch's stock layout. Read the flash out first
 # if it holds anything that cannot be regenerated -- on this board it does,
 # because the Escapement project keeps a Linux kernel, a rootfs and a home
 # partition in it. `esptool read_flash 0 0x1000000 backup.bin` beforehand.
 #
+# CHANGED 2026-11-17: nvs 24 KB -> 64 KB, and ota_0 shrunk to match ota_1.
+# Both changes were the TinyDesk author's advice on issue 20, and the NVS one
+# was measured before it was taken: the 24 KB region had FIVE of its six pages
+# full or active with one free page, and page sequence numbers of 66/100/101/102
+# -- garbage collection running continuously, no headroom. When NVS runs out,
+# nvs_flash_init() returns ESP_ERR_NVS_NO_FREE_PAGES and app_main() answers with
+# nvs_flash_erase(): every account, saved network and Bluetooth bond, silently.
+# 64 KB is what every other ESP32 port here uses (only crowpanel7 had 0x6000).
+#
+# NOTHING ABOVE 0x600000 MOVED. coredump, otadata, storage, modules and moddata
+# keep their addresses, so there was no littlefs migration and no module relink
+# for this change. The price was the two Bluetooth pairings: the new 64 KB NVS
+# covers 0xF000-0x19000, which held phy_init and the old app's first 36 KB, so
+# that region is erased rather than left holding app bytes for NVS to trip over.
+# RF calibration (phy_init) is regenerated on the next boot.
+#
+# THE SLOTS ARE EQUAL ON PURPOSE. An update writes whichever slot is not
+# running, so every image must fit the SMALLER one; 3 MB against 3008 KB meant
+# the real budget was the smaller number while looking like the larger. Both are
+# now 0x2F0000 and the app is 0x2e3fc0, so 48 KB is free -- and that is the
+# number that will actually stop a build.
+#
+# THE 24 KB AT 0x1A000-0x20000 IS DELIBERATELY UNUSED. Two 0x2F0000 slots that
+# end on the coredump boundary have to start at 0x20000 and 0x310000, and the
+# app's offset stays 64 KB aligned -- which the ESP32-S3 does not strictly need
+# (gen_esp32part.py asks only for 4 KB without secure boot, and the bootloader
+# maps from the aligned base below the image) but which is the layout every other
+# board here uses and is worth 24 KB out of 16 MB to keep conventional.
+#
 # Name,     Type, SubType,  Offset,   Size,
-nvs,        data, nvs,      0x9000,   0x6000,
-phy_init,   data, phy,      0xF000,   0x1000,
-ota_0,      app,  ota_0,    0x10000,  0x300000,
+nvs,        data, nvs,      0x9000,   0x10000,
+phy_init,   data, phy,      0x19000,  0x1000,
+ota_0,      app,  ota_0,    0x20000,  0x2F0000,
 ota_1,      app,  ota_1,    0x310000, 0x2F0000,
-# 64 KB carved out of ota_1's tail for panic backtraces. ota_1 holds the
-# inactive A/B slot and has never been used here (no update feed), and the
-# app is 0x2e3090 so 0x2F0000 still fits it. See EMU-021 in the reference:
-# with the console compiled out, this is the only way a panic reports itself.
+# 64 KB for panic backtraces, carved out below ota_1 rather than from its tail.
+# Because the console is compiled out (CONFIG_ESP_CONSOLE_NONE), this is the only
+# way a panic reports itself. See EMU-021 in the reference.
 coredump,   data, coredump, 0x600000, 0x10000,
 otadata,    data, ota,      0x610000, 0x2000,
 storage,    data, littlefs, 0x620000, 0x7E0000,
