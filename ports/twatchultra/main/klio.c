@@ -142,6 +142,40 @@ static void say_rc(const char *what, int8_t rc)
         printf("  %s: error %d\n", what, rc);
 }
 
+/* A return code as a word, for the messages that print rather than log. */
+static const char *rc_name(int8_t rc)
+{
+    switch (rc)
+    {
+    case BHY2_OK:                 return "ok";
+    case BHY2_E_NULL_PTR:         return "null pointer";
+    case BHY2_E_INVALID_PARAM:    return "invalid param";
+    case BHY2_E_IO:               return "io";
+    case BHY2_E_MAGIC:            return "bad magic";
+    case BHY2_E_TIMEOUT:          return "timeout";
+    case BHY2_E_BUFFER:           return "buffer";
+    case BHY2_E_INVALID_FIFO_TYPE:return "bad fifo type";
+    case BHY2_E_INVALID_EVENT_SIZE:return "bad event size";
+    case BHY2_E_PARAM_NOT_SET:    return "param not set";
+    default:                      return "error";
+    }
+}
+
+/* Turn learning and recognition on or off in one call, with the reset flags
+ * spelled out. Every caller here needs a different combination and the struct
+ * zero-initialises to "everything off, everything reset", which is a trap that
+ * has already cost one cycle -- a stray reset deletes the pattern table. */
+static int8_t change_state(int learn, int learn_reset, int recog, int recog_reset)
+{
+    bhy2_klio_sensor_state_t st = {
+        .learning_enabled = (uint8_t)(learn ? 1 : 0),
+        .learning_reset = (uint8_t)(learn_reset ? 1 : 0),
+        .recognition_enabled = (uint8_t)(recog ? 1 : 0),
+        .recognition_reset = (uint8_t)(recog_reset ? 1 : 0),
+    };
+    return bhy2_klio_set_state(&st, imu_dev());
+}
+
 /* Read a KLIO parameter and report it. Each one has its own size, documented in
  * bhy2_klio_defs.h, so the buffer is sized for the largest (244). */
 static bool read_param(const char *label, bhy2_klio_parameter_t id, uint16_t want)
@@ -310,6 +344,131 @@ static int cmd_klio(tdsh_session_t *session, int argc, char **argv)
             printf("no pattern learnt. progress reached %u%% and stopped, so the\n"
                    "part did not see the motion as repetitive enough.\n",
                    (unsigned)s_last.learn_progress);
+        return 0;
+    }
+
+    /* ------------------------------------------------------------ save */
+    /* PULL THE JUST-LEARNT PATTERN OUT AND PARK IT IN A SLOT.
+     *
+     * The whole certainty experiment rests on this: learning leaves a 157-byte
+     * fingerprint inside the algorithm, and until it is read out and written
+     * into the recognition table it exists nowhere the host can reach. Park one
+     * per variant and they can all be compared afterwards, in one call, without
+     * having to redo the motions.
+     *
+     *   klio save 0     after learning the reference
+     *   klio save 1     after learning a 70% amplitude variant
+     */
+    if (strcmp(sub, "save") == 0)
+    {
+        const int slot = argc >= 3 ? atoi(argv[2]) : 0;
+        if (slot < 0 || slot > 24)
+        {
+            printf("klio save <0..24>\n");
+            return 1;
+        }
+
+        change_state(0, 0, 0, 0);
+
+        uint8_t pattern[244];
+        uint16_t plen = sizeof(pattern);
+        int8_t rc = bhy2_klio_read_pattern(0, pattern, &plen, imu_dev());
+        (void)imu_poll();
+        if (rc != BHY2_OK || plen == 0 || plen > sizeof(pattern))
+        {
+            printf("read_pattern failed: %s (%d), %u bytes\n", rc_name(rc), rc,
+                   (unsigned)plen);
+            printf("learn a pattern first -- `klio learn` -- then save it.\n");
+            return 1;
+        }
+
+        rc = bhy2_klio_write_pattern((uint8_t)slot, pattern, plen, imu_dev());
+        (void)imu_poll();
+        printf("slot %d <- %u bytes: %s\n", slot, (unsigned)plen, rc_name(rc));
+
+        /* Written patterns are DISABLED until enabled, and a similarity
+         * calculation reads the table rather than the engine, so the slot has
+         * to be enabled for the comparison to have anything to chew on. */
+        const uint8_t id = (uint8_t)slot;
+        rc = bhy2_klio_set_pattern_states(KLIO_PATTERN_STATE_ENABLE, &id, 1,
+                                          imu_dev());
+        (void)imu_poll();
+        printf("slot %d enabled: %s\n", slot, rc_name(rc));
+        return rc == BHY2_OK ? 0 : 1;
+    }
+
+    /* --------------------------------------------------------- compare */
+    /* HOW SIMILAR IS EACH STORED VARIANT TO THE REFERENCE?
+     *
+     * bhy2_klio.h: "If the two patterns represent the same excercise the
+     * similarity will be close to 1.0, and if they are for very different
+     * excercises, the similarity will be negative."
+     *
+     * That is the number this whole exercise is for -- a graded answer, not a
+     * yes/no. One call, several slots, so a modulation sweep costs one command.
+     *
+     *   klio compare 0 1 2 3
+     */
+    if (strcmp(sub, "compare") == 0)
+    {
+        if (argc < 4)
+        {
+            printf("klio compare <ref slot> <slot> [slot...]\n");
+            printf("  prints similarity to the reference, as a percentage\n");
+            return 1;
+        }
+
+        const uint8_t ref = (uint8_t)atoi(argv[2]);
+        uint8_t ids[24];
+        int n = 0;
+        for (int i = 3; i < argc && n < 24; i++)
+        {
+            const int v = atoi(argv[i]);
+            if (v >= 0 && v <= 24)
+                ids[n++] = (uint8_t)v;
+        }
+        if (n == 0)
+        {
+            printf("klio compare: no valid slots\n");
+            return 1;
+        }
+
+        /* Enable every slot in the comparison. A pattern is disabled when
+         * written and a disabled one is not loaded for scoring. */
+        (void)bhy2_klio_set_pattern_states(KLIO_PATTERN_STATE_ENABLE, ids,
+                                           (uint16_t)n, imu_dev());
+        (void)imu_poll();
+
+        float sim[24] = {0};
+        const int8_t rc = bhy2_klio_similarity_score_multiple(ref, ids, (uint8_t)n,
+                                                              sim, imu_dev());
+        (void)imu_poll();
+        if (rc != BHY2_OK)
+        {
+            printf("similarity failed: %s (%d)\n", rc_name(rc), rc);
+            printf("driver status:\n");
+            uint32_t drv = 0;
+            if (bhy2_klio_read_reset_driver_status(&drv, imu_dev()) == BHY2_OK)
+                printf("  %lu\n", (unsigned long)drv);
+            return 1;
+        }
+
+        printf("similarity to slot %d\n\n", ref);
+        printf("  slot   score   percent  bar\n");
+        for (int i = 0; i < n; i++)
+        {
+            /* A tenth of a point of bar per percent, so a full match fills the
+             * row and a negative score shows nothing -- which is what it means:
+             * less alike than two unrelated motions. */
+            char bar[24];
+            int w = (int)(sim[i] * 20.0f);
+            if (w < 0) w = 0;
+            if (w > 20) w = 20;
+            memset(bar, '#', (size_t)w);
+            bar[w] = '\0';
+            printf("  %4u  %+6.3f  %5.1f%%  %s\n", ids[i], (double)sim[i],
+                   (double)(sim[i] * 100.0f), bar);
+        }
         return 0;
     }
 

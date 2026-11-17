@@ -494,12 +494,12 @@ static int imu_list_sensors(char *out, size_t cap)
     return n;
 }
 
-bool imu_start(void)
+/* Bring the rail, the bus and the SDK up, and stop BEFORE any firmware is
+ * uploaded. Split out of imu_start() so the boot diagnostic below can inspect a
+ * part whose firmware was refused -- which is exactly the case that cannot be
+ * inspected while a successful start is a precondition for every command. */
+static bool imu_hw_open(void)
 {
-    if (s_ready)
-        return true;
-    s_why[0] = '\0';
-
     if (!board_imu_rail_on())
     {
         snprintf(s_why, sizeof(s_why), "the sensor rail did not come up");
@@ -578,6 +578,18 @@ bool imu_start(void)
         return false;
     }
 
+    return true;
+}
+
+bool imu_start(void)
+{
+    if (s_ready)
+        return true;
+    s_why[0] = '\0';
+
+    if (!imu_hw_open())
+        return false;
+
     if (!fw_upload_and_boot())
         return false;
 
@@ -585,6 +597,213 @@ bool imu_start(void)
     imu_version(s_version, sizeof(s_version));
     ESP_LOGI(TAG, "BHI260AP up: %s", s_version);
     return true;
+}
+
+/* ------------------------------------------------------- boot diagnostic */
+
+/* WHAT THE PART SAYS ABOUT ITS OWN BOOT, in words.
+ *
+ * The upload path reports only a timeout when the part never raises
+ * HOST_FW_VERIFY_DONE, and a timeout does not distinguish "the image arrived and
+ * failed verification" from "the image never got there". The boot status byte
+ * does, and so does the error register.
+ *
+ * This exists because the question being asked is whether Bosch's DATA INJECTION
+ * firmware -- which they ship for the BHI360 (chip id 0x7A) and not for our
+ * BHI260 (0x70) -- will boot here. Chips can share a firmware container format
+ * and still refuse the payload, and the refusal is recorded in these two bytes.
+ */
+static void boot_status_report(const char *when)
+{
+    uint8_t st = 0, err = 0, chip = 0;
+
+    (void)bhy2_get_regs(BHY2_REG_CHIP_ID, &chip, 1, &s_bhy2);
+    if (bhy2_get_boot_status(&st, &s_bhy2) != BHY2_OK)
+    {
+        printf("  %-18s boot status unreadable\n", when);
+        return;
+    }
+    (void)bhy2_get_error_value(&err, &s_bhy2);
+
+    printf("  %-18s chip %02x  boot %02x  err %02x  %s%s%s%s%s\n", when, chip, st,
+           err,
+           (st & BHY2_BST_HOST_INTERFACE_READY) ? "iface-ready " : "",
+           (st & BHY2_BST_HOST_FW_VERIFY_DONE) ? "verify-done " : "",
+           (st & BHY2_BST_HOST_FW_VERIFY_ERROR) ? "VERIFY-ERROR " : "",
+           (st & BHY2_BST_NO_FLASH) ? "no-flash " : "",
+           (st & BHY2_BST_HOST_FW_IDLE) ? "idle " : "");
+}
+
+/* ---------------------------------------------------------- sine feeder --- */
+
+/* FEED THE PART A SINE THE HOST GENERATED, using Bosch's own injection
+ * sequence rather than a guess.
+ *
+ * The protocol comes from their `examples/swim/swim_data_injection` in
+ * BHI2xy_SensorAPI, and every step of it was missing from the earlier attempts:
+ *
+ *   1  bhy2_set_data_injection_mode(STEP_BY_STEP)
+ *   2  bhy2_set_virt_sensor_cfg(SENSOR_ID, rate, latency)   <-- CONFIGURE FIRST
+ *   3  drain the status FIFO
+ *   4  bhy2_inject_data(timestamp, 6)      a full timestamp, its OWN call
+ *   5  bhy2_inject_data(event, 7)          then one FIFO event
+ *   6  drain the FIFO between injections
+ *
+ * STEP 2 IS THE ONE THAT MATTERED. Injection supplies data for a virtual sensor;
+ * if no sensor is configured then nothing is listening and the bytes are
+ * accepted and dropped, which is exactly what every earlier result looked like.
+ * A 6-byte full timestamp also precedes the data as a separate injection --
+ * the part will not place an event in time without it.
+ *
+ * THE TEST MEASURES THE ROUND TRIP. Every sample is generated from the sine,
+ * injected, drained back through the part's own parser, and compared against
+ * what the callback saw. If the returned range matches the injected amplitude
+ * then the part really is consuming host data, which is the whole premise.
+ */
+static int cmd_imu_feed(int seconds, float hz, float amp)
+{
+    if (!s_ready && !imu_start())
+    {
+        printf("imu: %s\n", s_why);
+        return 1;
+    }
+
+    printf("feeding a %.2f Hz sine, %.2f g amplitude, 50 samples/s for %d s\n",
+           (double)hz, (double)amp, seconds);
+    printf("injected values are round-tripped through the part's own parser.\n\n");
+
+    /* 1. step-by-step, and confirm the mode really changed like Bosch does. */
+    if (!imu_inject_begin(BHY2_STEP_BY_STEP_INJECTION))
+    {
+        printf("imu: the part refused step-by-step injection mode\n");
+        return 1;
+    }
+
+    /* 2. CONFIGURE THE SENSOR. This is the step whose absence made injection
+     * look dead: the part needs to know a virtual sensor exists before it will
+     * accept data for one. */
+    const int8_t cfg = bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_ACC, 50.0f, 20,
+                                                &s_bhy2);
+    printf("  configure accel @50 Hz: %d\n", cfg);
+    (void)bhy2_register_fifo_parse_callback(BHY2_SENSOR_ID_ACC, on_accel, NULL,
+                                            &s_bhy2);
+    s_sensor_on = true;      /* so imu_poll() drains */
+
+    /* 3. drain whatever the configuration produced. */
+    for (int i = 0; i < 20; i++)
+    {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        (void)imu_poll();
+    }
+    s_have_accel = false;
+    const uint32_t before = s_accel_count;
+
+    float lo = 99.0f, hi = -99.0f;
+    uint32_t sent = 0, seen = 0;
+    const int step_ms = 20;                    /* 50 samples a second */
+    const int steps = seconds * 1000 / step_ms;
+    uint32_t ts = 0;
+
+    for (int i = 0; i < steps; i++)
+    {
+        const float t = (float)i * step_ms / 1000.0f;
+        const float z = amp * sinf(2.0f * (float)M_PI * hz * t);
+        const int16_t zq = (int16_t)(z * 4096.0f);
+        const int16_t xq = 0, yq = 0;
+
+        /* 4. the full timestamp, as its own injection. 0xFD is TS_FULL on the
+         * non-wakeup channel; five bytes carry the 40-bit value. */
+        uint8_t stamp[6];
+        stamp[0] = BHY2_SYS_ID_TS_FULL;
+        stamp[1] = (uint8_t)(ts & 0xFF);
+        stamp[2] = (uint8_t)((ts >> 8) & 0xFF);
+        stamp[3] = (uint8_t)((ts >> 16) & 0xFF);
+        stamp[4] = (uint8_t)((ts >> 24) & 0xFF);
+        stamp[5] = 0;
+        ts += (uint32_t)(step_ms * 1000);      /* microseconds */
+
+        /* 5. one accelerometer event: id, then three little-endian int16 in
+         * 1/4096 g. */
+        uint8_t ev[7];
+        ev[0] = BHY2_SENSOR_ID_ACC;
+        memcpy(ev + 1, &xq, 2);
+        memcpy(ev + 3, &yq, 2);
+        memcpy(ev + 5, &zq, 2);
+
+        if (imu_inject_frame(stamp, sizeof(stamp)) &&
+            imu_inject_frame(ev, sizeof(ev)))
+            sent++;
+
+        /* 6. drain so the parser sees it. */
+        vTaskDelay(pdMS_TO_TICKS(step_ms));
+        (void)imu_poll();
+
+        float ax, ay, az;
+        uint32_t n;
+        if (imu_accel(&ax, &ay, &az, &n))
+        {
+            seen = n - before;
+            if (az < lo) lo = az;
+            if (az > hi) hi = az;
+        }
+    }
+
+    imu_inject_end();
+    s_sensor_on = false;
+
+    const uint32_t got = s_accel_count - before;
+    printf("\n%lu samples injected, %lu arrived back\n", (unsigned long)sent,
+           (unsigned long)got);
+    if (got == 0)
+    {
+        printf("range: none\n");
+        printf("\nNOTHING CAME BACK. The part accepted the packets and produced no\n"
+               "events, so either the framing is still wrong or this firmware's\n"
+               "DataInject paths want a different sensor id.\n");
+        return 1;
+    }
+
+    printf("z range seen: %+.2f .. %+.2f g   (injected peak %+.2f)\n",
+           (double)lo, (double)hi, (double)amp);
+    printf("%s\n", (hi > 0.5f * amp && lo < -0.5f * amp)
+                   ? "THE SINE ARRIVED. Host-generated data is being consumed by\n"
+                     "the part and read back out of its own FIFO."
+                   : "Events arrived but the range does not match the injections.");
+    return 0;
+}
+
+static int cmd_imu_boot(bool upload)
+{
+    s_ready = false;
+    s_why[0] = '\0';
+
+    printf("part bring-up, no firmware:\n");
+    if (!imu_hw_open())
+    {
+        printf("  failed: %s\n", s_why);
+        return 1;
+    }
+    boot_status_report("after soft reset");
+
+    if (!upload)
+    {
+        printf("\n  `imu boot upload` sends whatever is at %s+0x%x\n",
+               IMU_FW_LABEL, (unsigned)IMU_FW_OFFSET);
+        return 0;
+    }
+
+    printf("\nuploading %s+0x%x:\n", IMU_FW_LABEL, (unsigned)IMU_FW_OFFSET);
+    const bool ok = fw_upload_and_boot();
+    printf("  result: %s\n", ok ? "BOOTED" : s_why);
+    boot_status_report(ok ? "after boot" : "after failure");
+
+    if (!ok)
+        printf("\n  VERIFY-ERROR means the image arrived and was rejected.\n"
+               "  A clean status that never sets verify-done means the part\n"
+               "  stopped before checking, i.e. wrong image for this silicon.\n");
+
+    s_ready = ok;
+    return ok ? 0 : 1;
 }
 
 void imu_stop(void)
@@ -1220,6 +1439,23 @@ static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
         imu_stop();
         printf("imu: accelerometer off (firmware stays loaded)\n");
         return 0;
+    }
+
+    /* BEFORE THE s_ready GATE, because the whole point is to inspect a part
+     * whose firmware did not load. */
+    if (strcmp(sub, "boot") == 0)
+        return cmd_imu_boot(argc >= 3 && strcmp(argv[2], "upload") == 0);
+
+    /* The sine feeder. Before the s_ready gate for symmetry with `boot`; it
+     * starts the part itself if needed. */
+    if (strcmp(sub, "feed") == 0)
+    {
+        const int secs = argc >= 3 ? atoi(argv[2]) : 10;
+        const float fhz = argc >= 4 ? (float)atof(argv[3]) : 1.0f;
+        const float amp = argc >= 5 ? (float)atof(argv[4]) : 0.5f;
+        return cmd_imu_feed(secs < 1 ? 1 : (secs > 120 ? 120 : secs),
+                            fhz <= 0.0f ? 1.0f : fhz,
+                            amp <= 0.0f ? 0.5f : amp);
     }
 
     if (!s_ready)
