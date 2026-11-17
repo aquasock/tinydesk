@@ -83,24 +83,30 @@ static void on_tick(td_window_t *win)
     if (!m)
         return;
 
-    /* START LAZILY, FROM THE TICK. The first start uploads firmware and takes
-     * seconds; doing that during launch would freeze the desktop. */
-    static bool started;
-    if (!started)
+    /* START EVERY TICK UNTIL IT TAKES -- not once, and that distinction is a
+     * bug that was shipped for one build. start() is idempotent and cheap when
+     * the port is already streaming, but the window CLOSES with stop() (by
+     * design: the sensor is turned off when nothing reads it). A once-only flag
+     * therefore left the second open waiting for a sample for ever, because the
+     * firmware was up and the sensors were off and nothing ever asked again.
+     *
+     * The retry is bounded so that a genuinely absent part does not re-attempt a
+     * three-second firmware upload on every tick. */
+    static int attempts;
+    const char *why = "";
+    if (!m->start(&why))
     {
-        const char *why = "";
-        if (m->start(&why))
-        {
-            started = true;
-            s_reason[0] = '\0';
-        }
-        else
+        if (++attempts >= 3)
         {
             snprintf(s_reason, sizeof(s_reason), "%s", why ? why : "no sensor");
             td_widget_set_text(s_msg, s_reason);
             return;
         }
+        td_widget_set_text(s_msg, "starting...");
+        return;
     }
+    attempts = 0;
+    s_reason[0] = '\0';
 
     td_imu_t r;
     if (!m->latest(&r))
