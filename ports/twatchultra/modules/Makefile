@@ -28,6 +28,10 @@ APP_ELF := $(PORT)/build/tinydesk.elf
 # object, so a moved address forces a rebuild.
 MODADDR_H := $(BUILD)/modaddr.h
 
+# For `make imu`, which flashes with esptool: the interpreter that has it.
+IDF_PY ?= /home/vash/esp/idf-tools/python_env/idf5.3_py3.14_env/bin/python
+PORT   ?= /dev/ttyACM1
+
 # The linker needs these as --defsym symbols too. They are read from nm as well
 # as the header: the header is what makes OBJECTS rebuild when an address moves,
 # and these are what the LINK consumes.
@@ -189,3 +193,28 @@ size: $(ELF)
 
 clean:
 	rm -rf $(BUILD)
+
+# --------------------------------------------------------------- the IMU
+#
+# The BHI260AP's firmware is not in the app image: it is a blob in `moddata` at
+# 0x10000, streamed into the part on first use. Flashing it is a separate step
+# from `make flac`, and deliberately so -- they share that partition without
+# overlapping (the codec's .rodata is at offset 0, 1,976 bytes; this is 64 KB in).
+#
+# WHY 0x10000 AND NOT 0x2000: the codec blob is written by objcopy at the start
+# of the partition. Leaving 64 KB of gap means `make flac` and `make imu` can be
+# flashed in either order and neither clobbers the other. Do not move either
+# without checking the other.
+IMU_IMG   := $(MODULES)/../components/imu/bhi260_klio.img
+IMU_AT    := 0xE10000
+
+.PHONY: imu imu-image
+imu-image:
+	@ls -la $(IMU_IMG)
+
+# Read the address out of the partition table rather than trusting this file:
+#   esptool ... read_flash 0x8000 0x1000 pt.bin && gen_esp32part.py pt.bin
+imu: $(IMU_IMG)
+	@printf 'IMU firmware %s -> 0x%X (moddata + 0x10000)\n' "$(IMU_IMG)" $(IMU_AT)
+	$(IDF_PY) -m esptool --chip esp32s3 -p $(PORT) -b 921600 \
+	    --before default_reset --after hard_reset write_flash $(IMU_AT) $(IMU_IMG)

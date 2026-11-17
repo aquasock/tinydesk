@@ -42,6 +42,7 @@
 #include "rtc.h"
 #include "touch.h"
 #include "memdiag.h"
+#include "imu.h"
 #include "pusher.h"
 #include "pwrkey.h"
 #include "charge.h"
@@ -671,6 +672,9 @@ bool link_init(void)
 
     if (!memdiag_register_command())
         ESP_LOGW(TAG, "mem command did not register");
+
+    if (!imu_register_command())
+        ESP_LOGW(TAG, "imu command did not register");
 
     charge_report(NULL);
 
