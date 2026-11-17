@@ -18,6 +18,7 @@ SIZE    := $(CROSS)size
 BUILD   ?= $(MODULES)/build
 PORT    := $(abspath $(MODULES)/..)
 APP_ELF := $(PORT)/build/tinydesk.elf
+APP_BIN := $(PORT)/build/tinydesk.bin
 
 # Addresses come from a GENERATED HEADER, not -D flags.
 #
@@ -100,12 +101,29 @@ LDFLAGS := -nostdlib -T $(MODULES)/link.ld -Wl,--build-id=none \
            -Wl,--defsym=MODDATA_AT=$(MODDATA_AT) \
            -Wl,-Map=$(BUILD)/mod.map
 
-.PHONY: all clean flash size check flac modaddr
+.PHONY: all clean flash size check flac modaddr addrcheck
 
 all: $(BIN)
 
+# A STALE MEASUREMENT MUST NOT BE ABLE TO REACH THE FLASH, and the build is the
+# cheapest place to stop it.
+#
+# moddata.at is measured on the BOARD; the app is built HERE. Nothing used to
+# connect the two, so an app rebuilt for its own reasons left moddata.at holding
+# the previous pair and `make flac` happily linked against it. On 2026-11-17 that
+# is exactly what shipped: five rebuilds for the IMU and KLIO work, moddata.at
+# still at entry 43's addresses, and `music` refusing every file until someone
+# read the status line. The runtime guard in modload.c turned a silent decoder
+# error into a diagnostic, which is the right backstop -- but the blob should
+# never have been linked.
+#
+# `flac` depends on this because it is phony, so the check runs on every module
+# build and cannot be skipped by a target that was already up to date.
+addrcheck:
+	@python3 $(MODULES)/check_addr_fresh.py $(APP_BIN) $(MODULES)/moddata.at
+
 # The FLAC decoder as a module.
-flac: $(BUILD)/flac.bin
+flac: addrcheck $(BUILD)/flac.bin
 
 $(BUILD)/flacmod.o: $(MODULES)/src/flacmod.cpp $(MODADDR_H) | $(BUILD)
 	$(CXX) $(FLAC_CXXFLAGS) -I$(MAIN) -c $< -o $@

@@ -27,8 +27,36 @@ import subprocess
 import sys
 import tempfile
 
-STORAGE_OFF = 0x620000
-STORAGE_LEN = 0x7E0000          # 8064 KiB
+#
+# THE GEOMETRY IS READ FROM partitions.csv, NOT TYPED, AND THAT IS A FIX.
+#
+# These two numbers were 0x620000/0x7E0000 -- the layout before entry 43 made
+# the flash four equal 4 MiB regions. So this script pointed at 8,064 KiB that
+# began 1.5 MiB below where storage starts, and `make modaddr` -- the one tool
+# that exists to repair a stale module link -- could not do it. The result was a
+# FLAC blob linked for 0x42ad0000/0x3ccd0000 while the live mapping had moved to
+# 0x42ae0000/0x3cce0000, and `music` refused every file until someone looked.
+#
+# partitions.csv is already the single source of truth for where a partition
+# lives; a copy of two of its fields is a copy that can drift. Read it.
+PARTITIONS_CSV = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "partitions.csv")
+
+
+def storage_geometry(path=PARTITIONS_CSV):
+    """Offset and size of the `storage` row, straight out of the table."""
+    with open(path) as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            cols = [c.strip() for c in line.split(",")]
+            if len(cols) >= 5 and cols[0] == "storage":
+                return int(cols[3], 0), int(cols[4], 0)
+    sys.exit("read_modaddr: no 'storage' row in %s" % path)
+
+
+STORAGE_OFF, STORAGE_LEN = storage_geometry()
 
 # The file's literal bytes, as modload_prepare() writes them.
 PATTERN = re.compile(rb"inst=(0x[0-9a-fA-F]+)\s*\n\s*data=(0x[0-9a-fA-F]+)")
@@ -82,6 +110,12 @@ def main():
     ap.add_argument("--baud", default="921600")
     ap.add_argument("-o", "--out", default=os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "moddata.at"))
+    # The app image these addresses belong to. Recorded rather than used to read
+    # the board: check_addr_fresh.py compares this size against the current build
+    # and refuses to link a module against a measurement from a different app.
+    ap.add_argument("--app-bin", default=os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "build", "tinydesk.bin"))
     args = ap.parse_args()
 
     img = read_storage(args.port, args.baud)
@@ -95,6 +129,16 @@ def main():
                  "booted? modload_prepare() writes /root/modaddr.txt at boot.")
 
     inst, data = pair
+
+    # WHICH APP THESE WERE MEASURED AGAINST. The pair alone cannot say, and a blob
+    # is only valid for the build that produced them, so the size is written down
+    # beside them and the build refuses a mismatch instead of shipping it.
+    try:
+        app_size = os.path.getsize(args.app_bin)
+    except OSError:
+        sys.exit("read_modaddr: no app image at %s -- build the app first"
+                 % args.app_bin)
+
     text = """# Addresses the MMU gave for the two module partitions.
 #
 # COPIED FROM THE WATCH, never typed. modload_prepare() rewrites
@@ -110,13 +154,18 @@ def main():
 # for the app build that produced these numbers: the loader compares them against
 # the live mapping and refuses to call a mismatch, so a stale value is a log line
 # rather than a decoder reading garbage.
+# `app` is the size of the app image these numbers were measured against, so
+# check_addr_fresh.py can refuse to link a module for a different app instead of
+# leaving the loader to catch it on the board.
 inst=%s
 data=%s
-""" % (inst, data)
+app=%d
+""" % (inst, data, app_size)
 
     with open(args.out, "w") as f:
         f.write(text)
-    print("wrote %s\n  inst=%s\n  data=%s" % (args.out, inst, data))
+    print("wrote %s\n  inst=%s\n  data=%s\n  app=%d bytes" %
+          (args.out, inst, data, app_size))
 
 
 if __name__ == "__main__":

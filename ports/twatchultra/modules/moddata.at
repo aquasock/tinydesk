@@ -13,5 +13,9 @@
 # for the app build that produced these numbers: the loader compares them against
 # the live mapping and refuses to call a mismatch, so a stale value is a log line
 # rather than a decoder reading garbage.
-inst=0x42ad0000
-data=0x3ccd0000
+# `app` is the size of the app image these numbers were measured against, so
+# check_addr_fresh.py can refuse to link a module for a different app instead of
+# leaving the loader to catch it on the board.
+inst=0x42ae0000
+data=0x3cce0000
+app=3054112
