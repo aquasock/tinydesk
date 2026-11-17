@@ -75,16 +75,19 @@
 #define PMU_ADDR            0x34
 #define PMU_ALDO1_VOLT      0x92
 #define PMU_ALDO2_VOLT      0x93
+#define PMU_ALDO4_VOLT      0x95
 #define PMU_BLDO2_VOLT      0x97
 #define PMU_BLDO1_VOLT      0x96
 #define PMU_LDO_EN          0x90
 #define PMU_ALDO1_EN_BIT    0
 #define PMU_ALDO2_EN_BIT    1
+#define PMU_ALDO4_EN_BIT    3
 #define PMU_BLDO1_EN_BIT    4
 #define PMU_BLDO2_EN_BIT    5
-/* 3.3 V: (3300 - 500) / 100 = 28 */
+/* 3.3 V: (3300 - 500) / 100 = 28. 1.8 V: (1800 - 500) / 100 = 13. */
 #define PMU_ALDO1_3300MV    28
 #define PMU_ALDO2_3300MV    28
+#define PMU_ALDO4_1800MV    13
 #define PMU_BLDO1_3300MV    28
 #define PMU_BLDO2_3300MV    28
 
@@ -245,6 +248,59 @@ bool board_sd_rail_on(void)
     }
 
     ESP_LOGI(TAG, "PMU aldo1_v=%02x ldo_en=%02x", v, en);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    return true;
+}
+
+/* Raise ALDO4 to 1.8 V and enable it: the BHI260AP's supply.
+ *
+ * ALDO4 IS THE SENSOR RAIL AND NOTHING HAD EVER ENABLED IT, so the IMU was
+ * absent from the I2C bus for the whole life of this port -- a scan found only
+ * the touch panel, expander, PMU, RTC and haptic. Enabling it from MicroPython
+ * made 0x28 appear at once, and its chip ID read back 0x70 (BHI260_CHIP_ID).
+ *
+ * The vendor's own rail table is the source: ALDO1 SDCard 3.3 V, ALDO2 Display
+ * 3.3 V, ALDO3 Radio 3.3 V, ALDO4 SENSOR **1.8 V**, BLDO1 GPS 3.3 V, BLDO2
+ * Speaker 3.3 V, DLDO1 NFC. Note the voltage: 1.8 V, not 3.3, and it is
+ * IMU_MAX 3.6 V on the part -- 3.3 would be in spec but is not what the board
+ * is built for, and the vendor sets 1.8.
+ *
+ * THIS FAILURE LOOKS EXACTLY LIKE A MISSING PART. An unpowered I2C device does
+ * not NAK a scan; it is simply not there, so the symptom is "this board has no
+ * IMU" rather than "the rail is down". The same shape as the amplifier on BLDO2
+ * and the card on ALDO1.
+ *
+ * Returns false only if the PMU does not answer; a rail already up is success. */
+bool board_imu_rail_on(void)
+{
+    uint8_t v, en;
+
+    if (!pmu_r(PMU_ALDO4_VOLT, &v) || !pmu_r(PMU_LDO_EN, &en))
+    {
+        ESP_LOGE(TAG, "PMU did not answer");
+        return false;
+    }
+
+    if ((v & 0x1F) != PMU_ALDO4_1800MV)
+    {
+        if (!pmu_w(PMU_ALDO4_VOLT, (uint8_t)((v & 0xE0) | PMU_ALDO4_1800MV)))
+        {
+            ESP_LOGE(TAG, "could not set ALDO4 voltage");
+            return false;
+        }
+    }
+    if (!(en & (1u << PMU_ALDO4_EN_BIT)))
+    {
+        if (!pmu_w(PMU_LDO_EN, (uint8_t)(en | (1u << PMU_ALDO4_EN_BIT))))
+        {
+            ESP_LOGE(TAG, "could not enable ALDO4");
+            return false;
+        }
+    }
+
+    ESP_LOGI(TAG, "PMU aldo4_v=%02x ldo_en=%02x", v, en);
+    /* The BHI260AP needs its rail stable before it answers; the datasheet's
+     * power-on time is well under this. */
     vTaskDelay(pdMS_TO_TICKS(20));
     return true;
 }
@@ -413,6 +469,14 @@ void board_power_rails_preinit(void)
 
     if (!board_sd_rail_on())
         ESP_LOGW(TAG, "SD rail did not come up; a card will not mount");
+
+    /* THE IMU'S RAIL, raised at bring-up rather than on first use. It costs one
+     * register write and 20 ms, and it means the part is on the bus for any
+     * later probe -- including a `py` scan the operator runs to check the
+     * hardware, which is exactly how its absence was found. The firmware upload
+     * is what waits for first use, not the power. */
+    if (!board_imu_rail_on())
+        ESP_LOGW(TAG, "IMU rail did not come up; the BHI260AP will not answer");
 
     /* Park the other chips on the SD card's bus. See the note above. */
     if (gpio_config(&park) == ESP_OK)

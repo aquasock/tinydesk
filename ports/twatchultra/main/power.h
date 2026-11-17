@@ -52,6 +52,11 @@ bool board_display_rail_on(void);
  * silent shape as the haptic rail, which answers I2C with its supply off. */
 bool board_sd_rail_on(void);
 
+/* Raise ALDO4 to 1.8 V and enable it: the BHI260AP's supply. Nothing enabled it
+ * before, so the IMU did not appear on the bus at all -- an unpowered device is
+ * absent rather than faulty, which reads as "this board has no IMU". */
+bool board_imu_rail_on(void);
+
 /* Raise the AXP2101's BLDO1 to 3.3 V and enable it: the GNSS module's supply.
  *
  * BRD-003 assigns BLDO1 to the GNSS receiver. Note the register adjacency to
