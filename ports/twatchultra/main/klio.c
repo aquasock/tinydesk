@@ -756,6 +756,7 @@ static int cmd_klio(tdsh_session_t *session, int argc, char **argv)
         const int step_ms = 1000 / rate;
         const int steps = seconds * 1000 / step_ms;
         uint32_t sent = 0;
+        uint32_t ts_us = 0;
 
         int last_pct = -1;
         int peak_pct = 0;
@@ -925,6 +926,24 @@ static int cmd_klio(tdsh_session_t *session, int argc, char **argv)
                     int16_t a[3] = {(int16_t)(ax * 4096.0f), (int16_t)(ay * 4096.0f),
                                     (int16_t)(az * 4096.0f)};
                     int16_t g[3] = {0, (int16_t)(gy * 16.0f), 0};
+
+                    /* A FULL TIMESTAMP GOES FIRST, AS ITS OWN INJECTION.
+                     *
+                     * Bosch's swim_data_injection.c does exactly this and it is
+                     * the one step this command was missing: the part will not
+                     * place an event in time without it, so an event injected
+                     * without a preceding timestamp has nowhere to sit. 0xFD is
+                     * TS_FULL on the non-wakeup channel; five bytes carry the
+                     * 40-bit microsecond value. */
+                    uint8_t stamp[6];
+                    stamp[0] = BHY2_SYS_ID_TS_FULL;
+                    stamp[1] = (uint8_t)(ts_us & 0xFF);
+                    stamp[2] = (uint8_t)((ts_us >> 8) & 0xFF);
+                    stamp[3] = (uint8_t)((ts_us >> 16) & 0xFF);
+                    stamp[4] = (uint8_t)((ts_us >> 24) & 0xFF);
+                    stamp[5] = 0;
+                    ts_us += (uint32_t)(step_ms * 1000);
+                    (void)imu_inject_frame(stamp, sizeof(stamp));
 
                     pkt[0] = acc_id;
                     memcpy(pkt + 1, a, 6);
