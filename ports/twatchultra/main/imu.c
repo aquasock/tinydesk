@@ -1544,10 +1544,45 @@ static volatile uint32_t s_tap_frames;
 static volatile int      s_tap_progress;
 static volatile int      s_tap_index = -1;
 
+/* THE FIRST FEW FRAMES, VERBATIM, WITH THEIR SIZE.
+ *
+ * The decode below (d[1] = index, d[2] = progress) comes from the extended-port
+ * notes, not from Bosch, and this session has produced progress values of 246 --
+ * which a 0..100 field cannot be. Recording the raw bytes is the only way to
+ * tell a bad decode from a bad engine. */
+static uint8_t s_tap_raw[6][14];
+static uint8_t s_tap_raw_len[6];
+static volatile uint8_t s_tap_raw_n;
+
 static void klio_tap_cb(const struct bhy2_fifo_parse_data_info *info, void *priv)
 {
     (void)priv;
-    if (info->data_size < 3)
+    if (info->data_size < 1)
+        return;
+
+    if (s_tap_raw_n < 6)
+    {
+        const uint8_t k = s_tap_raw_n++;
+        const uint8_t n = info->data_size < 14 ? info->data_size : 14;
+        s_tap_raw_len[k] = n;
+        memcpy(s_tap_raw[k], info->data_ptr, n);
+    }
+    /* A KLIO FRAME IS EXACTLY 11 BYTES, AND ANYTHING ELSE IS NOT ONE.
+     *
+     * The raw dump proved the tap was decoding accelerometer events as KLIO:
+     *
+     *   11: 00 ff 14 00 00 ff 00 00 00 00 fd   KLIO, d[2] = 0x14 = progress 20
+     *    7: 43 03 01 07 11 0e 0d               accel x/y/z = 0.20/0.44/0.88 g
+     *
+     * A 7-byte accel frame passed a `>= 3` check and its data bytes were read as
+     * progress and index, which is where the impossible values came from -- 246
+     * among them. The count of "frames" was likewise inflated with samples that
+     * were never KLIO output.
+     *
+     * 11 is not a guess: it is the size recorded when this engine was first made
+     * to work (entry 52), confirmed above against a frame whose d[2] is a legal
+     * progress value. */
+    if (info->data_size != 11)
         return;
     const uint8_t *d = info->data_ptr;
     s_tap_index = (int8_t)d[1];
@@ -1557,6 +1592,7 @@ static void klio_tap_cb(const struct bhy2_fifo_parse_data_info *info, void *priv
 
 static void klio_tap_reset(void)
 {
+    s_tap_raw_n = 0;
     s_tap_frames = 0;
     s_tap_progress = 0;
     s_tap_index = -1;
@@ -1794,7 +1830,13 @@ static int cmd_imu_inject(int seconds, int shape, int target)
     if (tr)
         fprintf(tr, "inject %d s, shape %d, target %d\n", seconds, shape, target);
 
-    const int step_ms = 20;                  /* 50 samples a second */
+    /* 10 ms, TO MATCH THE 100 Hz THE ALGORITHM IS CONFIGURED FOR.
+     *
+     * This is the single-variable test entry 72 prescribed. Everything else --
+     * the block layout, the accel and gyro configuration, the drain pattern,
+     * the waveform -- is unchanged from the previous run. The engine asks for
+     * 100 Hz and was being fed 50. */
+    const int step_ms = 10;                  /* 100 blocks a second */
     const int steps = seconds * 1000 / step_ms;
     uint32_t sent = 0, ts = 0;
     int8_t last_err = -2;
@@ -1960,6 +2002,14 @@ static int cmd_imu_inject(int seconds, int shape, int target)
     {
         fprintf(tr, "totals: %lu blocks, %u frames, peak %d, read_pattern %u B\n",
                 (unsigned long)sent, (unsigned)s_tap_frames, peak, (unsigned)plen);
+        fprintf(tr, "\nfirst frames (len:hex):\n");
+        for (uint8_t k = 0; k < s_tap_raw_n; k++)
+        {
+            fprintf(tr, "  %u:", (unsigned)s_tap_raw_len[k]);
+            for (uint8_t b = 0; b < s_tap_raw_len[k]; b++)
+                fprintf(tr, " %02x", s_tap_raw[k][b]);
+            fprintf(tr, "\n");
+        }
         fclose(tr);
         printf("\ntrace: cat /root/inject.txt\n");
     }
