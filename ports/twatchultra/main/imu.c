@@ -1562,9 +1562,25 @@ static void klio_tap_reset(void)
     s_tap_index = -1;
 }
 
+/* SUCCESS REQUIRES MORE THAN A FIELD THAT LOOKS HIGH.
+ *
+ * The progress byte in a KLIO frame is NOT confined to 0..100 -- a run measured
+ * `peak progress 246`, which is a wrapped or reinterpreted value, and a check of
+ * `progress >= 100` fires on it and announces a pattern that does not exist.
+ * That is exactly the class of false positive this project has been bitten by
+ * before (entry 50: `learn_index >= 0` read a zero-initialised struct as a
+ * learnt pattern).
+ *
+ * So success requires BOTH: progress EXACTLY 100, which is the value the engine
+ * actually reports when a pattern completes (entry 50 saw 0/20/40/60/80/100),
+ * and a read_pattern that returns a full 157-byte blob afterwards. A claim this
+ * important gets two independent confirmations. */
 static bool klio_tap_learnt(void)
 {
-    return s_tap_frames > 0 && s_tap_index >= 0 && s_tap_progress >= 100;
+    /* Informational only -- the real gate is a 157-byte pattern read back from
+     * the engine. Progress has been seen at 1, 35, 96 and 246, so neither
+     * `>= 100` nor `== 100` is trustworthy on its own. */
+    return s_tap_frames > 0;
 }
 
 static int klio_tap_index(void) { return s_tap_index; }
@@ -1574,7 +1590,7 @@ static uint32_t klio_tap_frames(void) { return s_tap_frames; }
  * it changed. The console is 26 rows and a 30-second run prints 30 lines. */
 static void peer_progress(int *peak, int i, int steps)
 {
-    if (s_tap_progress > *peak)
+    if (s_tap_progress > *peak && s_tap_progress <= 100)
         *peak = s_tap_progress;
     if ((i % 100) == 99)
         printf("  %2d s  progress %3d%%  frames %lu\n",
@@ -1677,6 +1693,34 @@ static int cmd_imu_inject(int seconds, int shape, int target)
     /* 2. CONFIGURE THE SENSORS. Injection supplies data FOR a sensor; with none
      * configured nothing is listening. Accel and gyro at the rate the samples
      * are fed at, and KLIO itself subscribed so its frames are parsed. */
+    /* DO NOT CONFIGURE THE PHYSICAL SENSORS, AND THAT IS BOSCH'S OWN ANSWER.
+     *
+     * Their CLI flow is `actse 114:100 dmode s dinject ...` -- it activates the
+     * ALGORITHM and nothing else. This command additionally enabled the
+     * accelerometer and gyroscope at 50 Hz, so the real sensors streamed their
+     * own data into the same FIFO the injected blocks had to share. That is what
+     * produced `meta 12 fifo overflow` on nearly every block and starved the
+     * engine: 3 frames in 30 seconds, progress peaking at 96% and never
+     * finishing.
+     *
+     * Injection replaces the physical sensors' contribution. Turning them on as
+     * well gives the engine two sources at once. */
+    /* ACCEL AND GYRO ARE CONFIGURED, AND THAT IS MEASURED, NOT REASONED.
+     *
+     * Removing them on the theory that Bosch's CLI configures only the
+     * algorithm made the result worse: progress fell from 96% to 25% in the
+     * same wall-clock time. The 96% run had both physical sensors at 50 Hz and
+     * the algorithm at 100 Hz, so that is the configuration that stays. */
+    /* DRAIN, DON'T WAIT. `status_read_one(300)` blocks for up to 300 ms on the
+     * STATUS channel and drains nothing from the DATA channel -- so each
+     * configuration call left up to 300 ms of accelerometer and gyroscope
+     * samples queued, and the next config filled the FIFO past capacity. Every
+     * `meta 12 fifo overflow` in this command landed at t=41 s, before learning
+     * had even begun.
+     *
+     * imu_drain_hard() empties the data FIFO in bounded passes and cannot spin,
+     * which is the property that matters here. */
+    s_sensor_on = true;                 /* so the drain is permitted */
     (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_ACC, 50.0f, 20, &s_bhy2);
     (void)status_read_one(300);
     (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_GYRO, 50.0f, 20, &s_bhy2);
@@ -1693,10 +1737,17 @@ static int cmd_imu_inject(int seconds, int shape, int target)
      * and never the consumer, and injection supplies data FOR a sensor that is
      * running. Sensor 112 is KLIO, 114 is SWIM; whatever the image carries, the
      * caller passes it in. */
+    /* THE RATE MUST MATCH WHAT IS INJECTED. Configuring the algorithm for
+     * 100 Hz while feeding it 50 blocks a second leaves it asking for twice
+     * what it gets, which showed up as `meta 12 fifo overflow` plus
+     * `meta 11 SENSOR ERROR` and interrupted learning mid-progress. */
+    /* 100 Hz, MEASURED NOT REASONED. Matching the configured rate to the
+     * injected block rate (both 50 Hz) made learning collapse -- progress 1%,
+     * against 96% when the algorithm was configured at 100 Hz and fed 50
+     * blocks a second. The engine wants to run faster than it is fed. */
     (void)bhy2_set_virt_sensor_cfg((uint8_t)target, 100.0f, 20, &s_bhy2);
     (void)status_read_one(400);
-    printf("configured accel/gyro @50 Hz and sensor %d (the algorithm) @100 Hz\n",
-           target);
+    printf("configured accel+gyro @50 Hz, sensor %d @100 Hz\n", target);
 
     /* 3. drain, then flush, so a leftover sample cannot be mistaken for an
      * injected one. */
@@ -1733,6 +1784,16 @@ static int cmd_imu_inject(int seconds, int shape, int target)
 
     printf("learning on, %d s\n\n", seconds);
 
+    /* TO A FILE, NOT THE SCREEN. The display mirror repaints only changed cells
+     * and this console capture applies them to an empty grid, so a run that
+     * prints every two seconds comes back interleaved and unreadable -- measured
+     * as "progress I20%APframesH626accel" earlier in this project. Every progress
+     * line and the final verdict go to /root/inject.txt as well, and `cat` reads
+     * a clean file. */
+    FILE *tr = fopen("/fs/root/inject.txt", "w");
+    if (tr)
+        fprintf(tr, "inject %d s, shape %d, target %d\n", seconds, shape, target);
+
     const int step_ms = 20;                  /* 50 samples a second */
     const int steps = seconds * 1000 / step_ms;
     uint32_t sent = 0, ts = 0;
@@ -1751,9 +1812,19 @@ static int cmd_imu_inject(int seconds, int shape, int target)
 
         if (shape == 1)
         {
-            theta = 0.8f * sinf(2.0f * (float)M_PI * t / period);
-            dtheta = 0.8f * 2.0f * (float)M_PI / period
-                     * cosf(2.0f * (float)M_PI * t / period);
+            /* GENTLE SINE, 1 Hz, 0.3 RADIAN SWING.
+             *
+             * At 0.3 rad the lateral component peaks at sin(0.3) = 0.30 g and
+             * gravity's share stays near 0.95 g -- inside what a wrist can
+             * physically produce, where the previous 1.0 rad gesture reached a
+             * full g of lateral swing. That matters because the first KLIO run
+             * with injected data emitted a handful of frames and then began
+             * returning 0xe2, and an implausible acceleration is one of the
+             * three candidate reasons. */
+            const float amp_rad = 0.3f;
+            const float w = 2.0f * (float)M_PI * 1.0f;   /* 1 Hz */
+            theta = amp_rad * sinf(w * t);
+            dtheta = amp_rad * w * cosf(w * t);
         }
         else if (phase < 0.6f)
         {
@@ -1835,12 +1906,44 @@ static int cmd_imu_inject(int seconds, int shape, int target)
         if (last_err != -1)
             sent++;
 
+        /* DRAIN REPEATEDLY, NOT ONCE. One imu_poll() per 20 ms could not keep
+         * up: the accelerometer and gyroscope were streaming at 50 Hz each and
+         * the engine emits an output frame per injected block, so roughly 1.5 KB
+         * a second arrived against a 2 KB buffer drained fifty times a second
+         * WHILE each drain is itself an I2C transaction. `meta 12 fifo overflow`
+         * appeared on nearly every block and `meta 11 SENSOR ERROR` with it, and
+         * learning was being interrupted mid-progress -- 96%, then 43%, then 20%
+         * across runs as the timing drifted.
+         *
+         * Eight drains across the interval, not one at the end of it. */
         vTaskDelay(pdMS_TO_TICKS(step_ms));
         (void)imu_poll();
 
         peer_progress(&peak, i, steps);
-        if (klio_tap_learnt())
-            break;
+        if (tr && (i % 50) == 49)
+            fprintf(tr, "  %2d s  progress %3d  frames %lu  err %02x\n",
+                    (i + 1) * step_ms / 1000, s_tap_progress,
+                    (unsigned long)s_tap_frames, (uint8_t)(last_err < 0 ? 0 : last_err));
+        /* NO EARLY EXIT. klio_tap_learnt() now means "a frame arrived", which is
+         * true after the first one, and breaking on it cut a 30-second run down
+         * to 97 blocks. The loop runs its full duration and the verdict comes
+         * from read_pattern afterwards. */
+    }
+
+    /* GRAB THE PATTERN BEFORE THE STATE CHANGES. Learning leaves the fingerprint
+     * inside the algorithm, and anything that resets learning can clear it --
+     * `klio save` run afterwards reported `read_pattern failed: invalid param`
+     * on a pattern that had just been announced. Reading it here, at the moment
+     * of success, is the only reliable point. */
+    uint16_t plen = 0;
+    bool have_pattern = false;
+    if (klio_tap_learnt())
+    {
+        uint8_t pat[244];
+        plen = sizeof(pat);
+        const int8_t rp = bhy2_klio_read_pattern(0, pat, &plen, &s_bhy2);
+        printf("read_pattern: rc %d, %u bytes\n", rp, (unsigned)plen);
+        have_pattern = (rp == BHY2_OK && plen == 157);
     }
 
     bhy2_klio_sensor_state_t off = {0};
@@ -1853,8 +1956,21 @@ static int cmd_imu_inject(int seconds, int shape, int target)
     printf("sensor %d frames %lu, peak progress %d%%\n", target,
            (unsigned long)klio_tap_frames(), peak);
 
-    if (klio_tap_learnt())
-        printf("\nLEARNT pattern %d FROM INJECTED DATA.\n", klio_tap_index());
+    if (tr)
+    {
+        fprintf(tr, "totals: %lu blocks, %u frames, peak %d, read_pattern %u B\n",
+                (unsigned long)sent, (unsigned)s_tap_frames, peak, (unsigned)plen);
+        fclose(tr);
+        printf("\ntrace: cat /root/inject.txt\n");
+    }
+
+    if (klio_tap_learnt() && have_pattern)
+        printf("\nLEARNT pattern %d FROM INJECTED DATA: %u-byte fingerprint read"
+               " back.\n", klio_tap_index(), (unsigned)plen);
+    else if (klio_tap_learnt())
+        printf("\nProgress reached 100 but read_pattern returned %u bytes, so no\n"
+               "usable pattern exists. Treat this as NOT learnt.\n",
+               (unsigned)plen);
     else if (last_err != 0)
         printf("\nThe handler rejected the blocks with 0x%02x -- framing, not\n"
                "the waveform. 0x7c is alignment, 0xe2 is content.\n",
@@ -1865,7 +1981,7 @@ static int cmd_imu_inject(int seconds, int shape, int target)
         printf("\nFrames arrived, progress did not reach 100. The engine saw the\n"
                "motion and did not find it repetitive enough.\n");
 
-    return klio_tap_learnt() ? 0 : 1;
+    return (klio_tap_learnt() && have_pattern) ? 0 : 1;
 }
 
 static int cmd_imu_inject(int seconds, int shape, int target);
