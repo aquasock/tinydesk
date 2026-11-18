@@ -81,6 +81,19 @@ bool imu_orientation(float *heading, float *pitch, float *roll);
  * walking sensor ids and a trailing zero byte is a byte the part did not send.
  * imu_inject_end() returns the part to normal mode.
  */
+/* Stop the physical sensors and empty the FIFO, then drain repeatedly until it
+ * stays empty. Pattern-table work (read_pattern, write_pattern,
+ * set_pattern_states, similarity) is pure computation on the part and does not
+ * need the sensors streaming -- but leaving them streaming while several
+ * blocking I2C calls run overflows the FIFO, and a dropped packet during those
+ * calls is indistinguishable from a corrupt result. */
+void imu_quiesce(void);
+
+/* Drain the FIFO regardless of whether a sensor is nominally on. The normal
+ * imu_poll() refuses when s_sensor_on is false, which is exactly the state a
+ * quiesce leaves behind. */
+void imu_drain_hard(void);
+
 bool imu_inject_begin(int mode);
 bool imu_inject_frame(const uint8_t *payload, uint16_t len);
 void imu_inject_end(void);

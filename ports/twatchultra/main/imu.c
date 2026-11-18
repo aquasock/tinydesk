@@ -1442,6 +1442,44 @@ static bool try_inject(const char *name, const uint8_t *payload, uint16_t len,
 
 /* ------------------------------------------------------- injection, exported */
 
+void imu_drain_hard(void)
+{
+    if (!s_ready)
+        return;
+    /* A finite number of passes, never a loop on "is it empty" -- the SDK's own
+     * drain spins for ever if the FIFO outgrows the buffer, and this function
+     * exists to avoid that class of bug rather than recreate it. */
+    for (int i = 0; i < 12; i++)
+        (void)bhy2_get_and_process_fifo(s_fifo, sizeof(s_fifo), &s_bhy2);
+}
+
+void imu_quiesce(void)
+{
+    if (!s_ready)
+        return;
+
+    /* Drain first, so the stop commands are not queued behind sample data. */
+    imu_drain_hard();
+
+    (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_ACC, 0.0f, 0, &s_bhy2);
+    (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_GYRO, 0.0f, 0, &s_bhy2);
+    (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_KLIO, 0.0f, 0, &s_bhy2);
+
+    s_sensor_on = false;
+    s_ori_on = false;
+
+    /* And again, for whatever was already in flight when they stopped. */
+    imu_drain_hard();
+    vTaskDelay(pdMS_TO_TICKS(20));
+    imu_drain_hard();
+
+    /* A flush is the belt to that braces: it discards anything the part still
+     * holds, so the next operation starts from a known-empty FIFO. */
+    (void)bhy2_clear_fifo(0xFF, &s_bhy2);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    imu_drain_hard();
+}
+
 bool imu_inject_begin(int mode)
 {
     if (!s_ready)

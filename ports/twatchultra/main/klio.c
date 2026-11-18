@@ -383,12 +383,25 @@ static int cmd_klio(tdsh_session_t *session, int argc, char **argv)
             return 1;
         }
 
+        /* QUIESCE FIRST. read_pattern, write_pattern and set_pattern_states are
+         * several blocking I2C calls each, and the learn pass leaves accel and
+         * gyro streaming at 100 Hz. Without this the FIFO overflows mid-save
+         * (`meta 12 fifo overflow`) and what lands in the slot is whatever
+         * survived -- which is how a pattern came back scoring -8.837. */
+        imu_quiesce();
         change_state(0, 0, 0, 0);
+        imu_drain_hard();
 
         uint8_t pattern[244];
         uint16_t plen = sizeof(pattern);
         int8_t rc = bhy2_klio_read_pattern(0, pattern, &plen, imu_dev());
-        (void)imu_poll();
+        imu_drain_hard();
+        /* The blob size the part itself reports, read rather than assumed: a
+         * short read means the pattern is not complete and must not be saved. */
+        printf("  read %u bytes\n", (unsigned)plen);
+        if (rc == BHY2_OK && plen != 157)
+            printf("  WARNING: expected 157, got %u -- saving anyway\n",
+                   (unsigned)plen);
         if (rc != BHY2_OK || plen == 0 || plen > sizeof(pattern))
         {
             printf("read_pattern failed: %s (%d), %u bytes\n", rc_name(rc), rc,
@@ -403,8 +416,9 @@ static int cmd_klio(tdsh_session_t *session, int argc, char **argv)
             s_bank_len[slot] = plen;
         }
 
+        imu_drain_hard();
         rc = bhy2_klio_write_pattern((uint8_t)slot, pattern, plen, imu_dev());
-        (void)imu_poll();
+        imu_drain_hard();
         printf("slot %d <- %u bytes: %s\n", slot, (unsigned)plen, rc_name(rc));
 
         /* Written patterns are DISABLED until enabled, and a similarity
@@ -413,7 +427,7 @@ static int cmd_klio(tdsh_session_t *session, int argc, char **argv)
         const uint8_t id = (uint8_t)slot;
         rc = bhy2_klio_set_pattern_states(KLIO_PATTERN_STATE_ENABLE, &id, 1,
                                           imu_dev());
-        (void)imu_poll();
+        imu_drain_hard();
         printf("slot %d enabled: %s\n", slot, rc_name(rc));
         return rc == BHY2_OK ? 0 : 1;
     }
@@ -427,7 +441,9 @@ static int cmd_klio(tdsh_session_t *session, int argc, char **argv)
      * be re-run without redoing the motions. */
     if (strcmp(sub, "restore") == 0)
     {
+        imu_quiesce();
         change_state(0, 0, 0, 0);
+        imu_drain_hard();
 
         int ok = 0, tried = 0;
         for (int i = 0; i < KLIO_BANK; i++)
@@ -438,9 +454,10 @@ static int cmd_klio(tdsh_session_t *session, int argc, char **argv)
             const int8_t w = bhy2_klio_write_pattern((uint8_t)i, s_bank[i],
                                                      s_bank_len[i], imu_dev());
             const uint8_t id = (uint8_t)i;
+            imu_drain_hard();
             const int8_t e = bhy2_klio_set_pattern_states(
                 KLIO_PATTERN_STATE_ENABLE, &id, 1, imu_dev());
-            (void)imu_poll();
+            imu_drain_hard();
             printf("  slot %d (%u B): write %s, enable %s\n", i,
                    (unsigned)s_bank_len[i], rc_name(w), rc_name(e));
             if (w == BHY2_OK && e == BHY2_OK)
@@ -503,16 +520,35 @@ static int cmd_klio(tdsh_session_t *session, int argc, char **argv)
             return 1;
         }
 
+        /* QUIESCE, AND THIS IS THE FIX FOR A SCORE OF -8.837. The similarity
+         * call is a parameter write followed by a parameter read, with the part
+         * doing the arithmetic in between -- several blocking I2C transactions.
+         * With accel and gyro still streaming from the learn pass the FIFO
+         * overflows during it (`meta 12 fifo overflow` in every line of the run
+         * that produced -8.837) and the returned buffer is not the answer.
+         *
+         * The SDK does not bound-check it either: score_multiple() calls
+         * bhy2_get_parameter() and copies whatever comes back into the caller's
+         * float array without comparing ret_len, so a short or failed read
+         * arrives as a plausible-looking negative number. */
+        imu_quiesce();
+        change_state(0, 0, 0, 0);
+        imu_drain_hard();
+
         /* Enable every slot in the comparison. A pattern is disabled when
          * written and a disabled one is not loaded for scoring. */
         (void)bhy2_klio_set_pattern_states(KLIO_PATTERN_STATE_ENABLE, ids,
                                            (uint16_t)n, imu_dev());
-        (void)imu_poll();
+        imu_drain_hard();
 
         float sim[24] = {0};
+        for (int i = 0; i < 24; i++)
+            sim[i] = -99.0f;      /* a value no real score can take, so a
+                                   * slot the call failed to fill is visible */
+
         const int8_t rc = bhy2_klio_similarity_score_multiple(ref, ids, (uint8_t)n,
                                                               sim, imu_dev());
-        (void)imu_poll();
+        imu_drain_hard();
         if (rc != BHY2_OK)
         {
             printf("similarity failed: %s (%d)\n", rc_name(rc), rc);
@@ -525,21 +561,57 @@ static int cmd_klio(tdsh_session_t *session, int argc, char **argv)
 
         printf("similarity to slot %d\n\n", ref);
         printf("  slot   score   percent  bar\n");
+        int out_of_range = 0;
         for (int i = 0; i < n; i++)
         {
             /* A tenth of a point of bar per percent, so a full match fills the
              * row and a negative score shows nothing -- which is what it means:
              * less alike than two unrelated motions. */
             char bar[24];
-            int w = (int)(sim[i] * 20.0f);
+            int w = (int)(sim[i] * 20.0f);   /* only meaningful for 0..1 */
             if (w < 0) w = 0;
             if (w > 20) w = 20;
             memset(bar, '#', (size_t)w);
             bar[w] = '\0';
-            printf("  %4u  %+6.3f  %5.1f%%  %s\n", ids[i], (double)sim[i],
-                   (double)(sim[i] * 100.0f), bar);
+            const double v = (double)sim[i];
+            if (v < -99.5)
+            {
+                printf("  %4u   ----        --  (not filled by the call)\n",
+                       ids[i]);
+                continue;
+            }
+            /* THE SCALE IS NOT -1..+1 and assuming it was is a defect this
+             * once had. bhy2_klio.h says only that two similar patterns score
+             * "close to 1.0" and two very different ones "negative", with NO
+             * stated floor. Measured on this board, an orthogonal motion against
+             * a forward-back reference scores -4.486, reproducibly to four
+             * decimal places across runs -- which makes it a real score, not a
+             * corrupt read. The earlier -8.837 that started this was also
+             * probably genuine, from a run whose FIFO was overflowing.
+             *
+             * So: print what the part says. Flag only a value that is not finite,
+             * because that cannot be an answer. */
+            if (!isfinite(v))
+            {
+                printf("  %4u   ----        --  (not a number)\n", ids[i]);
+                out_of_range++;
+                continue;
+            }
+            if (v > 1.05)
+                printf("  %4u  %+6.3f  %5.1f%%  %s  (above 1.0)\n",
+                       ids[i], v, v * 100.0, bar);
+            else if (v < -0.001)
+                printf("  %4u  %+6.3f        --  %s  (negative = dissimilar)\n",
+                       ids[i], v,
+                       v < -1.0 ? "well below" : "slightly");
+            else
+                printf("  %4u  %+6.3f  %5.1f%%  %s\n", ids[i], v, v * 100.0, bar);
         }
-        return 0;
+        if (out_of_range)
+            printf("\n%d slot(s) returned a non-numeric value. Re-run `klio restore`\n"
+                   "and try again.\n", out_of_range);
+
+        return out_of_range ? 1 : 0;
     }
 
     /* ----------------------------------------------------------- trace */
