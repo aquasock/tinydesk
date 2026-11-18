@@ -24,7 +24,7 @@ TWO THINGS LEARNED THE HARD WAY, both of which produced a confident wrong answer
 Positions are clamped for the same reason: 999;999 is a legitimate query and
 must not poison every later write.
 """
-import os, select, sys, termios, time, tty
+import os, select, subprocess, sys, termios, time, tty
 
 COLS, ROWS = 40, 26
 
@@ -103,7 +103,79 @@ class Screen:
         return "\n".join("".join(r).rstrip() for r in self.g)
 
 
-def open_port(port="/dev/ttyACM0"):
+def _udev_props(port):
+    """The kernel's description of the device behind a tty path."""
+    try:
+        real = os.path.realpath(port)
+        name = os.path.basename(real)
+        out = subprocess.run(
+            ["udevadm", "info", "-q", "property", "-n", "/dev/" + name],
+            capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return {}
+    props = {}
+    for line in out.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            props[k] = v
+    return props
+
+
+def _describe(port):
+    p = _udev_props(port)
+    return "%s (%s %s)" % (os.path.basename(port),
+                           p.get("ID_VENDOR_ID", "?"),
+                           p.get("ID_MODEL", "?"))
+
+
+# The watch is the ESP32-S3's own USB-Serial-JTAG: vendor 303a, model 1001.
+_WATCH_VID_MODEL = ("303a", "1001")
+_WATCH_FORCED = [False]
+
+
+def _is_watch(port):
+    if _WATCH_FORCED[0]:
+        return True
+    p = _udev_props(port)
+    return (p.get("ID_VENDOR_ID"), p.get("ID_MODEL_ID")) == _WATCH_VID_MODEL
+
+
+def watch_port():
+    """The watch's port, by serial number rather than by ttyACM number.
+
+    THE WATCH AND THE TINYTANG SWAP ttyACM0 AND ttyACM1 BETWEEN REBOOTS, so
+    neither number identifies a board. /dev/serial/by-id names the device by its
+    USB serial and is the only stable handle; read_modaddr.py in the port already
+    resolves the watch this way for the same reason.
+    """
+    by_id = "/dev/serial/by-id"
+    watch_serial = "usb-Espressif_USB_JTAG_serial_debug_unit_80:45:6B:46:DF:54-if00"
+    path = os.path.join(by_id, watch_serial)
+    if os.path.exists(path):
+        return path
+    for name in sorted(os.listdir(by_id)) if os.path.isdir(by_id) else []:
+        if name.startswith("usb-Espressif_USB_JTAG_serial_debug_unit"):
+            return os.path.join(by_id, name)
+    return "/dev/ttyACM1"
+
+
+def open_port(port=None):
+    """Open the board's USB port, refusing anything that is not the watch.
+
+    THE DEFAULT USED TO BE /dev/ttyACM0, AND ON THIS WORKSTATION THAT IS THE
+    TINYTANG. A run with no argument therefore wrote its Ctrl+L repaint into a
+    different board's shell, which is how the operator came to say "you are
+    sending crap to the tang". The numbers swap between reboots, so identity is
+    checked from the kernel's own description of the device and gates a WRITE: a
+    mismatch raises before a byte is sent. --force-port exists for a different
+    board, not as a convenience.
+    """
+    port = port or watch_port()
+    if not _is_watch(port):
+        raise SystemExit(
+            "%s is not the watch (expected an Espressif USB-JTAG debug unit).\n"
+            "  found: %s\n"
+            "  refusing to write to it." % (port, _describe(port)))
     fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
     a = termios.tcgetattr(fd)
     a[0] = a[1] = 0
@@ -155,8 +227,8 @@ def drain_quiet(fd, quiet=0.15, limit=3.0):
     return out
 
 
-def read_screen(keys=b"", wait=2.0, fresh=True):
-    fd = open_port()
+def read_screen(keys=b"", wait=2.0, fresh=True, port=None):
+    fd = open_port(port or watch_port())
     drain_quiet(fd)
     if keys:
         os.write(fd, keys)
@@ -171,6 +243,22 @@ def read_screen(keys=b"", wait=2.0, fresh=True):
 
 
 if __name__ == "__main__":
-    keys = sys.argv[1].encode().decode("unicode_escape").encode("latin-1") if len(sys.argv) > 1 else b""
-    wait = float(sys.argv[2]) if len(sys.argv) > 2 else 2.0
-    print(read_screen(keys, wait).text())
+    argv = sys.argv[1:]
+    port, rest = None, []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--port":
+            port = argv[i + 1]
+            i += 2
+        elif argv[i].startswith("--port="):
+            port = argv[i].split("=", 1)[1]
+            i += 1
+        elif argv[i] == "--force-port":
+            _WATCH_FORCED[0] = True
+            i += 1
+        else:
+            rest.append(argv[i])
+            i += 1
+    keys = rest[0].encode().decode("unicode_escape").encode("latin-1") if rest else b""
+    wait = float(rest[1]) if len(rest) > 1 else 2.0
+    print(read_screen(keys, wait, port=port).text())

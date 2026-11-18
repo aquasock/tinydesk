@@ -429,12 +429,78 @@ static void on_ori(const struct bhy2_fifo_parse_data_info *info, void *priv)
  * event on the same FIFO, and a rejected configuration looks exactly like an
  * accepted one unless something listens. Registering this is what turned "cfg
  * returned 0 and then nothing ever happened" into a readable answer. */
+/* META EVENTS ARE PART OF THE MEASUREMENT, NOT JUST THE LOG.
+ *
+ * `meta 12 (fifo overflow)` and `meta 11 (SENSOR ERROR)` are the part's own
+ * verdicts on whether the engine is being starved, and until now they went only
+ * to ESP_LOGW -- which the display mirror garbles and which is compiled out on
+ * the image being measured. Entry 73's diagnosis of a FIFO overflow was an
+ * inference from a reason byte, not a count of overflows.
+ *
+ * These are counters, deliberately: no I/O from a FIFO callback, so instrumenting
+ * the run cannot change it. The inject command writes them into its trace. */
+static volatile uint32_t s_meta_total;
+static volatile uint32_t s_meta_overflow;
+static volatile uint32_t s_meta_sensor_err;
+static volatile uint8_t  s_meta_last_ev;
+static volatile uint8_t  s_meta_last_sensor;
+
+/* WHAT THE FOUR THOUSAND META EVENTS ACTUALLY ARE.
+ *
+ * The first instrumented run counted 4135 meta events in 30 seconds and no
+ * overflow, and recorded a last event code of 0 -- which is not in the SDK's
+ * vocabulary at all (bhy2_defs.h defines 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+ * 14, 15, 16, 18, 19, 20). A total with no distribution is a number that invites
+ * a guess, so the next run carries the distribution and the packet sizes.
+ *
+ * IN PSRAM, NOT .bss, AND THAT IS NOT FUSSINESS. The first version was a static
+ * array and it cost `music` its I2S slot: `state error, 0 frames, 0 errors, 0
+ * short writes: slot: ESP_ERR_NO_MEM`, on a module that loaded fine (magic
+ * 464c4143, rate 44100) and decoded six times. A hundred and twenty-eight bytes
+ * of .bss was enough to cross the line, which is EMU-018's rule arriving again.
+ * The array is therefore allocated by the inject command that needs it and is
+ * NULL the rest of the time, so on_meta tolerates NULL rather than requiring it. */
+static volatile uint32_t *s_meta_hist;
+static volatile uint8_t  s_meta_max_size;
+
+/* THE FIRST FEW META PACKETS, VERBATIM.
+ *
+ * The histogram above reports codes 0 and 31 in the thousands and 31 is not in
+ * bhy2_defs.h's vocabulary at all, with the sensor byte always 0. Either the part
+ * emits meta packets this SDK does not describe, or this callback is being handed
+ * something that is not a meta packet -- and the answer decides whether the
+ * overflow count means anything. Recording the bytes is the only way to tell,
+ * exactly as it was for the KLIO tap. */
+static uint8_t s_meta_raw[4][12];
+static volatile uint8_t s_meta_raw_len[4];
+static volatile uint8_t s_meta_raw_n;
+
 static void on_meta(const struct bhy2_fifo_parse_data_info *info, void *priv)
 {
     (void)priv;
     if (info->data_size < 1)
         return;
     const uint8_t ev = info->data_ptr[0];
+    const uint8_t sensor = info->data_size > 1 ? info->data_ptr[1] : 0;
+
+    s_meta_total++;
+    s_meta_last_ev = ev;
+    s_meta_last_sensor = sensor;
+    if (s_meta_raw_n < 4)
+    {
+        const uint8_t k = s_meta_raw_n++;
+        const uint8_t n = info->data_size < 12 ? info->data_size : 12;
+        s_meta_raw_len[k] = n;
+        memcpy(s_meta_raw[k], info->data_ptr, n);
+    }
+    if (s_meta_hist)
+        s_meta_hist[ev < 32 ? ev : 31]++;
+    if (info->data_size > s_meta_max_size)
+        s_meta_max_size = info->data_size;
+    if (ev == BHY2_META_EVENT_FIFO_OVERFLOW)
+        s_meta_overflow++;
+    else if (ev == BHY2_META_EVENT_SENSOR_ERROR)
+        s_meta_sensor_err++;
     const char *name = "?";
     switch (ev)
     {
@@ -458,11 +524,9 @@ static void on_meta(const struct bhy2_fifo_parse_data_info *info, void *priv)
     const bool loud = ev == BHY2_META_EVENT_SENSOR_ERROR ||
                       ev == BHY2_META_EVENT_FIFO_OVERFLOW;
     if (loud)
-        ESP_LOGW(TAG, "meta %u (%s) sensor %u", ev, name,
-                 info->data_size > 1 ? info->data_ptr[1] : 0);
+        ESP_LOGW(TAG, "meta %u (%s) sensor %u", ev, name, sensor);
     else
-        ESP_LOGD(TAG, "meta %u (%s) sensor %u", ev, name,
-                 info->data_size > 1 ? info->data_ptr[1] : 0);
+        ESP_LOGD(TAG, "meta %u (%s) sensor %u", ev, name, sensor);
 }
 
 /* ---------------------------------------------------------- start/stop */
@@ -1544,6 +1608,21 @@ static volatile uint32_t s_tap_frames;
 static volatile int      s_tap_progress;
 static volatile int      s_tap_index = -1;
 
+/* THE FOURTH BYTE IS WHY, AND NOTHING WAS RECORDING IT.
+ *
+ * The operator watched learning reach 40 percent and drop back to 0, and the
+ * captured frames show the mechanism in that byte: `progress 20, reason 0` then
+ * `progress 0, reason 1`. The engine's own vocabulary for the field is 0 = ok,
+ * 1 = interrupted, 2 = no movement. Entry 73 concluded "interrupted" from two
+ * frames and could not say why, because the reason was never kept -- the tap
+ * stored index and progress only.
+ *
+ * Counting each reason costs four counters and no I/O, so this cannot perturb
+ * the run it measures. `s_tap_reasons[3]` collects anything outside the
+ * documented vocabulary rather than dropping it. */
+static volatile uint32_t s_tap_reasons[4];
+static volatile uint8_t  s_tap_last_reason;
+
 /* THE FIRST FEW FRAMES, VERBATIM, WITH THEIR SIZE.
  *
  * The decode below (d[1] = index, d[2] = progress) comes from the extended-port
@@ -1587,6 +1666,10 @@ static void klio_tap_cb(const struct bhy2_fifo_parse_data_info *info, void *priv
     const uint8_t *d = info->data_ptr;
     s_tap_index = (int8_t)d[1];
     s_tap_progress = d[2];
+    s_tap_last_reason = d[3];
+    /* 0/1/2 are the documented reasons; anything else lands in slot 3 so an
+     * unexpected value is visible rather than silently folded in with "ok". */
+    s_tap_reasons[d[3] < 3 ? d[3] : 3]++;
     s_tap_frames++;
 }
 
@@ -1596,6 +1679,9 @@ static void klio_tap_reset(void)
     s_tap_frames = 0;
     s_tap_progress = 0;
     s_tap_index = -1;
+    s_tap_last_reason = 0;
+    for (int i = 0; i < 4; i++)
+        s_tap_reasons[i] = 0;
 }
 
 /* SUCCESS REQUIRES MORE THAN A FIELD THAT LOOKS HIGH.
@@ -1624,13 +1710,22 @@ static uint32_t klio_tap_frames(void) { return s_tap_frames; }
 
 /* Report progress without filling the screen: every two seconds, and only when
  * it changed. The console is 26 rows and a 30-second run prints 30 lines. */
-static void peer_progress(int *peak, int i, int steps)
+static void peer_progress(int *peak, int i, int steps, int step_ms)
 {
     if (s_tap_progress > *peak && s_tap_progress <= 100)
         *peak = s_tap_progress;
     if ((i % 100) == 99)
+        /* THE ELAPSED SECONDS COME FROM THE ACTUAL STEP, NOT A CONSTANT.
+         *
+         * This printed `(i + 1) * 20 / 1000`. Twenty was the block interval when
+         * injection ran at 50 Hz; the interval became 10 ms and the label did
+         * not, so a 30-second run reported `60 s` and every console timeline in
+         * this project has been double its true length since entry 73. The
+         * operator's own account of a run (0, then a climb to 60, then back to
+         * 0) is what exposed it -- the file trace and the screen disagreed about
+         * when things happened. */
         printf("  %2d s  progress %3d%%  frames %lu\n",
-               (i + 1) * 20 / 1000, s_tap_progress,
+               (i + 1) * step_ms / 1000, s_tap_progress,
                (unsigned long)s_tap_frames);
     (void)steps;
 }
@@ -1705,7 +1800,7 @@ static int8_t inject_block(uint8_t *pkt, uint16_t len)
  * between. `wave 1` keeps the sine as a control, because a control that fails
  * is how this was established.
  */
-static int cmd_imu_inject(int seconds, int shape, int target)
+static int cmd_imu_inject(int seconds, int shape, int target, int phys)
 {
     if (!s_ready && !imu_start())
     {
@@ -1757,10 +1852,34 @@ static int cmd_imu_inject(int seconds, int shape, int target)
      * imu_drain_hard() empties the data FIFO in bounded passes and cannot spin,
      * which is the property that matters here. */
     s_sensor_on = true;                 /* so the drain is permitted */
-    (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_ACC, 50.0f, 20, &s_bhy2);
-    (void)status_read_one(300);
-    (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_GYRO, 50.0f, 20, &s_bhy2);
-    (void)status_read_one(300);
+    /* THE PHYSICAL SENSORS BECOME A VARIABLE, because their contribution was
+     * never measured cleanly.
+     *
+     * `phys 0` leaves the accelerometer and gyroscope off and injects into the
+     * algorithm alone -- which is what Bosch's own CLI does (`actse 114:100
+     * dmode s dinject`). The earlier comparison in this command's history ran
+     * while the tap was decoding accelerometer frames as KLIO, so its verdict
+     * ("removing them made it worse: 96% to 25%") is void, and `phys 1` keeps
+     * that configuration as the default so an unadorned run is unchanged.
+     *
+     * The instrumented counters are what make this worth re-running: they report
+     * FIFO overflows attributed to SENSOR 4, the accelerometer, during injection.
+     * If those are real, `phys 0` removes the producer that is overflowing the
+     * FIFO instead of trying to drain faster than it fills. */
+    if (phys)
+    {
+        (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_ACC, 50.0f, 20, &s_bhy2);
+        (void)status_read_one(300);
+        (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_GYRO, 50.0f, 20, &s_bhy2);
+        (void)status_read_one(300);
+    }
+    else
+    {
+        (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_ACC, 0.0f, 0, &s_bhy2);
+        (void)status_read_one(300);
+        (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_GYRO, 0.0f, 0, &s_bhy2);
+        (void)status_read_one(300);
+    }
 
     /* AND THE ALGORITHM ITSELF, AT 100 Hz, WHICH IS THE STEP THAT WAS MISSING.
      *
@@ -1783,7 +1902,8 @@ static int cmd_imu_inject(int seconds, int shape, int target)
      * blocks a second. The engine wants to run faster than it is fed. */
     (void)bhy2_set_virt_sensor_cfg((uint8_t)target, 100.0f, 20, &s_bhy2);
     (void)status_read_one(400);
-    printf("configured accel+gyro @50 Hz, sensor %d @100 Hz\n", target);
+    printf("configured accel+gyro %s, sensor %d @100 Hz\n",
+           phys ? "@50 Hz" : "OFF", target);
 
     /* 3. drain, then flush, so a leftover sample cannot be mistaken for an
      * injected one. */
@@ -1810,6 +1930,26 @@ static int cmd_imu_inject(int seconds, int shape, int target)
                                             klio_tap_cb, NULL, &s_bhy2);
     klio_tap_reset();
 
+    /* SNAPSHOT THE PART'S OWN VERDICTS BEFORE THE RUN STARTS.
+     *
+     * Configuration itself can provoke a FIFO overflow, and this command has
+     * been read as though every overflow happened during learning when some
+     * may have happened before it. Taking a baseline separates the two, so
+     * "overflowed while injecting" is a fact rather than an inference. */
+    const uint32_t meta_base_total = s_meta_total;
+    const uint32_t meta_base_overflow = s_meta_overflow;
+    const uint32_t meta_base_sensor_err = s_meta_sensor_err;
+    /* The distribution lives in PSRAM; see the note on s_meta_hist. */
+    uint32_t *meta_base_hist = heap_caps_malloc(32 * sizeof(uint32_t),
+                                                MALLOC_CAP_SPIRAM);
+    s_meta_hist = meta_base_hist;
+    if (meta_base_hist)
+        for (int i = 0; i < 32; i++)
+            meta_base_hist[i] = 0;
+    printf("meta before run: %lu total, %lu overflow, %lu sensor error\n",
+           (unsigned long)meta_base_total, (unsigned long)meta_base_overflow,
+           (unsigned long)meta_base_sensor_err);
+
     /* OPEN THE DRAIN GATE. imu_poll() returns immediately unless s_sensor_on is
      * set -- a guard that exists so a one-shot command leaves the part quiet --
      * and this command never set it, so THE FIFO WAS NEVER DRAINED DURING
@@ -1823,12 +1963,18 @@ static int cmd_imu_inject(int seconds, int shape, int target)
     /* TO A FILE, NOT THE SCREEN. The display mirror repaints only changed cells
      * and this console capture applies them to an empty grid, so a run that
      * prints every two seconds comes back interleaved and unreadable -- measured
-     * as "progress I20%APframesH626accel" earlier in this project. Every progress
-     * line and the final verdict go to /root/inject.txt as well, and `cat` reads
-     * a clean file. */
-    FILE *tr = fopen("/fs/root/inject.txt", "w");
+     * as "progress I20%APframesH626accel" earlier in this project.
+     *
+     * ONE FILE PER SHAPE, and that is a correction earned the hard way: with a
+     * single fixed name, running the gesture and then the sine control destroyed
+     * the gesture's evidence before it could be read off the chip, and the two
+     * runs are the whole comparison. The name now carries the shape. */
+    char trace_path[40];
+    snprintf(trace_path, sizeof(trace_path), "/fs/root/inject-%d-p%d.txt", shape, phys);
+    FILE *tr = fopen(trace_path, "w");
     if (tr)
-        fprintf(tr, "inject %d s, shape %d, target %d\n", seconds, shape, target);
+        fprintf(tr, "inject %d s, shape %d, target %d, phys %d\n",
+                seconds, shape, target, phys);
 
     /* 10 ms, TO MATCH THE 100 Hz THE ALGORITHM IS CONFIGURED FOR.
      *
@@ -1958,14 +2104,34 @@ static int cmd_imu_inject(int seconds, int shape, int target)
          * across runs as the timing drifted.
          *
          * Eight drains across the interval, not one at the end of it. */
+        /* CORRECTED: IT IS ONE DRAIN PER BLOCK, NOT EIGHT, AND THE OVERFLOW
+         * CLAIM ABOVE IS NOT WHAT THE INSTRUMENTED RUN MEASURED.
+         *
+         * Entry 74 counted meta events during a 30-second run at 100 blocks a
+         * second: 4135 meta events, and ZERO FIFO overflows and ZERO sensor
+         * errors. So "overflow appeared on nearly every block" was a reading of
+         * the ESP_LOGW stream at a time the tap was also decoding accelerometer
+         * frames as KLIO, and it does not survive being counted.
+         *
+         * The code below is unchanged and is what the count describes: one
+         * delay of the full block interval, then one drain. A single
+         * bhy2_get_and_process_fifo() with a 2 KB buffer covers well over a
+         * second of 100 Hz data, so one drain per 10 ms block cannot starve the
+         * FIFO. Do not "improve" this into a loop: imu_poll()'s own comment
+         * records two attempts at that which wedged the shell task. */
         vTaskDelay(pdMS_TO_TICKS(step_ms));
         (void)imu_poll();
 
-        peer_progress(&peak, i, steps);
+        peer_progress(&peak, i, steps, step_ms);
         if (tr && (i % 50) == 49)
-            fprintf(tr, "  %2d s  progress %3d  frames %lu  err %02x\n",
-                    (i + 1) * step_ms / 1000, s_tap_progress,
-                    (unsigned long)s_tap_frames, (uint8_t)(last_err < 0 ? 0 : last_err));
+            /* Tenths of a second, because the trace samples every 500 ms and
+             * whole-second labels printed each sample twice under the same
+             * second, which read as a stalled counter rather than a 2 Hz one. */
+            fprintf(tr, "  %3d.%d s  progress %3d  frames %lu  err %02x  reason %u\n",
+                    (i + 1) * step_ms / 1000, ((i + 1) * step_ms % 1000) / 100,
+                    s_tap_progress,
+                    (unsigned long)s_tap_frames, (uint8_t)(last_err < 0 ? 0 : last_err),
+                    (unsigned)s_tap_last_reason);
         /* NO EARLY EXIT. klio_tap_learnt() now means "a frame arrived", which is
          * true after the first one, and breaking on it cut a 30-second run down
          * to 97 blocks. The loop runs its full duration and the verdict comes
@@ -1997,11 +2163,42 @@ static int cmd_imu_inject(int seconds, int shape, int target)
            (uint8_t)last_err);
     printf("sensor %d frames %lu, peak progress %d%%\n", target,
            (unsigned long)klio_tap_frames(), peak);
+    printf("reasons ok %lu interrupted %lu no-move %lu other %lu\n",
+           (unsigned long)s_tap_reasons[0], (unsigned long)s_tap_reasons[1],
+           (unsigned long)s_tap_reasons[2], (unsigned long)s_tap_reasons[3]);
+    printf("meta overflow %lu sensor-error %lu\n",
+           (unsigned long)(s_meta_overflow - meta_base_overflow),
+           (unsigned long)(s_meta_sensor_err - meta_base_sensor_err));
 
     if (tr)
     {
         fprintf(tr, "totals: %lu blocks, %u frames, peak %d, read_pattern %u B\n",
                 (unsigned long)sent, (unsigned)s_tap_frames, peak, (unsigned)plen);
+        /* WHY THE ENGINE STOPPED, IN THE ENGINE'S OWN WORDS. reason 0 = ok,
+         * 1 = interrupted, 2 = no movement, 3 = unexplained value. */
+        fprintf(tr, "reasons: ok %lu, interrupted %lu, no-move %lu, other %lu"
+                    "  (last %u)\n",
+                (unsigned long)s_tap_reasons[0], (unsigned long)s_tap_reasons[1],
+                (unsigned long)s_tap_reasons[2], (unsigned long)s_tap_reasons[3],
+                (unsigned)s_tap_last_reason);
+        fprintf(tr, "meta during run: overflow %lu, sensor-error %lu, all %lu"
+                    "  (last ev %u sensor %u, max size %u)\n",
+                (unsigned long)(s_meta_overflow - meta_base_overflow),
+                (unsigned long)(s_meta_sensor_err - meta_base_sensor_err),
+                (unsigned long)(s_meta_total - meta_base_total),
+                (unsigned)s_meta_last_ev, (unsigned)s_meta_last_sensor,
+                (unsigned)s_meta_max_size);
+        /* The distribution, because a total alone invites a guess. */
+        if (s_meta_hist)
+        {
+            fprintf(tr, "meta codes:");
+            for (int i = 0; i < 32; i++)
+                if (s_meta_hist[i])
+                    fprintf(tr, " %d=%lu", i, (unsigned long)s_meta_hist[i]);
+            fprintf(tr, "\n");
+        }
+        else
+            fprintf(tr, "meta codes: (no histogram -- PSRAM allocation failed)\n");
         fprintf(tr, "\nfirst frames (len:hex):\n");
         for (uint8_t k = 0; k < s_tap_raw_n; k++)
         {
@@ -2010,9 +2207,24 @@ static int cmd_imu_inject(int seconds, int shape, int target)
                 fprintf(tr, " %02x", s_tap_raw[k][b]);
             fprintf(tr, "\n");
         }
+        /* Verbatim, because the histogram alone cannot say whether these are
+         * meta packets at all. */
+        fprintf(tr, "first meta packets (len:hex):\n");
+        for (uint8_t k = 0; k < s_meta_raw_n && k < 4; k++)
+        {
+            fprintf(tr, "  %u:", (unsigned)s_meta_raw_len[k]);
+            for (uint8_t b = 0; b < s_meta_raw_len[k]; b++)
+                fprintf(tr, " %02x", s_meta_raw[k][b]);
+            fprintf(tr, "\n");
+        }
         fclose(tr);
-        printf("\ntrace: cat /root/inject.txt\n");
+        printf("\ntrace: cat %s\n", trace_path);
     }
+
+    /* The histogram is PSRAM, so hand it back before returning: this command is
+     * meant to be run repeatedly and a leak here would outlive the measurement. */
+    s_meta_hist = NULL;
+    free(meta_base_hist);
 
     if (klio_tap_learnt() && have_pattern)
         printf("\nLEARNT pattern %d FROM INJECTED DATA: %u-byte fingerprint read"
@@ -2034,7 +2246,7 @@ static int cmd_imu_inject(int seconds, int shape, int target)
     return (klio_tap_learnt() && have_pattern) ? 0 : 1;
 }
 
-static int cmd_imu_inject(int seconds, int shape, int target);
+static int cmd_imu_inject(int seconds, int shape, int target, int phys);
 static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
 {
     (void)session;
@@ -2065,8 +2277,9 @@ static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
         const int secs   = argc >= 3 ? atoi(argv[2]) : 30;
         const int shp    = argc >= 4 ? atoi(argv[3]) : 0;
         const int target = argc >= 5 ? atoi(argv[4]) : BHY2_SENSOR_ID_KLIO;
+        const int phys   = argc >= 6 ? atoi(argv[5]) : 1;
         return cmd_imu_inject(secs < 5 ? 5 : (secs > 120 ? 120 : secs),
-                              shp == 1 ? 1 : 0, target);
+                              shp == 1 ? 1 : 0, target, phys ? 1 : 0);
     }
 
     if (strcmp(sub, "feed") == 0)
