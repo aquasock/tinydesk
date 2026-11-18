@@ -1969,12 +1969,22 @@ static int cmd_imu_inject(int seconds, int shape, int target, int phys)
      * single fixed name, running the gesture and then the sine control destroyed
      * the gesture's evidence before it could be read off the chip, and the two
      * runs are the whole comparison. The name now carries the shape. */
-    char trace_path[40];
-    snprintf(trace_path, sizeof(trace_path), "/fs/root/inject-%d-p%d.txt", shape, phys);
+    /* THREE RUNS OF THE SAME CONFIGURATION MUST NOT DESTROY EACH OTHER.
+     *
+     * Entry 74 found the peak is not reproducible -- 80 percent in one run of
+     * the gesture and 20 in an identical second run -- so a single run is not
+     * evidence about convergence and every configuration now has to be repeated.
+     * Naming the file for shape and phys alone meant the second run overwrote the
+     * first, which is how that variance was nearly missed. A run counter is the
+     * smallest thing that makes repetition possible. */
+    static uint32_t s_run_no;
+    char trace_path[52];
+    snprintf(trace_path, sizeof(trace_path), "/fs/root/inject-%d-p%d-r%lu.txt",
+             shape, phys, (unsigned long)++s_run_no);
     FILE *tr = fopen(trace_path, "w");
     if (tr)
-        fprintf(tr, "inject %d s, shape %d, target %d, phys %d\n",
-                seconds, shape, target, phys);
+        fprintf(tr, "inject %d s, shape %d, target %d, phys %d, run %lu\n",
+                seconds, shape, target, phys, (unsigned long)s_run_no);
 
     /* 10 ms, TO MATCH THE 100 Hz THE ALGORITHM IS CONFIGURED FOR.
      *
@@ -1992,9 +2002,31 @@ static int cmd_imu_inject(int seconds, int shape, int target, int phys)
     {
         const float t = (float)i * step_ms / 1000.0f;
 
-        /* One cycle is 1.5 s: 60% swing, 40% rest. theta is the wrist angle,
-         * dtheta its derivative; acceleration is gravity rotated by theta. */
-        const float period = 1.5f;
+        /* THE SWING IS 0.9 s IN EVERY GESTURE SHAPE; WHAT CHANGES IS THE REST.
+         *
+         * Entry 74 left exactly one thing to vary: with the FIFO quiet and no
+         * errors at all, KLIO counts repetitions to 80 percent and then reports
+         * change_reason 1 -- documented in bhy2_klio_defs.h as "interrupted by a
+         * non-repetitive activity" -- and never once reports reason 2, "no
+         * significant movement". So the engine is judging the motion, not the
+         * transport, and the quantity that judgement is about is the boundary
+         * between one repetition and the next.
+         *
+         * The rest phase is already as still as injection can make it: theta is
+         * exactly 0, so the accelerometer sits at a constant 1 g on z and the
+         * gyroscope at exactly zero. Stillness therefore cannot be sharpened;
+         * its DURATION can be lengthened, and that is the one variable here.
+         *
+         *   shape 0   0.9 s swing + 0.6 s rest  = 1.5 s cycle  (the baseline)
+         *   shape 2   0.9 s swing + 1.5 s rest  = 2.4 s cycle  (this test)
+         *   shape 1   the 1 Hz sine control, unchanged
+         *
+         * One variable per flash, so nothing else differs: same amplitude of
+         * 1.0 radian, same 100 Hz injection, same sensors-off configuration. */
+        const float swing_s = 0.9f;
+        const float rest_s  = (shape == 2) ? 1.5f : 0.6f;
+        const float period  = swing_s + rest_s;
+        const float swing_frac = swing_s / period;
         const float phase = fmodf(t, period) / period;
         float theta = 0.0f, dtheta = 0.0f;
 
@@ -2014,12 +2046,12 @@ static int cmd_imu_inject(int seconds, int shape, int target, int phys)
             theta = amp_rad * sinf(w * t);
             dtheta = amp_rad * w * cosf(w * t);
         }
-        else if (phase < 0.6f)
+        else if (phase < swing_frac)
         {
-            const float u = phase / 0.6f;             /* 0..1 through the swing */
+            const float u = phase / swing_frac;       /* 0..1 through the swing */
             const float s = 0.5f - 0.5f * cosf(2.0f * (float)M_PI * u);
             theta = 1.0f * s;
-            dtheta = 1.0f * (float)M_PI / 0.6f * sinf(2.0f * (float)M_PI * u)
+            dtheta = 1.0f * (float)M_PI / swing_frac * sinf(2.0f * (float)M_PI * u)
                      / period;
         }
 
@@ -2278,8 +2310,22 @@ static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
         const int shp    = argc >= 4 ? atoi(argv[3]) : 0;
         const int target = argc >= 5 ? atoi(argv[4]) : BHY2_SENSOR_ID_KLIO;
         const int phys   = argc >= 6 ? atoi(argv[5]) : 1;
+        /* SIX SHAPES BECAME THREE, AND THE OLD `shp == 1 ? 1 : 0` SILENTLY
+         * TURNED EVERY OTHER VALUE INTO THE BASELINE. Adding shape 2 would have
+         * run the 1.5 s cycle again and reported it as a longer rest, which is
+         * the exact class of quiet substitution this project keeps paying for.
+         * Only 0, 1 and 2 exist; anything else is refused rather than mapped. */
+        if (shp < 0 || shp > 2)
+        {
+            printf("imu inject <seconds> [shape] [sensor] [phys]\n"
+                   "  shape 0 = gesture, 0.9 s swing + 0.6 s rest (baseline)\n"
+                   "  shape 1 = 1 Hz sine control\n"
+                   "  shape 2 = gesture, 0.9 s swing + 1.5 s rest\n"
+                   "  phys  1 = accel+gyro at 50 Hz, 0 = both off (use 0)\n");
+            return 1;
+        }
         return cmd_imu_inject(secs < 5 ? 5 : (secs > 120 ? 120 : secs),
-                              shp == 1 ? 1 : 0, target, phys ? 1 : 0);
+                              shp, target, phys ? 1 : 0);
     }
 
     if (strcmp(sub, "feed") == 0)
