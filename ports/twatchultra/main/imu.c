@@ -118,6 +118,10 @@ static volatile uint8_t s_accel_raw_len;
 /* The first few payloads verbatim, with their reported sizes, so an off-by-one
  * in the event size shows up as a sequence rather than a single sample. */
 static uint8_t s_first[5][9];
+/* Parsed timestamps from consecutive physical accelerometer samples, used to
+ * derive the part's timestamp unit from a source that injection cannot touch. */
+static uint64_t s_accel_ts[12];
+static volatile uint8_t s_accel_ts_n;
 static volatile uint8_t s_first_len[5];
 static volatile int s_first_n;
 
@@ -379,6 +383,14 @@ static void on_accel(const struct bhy2_fifo_parse_data_info *info, void *priv)
     (void)priv;
     if (info->data_size < 6)
         return;
+    /* A CLEAN CLOCK SAMPLE: the physical accelerometer, no injection involved.
+     * The part's timestamp unit is not documented in this SDK, and measuring it
+     * during an injected run is worthless because the injected deltas are
+     * themselves what is in question. Here the only contribution is the part's
+     * own timekeeping, so consecutive deltas at a known sample rate give the
+     * unit directly. */
+    if (info->time_stamp && s_accel_ts_n < 12)
+        s_accel_ts[s_accel_ts_n++] = *info->time_stamp;
     int16_t s[3];
     memcpy(s, info->data_ptr, 6);
     memcpy(s_accel_raw, info->data_ptr,
@@ -1633,6 +1645,24 @@ static uint8_t s_tap_raw[6][14];
 static uint8_t s_tap_raw_len[6];
 static volatile uint8_t s_tap_raw_n;
 
+/* WHAT THE PART'S OWN CLOCK SAYS, because the delta field we inject is
+ * undocumented in units.
+ *
+ * bhy2.c adds a TS_LARGE_DELTA's 16-bit value to a running counter, so the
+ * field is a DELTA. This command writes an absolute counter into it -- 10000,
+ * 20000, ... reset to 0 once it passes 65000, i.e. every seventh block -- which
+ * makes the engine's notion of time both wrong in scale and sawtoothed with a
+ * 70 ms period. The fix needs the unit, and the unit is not in this SDK.
+ *
+ * It can be measured instead: the SDK's parsed 64-bit timestamp is handed to
+ * every callback, so recording it at the first and last KLIO frame of a run and
+ * dividing by the run's real elapsed time gives units per second directly, with
+ * no assumption about the part's convention. */
+static volatile uint64_t s_tap_ts_first;
+static volatile uint64_t s_tap_ts_last;
+static volatile bool     s_tap_ts_have;
+static uint64_t          s_tap_ts_raw[6];
+
 static void klio_tap_cb(const struct bhy2_fifo_parse_data_info *info, void *priv)
 {
     (void)priv;
@@ -1667,6 +1697,19 @@ static void klio_tap_cb(const struct bhy2_fifo_parse_data_info *info, void *priv
     s_tap_index = (int8_t)d[1];
     s_tap_progress = d[2];
     s_tap_last_reason = d[3];
+    /* The parsed timestamp the SDK just computed for this frame. */
+    if (info->time_stamp)
+    {
+        const uint64_t v = *info->time_stamp;
+        if (!s_tap_ts_have)
+        {
+            s_tap_ts_first = v;
+            s_tap_ts_have = true;
+        }
+        s_tap_ts_last = v;
+        if (s_tap_frames < 6)
+            s_tap_ts_raw[s_tap_frames] = v;
+    }
     /* 0/1/2 are the documented reasons; anything else lands in slot 3 so an
      * unexpected value is visible rather than silently folded in with "ok". */
     s_tap_reasons[d[3] < 3 ? d[3] : 3]++;
@@ -1680,6 +1723,11 @@ static void klio_tap_reset(void)
     s_tap_progress = 0;
     s_tap_index = -1;
     s_tap_last_reason = 0;
+    s_tap_ts_have = false;
+    s_tap_ts_first = 0;
+    s_tap_ts_last = 0;
+    for (int i = 0; i < 6; i++)
+        s_tap_ts_raw[i] = 0;
     for (int i = 0; i < 4; i++)
         s_tap_reasons[i] = 0;
 }
@@ -1997,6 +2045,9 @@ static int cmd_imu_inject(int seconds, int shape, int target, int phys)
     uint32_t sent = 0, ts = 0;
     int8_t last_err = -2;
     int peak = 0;
+    /* Wall clock around the run, so the part's parsed timestamps can be turned
+     * into units per second without assuming the unit. */
+    const int64_t run_t0_us = esp_timer_get_time();
 
     for (int i = 0; i < steps; i++)
     {
@@ -2062,13 +2113,33 @@ static int cmd_imu_inject(int seconds, int shape, int target, int phys)
         const int16_t gy = (int16_t)(dtheta * 180.0f / (float)M_PI * 16.0f);
         const int16_t gz = 0;
 
-        /* THE TIMESTAMP IS ITS OWN INJECTION CALL, as Bosch's tool does:
-         * bhy2_inject_data(inject_lts, 6) then bhy2_inject_data(log, 17). One
-         * combined block was a simplification that is not what the reference
-         * implementation sends. */
-        ts += (uint32_t)(step_ms * 1000);
-        if (ts > 65000u)
-            ts = 0;
+        /* THE TIMESTAMP IS A DELTA, AND ITS UNIT IS MEASURED, NOT ASSUMED.
+         *
+         * bhy2.c's parser does `*time_stamp += BHY2_LE2U16(buffer + pos + 1)` for
+         * a TS_LARGE_DELTA -- it ADDS the 16-bit value to a running counter. This
+         * command was writing an absolute millisecond counter into that field and
+         * resetting it to 0 whenever it passed 65000, which is wrong twice over:
+         * the value was an absolute time in a field the part adds, and it
+         * sawtoothed back to zero every seventh block.
+         *
+         * The unit is in no header this port vendors, so `imu clock` measured it
+         * from the physical accelerometer alone -- outside any injection -- and
+         * this constant comes from that measurement: consecutive 50 Hz samples
+         * advanced the parsed timestamp by 1282-1283 units, so 20 ms is 1283
+         * units and 10 ms is 641. (64130 units/s, i.e. one unit = 15.59 us; the
+         * part's clock is ~64 kHz.)
+         *
+         * The old value was 10000 units per block, which is 15.6x too large.
+         * A segmentation algorithm that measures how long a gesture took cannot
+         * be expected to segment when its clock runs 15.6x fast and resets. */
+        const uint32_t ts_delta_per_block =
+            (uint32_t)((step_ms * 64130u) / 1000u);   /* 10 ms -> 641 units */
+        ts += ts_delta_per_block;
+        /* NO RESET. Only the low 16 bits are written into the field (see the
+         * block assembly below), so a free-running counter wraps modulo 2^16 on
+         * its own -- which is exactly how the part's own delta arithmetic
+         * behaves. The previous code zeroed it at 65000, inserting a deliberate
+         * backwards jump into a clock the engine was trying to read. */
 
         /* ONE ID, THEN SIXTEEN BYTES -- not three id-prefixed sub-events.
          *
@@ -2231,6 +2302,32 @@ static int cmd_imu_inject(int seconds, int shape, int target, int phys)
         }
         else
             fprintf(tr, "meta codes: (no histogram -- PSRAM allocation failed)\n");
+        /* THE PART'S CLOCK, MEASURED RATHER THAN ASSUMED. The delta field this
+         * command injects is documented nowhere in this SDK's headers, and it is
+         * being fed an absolute counter that resets every seventh block. The
+         * units per second below come from the SDK's own parsed timestamps at
+         * the first and last frame divided by the run's real duration. */
+        {
+            const int64_t el_us = esp_timer_get_time() - run_t0_us;
+            fprintf(tr, "part clock: first %llu last %llu span %llu units"
+                        " over %lld us\n",
+                    (unsigned long long)s_tap_ts_first,
+                    (unsigned long long)s_tap_ts_last,
+                    (unsigned long long)(s_tap_ts_last - s_tap_ts_first),
+                    (long long)el_us);
+            if (s_tap_ts_have && s_tap_ts_last > s_tap_ts_first && el_us > 0)
+                fprintf(tr, "part clock: %.1f units per second"
+                            " (=> 10 ms = %.2f units)\n",
+                        (double)(s_tap_ts_last - s_tap_ts_first) * 1e6 / (double)el_us,
+                        (double)(s_tap_ts_last - s_tap_ts_first) * 1e6 / (double)el_us * 0.01);
+            else
+                fprintf(tr, "part clock: no usable span (%u frames)\n",
+                        (unsigned)s_tap_frames);
+            fprintf(tr, "parsed ts per frame:");
+            for (int k = 0; k < 6; k++)
+                fprintf(tr, " %llu", (unsigned long long)s_tap_ts_raw[k]);
+            fprintf(tr, "\n");
+        }
         fprintf(tr, "\nfirst frames (len:hex):\n");
         for (uint8_t k = 0; k < s_tap_raw_n; k++)
         {
@@ -2299,6 +2396,79 @@ static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
      * whose firmware did not load. */
     if (strcmp(sub, "boot") == 0)
         return cmd_imu_boot(argc >= 3 && strcmp(argv[2], "upload") == 0);
+
+    /* WHAT UNIT IS THE PART'S CLOCK IN?
+     *
+     * The injected timestamp is a DELTA (bhy2.c adds it to a running counter),
+     * and this command has been writing an absolute counter into it -- 10000,
+     * 20000, ... reset once it passes 65000, so it sawtooths every seventh
+     * block. Fixing that needs the unit, the unit is in no header this port
+     * vendors, and measuring it inside an injected run is circular because the
+     * injected deltas are the thing in question.
+     *
+     * So measure it from the physical accelerometer alone: run it at a known
+     * rate, take the SDK's parsed timestamp for consecutive samples, and the
+     * unit falls out of (mean delta per sample) against (20 ms per sample). */
+    if (strcmp(sub, "clock") == 0)
+    {
+        if (!imu_start())
+        {
+            printf("imu: %s\n", s_why);
+            return 1;
+        }
+        s_accel_ts_n = 0;
+        if (!imu_accel_enable(50.0f))
+        {
+            printf("imu: accelerometer would not start\n");
+            return 1;
+        }
+        for (int i = 0; i < 400 && s_accel_ts_n < 12; i++)
+        {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            (void)imu_poll();
+        }
+        imu_stop();
+        const uint8_t n = s_accel_ts_n;
+        printf("accel at 50 Hz, %u timestamps\n", (unsigned)n);
+        if (n < 3)
+        {
+            printf("imu: not enough samples; is the accelerometer streaming?\n");
+            return 1;
+        }
+        uint64_t prev = s_accel_ts[1];
+        printf("parsed ts:");
+        for (uint8_t i = 0; i < n; i++)
+            printf(" %llu", (unsigned long long)s_accel_ts[i]);
+        printf("\n");
+        /* Consecutive deltas, skipping any that are zero or wrap. */
+        uint64_t sum = 0;
+        uint32_t cnt = 0;
+        for (uint8_t i = 2; i < n; i++)
+        {
+            const uint64_t d = s_accel_ts[i] - s_accel_ts[i - 1];
+            if (d > 0 && d < 100000000ull)
+            {
+                sum += d;
+                cnt++;
+            }
+        }
+        (void)prev;
+        if (!cnt)
+        {
+            printf("imu: every consecutive delta was zero or wild\n");
+            return 1;
+        }
+        const double mean = (double)sum / (double)cnt;
+        printf("mean delta %llu units over %lu intervals\n",
+               (unsigned long long)(sum / cnt), (unsigned long)cnt);
+        /* The configured rate is 50 Hz, so consecutive samples are 20 ms apart. */
+        printf("20 ms = %.0f units  =>  %.0f units per second"
+               "  =>  1 unit = %.3f us\n",
+               mean, mean * 50.0, 20000.0 / mean);
+        printf("\nFor a 10 ms injected block the delta to write is %.0f units.\n",
+               mean / 2.0);
+        return 0;
+    }
 
     /* The sine feeder. Before the s_ready gate for symmetry with `boot`; it
      * starts the part itself if needed. */
