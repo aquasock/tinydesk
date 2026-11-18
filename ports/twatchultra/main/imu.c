@@ -129,6 +129,21 @@ static volatile bool s_have_accel;
 static float s_ax, s_ay, s_az;
 static uint32_t s_accel_count;
 
+/* THE GYROSCOPE, RAW, so a gesture can be recorded and replayed.
+ *
+ * Until now nothing in this port kept gyro values: the algorithm got them
+ * straight from the FIFO and only the accelerometer was decoded into floats for
+ * the windows. Recording a gesture needs all six numbers, and it needs them as
+ * the RAW int16 the part produced, because replay has to inject exactly what the
+ * part reported rather than a value that has been through a float round trip. */
+static volatile bool s_have_gyro;
+static volatile int16_t s_gx_raw, s_gy_raw, s_gz_raw;
+static volatile uint32_t s_gyro_count;
+/* The accelerometer's raw triple, kept beside its float form because a recorded
+ * gesture must replay the part's own integers, not a value that has been through
+ * a float conversion and back. */
+static volatile int16_t s_ax_raw, s_ay_raw, s_az_raw;
+
 
 /* The sensor ids the loaded firmware carries, as a compact "3 61 63 ..." string.
  * Built once and kept, because it is the answer to "why did nothing happen" and
@@ -410,6 +425,26 @@ static void on_accel(const struct bhy2_fifo_parse_data_info *info, void *priv)
     s_az = s[2] / 4096.0f;
     s_accel_count++;
     s_have_accel = true;
+    s_ax_raw = s[0];
+    s_ay_raw = s[1];
+    s_az_raw = s[2];
+}
+
+/* THE GYROSCOPE SINK, which nothing in this port had until a gesture needed to
+ * be recorded. Raw int16 in 16.4 LSB per degree per second, exactly as the part
+ * reports it, so a replay can inject the same numbers back. */
+static void on_gyro(const struct bhy2_fifo_parse_data_info *info, void *priv)
+{
+    (void)priv;
+    if (info->data_size < 6)
+        return;
+    int16_t s[3];
+    memcpy(s, info->data_ptr, 6);
+    s_gx_raw = s[0];
+    s_gy_raw = s[1];
+    s_gz_raw = s[2];
+    s_gyro_count++;
+    s_have_gyro = true;
 }
 
 /* ORIENTATION, WHICH IS THE INTERESTING ONE ON A WRIST.
@@ -1912,6 +1947,76 @@ static int cmd_imu_inject(int seconds, int shape, int target, int phys)
         }
     }
 
+    /* SHAPE 5: REPLAY A GESTURE RECORDED FROM A REAL HAND.
+     *
+     * This is the experiment five entries of waveform synthesis were working
+     * towards and could not answer. A gesture performed by a person DOES learn --
+     * `klio learn` reaches 100 percent and `klio detect` then reads back a
+     * 157-byte pattern -- so a recording of that same gesture is a known-good
+     * input. Injecting it settles the question the synthetic waveforms could not:
+     * if a real, learnable recording also fails to produce a pattern, injection
+     * is not equivalent to the sensor path and no waveform design will fix it;
+     * if it succeeds, the synthesis was wrong all along.
+     *
+     * The file is six int16 per sample -- ax, ay, az, gx, gy, gz -- written by
+     * `imu record` at 100 Hz, which is the rate this command injects at, so one
+     * recorded sample becomes one injected block and the motion is replayed at
+     * the speed it was performed. It loops if the run outlasts the recording.
+     *
+     * The values are the part's own integers and are injected unchanged: an
+     * acceleration that was 0.512 g when recorded is 2097 in both the file and the
+     * block, with no float round trip to move it. */
+    static int16_t *s_replay;
+    static uint32_t s_replay_n;
+    if (shape == 5 && !s_replay)
+    {
+        FILE *rf = fopen("/fs/root/gesture.bin", "rb");
+        if (!rf)
+        {
+            printf("imu: no /root/gesture.bin -- run `imu record <seconds>` first\n");
+            return 1;
+        }
+        uint8_t hdr[8];
+        if (fread(hdr, 1, sizeof(hdr), rf) != sizeof(hdr) ||
+            memcmp(hdr, "GEST", 4) != 0)
+        {
+            printf("imu: gesture.bin is not a recording (bad header)\n");
+            fclose(rf);
+            return 1;
+        }
+        /* Sample count is in the header so a truncated file is refused rather
+         * than read past. */
+        s_replay_n = (uint32_t)hdr[4] | ((uint32_t)hdr[5] << 8) |
+                     ((uint32_t)hdr[6] << 16) | ((uint32_t)hdr[7] << 24);
+        if (s_replay_n == 0 || s_replay_n > 12000u)
+        {
+            printf("imu: gesture.bin has an implausible length (%lu)\n",
+                   (unsigned long)s_replay_n);
+            fclose(rf);
+            return 1;
+        }
+        s_replay = heap_caps_malloc((size_t)s_replay_n * 6 * sizeof(int16_t),
+                                    MALLOC_CAP_SPIRAM);
+        if (!s_replay)
+        {
+            printf("imu: no PSRAM for the replay buffer\n");
+            fclose(rf);
+            return 1;
+        }
+        const size_t want = (size_t)s_replay_n * 6 * sizeof(int16_t);
+        const size_t got = fread(s_replay, 1, want, rf);
+        fclose(rf);
+        if (got != want)
+        {
+            printf("imu: gesture.bin short read (%u of %u bytes)\n",
+                   (unsigned)got, (unsigned)want);
+            s_replay = NULL;
+            return 1;
+        }
+        printf("replaying %lu samples (%.1f s at 100 Hz)\n",
+               (unsigned long)s_replay_n, (double)s_replay_n / 100.0);
+    }
+
     imu_status_ctx_t sctx;
     status_sync_begin(&sctx);
 
@@ -2162,10 +2267,26 @@ static int cmd_imu_inject(int seconds, int shape, int target, int phys)
                      / period;
         }
 
-        const int16_t ax = 0;
+        int16_t ax = 0;
         int16_t ay, az, gy;
         int16_t gx = 0;
-        if (shape == 3 && s_cycle_tab)
+        int16_t gz = 0;
+        if (shape == 5 && s_replay)
+        {
+            /* One recorded sample per block, looping if the run is longer than
+             * the recording. ALL SIX values go in exactly as the part reported
+             * them -- including ax and gz, which the synthetic shapes always
+             * left at zero. Dropping them would replay a different motion from
+             * the one that was recorded, which is the whole point of this test. */
+            const int k = (int)((uint32_t)i % s_replay_n);
+            ax = s_replay[k * 6 + 0];
+            ay = s_replay[k * 6 + 1];
+            az = s_replay[k * 6 + 2];
+            gx = s_replay[k * 6 + 3];
+            gy = s_replay[k * 6 + 4];
+            gz = s_replay[k * 6 + 5];
+        }
+        else if (shape == 3 && s_cycle_tab)
         {
             /* Index modulo the cycle length: no float arithmetic in this path at
              * all, so cycle k and cycle 0 are byte-for-byte identical inputs. */
@@ -2202,7 +2323,6 @@ static int cmd_imu_inject(int seconds, int shape, int target, int phys)
             gx = gy;
             gy = 0;
         }
-        const int16_t gz = 0;
 
         /* THE TIMESTAMP IS A DELTA, AND ITS UNIT IS MEASURED, NOT ASSUMED.
          *
@@ -2485,6 +2605,113 @@ static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
 
     /* BEFORE THE s_ready GATE, because the whole point is to inspect a part
      * whose firmware did not load. */
+    /* RECORD A GESTURE FROM A REAL HAND, so it can be replayed through injection.
+     *
+     * The accelerometer and gyroscope are configured at 100 Hz -- the rate
+     * `klio learn` uses and the rate `imu inject` feeds at -- and the latest raw
+     * triple from each is sampled every 10 ms into a PSRAM buffer. Sampling
+     * rather than queueing costs fidelity if a sensor bursts, but both sensors
+     * are at exactly the sampling rate, so each tick has a fresh value; queueing
+     * would instead need the two streams merged by timestamp and would add a
+     * failure mode to a recording whose whole value is being faithful.
+     *
+     * Six int16 per sample: ax, ay, az, gx, gy, gz -- the part's own integers.
+     * 30 seconds is 18 KB, which is why this is PSRAM and not .bss (EMU-018). */
+    if (strcmp(sub, "record") == 0)
+    {
+        const int secs = argc >= 3 ? atoi(argv[2]) : 20;
+        const int n_secs = secs < 3 ? 3 : (secs > 120 ? 120 : secs);
+        const uint32_t max_n = (uint32_t)n_secs * 100u;
+        if (!imu_start())
+        {
+            printf("imu: %s\n", s_why);
+            return 1;
+        }
+        (void)bhy2_register_fifo_parse_callback(BHY2_SENSOR_ID_ACC, on_accel, NULL,
+                                                &s_bhy2);
+        (void)bhy2_register_fifo_parse_callback(BHY2_SENSOR_ID_GYRO, on_gyro, NULL,
+                                                &s_bhy2);
+        /* BOTH AT 100 Hz, which is what the algorithm expects. */
+        (void)imu_accel_enable(100.0f);
+        (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_GYRO, 100.0f, 20, &s_bhy2);
+        s_sensor_on = true;
+        s_have_gyro = false;
+        /* Let the streams establish before the first sample is taken, so the
+         * recording does not open with a stale or absent gyro triple. */
+        for (int i = 0; i < 30; i++)
+        {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            (void)imu_poll();
+        }
+        if (!s_have_accel || !s_have_gyro)
+        {
+            printf("imu: accel %s, gyro %s -- both must stream to record\n",
+                   s_have_accel ? "ok" : "SILENT", s_have_gyro ? "ok" : "SILENT");
+            return 1;
+        }
+
+        int16_t *buf = heap_caps_malloc((size_t)max_n * 6 * sizeof(int16_t),
+                                        MALLOC_CAP_SPIRAM);
+        if (!buf)
+        {
+            printf("imu: no PSRAM for %lu samples\n", (unsigned long)max_n);
+            return 1;
+        }
+        const uint32_t a0 = s_accel_count, g0 = s_gyro_count;
+        printf("recording %d s at 100 Hz -- perform the gesture repeatedly NOW\n",
+               n_secs);
+        for (uint32_t i = 0; i < max_n; i++)
+        {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            (void)imu_poll();
+            buf[i * 6 + 0] = s_ax_raw;
+            buf[i * 6 + 1] = s_ay_raw;
+            buf[i * 6 + 2] = s_az_raw;
+            buf[i * 6 + 3] = s_gx_raw;
+            buf[i * 6 + 4] = s_gy_raw;
+            buf[i * 6 + 5] = s_gz_raw;
+        }
+        imu_stop();
+
+        const uint32_t got_a = s_accel_count - a0, got_g = s_gyro_count - g0;
+        printf("\n%lu accel and %lu gyro samples arrived for %lu ticks\n",
+               (unsigned long)got_a, (unsigned long)got_g,
+               (unsigned long)max_n);
+
+        FILE *wf = fopen("/fs/root/gesture.bin", "wb");
+        if (!wf)
+        {
+            printf("imu: cannot write /root/gesture.bin\n");
+            free(buf);
+            return 1;
+        }
+        const uint8_t hdr[8] = {'G', 'E', 'S', 'T',
+                                (uint8_t)(max_n & 0xFF),
+                                (uint8_t)((max_n >> 8) & 0xFF),
+                                (uint8_t)((max_n >> 16) & 0xFF),
+                                (uint8_t)((max_n >> 24) & 0xFF)};
+        const size_t body = (size_t)max_n * 6 * sizeof(int16_t);
+        const size_t wrote_h = fwrite(hdr, 1, sizeof(hdr), wf);
+        const size_t wrote_b = fwrite(buf, 1, body, wf);
+        fclose(wf);
+        free(buf);
+        if (wrote_h != sizeof(hdr) || wrote_b != body)
+        {
+            printf("imu: short write (%u + %u of %u + %u bytes)\n",
+                   (unsigned)wrote_h, (unsigned)wrote_b,
+                   (unsigned)sizeof(hdr), (unsigned)body);
+            return 1;
+        }
+        printf("wrote /root/gesture.bin: %u samples, %u bytes\n",
+               (unsigned)max_n, (unsigned)(sizeof(hdr) + body));
+        if (got_a < max_n / 2 || got_g < max_n / 2)
+            printf("\nWARNING: fewer than half the expected samples arrived -- the\n"
+                   "  streams were not running at 100 Hz and this recording is\n"
+                   "  mostly repeated values. Re-record before replaying.\n");
+        printf("\nNow: imu inject 30 5 112 0   (replays this recording)\n");
+        return 0;
+    }
+
     if (strcmp(sub, "boot") == 0)
         return cmd_imu_boot(argc >= 3 && strcmp(argv[2], "upload") == 0);
 
@@ -2576,7 +2803,7 @@ static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
          * run the 1.5 s cycle again and reported it as a longer rest, which is
          * the exact class of quiet substitution this project keeps paying for.
          * Only 0, 1 and 2 exist; anything else is refused rather than mapped. */
-        if (shp < 0 || shp > 4)
+        if (shp < 0 || shp > 5)
         {
             printf("imu inject <seconds> [shape] [sensor] [phys]\n"
                    "  shape 0 = gesture, 0.9 s swing + 0.6 s rest (baseline)\n"
@@ -2584,6 +2811,7 @@ static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
                    "  shape 2 = gesture, 0.9 s swing + 1.5 s rest\n"
                    "  shape 3 = shape 0 replayed from a table, cycles bit-identical\n"
                    "  shape 4 = shape 0 with the gyro on X, the axis the accel implies\n"
+                   "  shape 5 = replay /root/gesture.bin from `imu record`\n"
                    "  phys  1 = accel+gyro at 50 Hz, 0 = both off (use 0)\n");
             return 1;
         }
