@@ -1678,12 +1678,12 @@ static int cmd_imu_inject(int seconds, int shape)
      * configured nothing is listening. Accel and gyro at the rate the samples
      * are fed at, and KLIO itself subscribed so its frames are parsed. */
     (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_ACC, 50.0f, 20, &s_bhy2);
-    (void)imu_poll();
+    (void)status_read_one(300);
     (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_GYRO, 50.0f, 20, &s_bhy2);
-    (void)imu_poll();
+    (void)status_read_one(300);
     (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_KLIO, 50.0f, 20, &s_bhy2);
-    (void)imu_poll();
-    printf("configured accel/gyro/klio @50 Hz\n");
+    (void)status_read_one(300);
+    printf("configured accel/gyro/klio @50 Hz, acknowledgements drained\n");
 
     /* 3. drain, then flush, so a leftover sample cannot be mistaken for an
      * injected one. */
@@ -1751,26 +1751,34 @@ static int cmd_imu_inject(int seconds, int shape)
          * bhy2_inject_data(inject_lts, 6) then bhy2_inject_data(log, 17). One
          * combined block was a simplification that is not what the reference
          * implementation sends. */
-        uint8_t stamp[8] = {0};
-        stamp[0] = BHY2_SYS_ID_TS_LARGE_DELTA;
-        stamp[1] = (uint8_t)(ts & 0xFF);
-        stamp[2] = (uint8_t)((ts >> 8) & 0xFF);
-        (void)inject_block(stamp, 3);
-
         ts += (uint32_t)(step_ms * 1000);
         if (ts > 65000u)
             ts = 0;
 
+        /* ONE ID, THEN SIXTEEN BYTES -- not three id-prefixed sub-events.
+         *
+         * The log format is derivable from Bosch's own arithmetic: the first
+         * line is 19 characters for 6 timestamp values (6 x 3 + newline) and
+         * every data line is 52 characters for SENSOR_DATA_SIZE 17 values
+         * (17 x 3 + newline). So the file is plain two-hex-digit bytes, one
+         * space-separated, and an injected block is 17 BYTES, not a stream of
+         * FIFO events.
+         *
+         * 17 = one sensor id + 16. Sixteen decomposes as accel xyz (6) + gyro
+         * xyz (6) + a four-byte timestamp, which is the only arrangement that
+         * uses all sixteen without waste. The earlier block put three separate
+         * ids in and therefore carried only twelve bytes of sample data. */
         uint8_t blk[20] = {0};
         uint16_t n = 0;
         blk[n++] = BHY2_SENSOR_ID_ACC;
         memcpy(blk + n, &ax, 2); n += 2;
         memcpy(blk + n, &ay, 2); n += 2;
         memcpy(blk + n, &az, 2); n += 2;
-        blk[n++] = BHY2_SENSOR_ID_GYRO;
         memcpy(blk + n, &gx, 2); n += 2;
         memcpy(blk + n, &gy, 2); n += 2;
         memcpy(blk + n, &gz, 2); n += 2;
+        const uint32_t ts32 = ts;
+        memcpy(blk + n, &ts32, 4); n += 4;
 
         last_err = inject_block(blk, n);
         if (last_err >= 0)
