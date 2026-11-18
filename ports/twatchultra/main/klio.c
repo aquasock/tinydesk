@@ -67,6 +67,21 @@ static klio_frame_t s_last;
 /* Per-frame byte trace, off by default. See the note in on_klio(). */
 static bool s_trace = false;
 
+/* A HOST-SIDE COPY OF EVERY PATTERN SAVED, and it is not belt-and-braces.
+ *
+ * `klio learn` sets learning_reset = 1, which clears the engine's own pattern.
+ * Whether it also clears the recognition table the saved slots live in is not
+ * documented, and a calibration run depends on slot 0 surviving two further
+ * learning passes. Rather than find out on the operator's time, every save also
+ * stashes the 157 bytes here; `klio restore` writes them all back and enables
+ * them. 8 slots of 244 bytes is 2 KB of PSRAM.
+ *
+ * The table is 25 slots; 8 is what a calibration sweep needs and keeps the
+ * buffer small. */
+#define KLIO_BANK 8
+static uint8_t  s_bank[KLIO_BANK][244];
+static uint16_t s_bank_len[KLIO_BANK];
+
 /* Carries the per-cycle cross-axis amount from the generator to the frame. */
 static volatile float s_tilt = 0.1f;
 
@@ -382,6 +397,12 @@ static int cmd_klio(tdsh_session_t *session, int argc, char **argv)
             return 1;
         }
 
+        if (slot < KLIO_BANK)
+        {
+            memcpy(s_bank[slot], pattern, plen);
+            s_bank_len[slot] = plen;
+        }
+
         rc = bhy2_klio_write_pattern((uint8_t)slot, pattern, plen, imu_dev());
         (void)imu_poll();
         printf("slot %d <- %u bytes: %s\n", slot, (unsigned)plen, rc_name(rc));
@@ -395,6 +416,55 @@ static int cmd_klio(tdsh_session_t *session, int argc, char **argv)
         (void)imu_poll();
         printf("slot %d enabled: %s\n", slot, rc_name(rc));
         return rc == BHY2_OK ? 0 : 1;
+    }
+
+    /* --------------------------------------------------------- restore */
+    /* Put every stashed pattern back into the table and enable it.
+     *
+     * This is what makes a multi-pass calibration safe: after the second and
+     * third `klio learn` the earlier slots may or may not still be there, and
+     * one `klio restore` removes the question. It also means the whole sweep can
+     * be re-run without redoing the motions. */
+    if (strcmp(sub, "restore") == 0)
+    {
+        change_state(0, 0, 0, 0);
+
+        int ok = 0, tried = 0;
+        for (int i = 0; i < KLIO_BANK; i++)
+        {
+            if (s_bank_len[i] == 0)
+                continue;
+            tried++;
+            const int8_t w = bhy2_klio_write_pattern((uint8_t)i, s_bank[i],
+                                                     s_bank_len[i], imu_dev());
+            const uint8_t id = (uint8_t)i;
+            const int8_t e = bhy2_klio_set_pattern_states(
+                KLIO_PATTERN_STATE_ENABLE, &id, 1, imu_dev());
+            (void)imu_poll();
+            printf("  slot %d (%u B): write %s, enable %s\n", i,
+                   (unsigned)s_bank_len[i], rc_name(w), rc_name(e));
+            if (w == BHY2_OK && e == BHY2_OK)
+                ok++;
+        }
+        printf("%d of %d stashed patterns restored\n", ok, tried);
+        if (tried == 0)
+            printf("nothing stashed yet -- `klio save <slot>` after a learn\n");
+        return ok == tried ? 0 : 1;
+    }
+
+    /* ------------------------------------------------------------ list */
+    if (strcmp(sub, "list") == 0)
+    {
+        int n = 0;
+        for (int i = 0; i < KLIO_BANK; i++)
+        {
+            if (s_bank_len[i] == 0)
+                continue;
+            printf("  slot %d  %u bytes\n", i, (unsigned)s_bank_len[i]);
+            n++;
+        }
+        printf("%d pattern(s) stashed\n", n);
+        return 0;
     }
 
     /* --------------------------------------------------------- compare */
