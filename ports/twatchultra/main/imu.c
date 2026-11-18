@@ -48,6 +48,7 @@
 #include "bhy2.h"
 #include "bhy2_defs.h"
 #include "bhy2_hif.h"
+#include "bhy2_klio.h"
 #include "bhy2_klio_defs.h"
 #include "tinydesk/td_sysinfo.h"
 #include "imu.h"
@@ -1534,6 +1535,264 @@ void imu_inject_end(void)
     (void)bhy2_set_host_intf_ctrl(BHY2_HIF_CTRL_ASYNC_STATUS_CHANNEL, &s_bhy2);
 }
 
+/* --------------------------------------------------- KLIO data injection --- */
+
+/* A KLIO frame sink that lives here rather than in klio.c, so this command does
+ * not depend on that file's private state. The frame is 11 bytes: d[1] learn
+ * index (-1 = none), d[2] progress, d[5] recognition index (0xFF = none). */
+static volatile uint32_t s_tap_frames;
+static volatile int      s_tap_progress;
+static volatile int      s_tap_index = -1;
+
+static void klio_tap_cb(const struct bhy2_fifo_parse_data_info *info, void *priv)
+{
+    (void)priv;
+    if (info->data_size < 3)
+        return;
+    const uint8_t *d = info->data_ptr;
+    s_tap_index = (int8_t)d[1];
+    s_tap_progress = d[2];
+    s_tap_frames++;
+}
+
+static void klio_tap_reset(void)
+{
+    s_tap_frames = 0;
+    s_tap_progress = 0;
+    s_tap_index = -1;
+}
+
+static bool klio_tap_learnt(void)
+{
+    return s_tap_frames > 0 && s_tap_index >= 0 && s_tap_progress >= 100;
+}
+
+static int klio_tap_index(void) { return s_tap_index; }
+static uint32_t klio_tap_frames(void) { return s_tap_frames; }
+
+/* Report progress without filling the screen: every two seconds, and only when
+ * it changed. The console is 26 rows and a 30-second run prints 30 lines. */
+static void peer_progress(int *peak, int i, int steps)
+{
+    if (s_tap_progress > *peak)
+        *peak = s_tap_progress;
+    if ((i % 100) == 99)
+        printf("  %2d s  progress %3d%%  frames %lu\n",
+               (i + 1) * 20 / 1000, s_tap_progress,
+               (unsigned long)s_tap_frames);
+    (void)steps;
+}
+
+
+/* THE ALIGNMENT RULE, WHICH COST THIS PROJECT FIVE ENTRIES.
+ *
+ * The injection handler rejects any payload whose length is not a multiple of
+ * four, with error 0x7c. That code is undocumented in the BHI2xy SDK this port
+ * vendors and IS documented in the BHI360 SDK:
+ *
+ *   BHI360_ERR_INPUT_CHANNEL_NOT_WORD_ALIGNED      0x7C
+ *   BHI360_ERR_SENSOR_DATA_INJECTION               0xE2
+ *
+ * Every payload sent before entry 67 was 6, 7, 13 or 17 bytes -- none divisible
+ * by four -- so every one was rejected before reaching the handler, and the
+ * rejection read as "the part ignores injection".
+ *
+ * So: round the length up to a multiple of four and pad with zeros. The handler
+ * parses the block by walking event ids and lengths, so trailing zeros are read
+ * as filler (0xFF is BHY2_SYS_ID_FILLER) and ignored. */
+static uint16_t inject_pad(uint8_t *pkt, uint16_t len)
+{
+    const uint16_t padded = (uint16_t)((len + 3u) & ~3u);
+    for (uint16_t i = len; i < padded; i++)
+        pkt[i] = 0xFF;              /* explicit filler, not a zero-length event */
+    return padded;
+}
+
+/* Send one block, word-aligned, and report the part's verdict.
+ *
+ * The error register is CLEARED before each attempt by a soft status read,
+ * because it is sticky: without that a new failure is indistinguishable from an
+ * old one, which is exactly how 0x7c hid the truth for five entries. */
+static int8_t inject_block(uint8_t *pkt, uint16_t len)
+{
+    const uint16_t padded = inject_pad(pkt, len);
+
+    if (!imu_inject_frame(pkt, padded))
+        return -1;
+
+    uint8_t err = 0;
+    (void)bhy2_get_error_value(&err, &s_bhy2);
+    return (int8_t)err;
+}
+
+/* FEED KLIO SYNTHETIC MOTION AND SEE WHETHER IT LEARNS.
+ *
+ * This is the operator's whole idea, reduced to one command: put a known,
+ * repeatable waveform into the engine instead of a hand, and watch whether the
+ * classifier treats it as a gesture.
+ *
+ * THE BLOCK FORMAT. An injected block is one FIFO sample: an accelerometer
+ * event (id + 3 x int16, 7 bytes), a gyroscope event (7 bytes) and a
+ * large-delta timestamp (3 bytes) -- 17 bytes, padded to 20 for the alignment
+ * rule. Bosch's own field-trial logs contain exactly this.
+ *
+ * WHY A GESTURE AND NOT A SINE. KLIO segments motion into repetitions and
+ * counts them; progress runs 0/20/40/60/80/100. An endless sine has no
+ * repetition boundary, so it cannot be learned however clean it is. The default
+ * waveform is therefore discrete: a swing and a settle, repeated, with a rest
+ * between. `wave 1` keeps the sine as a control, because a control that fails
+ * is how this was established.
+ */
+static int cmd_imu_inject(int seconds, int shape)
+{
+    if (!s_ready && !imu_start())
+    {
+        printf("imu: %s\n", s_why);
+        return 1;
+    }
+
+    imu_status_ctx_t sctx;
+    status_sync_begin(&sctx);
+
+    /* 1. step-by-step, and read the status once afterwards as Bosch does. */
+    if (!imu_inject_begin(BHY2_STEP_BY_STEP_INJECTION))
+    {
+        printf("imu: injection mode refused\n");
+        status_sync_end(&sctx);
+        return 1;
+    }
+    (void)status_read_one(150);
+    printf("mode: step-by-step\n");
+
+    /* 2. CONFIGURE THE SENSORS. Injection supplies data FOR a sensor; with none
+     * configured nothing is listening. Accel and gyro at the rate the samples
+     * are fed at, and KLIO itself subscribed so its frames are parsed. */
+    (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_ACC, 50.0f, 20, &s_bhy2);
+    (void)imu_poll();
+    (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_GYRO, 50.0f, 20, &s_bhy2);
+    (void)imu_poll();
+    (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_KLIO, 50.0f, 20, &s_bhy2);
+    (void)imu_poll();
+    printf("configured accel/gyro/klio @50 Hz\n");
+
+    /* 3. drain, then flush, so a leftover sample cannot be mistaken for an
+     * injected one. */
+    for (int i = 0; i < 10; i++)
+    {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        (void)imu_poll();
+    }
+    (void)bhy2_clear_fifo(0xFF, &s_bhy2);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    (void)imu_poll();
+
+    /* 4. learning on, and reset first so progress is comparable between runs. */
+    bhy2_klio_sensor_state_t learn = {
+        .learning_enabled = 1, .learning_reset = 1,
+        .recognition_enabled = 0, .recognition_reset = 0,
+    };
+    (void)bhy2_klio_set_state(&learn, &s_bhy2);
+    (void)imu_poll();
+    (void)bhy2_register_fifo_parse_callback(BHY2_SENSOR_ID_KLIO,
+                                            klio_tap_cb, NULL, &s_bhy2);
+    klio_tap_reset();
+
+    printf("learning on, %d s\n\n", seconds);
+
+    const int step_ms = 20;                  /* 50 samples a second */
+    const int steps = seconds * 1000 / step_ms;
+    uint32_t sent = 0, ts = 0;
+    int8_t last_err = -2;
+    int peak = 0;
+
+    for (int i = 0; i < steps; i++)
+    {
+        const float t = (float)i * step_ms / 1000.0f;
+
+        /* One cycle is 1.5 s: 60% swing, 40% rest. theta is the wrist angle,
+         * dtheta its derivative; acceleration is gravity rotated by theta. */
+        const float period = 1.5f;
+        const float phase = fmodf(t, period) / period;
+        float theta = 0.0f, dtheta = 0.0f;
+
+        if (shape == 1)
+        {
+            theta = 0.8f * sinf(2.0f * (float)M_PI * t / period);
+            dtheta = 0.8f * 2.0f * (float)M_PI / period
+                     * cosf(2.0f * (float)M_PI * t / period);
+        }
+        else if (phase < 0.6f)
+        {
+            const float u = phase / 0.6f;             /* 0..1 through the swing */
+            const float s = 0.5f - 0.5f * cosf(2.0f * (float)M_PI * u);
+            theta = 1.0f * s;
+            dtheta = 1.0f * (float)M_PI / 0.6f * sinf(2.0f * (float)M_PI * u)
+                     / period;
+        }
+
+        const int16_t ax = 0;
+        const int16_t ay = (int16_t)(sinf(theta) * 4096.0f);
+        const int16_t az = (int16_t)(cosf(theta) * 4096.0f);
+        const int16_t gx = 0;
+        const int16_t gy = (int16_t)(dtheta * 180.0f / (float)M_PI * 16.0f);
+        const int16_t gz = 0;
+
+        uint8_t blk[20] = {0};
+        uint16_t n = 0;
+        blk[n++] = BHY2_SENSOR_ID_ACC;
+        memcpy(blk + n, &ax, 2); n += 2;
+        memcpy(blk + n, &ay, 2); n += 2;
+        memcpy(blk + n, &az, 2); n += 2;
+        blk[n++] = BHY2_SENSOR_ID_GYRO;
+        memcpy(blk + n, &gx, 2); n += 2;
+        memcpy(blk + n, &gy, 2); n += 2;
+        memcpy(blk + n, &gz, 2); n += 2;
+        blk[n++] = BHY2_SYS_ID_TS_LARGE_DELTA;
+        blk[n++] = (uint8_t)(ts & 0xFF);
+        blk[n++] = (uint8_t)((ts >> 8) & 0xFF);
+
+        ts += (uint32_t)(step_ms * 1000);
+        if (ts > 65000u)
+            ts = 0;
+
+        last_err = inject_block(blk, n);
+        if (last_err >= 0)
+            sent++;
+
+        vTaskDelay(pdMS_TO_TICKS(step_ms));
+        (void)imu_poll();
+
+        peer_progress(&peak, i, steps);
+        if (klio_tap_learnt())
+            break;
+    }
+
+    bhy2_klio_sensor_state_t off = {0};
+    (void)bhy2_klio_set_state(&off, &s_bhy2);
+    imu_inject_end();
+    status_sync_end(&sctx);
+
+    printf("\n%lu blocks sent, last error 0x%02x\n", (unsigned long)sent,
+           (uint8_t)last_err);
+    printf("klio frames %lu, peak progress %d%%\n",
+           (unsigned long)klio_tap_frames(), peak);
+
+    if (klio_tap_learnt())
+        printf("\nLEARNT pattern %d FROM INJECTED DATA.\n", klio_tap_index());
+    else if (last_err != 0)
+        printf("\nThe handler rejected the blocks with 0x%02x -- framing, not\n"
+               "the waveform. 0x7c is alignment, 0xe2 is content.\n",
+               (uint8_t)last_err);
+    else if (klio_tap_frames() == 0)
+        printf("\nBlocks accepted, no KLIO frames -- the engine never saw them.\n");
+    else
+        printf("\nFrames arrived, progress did not reach 100. The engine saw the\n"
+               "motion and did not find it repetitive enough.\n");
+
+    return klio_tap_learnt() ? 0 : 1;
+}
+
+static int cmd_imu_inject(int seconds, int shape);
 static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
 {
     (void)session;
@@ -1557,6 +1816,16 @@ static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
 
     /* The sine feeder. Before the s_ready gate for symmetry with `boot`; it
      * starts the part itself if needed. */
+    /* Data injection into KLIO. Before the s_ready gate, and it starts the part
+     * itself, because the point is a controlled experiment from a cold board. */
+    if (strcmp(sub, "inject") == 0 && argc >= 2)
+    {
+        const int secs = argc >= 3 ? atoi(argv[2]) : 30;
+        const int shp  = argc >= 4 ? atoi(argv[3]) : 0;
+        return cmd_imu_inject(secs < 5 ? 5 : (secs > 120 ? 120 : secs),
+                              shp == 1 ? 1 : 0);
+    }
+
     if (strcmp(sub, "feed") == 0)
     {
         const int secs = argc >= 3 ? atoi(argv[2]) : 10;
