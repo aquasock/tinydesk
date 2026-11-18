@@ -1602,9 +1602,19 @@ static void peer_progress(int *peak, int i, int steps)
  * as filler (0xFF is BHY2_SYS_ID_FILLER) and ignored. */
 static uint16_t inject_pad(uint8_t *pkt, uint16_t len)
 {
+    /* ZERO, NOT 0xFF, AND THE REASON IS IN BOSCH'S OWN SDK.
+     *
+     * bhy2_hif_exec_cmd_generic() rounds the declared length up to a multiple of
+     * four and then memsets the tail of its command buffer to zero. So when
+     * Bosch's own tool calls bhy2_inject_data(log, 17) -- an UNALIGNED length --
+     * what reaches the part is a declared length of 20 with three ZERO bytes of
+     * padding. This function originally used 0xFF on the theory that
+     * BHY2_SYS_ID_FILLER is the right filler; 0xFF is a filler ID the parser
+     * knows, but the injection handler is not necessarily the FIFO parser, and
+     * the SDK's behaviour is the observable one. */
     const uint16_t padded = (uint16_t)((len + 3u) & ~3u);
     for (uint16_t i = len; i < padded; i++)
-        pkt[i] = 0xFF;              /* explicit filler, not a zero-length event */
+        pkt[i] = 0x00;
     return padded;
 }
 
@@ -1737,6 +1747,20 @@ static int cmd_imu_inject(int seconds, int shape)
         const int16_t gy = (int16_t)(dtheta * 180.0f / (float)M_PI * 16.0f);
         const int16_t gz = 0;
 
+        /* THE TIMESTAMP IS ITS OWN INJECTION CALL, as Bosch's tool does:
+         * bhy2_inject_data(inject_lts, 6) then bhy2_inject_data(log, 17). One
+         * combined block was a simplification that is not what the reference
+         * implementation sends. */
+        uint8_t stamp[8] = {0};
+        stamp[0] = BHY2_SYS_ID_TS_LARGE_DELTA;
+        stamp[1] = (uint8_t)(ts & 0xFF);
+        stamp[2] = (uint8_t)((ts >> 8) & 0xFF);
+        (void)inject_block(stamp, 3);
+
+        ts += (uint32_t)(step_ms * 1000);
+        if (ts > 65000u)
+            ts = 0;
+
         uint8_t blk[20] = {0};
         uint16_t n = 0;
         blk[n++] = BHY2_SENSOR_ID_ACC;
@@ -1747,13 +1771,6 @@ static int cmd_imu_inject(int seconds, int shape)
         memcpy(blk + n, &gx, 2); n += 2;
         memcpy(blk + n, &gy, 2); n += 2;
         memcpy(blk + n, &gz, 2); n += 2;
-        blk[n++] = BHY2_SYS_ID_TS_LARGE_DELTA;
-        blk[n++] = (uint8_t)(ts & 0xFF);
-        blk[n++] = (uint8_t)((ts >> 8) & 0xFF);
-
-        ts += (uint32_t)(step_ms * 1000);
-        if (ts > 65000u)
-            ts = 0;
 
         last_err = inject_block(blk, n);
         if (last_err >= 0)
