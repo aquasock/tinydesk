@@ -1653,7 +1653,7 @@ static int8_t inject_block(uint8_t *pkt, uint16_t len)
  * between. `wave 1` keeps the sine as a control, because a control that fails
  * is how this was established.
  */
-static int cmd_imu_inject(int seconds, int shape)
+static int cmd_imu_inject(int seconds, int shape, int target)
 {
     if (!s_ready && !imu_start())
     {
@@ -1681,9 +1681,22 @@ static int cmd_imu_inject(int seconds, int shape)
     (void)status_read_one(300);
     (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_GYRO, 50.0f, 20, &s_bhy2);
     (void)status_read_one(300);
-    (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_KLIO, 50.0f, 20, &s_bhy2);
-    (void)status_read_one(300);
-    printf("configured accel/gyro/klio @50 Hz, acknowledgements drained\n");
+
+    /* AND THE ALGORITHM ITSELF, AT 100 Hz, WHICH IS THE STEP THAT WAS MISSING.
+     *
+     * Bosch's own CLI documents the flow as:
+     *
+     *   actse 114:100   dmode s   dinject field_log.txt   dmode n   actse 114:0
+     *
+     * `actse 114:100` ACTIVATES SENSOR 114 AT 100 Hz -- the algorithm, not the
+     * accelerometer. Every attempt in this port configured the physical sensors
+     * and never the consumer, and injection supplies data FOR a sensor that is
+     * running. Sensor 112 is KLIO, 114 is SWIM; whatever the image carries, the
+     * caller passes it in. */
+    (void)bhy2_set_virt_sensor_cfg((uint8_t)target, 100.0f, 20, &s_bhy2);
+    (void)status_read_one(400);
+    printf("configured accel/gyro @50 Hz and sensor %d (the algorithm) @100 Hz\n",
+           target);
 
     /* 3. drain, then flush, so a leftover sample cannot be mistaken for an
      * injected one. */
@@ -1703,9 +1716,20 @@ static int cmd_imu_inject(int seconds, int shape)
     };
     (void)bhy2_klio_set_state(&learn, &s_bhy2);
     (void)imu_poll();
-    (void)bhy2_register_fifo_parse_callback(BHY2_SENSOR_ID_KLIO,
+    /* Register the tap on the TARGET sensor, whatever it is -- 112 is KLIO and
+     * 114 is SWIM, and watching the wrong one reported "0 frames" whether or
+     * not the algorithm was producing anything. */
+    (void)bhy2_register_fifo_parse_callback((uint8_t)target,
                                             klio_tap_cb, NULL, &s_bhy2);
     klio_tap_reset();
+
+    /* OPEN THE DRAIN GATE. imu_poll() returns immediately unless s_sensor_on is
+     * set -- a guard that exists so a one-shot command leaves the part quiet --
+     * and this command never set it, so THE FIFO WAS NEVER DRAINED DURING
+     * INJECTION AT ALL. 500 blocks went in, nothing came out, the FIFO overflowed
+     * and the final error was 0xc0 (CMD_ERROR) rather than the 0x00 that one
+     * injected block returns on its own. */
+    s_sensor_on = true;
 
     printf("learning on, %d s\n\n", seconds);
 
@@ -1768,20 +1792,47 @@ static int cmd_imu_inject(int seconds, int shape)
          * xyz (6) + a four-byte timestamp, which is the only arrangement that
          * uses all sixteen without waste. The earlier block put three separate
          * ids in and therefore carried only twelve bytes of sample data. */
+        /* THE EVENT IDS ARE 55 AND 58, NOT THE SENSOR IDS.
+         *
+         * This is the answer to the whole injection problem, and it is in
+         * Bosch's `dinject_defs.h` under names that look like sensor ids and
+         * are not:
+         *
+         *   #define ACCEL_INJECT_ID          55
+         *   #define GYRO_INJECT_ID           58
+         *   #define ACCEL_INJECT_EVENT_SIZE   7
+         *   #define GYRO_INJECT_EVENT_SIZE    7
+         *
+         * Every attempt in this port used a SENSOR id -- 4 (ACC), 13 (GYRO),
+         * 3 (ACC_RAW), 12 (GYRO_RAW), or the driver ids 76/79 -- and every one
+         * returned 0xe2. The injection handler does not take sensor ids; it
+         * takes these two dedicated inject ids, and the block is built from
+         * them exactly as a FIFO log line is.
+         *
+         * Verified on the glass: a block built this way returns error 0x00,
+         * six times in a row, where the same block with id 4 returns 0xe2. */
         uint8_t blk[20] = {0};
         uint16_t n = 0;
-        blk[n++] = BHY2_SENSOR_ID_ACC;
+        blk[n++] = 55;                       /* ACCEL_INJECT_ID */
         memcpy(blk + n, &ax, 2); n += 2;
         memcpy(blk + n, &ay, 2); n += 2;
         memcpy(blk + n, &az, 2); n += 2;
+        blk[n++] = 58;                       /* GYRO_INJECT_ID */
         memcpy(blk + n, &gx, 2); n += 2;
         memcpy(blk + n, &gy, 2); n += 2;
         memcpy(blk + n, &gz, 2); n += 2;
-        const uint32_t ts32 = ts;
-        memcpy(blk + n, &ts32, 4); n += 4;
+        blk[n++] = BHY2_SYS_ID_TS_LARGE_DELTA;
+        blk[n++] = (uint8_t)(ts & 0xFF);
+        blk[n++] = (uint8_t)((ts >> 8) & 0xFF);
 
         last_err = inject_block(blk, n);
-        if (last_err >= 0)
+        /* COUNT THE WRITE, NOT THE VERDICT. inject_block returns -1 only when
+         * the I2C write itself failed; any other value is the part's error
+         * register after a block it did receive. Counting only clean writes
+         * made a full run report "0 blocks sent", which read as though nothing
+         * was transmitted when in fact every block went out and the handler
+         * complained about each one. */
+        if (last_err != -1)
             sent++;
 
         vTaskDelay(pdMS_TO_TICKS(step_ms));
@@ -1799,7 +1850,7 @@ static int cmd_imu_inject(int seconds, int shape)
 
     printf("\n%lu blocks sent, last error 0x%02x\n", (unsigned long)sent,
            (uint8_t)last_err);
-    printf("klio frames %lu, peak progress %d%%\n",
+    printf("sensor %d frames %lu, peak progress %d%%\n", target,
            (unsigned long)klio_tap_frames(), peak);
 
     if (klio_tap_learnt())
@@ -1817,7 +1868,7 @@ static int cmd_imu_inject(int seconds, int shape)
     return klio_tap_learnt() ? 0 : 1;
 }
 
-static int cmd_imu_inject(int seconds, int shape);
+static int cmd_imu_inject(int seconds, int shape, int target);
 static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
 {
     (void)session;
@@ -1845,10 +1896,11 @@ static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
      * itself, because the point is a controlled experiment from a cold board. */
     if (strcmp(sub, "inject") == 0 && argc >= 2)
     {
-        const int secs = argc >= 3 ? atoi(argv[2]) : 30;
-        const int shp  = argc >= 4 ? atoi(argv[3]) : 0;
+        const int secs   = argc >= 3 ? atoi(argv[2]) : 30;
+        const int shp    = argc >= 4 ? atoi(argv[3]) : 0;
+        const int target = argc >= 5 ? atoi(argv[4]) : BHY2_SENSOR_ID_KLIO;
         return cmd_imu_inject(secs < 5 ? 5 : (secs > 120 ? 120 : secs),
-                              shp == 1 ? 1 : 0);
+                              shp == 1 ? 1 : 0, target);
     }
 
     if (strcmp(sub, "feed") == 0)
