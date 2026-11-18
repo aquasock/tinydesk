@@ -1856,6 +1856,62 @@ static int cmd_imu_inject(int seconds, int shape, int target, int phys)
         return 1;
     }
 
+    /* SHAPE 3: ONE CYCLE COMPUTED ONCE, THEN REPLAYED INDEX FOR INDEX.
+     *
+     * Every other shape recomputes the waveform per block from
+     * `fmodf(t, period)` where t is `i * 0.01` as a float. Ten milliseconds is
+     * not exactly representable in binary, so the phase at the start of cycle n
+     * is not the phase at the start of cycle 0, and the INT16 sample values
+     * differ between cycles that are supposed to be identical. KLIO's whole job
+     * is deciding whether consecutive movements are the same movement, so a
+     * waveform whose cycles are not bit-identical is testing the wrong thing.
+     *
+     * This shape builds the cycle once into a table -- phase driven by an integer
+     * index, so cycle k and cycle k+1 use numerically identical inputs -- and the
+     * loop reads table[i % cycle_blocks]. If the engine still resets at the same
+     * point, cycle-to-cycle sameness is not the problem and the waveform's SHAPE
+     * is, which is the next thing to vary.
+     *
+     * The same 0.9 s swing and 0.6 s rest as shape 0, so the only difference from
+     * the baseline is that the cycles are exactly equal. */
+    const int cycle_ms = 1500;                       /* 0.9 swing + 0.6 rest */
+    const int cycle_blocks = cycle_ms / 10;          /* 150 at the 10 ms rate */
+    static int16_t *s_cycle_tab;                     /* 3 int16 per block */
+    if (shape == 3 && !s_cycle_tab)
+    {
+        /* PSRAM, not .bss: EMU-018 records that a few hundred bytes of static
+         * internal DRAM is enough to starve a peripheral, and 900 bytes here
+         * would repeat exactly that mistake. Allocated once per boot because the
+         * table is a fixed property of the waveform, not of the run. */
+        s_cycle_tab = heap_caps_malloc((size_t)cycle_blocks * 3 * sizeof(int16_t),
+                                       MALLOC_CAP_SPIRAM);
+        if (!s_cycle_tab)
+        {
+            printf("imu: no PSRAM for the cycle table -- shape 3 unavailable\n");
+            return 1;
+        }
+        const float swing_frac = 0.6f;
+        for (int k = 0; k < cycle_blocks; k++)
+        {
+            /* Integer index in, exact phase out: the same k always produces the
+             * same three numbers, which is the entire point. */
+            const float phase = (float)k / (float)cycle_blocks;
+            float theta = 0.0f, dtheta = 0.0f;
+            if (phase < swing_frac)
+            {
+                const float u = phase / swing_frac;
+                const float s = 0.5f - 0.5f * cosf(2.0f * (float)M_PI * u);
+                theta = s;
+                dtheta = (float)M_PI / swing_frac * sinf(2.0f * (float)M_PI * u)
+                         / ((float)cycle_ms / 1000.0f);
+            }
+            s_cycle_tab[k * 3 + 0] = (int16_t)(sinf(theta) * 4096.0f);
+            s_cycle_tab[k * 3 + 1] = (int16_t)(cosf(theta) * 4096.0f);
+            s_cycle_tab[k * 3 + 2] =
+                (int16_t)(dtheta * 180.0f / (float)M_PI * 16.0f);
+        }
+    }
+
     imu_status_ctx_t sctx;
     status_sync_begin(&sctx);
 
@@ -2107,10 +2163,45 @@ static int cmd_imu_inject(int seconds, int shape, int target, int phys)
         }
 
         const int16_t ax = 0;
-        const int16_t ay = (int16_t)(sinf(theta) * 4096.0f);
-        const int16_t az = (int16_t)(cosf(theta) * 4096.0f);
-        const int16_t gx = 0;
-        const int16_t gy = (int16_t)(dtheta * 180.0f / (float)M_PI * 16.0f);
+        int16_t ay, az, gy;
+        int16_t gx = 0;
+        if (shape == 3 && s_cycle_tab)
+        {
+            /* Index modulo the cycle length: no float arithmetic in this path at
+             * all, so cycle k and cycle 0 are byte-for-byte identical inputs. */
+            const int k = i % cycle_blocks;
+            ay = s_cycle_tab[k * 3 + 0];
+            az = s_cycle_tab[k * 3 + 1];
+            gy = s_cycle_tab[k * 3 + 2];
+        }
+        else
+        {
+            ay = (int16_t)(sinf(theta) * 4096.0f);
+            az = (int16_t)(cosf(theta) * 4096.0f);
+            gy = (int16_t)(dtheta * 180.0f / (float)M_PI * 16.0f);
+        }
+        /* THE GYRO AXIS, WHICH WAS WRONG AND IS A REAL PHYSICAL DEFECT.
+         *
+         * The acceleration this command injects is gravity rotated by theta in
+         * the y-z plane: ay = sin(theta), az = cos(theta). The rotation that
+         * carries +z toward +y is a rotation ABOUT X, so its angular velocity is
+         * (dtheta, 0, 0). The code has always written that rate into GY -- about
+         * the y axis -- which describes a different motion entirely.
+         *
+         * So every injected block has said two contradictory things at once: the
+         * accelerometer reporting a tilt about x and the gyroscope reporting a
+         * spin about y. No wrist can do that, and an algorithm that decides
+         * whether two movements are the same movement is entitled to reject it.
+         *
+         * `shape 4` moves the rate to the axis the acceleration implies and
+         * changes nothing else -- same swing, same rest, same amplitude, same
+         * rate -- so shape 0 stays as the baseline it has been for every entry
+         * since 73 and the comparison stays single-variable. */
+        if (shape == 4)
+        {
+            gx = gy;
+            gy = 0;
+        }
         const int16_t gz = 0;
 
         /* THE TIMESTAMP IS A DELTA, AND ITS UNIT IS MEASURED, NOT ASSUMED.
@@ -2485,12 +2576,14 @@ static int cmd_imu(tdsh_session_t *session, int argc, char **argv)
          * run the 1.5 s cycle again and reported it as a longer rest, which is
          * the exact class of quiet substitution this project keeps paying for.
          * Only 0, 1 and 2 exist; anything else is refused rather than mapped. */
-        if (shp < 0 || shp > 2)
+        if (shp < 0 || shp > 4)
         {
             printf("imu inject <seconds> [shape] [sensor] [phys]\n"
                    "  shape 0 = gesture, 0.9 s swing + 0.6 s rest (baseline)\n"
                    "  shape 1 = 1 Hz sine control\n"
                    "  shape 2 = gesture, 0.9 s swing + 1.5 s rest\n"
+                   "  shape 3 = shape 0 replayed from a table, cycles bit-identical\n"
+                   "  shape 4 = shape 0 with the gyro on X, the axis the accel implies\n"
                    "  phys  1 = accel+gyro at 50 Hz, 0 = both off (use 0)\n");
             return 1;
         }
