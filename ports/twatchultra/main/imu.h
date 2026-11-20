@@ -98,4 +98,16 @@ bool imu_inject_begin(int mode);
 bool imu_inject_frame(const uint8_t *payload, uint16_t len);
 void imu_inject_end(void);
 
+/* ---- what has to be put back after the part reboots ----------------------
+ *
+ * The BHI260AP's firmware is uploaded into its RAM by this host, so its pattern
+ * table and any other RAM-resident state start empty on every boot. Anything
+ * that needs to outlive a reset registers here, and imu_start() calls it once the
+ * firmware is up.
+ *
+ * WEAK ON PURPOSE: imu.c must not depend on klio.c, and a build without it must
+ * still link. imu.c defines an empty default; klio.c's strong definition wins.
+ */
+void klio_after_boot(void);
+
 #endif

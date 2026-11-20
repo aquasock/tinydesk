@@ -56,6 +56,15 @@
 
 static const char *TAG = "imu";
 
+/* DEFINED BY klio.c, WHICH THIS FILE MUST NOT DEPEND ON.
+ *
+ * The hook exists because the part's RAM does not survive a boot: klio.c keeps
+ * the learnt patterns in flash and puts them back here. The weak empty default
+ * means a build without klio.c links and boots exactly as before.
+ *
+ * This is the same pattern ports/esp_idf/app/main.c uses for board_imu_ops(). */
+__attribute__((weak)) void klio_after_boot(void) {}
+
 /* ------------------------------------------------------------ the part */
 
 #define IMU_ADDR       0x28     /* BHI260AP_SLAVE_ADDRESS_L: HSDO low */
@@ -731,6 +740,14 @@ bool imu_start(void)
     s_ready = true;
     imu_version(s_version, sizeof(s_version));
     ESP_LOGI(TAG, "BHI260AP up: %s", s_version);
+
+    /* PUT BACK WHAT DOES NOT SURVIVE A BOOT. The firmware above was just
+     * uploaded into the part's RAM, which means the engine's pattern table is
+     * empty however many gestures were learnt last session. klio.c restores its
+     * stored patterns here, and is written so that a missing or corrupt store
+     * leaves the sensor perfectly usable -- persistence may not be able to stop
+     * the IMU from starting. */
+    klio_after_boot();
     return true;
 }
 

@@ -33,15 +33,19 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "tdsh.h"
+
+#include "esp_heap_caps.h"
 
 #include "bhy2.h"
 #include "bhy2_defs.h"
 #include "bhy2_klio.h"
 #include "bhy2_klio_defs.h"
 #include "imu.h"
+#include "klio_store.h"
 
 static const char *TAG = "klio";
 
@@ -67,20 +71,31 @@ static klio_frame_t s_last;
 /* Per-frame byte trace, off by default. See the note in on_klio(). */
 static bool s_trace = false;
 
-/* A HOST-SIDE COPY OF EVERY PATTERN SAVED, and it is not belt-and-braces.
+/* THE PATTERN BANK IS PSRAM, AND THE FILE IS THE DURABLE COPY OF IT.
  *
- * `klio learn` sets learning_reset = 1, which clears the engine's own pattern.
- * Whether it also clears the recognition table the saved slots live in is not
- * documented, and a calibration run depends on slot 0 surviving two further
- * learning passes. Rather than find out on the operator's time, every save also
- * stashes the 157 bytes here; `klio restore` writes them all back and enables
- * them. 8 slots of 244 bytes is 2 KB of PSRAM.
+ * `klio learn` sets learning_reset = 1, which clears the engine's own pattern,
+ * so a bank has to exist for a saved pattern to survive a second learning pass.
+ * It also has to survive a REBOOT, which the part cannot do for us: the BHI260AP
+ * runs firmware the host uploads into its RAM, so its pattern table starts empty
+ * every boot (IMU-001). The bank is therefore mirrored to a file in littlefs,
+ * and `klio_after_boot()` puts it back into the engine once the firmware is up.
  *
- * The table is 25 slots; 8 is what a calibration sweep needs and keeps the
- * buffer small. */
-#define KLIO_BANK 8
-static uint8_t  s_bank[KLIO_BANK][244];
-static uint16_t s_bank_len[KLIO_BANK];
+ * PSRAM RATHER THAN .bss, which is the whole reason this is a heap allocation.
+ * The store is 32 slots of 264 bytes -- 8,448 -- and EMU-018 records that 4,148
+ * bytes of static .bss once starved the SSH server of its internal-RAM floor.
+ * The previous bank was 2 KB of .bss; growing it in place would have been the
+ * same mistake with a bigger number. Allocated once, on first use.
+ *
+ * The slot count is the PART's (25 here, read from the part rather than
+ * assumed), capped at the store format's limit. */
+static klio_store_t *s_store;
+
+#define KLIO_STORE_PATH "/fs/root/klio_patterns.bin"
+
+/* Room for the largest file the format can describe, plus the frame, and a
+ * little slack so a future format change fails on version rather than space. */
+#define KLIO_STORE_FILE_MAX \
+    (KLIO_STORE_MAX * (1 + 1 + 2 + KLIO_STORE_NAME_MAX + KLIO_STORE_BLOB_MAX) + 16)
 
 /* Carries the per-cycle cross-axis amount from the generator to the frame. */
 static volatile float s_tilt = 0.1f;
@@ -229,6 +244,220 @@ static bool read_param(const char *label, bhy2_klio_parameter_t id, uint16_t wan
     return true;
 }
 
+/* ------------------------------------------------------- the pattern bank */
+
+/* The bank, allocated on first use in PSRAM. See the note at s_store for why
+ * this is not a static array. */
+static klio_store_t *store(void)
+{
+    if (!s_store)
+    {
+        s_store = heap_caps_calloc(1, sizeof(*s_store), MALLOC_CAP_SPIRAM);
+        if (!s_store)
+        {
+            ESP_LOGE(TAG, "no PSRAM for the pattern bank");
+            return NULL;
+        }
+        klio_store_init(s_store);
+    }
+    return s_store;
+}
+
+/* How many slots the part offers. Read from the part, because the number is a
+ * property of the firmware image it is running rather than of this build, and
+ * fall back to the 25 the part reports here only when the read fails. */
+int klio_max_patterns(void)
+{
+    if (!imu_dev())
+        return 0;
+
+    uint8_t buf[2];
+    uint16_t len = sizeof(buf);
+    memset(buf, 0, sizeof(buf));
+
+    int n = 25;
+    if (bhy2_klio_get_parameter(KLIO_PARAM_RECOGNITION_MAX_PATTERNS, buf, &len,
+                                imu_dev()) == BHY2_OK)
+    {
+        uint16_t v;
+        memcpy(&v, buf, 2);
+        if (v > 0)
+            n = (int)v;
+    }
+    if (n > KLIO_STORE_MAX)
+        n = KLIO_STORE_MAX;
+    return n;
+}
+
+/* Write the bank to flash, atomically.
+ *
+ * TEMP FILE THEN RENAME, because the alternative is a power cut during a write
+ * leaving a half-written file that decodes to nothing -- the very state
+ * persistence exists to prevent. littlefs makes the rename atomic, so a reader
+ * sees either the old file or the new one and never a mixture. */
+static bool store_save_file(void)
+{
+    const klio_store_t *bank = store();
+    if (!bank)
+        return false;
+
+    uint8_t *buf = heap_caps_malloc(KLIO_STORE_FILE_MAX, MALLOC_CAP_SPIRAM);
+    if (!buf)
+    {
+        ESP_LOGE(TAG, "no PSRAM to encode the pattern store");
+        return false;
+    }
+
+    size_t len = 0;
+    const int rc = klio_store_encode(bank, buf, KLIO_STORE_FILE_MAX, &len);
+    if (rc != KLIO_STORE_OK)
+    {
+        ESP_LOGE(TAG, "cannot encode the pattern store: %s", klio_store_strerror(rc));
+        free(buf);
+        return false;
+    }
+
+    static const char *tmp = KLIO_STORE_PATH ".tmp";
+    FILE *f = fopen(tmp, "wb");
+    if (!f)
+    {
+        ESP_LOGE(TAG, "cannot write %s", tmp);
+        free(buf);
+        return false;
+    }
+    const size_t wrote = fwrite(buf, 1, len, f);
+    const bool flushed = fflush(f) == 0;
+    fclose(f);
+    free(buf);
+
+    if (wrote != len || !flushed)
+    {
+        ESP_LOGE(TAG, "short write to %s (%u of %u bytes)", tmp,
+                 (unsigned)wrote, (unsigned)len);
+        remove(tmp);
+        return false;
+    }
+    if (rename(tmp, KLIO_STORE_PATH) != 0)
+    {
+        ESP_LOGE(TAG, "cannot rename %s into place", tmp);
+        remove(tmp);
+        return false;
+    }
+    return true;
+}
+
+/* Read the file into the bank. 1 when patterns were loaded, 0 when there is no
+ * file, -1 when the file exists and was refused -- the distinction matters
+ * because "none stored" and "corrupt" deserve different words. */
+static int store_load_file(void)
+{
+    klio_store_t *bank = store();
+    if (!bank)
+        return -1;
+
+    FILE *f = fopen(KLIO_STORE_PATH, "rb");
+    if (!f)
+        return 0;
+
+    uint8_t *buf = heap_caps_malloc(KLIO_STORE_FILE_MAX, MALLOC_CAP_SPIRAM);
+    if (!buf)
+    {
+        fclose(f);
+        ESP_LOGE(TAG, "no PSRAM to read the pattern store");
+        return -1;
+    }
+
+    const size_t got = fread(buf, 1, KLIO_STORE_FILE_MAX, f);
+    /* A file longer than the format can describe cannot be a file this build
+     * wrote; refuse it rather than decode the prefix of it. */
+    const bool overlong = (got == KLIO_STORE_FILE_MAX) && (fgetc(f) != EOF);
+    fclose(f);
+
+    if (overlong)
+    {
+        free(buf);
+        ESP_LOGW(TAG, "pattern store is larger than the format allows");
+        return -1;
+    }
+
+    const int rc = klio_store_decode(bank, buf, got);
+    free(buf);
+    if (rc != KLIO_STORE_OK)
+    {
+        ESP_LOGW(TAG, "pattern store refused: %s (%d)", klio_store_strerror(rc), rc);
+        return -1;
+    }
+    if (bank->count == 0)
+        return 0;
+    ESP_LOGI(TAG, "pattern store: %d pattern(s)", bank->count);
+    return 1;
+}
+
+/* Put every banked pattern back into the engine and enable it.
+ *
+ * QUIESCE FIRST. write_pattern and set_pattern_states are several blocking I2C
+ * transactions each, and a restore can run while the sensors stream; a FIFO
+ * overflow here drops packets mid-transfer and is how a pattern once came back
+ * scoring -8.837. */
+static bool store_restore_into_part(bool verbose)
+{
+    const klio_store_t *bank = store();
+    if (!bank || !imu_dev())
+        return false;
+
+    imu_quiesce();
+    change_state(0, 0, 0, 0);
+    imu_drain_hard();
+
+    int ok = 0;
+    for (int i = 0; i < bank->count; i++)
+    {
+        const klio_store_rec_t *r = &bank->rec[i];
+        const int8_t w = bhy2_klio_write_pattern(r->slot, r->blob, r->len, imu_dev());
+        imu_drain_hard();
+        const uint8_t id = r->slot;
+        const int8_t e = bhy2_klio_set_pattern_states(KLIO_PATTERN_STATE_ENABLE,
+                                                      &id, 1, imu_dev());
+        imu_drain_hard();
+        if (w == BHY2_OK && e == BHY2_OK)
+            ok++;
+        if (verbose)
+            printf("  slot %u (%u B): write %s, enable %s\n", (unsigned)r->slot,
+                   (unsigned)r->len, rc_name(w), rc_name(e));
+        else
+            ESP_LOGI(TAG, "slot %u (%u B): write %s, enable %s",
+                     (unsigned)r->slot, (unsigned)r->len, rc_name(w), rc_name(e));
+    }
+
+    if (verbose)
+        printf("%d of %d stored pattern(s) restored\n", ok, bank->count);
+    else
+        ESP_LOGI(TAG, "restored %d of %d pattern(s) after boot", ok, bank->count);
+
+    return ok == bank->count;
+}
+
+/* Called by imu_start() through a weak symbol, once the part's firmware is up.
+ *
+ * EVERY BOOT STARTS WITH AN EMPTY ENGINE. The BHI260AP's firmware is uploaded
+ * into its RAM by this host, so nothing in the pattern table survives a reset --
+ * which is why every entry before this one recorded "patterns do not survive a
+ * reboot" as a standing limitation. This is the fix: the 157-byte blobs are in
+ * littlefs, and they go back in here.
+ *
+ * It must never be able to stop the sensor starting, so every failure path below
+ * logs and returns. */
+void klio_after_boot(void)
+{
+    if (!imu_dev())
+        return;
+
+    if (store_load_file() <= 0)
+        return;                 /* nothing stored, or already logged and refused */
+
+    (void)store_restore_into_part(false);
+}
+
 /* ------------------------------------------------------------ the command */
 
 static int cmd_klio(tdsh_session_t *session, int argc, char **argv)
@@ -262,8 +491,27 @@ static int cmd_klio(tdsh_session_t *session, int argc, char **argv)
         read_param("input sensors", KLIO_PARAM_INPUT_SENSORS, 1);
         printf("  frames received          %lu\n", (unsigned long)s_last.frames);
         printf("\n  klio learn    train a gesture with your hand\n");
-        printf("  klio detect   recognise what you do\n");
+        printf("  klio detect   learn-then-recognise in one step\n");
+        printf("  klio recognise test a SAVED pattern (no learn slot)\n");
         printf("  klio stop     both off\n");
+        printf("  klio save <n> keep the learnt pattern in slot n, in flash\n");
+        printf("  klio stored   what is kept in flash\n");
+        printf("  klio restore  put the kept patterns back into the engine\n");
+        printf("  klio forget <n>  drop a kept pattern\n");
+
+        /* What is on flash, reported with the state, because "is my gesture
+         * still there" is the question a person asks after a restart and the
+         * engine's own table cannot answer it. */
+        {
+            const int have = store_load_file();
+            klio_store_t *bank = store();
+            if (bank && have > 0)
+                printf("  kept in flash            %d pattern(s)\n", bank->count);
+            else if (have == 0)
+                printf("  kept in flash            none\n");
+            else
+                printf("  kept in flash            unreadable (see log)\n");
+        }
         return 0;
     }
 
@@ -374,12 +622,25 @@ static int cmd_klio(tdsh_session_t *session, int argc, char **argv)
      *   klio save 0     after learning the reference
      *   klio save 1     after learning a 70% amplitude variant
      */
+    /* ------------------------------------------------------------ save */
+    /* Read the learnt pattern out of the engine, write it to a slot, and keep a
+     * DURABLE copy -- which is the part that did not exist before: slot 0 of the
+     * engine lives in the part's RAM and dies with the power, while the file
+     * this writes is in littlefs and is reloaded by klio_after_boot() at the next
+     * start. */
     if (strcmp(sub, "save") == 0)
     {
+        const int max_slots = klio_max_patterns();
         const int slot = argc >= 3 ? atoi(argv[2]) : 0;
-        if (slot < 0 || slot > 24)
+
+        if (max_slots <= 0)
         {
-            printf("klio save <0..24>\n");
+            printf("klio save: the part has not reported its slot count\n");
+            return 1;
+        }
+        if (slot < 0 || slot >= max_slots)
+        {
+            printf("klio save <0..%d>\n", max_slots - 1);
             return 1;
         }
 
@@ -410,16 +671,12 @@ static int cmd_klio(tdsh_session_t *session, int argc, char **argv)
             return 1;
         }
 
-        if (slot < KLIO_BANK)
-        {
-            memcpy(s_bank[slot], pattern, plen);
-            s_bank_len[slot] = plen;
-        }
-
         imu_drain_hard();
         rc = bhy2_klio_write_pattern((uint8_t)slot, pattern, plen, imu_dev());
         imu_drain_hard();
         printf("slot %d <- %u bytes: %s\n", slot, (unsigned)plen, rc_name(rc));
+        if (rc != BHY2_OK)
+            return 1;
 
         /* Written patterns are DISABLED until enabled, and a similarity
          * calculation reads the table rather than the engine, so the slot has
@@ -429,58 +686,135 @@ static int cmd_klio(tdsh_session_t *session, int argc, char **argv)
                                           imu_dev());
         imu_drain_hard();
         printf("slot %d enabled: %s\n", slot, rc_name(rc));
+
+        /* NOW THE FILE, and only after the engine accepted the pattern: storing
+         * a blob the part refused would fill the file with something that can
+         * never match, and the failure would only show up at the next boot. */
+        klio_store_t *bank = store();
+        if (!bank)
+            return 1;
+
+        /* LOAD THE FILE FIRST IF THE BANK IS EMPTY, because the alternative is
+         * clobbering patterns that are on flash. The restore at imu_start()
+         * normally leaves the bank populated, so this is a guard rather than the
+         * usual path -- but a save that silently reduced a four-pattern file to
+         * one because this session happened never to restore first would be
+         * exactly the kind of loss persistence exists to prevent. */
+        if (bank->count == 0)
+            (void)store_load_file();
+
+        klio_store_rec_t r;
+        memset(&r, 0, sizeof(r));
+        r.slot = (uint8_t)slot;
+        r.flags = KLIO_STORE_FLAG_ENABLED;
+        r.len = plen;
+        memcpy(r.blob, pattern, plen);
+
+        if (klio_store_put(bank, &r) < 0)
+        {
+            printf("  the pattern bank is full -- `klio forget <slot>` first\n");
+            return 1;
+        }
+        if (store_save_file())
+            printf("  kept in %s (%d pattern(s))\n", KLIO_STORE_PATH, bank->count);
+        else
+            printf("  WARNING: the part has it, but %s could not be written\n",
+                   KLIO_STORE_PATH);
+
         return rc == BHY2_OK ? 0 : 1;
     }
 
     /* --------------------------------------------------------- restore */
-    /* Put every stashed pattern back into the table and enable it.
+    /* Reload the file and put every pattern back into the engine.
      *
-     * This is what makes a multi-pass calibration safe: after the second and
-     * third `klio learn` the earlier slots may or may not still be there, and
-     * one `klio restore` removes the question. It also means the whole sweep can
-     * be re-run without redoing the motions. */
+     * This is also what happens automatically at boot (klio_after_boot), so the
+     * command exists for the case where the table was cleared underneath a
+     * running session -- `klio learn` resets the engine's state, and this is how
+     * a stored pattern gets back in without a reboot. */
     if (strcmp(sub, "restore") == 0)
     {
-        imu_quiesce();
-        change_state(0, 0, 0, 0);
-        imu_drain_hard();
-
-        int ok = 0, tried = 0;
-        for (int i = 0; i < KLIO_BANK; i++)
+        const int have = store_load_file();
+        if (have == 0)
         {
-            if (s_bank_len[i] == 0)
-                continue;
-            tried++;
-            const int8_t w = bhy2_klio_write_pattern((uint8_t)i, s_bank[i],
-                                                     s_bank_len[i], imu_dev());
-            const uint8_t id = (uint8_t)i;
-            imu_drain_hard();
-            const int8_t e = bhy2_klio_set_pattern_states(
-                KLIO_PATTERN_STATE_ENABLE, &id, 1, imu_dev());
-            imu_drain_hard();
-            printf("  slot %d (%u B): write %s, enable %s\n", i,
-                   (unsigned)s_bank_len[i], rc_name(w), rc_name(e));
-            if (w == BHY2_OK && e == BHY2_OK)
-                ok++;
+            printf("no stored patterns at %s\n", KLIO_STORE_PATH);
+            printf("`klio save <slot>` after a learn writes one there.\n");
+            return 1;
         }
-        printf("%d of %d stashed patterns restored\n", ok, tried);
-        if (tried == 0)
-            printf("nothing stashed yet -- `klio save <slot>` after a learn\n");
-        return ok == tried ? 0 : 1;
+        if (have < 0)
+        {
+            printf("%s exists but was refused -- see the log\n", KLIO_STORE_PATH);
+            return 1;
+        }
+        return store_restore_into_part(true) ? 0 : 1;
     }
 
-    /* ------------------------------------------------------------ list */
-    if (strcmp(sub, "list") == 0)
+    /* ---------------------------------------------------------- forget */
+    /* Keep the gesture out of the file AND out of the engine.
+     *
+     * Both halves matter: dropping only the file would leave the pattern
+     * matching for as long as the watch stayed on, which reads as "forget does
+     * not work"; dropping only the engine would bring it back at the next boot,
+     * which reads as "it came back". */
+    if (strcmp(sub, "forget") == 0)
     {
-        int n = 0;
-        for (int i = 0; i < KLIO_BANK; i++)
+        const int slot = argc >= 3 ? atoi(argv[2]) : -1;
+        if (slot < 0 || slot > 255)
         {
-            if (s_bank_len[i] == 0)
-                continue;
-            printf("  slot %d  %u bytes\n", i, (unsigned)s_bank_len[i]);
-            n++;
+            printf("klio forget <slot>\n");
+            return 1;
         }
-        printf("%d pattern(s) stashed\n", n);
+
+        (void)store_load_file();
+        klio_store_t *bank = store();
+        if (!bank)
+            return 1;
+
+        if (!klio_store_drop(bank, slot))
+        {
+            printf("slot %d is not stored\n", slot);
+            return 1;
+        }
+
+        imu_quiesce();
+        const uint8_t id = (uint8_t)slot;
+        (void)bhy2_klio_set_pattern_states(KLIO_PATTERN_STATE_DISABLE, &id, 1,
+                                           imu_dev());
+        imu_drain_hard();
+
+        const bool kept = store_save_file();
+        printf("slot %d forgotten; %d pattern(s) still stored%s\n", slot,
+               bank->count, kept ? "" : "  (WARNING: the file was not rewritten)");
+        return kept ? 0 : 1;
+    }
+
+    /* --------------------------------------------------------- stored */
+    if (strcmp(sub, "stored") == 0 || strcmp(sub, "list") == 0)
+    {
+        const int have = store_load_file();
+        klio_store_t *bank = store();
+        if (!bank)
+            return 1;
+
+        if (have < 0)
+        {
+            printf("%s exists but was refused -- see the log\n", KLIO_STORE_PATH);
+            return 1;
+        }
+        if (bank->count == 0)
+        {
+            printf("no stored patterns at %s\n", KLIO_STORE_PATH);
+            return 0;
+        }
+
+        for (int i = 0; i < bank->count; i++)
+        {
+            const klio_store_rec_t *r = &bank->rec[i];
+            printf("  slot %2u  %3u bytes  %s%s%s\n", (unsigned)r->slot,
+                   (unsigned)r->len,
+                   (r->flags & KLIO_STORE_FLAG_ENABLED) ? "enabled" : "disabled",
+                   r->name[0] ? "  " : "", r->name);
+        }
+        printf("%d pattern(s) stored in %s\n", bank->count, KLIO_STORE_PATH);
         return 0;
     }
 
@@ -1196,6 +1530,115 @@ static int cmd_klio(tdsh_session_t *session, int argc, char **argv)
         return 0;
     }
 
+    /* ------------------------------------------------------- recognise */
+    /* RECOGNITION ONLY -- no read_pattern, no write_pattern.
+     *
+     * This exists because `klio detect` cannot test a SAVED pattern. detect's
+     * first step is read_pattern(0), which reads the engine's LEARN slot; once a
+     * pattern has been written into the recognition table that slot is consumed
+     * and read_pattern returns -2 with driver status 3 (invalid pattern
+     * operation). So detect reports "no learnt pattern" against a pattern that
+     * is loaded, enabled and matching perfectly well.
+     *
+     * The distinction is the whole point of persistence: a restored pattern
+     * never passes through the learn slot at all. It is written straight into
+     * the recognition table by klio_after_boot() -- or by `klio restore` -- so
+     * the only correct test is to turn recognition on and listen. */
+    if (strcmp(sub, "recognise") == 0 || strcmp(sub, "recognize") == 0)
+    {
+        const int secs = argc >= 3 ? atoi(argv[2]) : 30;
+        if (secs < 1 || secs > 120)
+        {
+            printf("klio recognise [1..120]\n");
+            return 1;
+        }
+
+        klio_store_t *bank = store();
+        const int have = store_load_file();
+        if (have <= 0 || !bank || bank->count == 0)
+        {
+            printf("nothing is loaded to recognise\n");
+            printf("`klio save <slot>` keeps a learnt pattern, and `klio restore`\n"
+                   "puts stored ones back into the engine.\n");
+            return 1;
+        }
+
+        /* ENABLE EVERY STORED SLOT. A pattern in the recognition table that is
+         * not enabled is never used, and this is where that would show up as
+         * "recognition does nothing". */
+        for (int i = 0; i < bank->count; i++)
+        {
+            const uint8_t id = bank->rec[i].slot;
+            const int8_t rc = bhy2_klio_set_pattern_states(KLIO_PATTERN_STATE_ENABLE,
+                                                           &id, 1, imu_dev());
+            printf("slot %u enable: %s (%d)\n", (unsigned)id,
+                   rc == BHY2_OK ? "ok" : "FAILED", rc);
+            imu_drain_hard();
+        }
+
+        /* 50 Hz, for the FIFO reason detect documents: the setup calls below are
+         * several I2C transactions during which nothing drains. */
+        (void)imu_stream_on(50.0f);
+        (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_GYRO, 50.0f, 20, imu_dev());
+        (void)bhy2_set_fifo_wmark_wkup(32, imu_dev());
+        imu_poll();
+
+        /* LEARNING OFF AND NO RESET -- either field being 1 would wipe the table
+         * that is about to be tested. */
+        {
+            bhy2_klio_sensor_state_t st = {
+                .learning_enabled = 0,
+                .learning_reset = 0,
+                .recognition_enabled = 1,
+                .recognition_reset = 0,
+            };
+            const int8_t rc = bhy2_klio_set_state(&st, imu_dev());
+            printf("recognition on: %s (%d)\n", rc == BHY2_OK ? "ok" : "FAILED", rc);
+            if (rc != BHY2_OK)
+                return 1;
+        }
+
+        (void)bhy2_register_fifo_parse_callback(BHY2_SENSOR_ID_KLIO, on_klio, NULL,
+                                                imu_dev());
+        (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_KLIO, 50.0f, 20, imu_dev());
+
+        printf("\nperform the trained gesture, repeatedly, for %d s.\n\n", secs);
+
+        const uint32_t frames0 = s_last.frames;
+        s_last.recog_index = 0xFF;
+        int last_idx = -1;
+        float last_count = -1.0f;
+        const int64_t t0 = esp_timer_get_time();
+
+        while (esp_timer_get_time() - t0 < (int64_t)secs * 1000000)
+        {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            (void)imu_poll();
+            (void)imu_poll();       /* twice, as detect does: cheap, and one
+                                     * call per pass can lag the fill */
+
+            if (s_last.recog_index != 0xFF &&
+                ((int)s_last.recog_index != last_idx ||
+                 s_last.recog_count > last_count + 0.4f))
+            {
+                printf("  RECOGNISED pattern %u, count %.1f\n",
+                       (unsigned)s_last.recog_index, (double)s_last.recog_count);
+                last_idx = (int)s_last.recog_index;
+                last_count = s_last.recog_count;
+            }
+        }
+
+        printf("\nframes from the engine: %lu\n",
+               (unsigned long)(s_last.frames - frames0));
+        printf("%s\n", last_idx >= 0
+                       ? "MATCH: the stored pattern is live in the engine"
+                       : "NO MATCH: the pattern is loaded and enabled, so either the "
+                         "gesture differed or the blob is not what was learnt");
+
+        (void)bhy2_klio_set_state(&(bhy2_klio_sensor_state_t){0}, imu_dev());
+        return last_idx >= 0 ? 0 : 1;
+    }
+
     if (strcmp(sub, "reset") == 0)
     {
         bhy2_klio_sensor_state_t st = {0};
@@ -1205,13 +1648,15 @@ static int cmd_klio(tdsh_session_t *session, int argc, char **argv)
         return 0;
     }
 
-    printf("usage: klio [status|learn|detect|stop|reset]\n");
+    printf("usage: klio [status|learn|detect|stop|reset]\n"
+           "       klio [save <slot>|stored|restore|forget <slot>]\n"
+           "       klio [recognise [seconds]]\n");
     return 2;
 }
 
 static const tdsh_command_t s_klio_cmd = {
     "klio",
-    "klio [status|learn|detect|stop|reset]",
+    "klio [status|learn|detect|recognise|stop|reset|save|stored|restore|forget]",
     "The BHI260AP's self-learning gesture engine",
     cmd_klio,
     TDSH_CMD_INTERACTIVE,

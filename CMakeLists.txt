@@ -445,6 +445,46 @@ if(TD_BUILD_TESTS)
     target_compile_options(test_imu_posture PRIVATE ${TD_WARNINGS})
     add_test(NAME test_imu_posture COMMAND test_imu_posture)
 
+    # The on-flash pattern store: a serialiser with a CRC, so the corruption and
+    # truncation branches can be walked exhaustively at a desk. A pattern that
+    # decodes wrongly is written back into the engine and simply never matches,
+    # which a wearer experiences as "it forgot" -- so every refusal is tested.
+    add_executable(test_klio_store tests/test_klio_store.c
+                   ports/twatchultra/main/klio_store.c)
+    target_include_directories(test_klio_store PRIVATE ports/twatchultra/main include tests)
+    set_target_properties(test_klio_store PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+    target_compile_options(test_klio_store PRIVATE ${TD_WARNINGS})
+    add_test(NAME test_klio_store COMMAND test_klio_store)
+
+    # THE SAME SUITE UNDER A SANITISER, because part of a decoder's contract is
+    # not reading past the buffer it is handed, and an over-read is invisible to
+    # a plain build: the test's own copy of the file sat in a static array wider
+    # than the file, so a removed bounds check survived a clean run. The suite
+    # allocates its decode buffers at exactly the file's length precisely so this
+    # target can see a violation. Gated on the compiler supporting it, so a
+    # toolchain without ASan simply does not build this one.
+    include(CheckCCompilerFlag)
+    # The probe must pass the flag to the LINK step as well, or it fails on
+    # `__asan_init` being undefined -- a check that says "no ASan" on a
+    # toolchain that has it, which is how this block first went quietly inert.
+    set(CMAKE_REQUIRED_FLAGS "-fsanitize=address")
+    set(CMAKE_REQUIRED_LINK_OPTIONS "-fsanitize=address")
+    check_c_compiler_flag("-fsanitize=address" TD_HAVE_ASAN)
+    unset(CMAKE_REQUIRED_FLAGS)
+    unset(CMAKE_REQUIRED_LINK_OPTIONS)
+    if(TD_HAVE_ASAN)
+        add_executable(test_klio_store_asan tests/test_klio_store.c
+                       ports/twatchultra/main/klio_store.c)
+        target_include_directories(test_klio_store_asan PRIVATE
+                       ports/twatchultra/main include tests)
+        set_target_properties(test_klio_store_asan PROPERTIES
+                       C_STANDARD 11 C_STANDARD_REQUIRED ON)
+        target_compile_options(test_klio_store_asan PRIVATE ${TD_WARNINGS}
+                       -fsanitize=address,undefined -fno-omit-frame-pointer -g)
+        target_link_options(test_klio_store_asan PRIVATE -fsanitize=address,undefined)
+        add_test(NAME test_klio_store_asan COMMAND test_klio_store_asan)
+    endif()
+
     add_executable(test_tama_ui tests/test_tama_ui.c ports/twatchultra/main/tama_ui.c)
     target_include_directories(test_tama_ui PRIVATE ports/twatchultra/main)
     set_target_properties(test_tama_ui PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
