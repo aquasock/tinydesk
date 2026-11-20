@@ -5,6 +5,7 @@
 #define KLIO_H
 
 #include <stdbool.h>
+#include <stddef.h>   /* size_t */
 #include <stdint.h>   /* uint32_t in klio_learn_state_t */
 
 /* Register the `klio` diagnostic command with the shell. */
@@ -46,6 +47,38 @@ typedef struct
     int learnt_index;     /* the engine's index, -1 until a pattern is learnt */
     uint32_t frames;      /* frames received since the pass began */
 } klio_learn_state_t;
+
+/* ---- what a stored gesture opens, and the watch that fires it -------------
+ *
+ * A pattern's record carries the name of an app and a ARMED flag. The flag is the
+ * wearer's switch and is independent of whether the engine has the pattern
+ * enabled -- see klio_store.h.
+ */
+typedef struct
+{
+    bool active;      /* the engine is watching */
+    int armed;        /* how many stored patterns are switched on */
+} klio_arm_state_t;
+
+/* Start watching the armed patterns, restoring each pattern's enabled state from
+ * its flag. Recognition only: this does not learn and does not reset. */
+void klio_arm(klio_arm_state_t *out);
+
+/* Stop watching and leave the sensors quiet. */
+void klio_disarm(void);
+
+/* The app a stored slot opens ("" when it opens nothing), and its switch. */
+const char *klio_slot_app(int slot);
+bool klio_slot_armed(int slot);
+
+/* Point a stored slot at an app and set its switch. Writes the store; false when
+ * the slot is empty or the file could not be written. */
+bool klio_slot_set(int slot, const char *app, bool armed);
+
+/* Advance the watch and report a gesture that has STARTED. Fills the app it opens
+ * and the slot; returns true only when there is an app to open, so a match on an
+ * unmapped pattern is reported by slot but not fired. */
+bool klio_detect_tick(char *app_out, size_t cap, int *slot_out);
 
 bool klio_learn_active(void);
 bool klio_learn_begin(void);

@@ -119,12 +119,58 @@ static void f_learn_cancel(void)
     s_reading.learn_ok = false;
 }
 
+/* ---- the mapping fake ---- */
+
+static char s_app[24];
+static bool s_armed;
+static int s_set_calls;
+static bool s_set_fails;
+static int s_arm_calls, s_disarm_calls;
+static bool s_detect_ready;          /* a gesture has started */
+static char s_detect_app[24];
+
+static const char *f_gapp(void) { return s_app; }
+static bool f_garmed(void) { return s_armed; }
+static bool f_gset(const char *app, bool armed)
+{
+    s_set_calls++;
+    if (s_set_fails)
+        return false;
+    /* The window passes gapp() straight back in, so src and dst can be the same
+     * buffer. snprintf with overlapping arguments is undefined and here produced
+     * an empty name, which is why this copies through a temporary. */
+    if (app)
+    {
+        char tmp[sizeof(s_app)];
+        snprintf(tmp, sizeof(tmp), "%s", app);
+        snprintf(s_app, sizeof(s_app), "%s", tmp);
+    }
+    s_armed = armed;
+    return true;
+}
+static void f_arm(void) { s_arm_calls++; }
+static void f_disarm(void) { s_disarm_calls++; }
+static bool f_detect(char *out, int cap)
+{
+    if (!s_detect_ready)
+        return false;
+    s_detect_ready = false;
+    snprintf(out, cap, "%s", s_detect_app);
+    return true;
+}
+
 static const td_imu_ops_t s_ops = {
     .start = f_start,
     .stop = f_stop,
     .latest = f_latest,
     .learn_begin = f_learn_begin,
     .learn_cancel = f_learn_cancel,
+    .gapp = f_gapp,
+    .garmed = f_garmed,
+    .gset = f_gset,
+    .arm = f_arm,
+    .disarm = f_disarm,
+    .detect = f_detect,
 };
 
 static td_buffer_t back;
@@ -155,6 +201,30 @@ static td_widget_t *first_progress(td_window_t *w)
 {
     for (td_widget_t *p = w->widgets; p; p = p->next)
         if (p->type == TD_WT_PROGRESS)
+            return p;
+    return NULL;
+}
+
+static td_widget_t *first_checkbox(td_window_t *w)
+{
+    for (td_widget_t *p = w->widgets; p; p = p->next)
+        if (p->type == TD_WT_CHECKBOX)
+            return p;
+    return NULL;
+}
+
+static int app_index(const char *name)
+{
+    for (int i = 0; i < td_app_count(); i++)
+        if (!strcmp(td_app_get(i)->name, name))
+            return i;
+    return -1;
+}
+
+static td_widget_t *first_list(td_window_t *w)
+{
+    for (td_widget_t *p = w->widgets; p; p = p->next)
+        if (p->type == TD_WT_LIST)
             return p;
     return NULL;
 }
@@ -194,6 +264,11 @@ static int bar_percent(td_widget_t *bar)
 int main(void)
 {
     CHECK_EQ(td_init(&hal), 0);
+
+    /* THE REAL APP REGISTRY, so the picker is walked against the same list the
+     * Start menu shows. Without this the registry is empty, every index is -1,
+     * and a test that "tests the picker" silently selects "(none)". */
+    td_apps_register_all();
 
     static const td_sysinfo_t info = {.platform = "Test", .chip = "ESP32-S3",
                                       .imu = &s_ops};
@@ -318,6 +393,99 @@ int main(void)
     CHECK(widget_with(w, "learned and kept") != NULL);
     s_no_sample = false;
 
+    /* --- the mapping section -------------------------------------------- */
+
+    CHECK(widget_with(w, "Gesture opens") != NULL);
+    td_widget_t *app_btn = widget_with(w, "(none)");
+    CHECK(app_btn != NULL);
+    td_widget_t *arm_box = first_checkbox(w);
+    CHECK(arm_box != NULL);
+    if (arm_box)
+        CHECK_EQ(arm_box->value, 0);          /* off until the wearer says so */
+
+    /* The window must still fit the screen with both sections. */
+    CHECK(w->rect.x + w->rect.w <= cols);
+    CHECK(w->rect.y + w->rect.h <= rows);
+    check_fits(w);
+
+    /* Nothing to watch for yet, so nothing is armed. */
+    CHECK_EQ(s_arm_calls, 0);
+
+    /* --- mapping an app, through the picker ------------------------------- */
+    /* Picking an app must not silently switch detection on: the checkbox is the
+     * control for that, and it is right there. This walks the real picker -- the
+     * button, the list of every registered app, the activation -- because setting
+     * the fake's state directly is what let a "picker forces detect on" defect
+     * survive an earlier sweep. */
+    const int files = app_index("Files");
+    CHECK(files >= 0);
+    press(app_btn);
+    td_window_t *picker_probe = td_win_focused();
+    CHECK(picker_probe != NULL && picker_probe != w);
+    td_widget_t *list = picker_probe ? first_list(picker_probe) : NULL;
+    CHECK(list != NULL);
+    if (list)
+    {
+        /* "(none)" is row 0, so a registered app at index i is row i+1. */
+        td_list_select(list, files + 1);
+        press(list);
+    }
+    tick(500);
+    CHECK(strcmp(s_app, "Files") == 0);
+    CHECK(widget_with(w, "Files") != NULL);      /* the button shows it */
+    CHECK_EQ(s_set_calls, 1);
+    CHECK_EQ(s_armed, 0);                        /* still off: we only mapped */
+    CHECK(td_win_focused() == w);                /* the picker closed */
+
+    /* --- the checkbox arms it, and the watch starts ---------------------- */
+    s_arm_calls = 0;
+    if (arm_box)
+    {
+        td_checkbox_set(arm_box, true);
+        press(arm_box);
+    }
+    CHECK(s_armed);
+    CHECK_EQ(s_set_calls, 2);      /* the picker's, then this one */
+    /* The watch starts on the NEXT TICK, not inside the click: it is driven from
+     * the same place the display is refreshed, so the press only records the
+     * decision. */
+    tick(500);
+    CHECK_EQ(s_arm_calls, 1);
+
+    /* The other direction: switching off stops the watch rather than leaving the
+     * sensors streaming with nothing to read them. */
+    s_disarm_calls = 0;
+    if (arm_box)
+    {
+        td_checkbox_set(arm_box, false);
+        press(arm_box);
+    }
+    CHECK(!s_armed);
+    tick(500);
+    CHECK_EQ(s_disarm_calls, 1);
+
+    /* --- a failed save puts the box back --------------------------------- */
+    /* A checkbox showing a state the store refused would be a lie about what
+     * happens at the next boot. */
+    s_set_fails = true;
+    if (arm_box)
+    {
+        td_checkbox_set(arm_box, true);
+        press(arm_box);
+    }
+    CHECK(!s_armed);
+    CHECK_EQ(arm_box->value, 0);
+    CHECK(widget_with(w, "could not save -- try again") != NULL);
+    s_set_fails = false;
+
+    /* --- a gesture that fires opens its app ------------------------------ */
+    /* Armed, and the window is the focused one, so launching must leave it open
+     * with the new app focused -- a real launch through the real registry. */
+    s_arm_calls = 0;
+    f_gset("Files", true);
+    tick(500);
+    CHECK_EQ(s_arm_calls, 1);                 /* watch running again */
+
     /* --- Stop abandons a running pass ------------------------------------ */
 
     press(btn);
@@ -332,10 +500,12 @@ int main(void)
     s_start_calls = 0;
     press(btn);
     CHECK(s_learn_on);
+    s_disarm_calls = 0;
     td_win_close(w);
     tick(500);
     CHECK(!s_learn_on);         /* cancelled by on_close */
     CHECK(!s_started);          /* and the sensor was stopped */
+    CHECK_EQ(s_disarm_calls, 1);  /* and the gesture watch stopped with it */
 
     /* --- a board with no learning engine draws no gesture section --------- */
 

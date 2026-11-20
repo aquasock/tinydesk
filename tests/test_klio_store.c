@@ -173,6 +173,101 @@ static void test_replace_keeps_one_and_keeps_name(void)
     }
 }
 
+static void test_relearn_keeps_the_mapping_and_the_switch(void)
+{
+    /* RE-TRAINING A GESTURE MUST NOT UNDO WHAT IT DOES. The learn path re-saves
+     * slot 0 with a fresh blob and knows nothing about the app it opens or
+     * whether the wearer has detection switched on. If those were reset every
+     * time the motion was re-trained, the mapping would vanish at exactly the
+     * moment the wearer was least expecting it -- and the checkbox would appear
+     * to switch itself off. */
+    static klio_store_t s;
+    klio_store_init(&s);
+
+    klio_store_rec_t r;
+    rec(&r, 0, 157, 0x01, "Files", KLIO_STORE_FLAG_ENABLED | KLIO_STORE_FLAG_ARMED);
+    CHECK_EQ(klio_store_put(&s, &r), 0);
+
+    /* The re-learn: a new blob, no name, and a flags byte from a caller that
+     * only knows the engine enabled it. */
+    rec(&r, 0, 157, 0x02, NULL, KLIO_STORE_FLAG_ENABLED);
+    CHECK_EQ(klio_store_put(&s, &r), 0);
+    CHECK_EQ(s.count, 1);
+
+    const klio_store_rec_t *g = klio_store_find(&s, 0);
+    CHECK(g != NULL);
+    if (g)
+    {
+        CHECK_EQ(g->blob[0], 0x02);                    /* the new motion */
+        CHECK(strcmp(g->name, "Files") == 0);          /* the same app */
+        CHECK(g->flags & KLIO_STORE_FLAG_ARMED);       /* still switched on */
+        CHECK(g->flags & KLIO_STORE_FLAG_ENABLED);     /* and still enabled */
+    }
+
+    /* And a re-learn is allowed to change the engine's enable bit without
+     * touching the wearer's switch: the two are independent by design. */
+    rec(&r, 0, 157, 0x03, NULL, 0);
+    klio_store_put(&s, &r);
+    g = klio_store_find(&s, 0);
+    CHECK(g != NULL);
+    if (g)
+    {
+        CHECK(!(g->flags & KLIO_STORE_FLAG_ENABLED));
+        CHECK(g->flags & KLIO_STORE_FLAG_ARMED);
+    }
+}
+
+static void test_replace_is_the_one_that_can_change_the_mapping(void)
+{
+    /* THE DEFECT THIS EXISTS FOR. put() carries the armed bit over, which is what
+     * keeps a mapping alive across a re-learn -- but the settings path also went
+     * through put(), so arming a pattern wrote the record, had the armed bit
+     * restored from the old record, and then read back "not armed". On the watch
+     * that presented as a checkbox that unchecked itself the instant it was
+     * ticked, because the window redraws it from the store every tick.
+     *
+     * So the two operations are pinned apart here: replace() must win. */
+    static klio_store_t s;
+    klio_store_init(&s);
+
+    klio_store_rec_t r;
+    rec(&r, 0, 157, 0x01, "Files", KLIO_STORE_FLAG_ENABLED);
+    CHECK_EQ(klio_store_put(&s, &r), 0);
+    CHECK(!(klio_store_find(&s, 0)->flags & KLIO_STORE_FLAG_ARMED));
+
+    /* ARM IT, the way the settings path does. */
+    klio_store_rec_t w = *klio_store_find(&s, 0);
+    w.flags |= KLIO_STORE_FLAG_ARMED;
+    CHECK_EQ(klio_store_replace(&s, &w), 0);
+    CHECK(klio_store_find(&s, 0)->flags & KLIO_STORE_FLAG_ARMED);
+
+    /* AND DISARM IT the same way -- the other half of the same switch. */
+    w = *klio_store_find(&s, 0);
+    w.flags &= (uint8_t)~KLIO_STORE_FLAG_ARMED;
+    CHECK_EQ(klio_store_replace(&s, &w), 0);
+    CHECK(!(klio_store_find(&s, 0)->flags & KLIO_STORE_FLAG_ARMED));
+
+    /* put(), by contrast, CANNOT arm: that is its documented job, and if this
+     * ever starts passing the learn path will have stopped protecting mappings
+     * and the two operations will be one again. */
+    w = *klio_store_find(&s, 0);
+    w.flags |= KLIO_STORE_FLAG_ARMED;
+    w.name[0] = '\0';                       /* what a re-learn supplies */
+    CHECK_EQ(klio_store_put(&s, &w), 0);
+    CHECK(!(klio_store_find(&s, 0)->flags & KLIO_STORE_FLAG_ARMED));
+
+    /* replace() can also change the app, including clearing it. */
+    w = *klio_store_find(&s, 0);
+    snprintf(w.name, sizeof(w.name), "Terminal");
+    klio_store_replace(&s, &w);
+    CHECK(strcmp(klio_store_find(&s, 0)->name, "Terminal") == 0);
+
+    w = *klio_store_find(&s, 0);
+    w.name[0] = '\0';
+    klio_store_replace(&s, &w);
+    CHECK(klio_store_find(&s, 0)->name[0] == '\0');
+}
+
 static void test_drop_and_find(void)
 {
     static klio_store_t s;
@@ -207,7 +302,10 @@ static void test_drop_and_find(void)
 static void test_rejects_bad_records(void)
 {
     static klio_store_t s;
-    static uint8_t buf[1024];
+    /* 32 records of 8-byte blobs with 24-byte names is 1,164 bytes, so this
+     * buffer is sized from the format rather than guessed -- the name field
+     * widening in version 2 is exactly what a 1 KB buffer would have hidden. */
+    static uint8_t buf[4096];
     size_t len = 0;
     klio_store_rec_t r;
 
@@ -414,6 +512,114 @@ static void test_duplicate_slot_in_a_file_is_refused(void)
     free(copy);
 }
 
+/* Build a version 1 file by hand: 16-byte names and the old flag meaning.
+ * This is the file a watch running the previous firmware writes, and the
+ * firmware that adds app mapping has to keep reading it. */
+static size_t make_v1_file(uint8_t *out, size_t cap, uint8_t slot, int blob_len,
+                           uint8_t flags, const char *name)
+{
+    size_t p = 0;
+    out[p++] = 'K'; out[p++] = 'G'; out[p++] = 'S'; out[p++] = 'T';
+    out[p++] = 1;   out[p++] = 0;          /* version 1 */
+    out[p++] = 1;   out[p++] = 0;          /* one record */
+    out[p++] = slot;
+    out[p++] = flags;
+    out[p++] = (uint8_t)(blob_len & 0xFF);
+    out[p++] = (uint8_t)((blob_len >> 8) & 0xFF);
+    /* Bounded by the literal's own length, not by the field: indexing a shorter
+     * string up to 16 reads past its terminator, which is what the sanitised
+     * target caught here. */
+    const size_t nlen = name ? strlen(name) : 0;
+    for (int i = 0; i < 16; i++)           /* v1 name field is 16 bytes */
+        out[p++] = (uint8_t)((size_t)i < nlen ? name[i] : 0);
+    for (int i = 0; i < blob_len; i++)
+        out[p++] = (uint8_t)(0x40 + i);
+
+    const uint32_t crc = klio_store_crc32(out, p);
+    out[p] = (uint8_t)(crc & 0xFF);
+    out[p + 1] = (uint8_t)((crc >> 8) & 0xFF);
+    out[p + 2] = (uint8_t)((crc >> 16) & 0xFF);
+    out[p + 3] = (uint8_t)((crc >> 24) & 0xFF);
+    p += 4;
+    (void)cap;
+    return p;
+}
+
+static void test_version_1_files_still_load(void)
+{
+    /* A GESTURE LEARNT BEFORE THE FORMAT GREW MUST NOT DISAPPEAR on the firmware
+     * that adds app mapping. It reads, it keeps its blob, and it is NOT armed --
+     * there was no app to map it to, so silently watching for it would be a
+     * change of behaviour nobody asked for. */
+    static klio_store_t back;
+    static uint8_t buf[1024];
+
+    const size_t len = make_v1_file(buf, sizeof(buf), 0, 157, 1, "files");
+    CHECK_EQ(klio_store_decode(&back, buf, len), KLIO_STORE_OK);
+    CHECK_EQ(back.count, 1);
+
+    const klio_store_rec_t *g = klio_store_find(&back, 0);
+    CHECK(g != NULL);
+    if (g)
+    {
+        CHECK_EQ(g->len, 157);
+        CHECK_EQ(g->blob[0], 0x40);
+        CHECK_EQ(g->blob[156], (uint8_t)(0x40 + 156));
+        /* The v1 flag meant "enabled in the engine"; v1 had no armed concept. */
+        CHECK(g->flags & KLIO_STORE_FLAG_ENABLED);
+        CHECK(!(g->flags & KLIO_STORE_FLAG_ARMED));
+        CHECK(strcmp(g->name, "files") == 0);
+    }
+
+    /* And re-encoding it produces a v2 file, so the next save migrates it. */
+    static uint8_t out[2048];
+    size_t out_len = 0;
+    CHECK_EQ(klio_store_encode(&back, out, sizeof(out), &out_len), KLIO_STORE_OK);
+    CHECK_EQ(out[4], 2);                   /* version 2 */
+    CHECK_EQ(out[5], 0);
+
+    static klio_store_t again;
+    CHECK_EQ(klio_store_decode(&again, out, out_len), KLIO_STORE_OK);
+    CHECK_EQ(again.count, 1);
+    const klio_store_rec_t *h = klio_store_find(&again, 0);
+    CHECK(h != NULL);
+    if (h)
+    {
+        CHECK_EQ(h->len, 157);
+        CHECK(strcmp(h->name, "files") == 0);
+        CHECK(!(h->flags & KLIO_STORE_FLAG_ARMED));
+    }
+}
+
+static void test_version_outside_the_range_is_refused(void)
+{
+    static klio_store_t s, back;
+    static uint8_t buf[1024];
+    size_t len = 0;
+
+    klio_store_init(&s);
+    klio_store_rec_t r = {0};
+    r.slot = 0;
+    r.len = 4;
+    CHECK(klio_store_put(&s, &r) == 0);
+    CHECK_EQ(klio_store_encode(&s, buf, sizeof(buf), &len), KLIO_STORE_OK);
+
+    /* Zero and one-past-this-build are both refused, so the readable range is
+     * pinned rather than implied. */
+    for (int v = 0; v <= 3; v += 3)
+    {
+        uint8_t *copy = (uint8_t *)malloc(len);
+        CHECK(copy != NULL);
+        if (!copy)
+            return;
+        memcpy(copy, buf, len);
+        copy[4] = (uint8_t)v;
+        fix_crc(copy, len);
+        CHECK_EQ(klio_store_decode(&back, copy, len), KLIO_STORE_E_VERSION);
+        free(copy);
+    }
+}
+
 static void test_every_single_bit_flip_is_refused(void)
 {
     /* THE STRONGEST PROPERTY THE FORMAT CAN OFFER, checked exhaustively rather
@@ -555,6 +761,8 @@ int main(void)
     test_single_round_trip();
     test_many_and_order();
     test_replace_keeps_one_and_keeps_name();
+    test_relearn_keeps_the_mapping_and_the_switch();
+    test_replace_is_the_one_that_can_change_the_mapping();
     test_drop_and_find();
     test_rejects_bad_records();
     test_buffer_too_small();
@@ -562,6 +770,8 @@ int main(void)
     test_version_is_checked_before_crc();
     test_structural_lies_behind_a_valid_crc();
     test_duplicate_slot_in_a_file_is_refused();
+    test_version_1_files_still_load();
+    test_version_outside_the_range_is_refused();
     test_every_single_bit_flip_is_refused();
     test_trailing_bytes_are_refused();
     test_names_are_always_terminated();

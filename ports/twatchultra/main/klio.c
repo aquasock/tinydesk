@@ -105,6 +105,11 @@ static volatile float s_tilt = 0.1f;
  * enable exactly that slot rather than guessing. -1 until something is learnt. */
 static int s_learnt = -1;
 
+/* The gesture watch: whether the last frame matched, and whether the match it is
+ * currently inside has already fired. See klio_detect_tick. */
+static bool s_fired;
+static int s_fire_gap;
+
 /* The pass in progress, and where the last one started. See klio_learn_begin. */
 static klio_learn_state_t s_learn;
 static uint32_t s_learn_frames0;
@@ -415,30 +420,64 @@ static bool store_restore_into_part(bool verbose)
     change_state(0, 0, 0, 0);
     imu_drain_hard();
 
-    int ok = 0;
+    int ok = 0, armed = 0;
+
     for (int i = 0; i < bank->count; i++)
     {
         const klio_store_rec_t *r = &bank->rec[i];
+
+        /* THE WEARER'S SWITCH DECIDES WHETHER THE ENGINE WATCHES FOR IT.
+         *
+         * A pattern is written into the recognition table either way -- that is
+         * just storage, and it costs nothing to have it ready. Whether it is
+         * ENABLED is the wearer's decision, and this is the only place that
+         * decision is honoured: a gesture switched off in the window must not
+         * start firing at the next boot, or the checkbox would be a decoration.
+         *
+         * The engine's own bit is a cache of what was last written, not an
+         * instruction, so it is overwritten here from the armed flag rather than
+         * trusted. */
+        const bool want_enabled = (r->flags & KLIO_STORE_FLAG_ARMED) != 0;
+
         const int8_t w = bhy2_klio_write_pattern(r->slot, r->blob, r->len, imu_dev());
         imu_drain_hard();
-        const uint8_t id = r->slot;
-        const int8_t e = bhy2_klio_set_pattern_states(KLIO_PATTERN_STATE_ENABLE,
-                                                      &id, 1, imu_dev());
+
+        int8_t e = BHY2_OK;
+        if (want_enabled)
+        {
+            const uint8_t id = r->slot;
+            e = bhy2_klio_set_pattern_states(KLIO_PATTERN_STATE_ENABLE, &id, 1,
+                                             imu_dev());
+        }
+        else
+        {
+            const uint8_t id = r->slot;
+            e = bhy2_klio_set_pattern_states(KLIO_PATTERN_STATE_DISABLE, &id, 1,
+                                             imu_dev());
+        }
         imu_drain_hard();
+
         if (w == BHY2_OK && e == BHY2_OK)
             ok++;
+        if (want_enabled)
+            armed++;
+
         if (verbose)
-            printf("  slot %u (%u B): write %s, enable %s\n", (unsigned)r->slot,
-                   (unsigned)r->len, rc_name(w), rc_name(e));
+            printf("  slot %u (%u B): write %s, %s %s\n", (unsigned)r->slot,
+                   (unsigned)r->len, rc_name(w),
+                   want_enabled ? "enable" : "leave off", rc_name(e));
         else
-            ESP_LOGI(TAG, "slot %u (%u B): write %s, enable %s",
-                     (unsigned)r->slot, (unsigned)r->len, rc_name(w), rc_name(e));
+            ESP_LOGI(TAG, "slot %u (%u B): write %s, %s %s",
+                     (unsigned)r->slot, (unsigned)r->len, rc_name(w),
+                     want_enabled ? "enable" : "leave off", rc_name(e));
     }
 
     if (verbose)
-        printf("%d of %d stored pattern(s) restored\n", ok, bank->count);
+        printf("%d of %d stored pattern(s) restored, %d watching\n", ok,
+               bank->count, armed);
     else
-        ESP_LOGI(TAG, "restored %d of %d pattern(s) after boot", ok, bank->count);
+        ESP_LOGI(TAG, "restored %d of %d pattern(s) after boot, %d watching", ok,
+                 bank->count, armed);
 
     return ok == bank->count;
 }
@@ -462,6 +501,196 @@ void klio_after_boot(void)
         return;                 /* nothing stored, or already logged and refused */
 
     (void)store_restore_into_part(false);
+}
+
+/* ------------------------------------- what a gesture opens, and the watch */
+
+/* DETECTION IS A SMALL STATE MACHINE, NOT A STREAM OF EVENTS.
+ *
+ * The engine reports a match on every frame while the wearer keeps moving, with
+ * a `count` that climbs -- so a naive "recognition fired, launch the app" would
+ * launch it dozens of times for one gesture. The rule here is the one a person
+ * would expect: a gesture fires once, when it begins. A match arms; the gesture
+ * fires; and nothing more fires until the engine has stopped matching for a
+ * moment, which is what lifting the wrist and starting again looks like.
+ *
+ * `s_fire_gap` is counted in frames seen without a match rather than in
+ * milliseconds, because the frame rate is the engine's, not ours, and a time
+ * constant would be a guess about a rate this project has measured differently
+ * at different configurations. */
+
+void klio_arm(klio_arm_state_t *out)
+{
+    klio_store_t *bank = store();
+    const int have = store_load_file();
+    if (have <= 0 || !bank || bank->count == 0)
+    {
+        if (out)
+            memset(out, 0, sizeof(*out));
+        return;
+    }
+
+    /* ENABLE ONLY WHAT IS ARMED -- and disable what is not, so switching
+     * detection off in the window takes effect without a reboot. */
+    int armed = 0;
+    for (int i = 0; i < bank->count; i++)
+    {
+        const uint8_t id = bank->rec[i].slot;
+        const bool on = (bank->rec[i].flags & KLIO_STORE_FLAG_ARMED) != 0;
+        (void)bhy2_klio_set_pattern_states(on ? KLIO_PATTERN_STATE_ENABLE
+                                              : KLIO_PATTERN_STATE_DISABLE,
+                                           &id, 1, imu_dev());
+        imu_drain_hard();
+        if (on)
+            armed++;
+    }
+
+    /* 50 Hz, for the reason `klio detect` documents: the setup calls above are
+     * several I2C transactions during which nothing drains. */
+    (void)imu_stream_on(50.0f);
+    (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_GYRO, 50.0f, 20, imu_dev());
+    (void)bhy2_set_fifo_wmark_wkup(32, imu_dev());
+    (void)imu_poll();
+
+    bhy2_klio_sensor_state_t st = {
+        .learning_enabled = 0,
+        .learning_reset = 0,        /* a reset would wipe what was just enabled */
+        .recognition_enabled = 1,
+        .recognition_reset = 0,
+    };
+    (void)bhy2_klio_set_state(&st, imu_dev());
+
+    (void)bhy2_register_fifo_parse_callback(BHY2_SENSOR_ID_KLIO, on_klio, NULL,
+                                            imu_dev());
+    (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_KLIO, 50.0f, 20, imu_dev());
+
+    s_last.recog_index = 0xFF;
+    s_last.frames = 0;
+    s_fire_gap = 0;
+    s_fired = false;
+
+    if (out)
+    {
+        out->active = armed > 0;
+        out->armed = armed;
+    }
+    ESP_LOGI(TAG, "watching %d armed pattern(s)", armed);
+}
+
+void klio_disarm(void)
+{
+    if (!imu_dev())
+        return;
+
+    bhy2_klio_sensor_state_t off = {0};
+    off.learning_reset = 0;
+    off.recognition_reset = 0;
+    (void)bhy2_klio_set_state(&off, imu_dev());
+    (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_KLIO, 0.0f, 0, imu_dev());
+    imu_quiesce();
+    s_fired = false;
+}
+
+/* The app a stored slot opens, or "" when it opens nothing. */
+const char *klio_slot_app(int slot)
+{
+    klio_store_t *bank = store();
+    const klio_store_rec_t *r = klio_store_find(bank, slot);
+    return (r && r->name[0]) ? r->name : "";
+}
+
+bool klio_slot_armed(int slot)
+{
+    klio_store_t *bank = store();
+    const klio_store_rec_t *r = klio_store_find(bank, slot);
+    return r && (r->flags & KLIO_STORE_FLAG_ARMED);
+}
+
+/* Set the app a stored slot opens, and whether it is watched for. Returns false
+ * when the slot is empty or the file could not be written -- because a mapping
+ * that survives only until the next boot is worse than one that refused. */
+bool klio_slot_set(int slot, const char *app, bool armed)
+{
+    klio_store_t *bank = store();
+    if (!bank)
+        return false;
+
+    /* Load before editing: this can be the first call after a boot in which
+     * nothing has touched the store, and editing an empty bank would then write
+     * a one-pattern file over whatever is on flash. */
+    if (bank->count == 0)
+        (void)store_load_file();
+
+    const klio_store_rec_t *cur = klio_store_find(bank, slot);
+    if (!cur)
+        return false;
+
+    /* Copy before replacing: `cur` points INTO the bank and the assignment below
+     * overwrites the bytes it points at. */
+    klio_store_rec_t r = *cur;
+
+    if (app)
+    {
+        snprintf(r.name, sizeof(r.name), "%s", app);
+    }
+
+    if (armed)
+        r.flags |= KLIO_STORE_FLAG_ARMED;
+    else
+        r.flags &= (uint8_t)~KLIO_STORE_FLAG_ARMED;
+
+    /* REPLACE, NOT PUT. put() deliberately carries the existing mapping over --
+     * it exists so the learn path cannot wipe what a gesture does. Calling it
+     * here is what made the checkbox flip straight back: the armed bit being
+     * written was replaced by the old one before the file was even touched. */
+    if (klio_store_replace(bank, &r) < 0)
+        return false;
+
+    return store_save_file();
+}
+
+/* Advance the watch and say whether a gesture fired, and which app it opens.
+ *
+ * Called once per window tick. Cheap: the draining is the caller's imu_poll()
+ * and this only looks at what the last frame said. */
+bool klio_detect_tick(char *app_out, size_t cap, int *slot_out)
+{
+    const bool match = s_last.recog_index != 0xFF;
+
+    if (match)
+        s_fire_gap = 0;
+    else
+        s_fire_gap++;
+
+    /* A MATCH IS AN EDGE, NOT A LEVEL. While the wearer holds the gesture the
+     * engine keeps reporting it, so the flag stays set; the gesture fires on the
+     * transition, and the gap below is what re-arms it for the next one. */
+    const bool fire = match && !s_fired;
+
+    if (fire)
+    {
+        s_fired = true;
+        const int slot = (int)s_last.recog_index;
+        const char *app = klio_slot_app(slot);
+        if (slot_out)
+            *slot_out = slot;
+        if (app_out && cap)
+            snprintf(app_out, cap, "%s", app);
+        return app[0] != '\0';       /* a match with no app mapped fires nothing */
+    }
+
+    /* RE-ARM AFTER THE ENGINE STOPS MATCHING for long enough that the gesture has
+     * plainly ended. Eight frames at the recognition rate is a fraction of a
+     * second -- long enough that the flicker between repetitions does not
+     * re-trigger, short enough that the next deliberate gesture is not missed. */
+    if (!match && s_fired && s_fire_gap >= 8)
+        s_fired = false;
+
+    if (app_out && cap)
+        app_out[0] = '\0';
+    if (slot_out)
+        *slot_out = -1;
+    return false;
 }
 
 /* ------------------------------------------------ learning, without blocking */
@@ -974,10 +1203,15 @@ static int cmd_klio(tdsh_session_t *session, int argc, char **argv)
         for (int i = 0; i < bank->count; i++)
         {
             const klio_store_rec_t *r = &bank->rec[i];
-            printf("  slot %2u  %3u bytes  %s%s%s\n", (unsigned)r->slot,
+            /* THE THREE THINGS A PERSON NEEDS TO SEE, and the distinction
+             * between the last two is the one this project got wrong once:
+             * `enabled` is the engine's state, `watching` is the wearer's
+             * switch. A record can be enabled and not watched. */
+            printf("  slot %2u  %3u bytes  %-8s  %-9s  %s\n", (unsigned)r->slot,
                    (unsigned)r->len,
                    (r->flags & KLIO_STORE_FLAG_ENABLED) ? "enabled" : "disabled",
-                   r->name[0] ? "  " : "", r->name);
+                   (r->flags & KLIO_STORE_FLAG_ARMED) ? "watching" : "off",
+                   r->name[0] ? r->name : "(opens nothing)");
         }
         printf("%d pattern(s) stored in %s\n", bank->count, KLIO_STORE_PATH);
         return 0;

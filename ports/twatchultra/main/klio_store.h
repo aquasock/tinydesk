@@ -29,15 +29,29 @@
  * Each record is:
  *
  *            1  slot            0..255 (the engine's own pattern index)
- *            1  flags           bit 0: enabled
+ *            1  flags           bit 0 armed, bit 1 enabled
  *            2  length          1..244, the blob's real size
- *           16  name            NUL-padded, reserved for the UI
+ *           24  name            NUL-padded; the app a gesture opens
  *            n  blob            `length` bytes
  *
- * THE NAME FIELD IS RESERVED, NOT USED. Nothing writes a label into it yet and
- * the restore path ignores it. It is here because adding it later would mean a
- * format bump and a migration for a field the app is certain to want; sixteen
- * bytes per pattern is 400 bytes at the part's maximum.
+ * THE NAME FIELD NAMES AN APP. It was reserved as 16 bytes in version 1 and this
+ * is what it was reserved for -- and 16 turned out to be ONE BYTE TOO SMALL: the
+ * longest registered app name on this board is "On-screen keyboard" at 18
+ * characters, against 15 usable bytes. So version 2 widens it to 24 (23 usable).
+ *
+ * WHY BOTH "ARMED" AND "ENABLED" FLAGS. They answer different questions and only
+ * one of them is ours to answer. `enabled` is the ENGINE's state -- whether the
+ * recognition table has the pattern switched on -- and the port sets it when it
+ * writes the pattern in. `armed` is the WEARER's switch: whether this gesture
+ * should be watched for at all. A pattern can be enabled in the engine while the
+ * wearer has switched detection off, and conflating the two would mean a
+ * checkbox that fights the boot-time restore.
+ *
+ * VERSION 1 FILES STILL LOAD. A v1 record is 16 bytes of name and its flag bit 0
+ * meant "enabled", so the decoder reads a v1 file into the same struct -- name
+ * padded, armed left clear, which is the honest reading: a gesture stored before
+ * there was anything to map it to has no app and should not silently start
+ * firing. The next save rewrites the file as v2.
  */
 #ifndef KLIO_STORE_H
 #define KLIO_STORE_H
@@ -51,7 +65,10 @@
 #define KLIO_STORE_MAGIC_2 'S'
 #define KLIO_STORE_MAGIC_3 'T'
 
-#define KLIO_STORE_VERSION 1
+#define KLIO_STORE_VERSION 2
+
+/* The only earlier version this build can still read. */
+#define KLIO_STORE_VERSION_MIN 1
 
 /* The engine's own ceiling, from bhy2_klio_defs.h: pattern_data is 244 bytes and
  * a learnt pattern is 157 of them. Kept at the struct's size rather than at 157
@@ -65,9 +82,16 @@
  * growing without bound. Worst case in flash is 32 * 263 + 12 = 8,428 bytes. */
 #define KLIO_STORE_MAX 32
 
-#define KLIO_STORE_NAME_MAX 16
+/* 23 usable characters plus the terminator. Sized for "On-screen keyboard" (18)
+ * with room to spare, because app names are upstream's to add. */
+#define KLIO_STORE_NAME_MAX 24
 
+/* The ENGINE's state: this pattern is switched on in the recognition table. */
 #define KLIO_STORE_FLAG_ENABLED 0x01u
+
+/* THE WEARER'S switch: watch for this gesture at all. Independent of the flag
+ * above -- see the note in the header comment. */
+#define KLIO_STORE_FLAG_ARMED 0x02u
 
 typedef struct
 {
@@ -104,8 +128,21 @@ void klio_store_init(klio_store_t *s);
 /* Add or replace the record for this slot. Returns the record's index, or -1
  * when the store is full or the record is invalid (length 0 or over the blob
  * maximum). A slot can only appear once: putting it again replaces it in place,
- * so a re-learnt pattern does not shadow the old one on restore. */
+ * so a re-learnt pattern does not shadow the old one on restore.
+ *
+ * PUT KEEPS THE MAPPING. When the slot already holds a record, an empty name
+ * keeps the app that is there and the armed bit is carried over. That is the
+ * correct behaviour for the LEARN path, which has a new blob and no opinion
+ * about what the gesture does.
+ *
+ * PUT MUST NOT BE USED TO CHANGE THE MAPPING. It cannot: the armed bit it
+ * carries over is the one it was asked to write. Use replace(). */
 int klio_store_put(klio_store_t *s, const klio_store_rec_t *r);
+
+/* Add or replace the record for this slot, taking it EXACTLY as given -- app name
+ * and armed bit included. This is the operation for a settings change, where the
+ * caller is deliberately saying what the record should now be. */
+int klio_store_replace(klio_store_t *s, const klio_store_rec_t *r);
 
 /* The record for this slot, or NULL. */
 const klio_store_rec_t *klio_store_find(const klio_store_t *s, int slot);

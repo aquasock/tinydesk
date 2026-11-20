@@ -464,6 +464,31 @@ typedef struct
      * the engine training in the background. */
     bool (*learn_begin)(void);
     void (*learn_cancel)(void);
+
+      /* WHAT A STORED GESTURE OPENS, AND THE WATCH THAT FIRES IT. OPTIONAL like
+     * the pair above; a board with a learning engine but no app launcher leaves
+     * these NULL and the window draws no mapping section.
+     *
+     * ONE STORED GESTURE FOR NOW. slot 0 is the gesture the Learn button
+     * produces, and these describe what it does -- the port's store already
+     * carries a name and a switch per record, so a collection is a matter of
+     * adding the UI, not a change of format.
+     *
+     * gapp() / garmed() / gset() act on the stored gesture. gset() writes it to
+     * flash and returns false when that fails, because a mapping that survives
+     * only until the next boot is worse than one that refused.
+     *
+     * arm() starts watching and honours each pattern's own switch; disarm()
+     * stops. detect() advances the watch and reports a gesture that has STARTED
+     * -- an edge, not a level, because the engine repeats a match on every frame
+     * for as long as the wearer keeps moving. A window that ignores this and
+     * acts on every match will launch the app dozens of times per gesture. */
+    const char *(*gapp)(void);
+    bool (*garmed)(void);
+    bool (*gset)(const char *app, bool armed);
+    void (*arm)(void);
+    void (*disarm)(void);
+    bool (*detect)(char *app_out, int cap);
 } td_imu_ops_t;
 
     /* --------------------------------------------------------- USB-C port */

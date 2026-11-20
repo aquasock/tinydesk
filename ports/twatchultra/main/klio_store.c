@@ -73,7 +73,25 @@ static bool rec_valid(const klio_store_rec_t *r)
     return r && r->len > 0 && r->len <= KLIO_STORE_BLOB_MAX;
 }
 
-int klio_store_put(klio_store_t *s, const klio_store_rec_t *r)
+/* THE TWO WAYS TO WRITE A SLOT, and the difference is a real distinction rather
+ * than spelling.
+ *
+ *   put()      for a caller that is updating the BLOB and nothing else. The learn
+ *              path is the case: it has a fresh 157 bytes and no opinion about
+ *              what the gesture opens or whether the wearer armed it, so those
+ *              survive.
+ *   replace()  for a caller that is changing the RECORD, including its mapping.
+ *              The settings path is the case, and it must win -- a switch that
+ *              the store overwrites with the old value is a switch that does
+ *              not work.
+ *
+ * THE FIRST VERSION HAD ONLY put(), with the preservation unconditional, and
+ * that is exactly how the checkbox came to flip straight back: arming a pattern
+ * wrote the record through put(), put() dutifully restored the armed bit from
+ * the record it was replacing, and the next tick read back "not armed". The host
+ * tests missed it because the app test used a fake port that never reached the
+ * store, and the store test only ever exercised put(). */
+static int store_write(klio_store_t *s, const klio_store_rec_t *r, bool keep_mapping)
 {
     if (!s || !rec_valid(r))
         return -1;
@@ -85,17 +103,28 @@ int klio_store_put(klio_store_t *s, const klio_store_rec_t *r)
     {
         if (s->rec[i].slot == r->slot)
         {
-            /* A caller that does not set the name must not erase one that is
-             * already there -- the UI will label patterns, and re-saving a
-             * pattern should not throw its label away. The old name has to be
-             * captured BEFORE the record is overwritten, or there is nothing
-             * left to keep. */
-            const bool keep_name = (r->name[0] == '\0');
+            /* A CALLER THAT KNOWS NOTHING ABOUT THE MAPPING MUST NOT DESTROY IT.
+             * The learn path re-saves slot 0 with a fresh blob and no idea what
+             * the gesture is for; if that wiped the name the wearer's mapping
+             * would vanish every time they re-trained the motion, which is the
+             * worst possible moment for it to vanish. So an empty name means
+             * "keep the one that is here", and the flag bit that says whether
+             * detection is armed is carried over the same way -- the blob is
+             * new, the decision about it is not.
+             *
+             * The old values are captured BEFORE the record is overwritten, or
+             * there is nothing left to keep. */
+            const bool keep_name = keep_mapping && (r->name[0] == '\0');
             char old_name[KLIO_STORE_NAME_MAX];
             memcpy(old_name, s->rec[i].name, KLIO_STORE_NAME_MAX);
+            const uint8_t old_flags = s->rec[i].flags;
+
             s->rec[i] = *r;
             if (keep_name)
                 memcpy(s->rec[i].name, old_name, KLIO_STORE_NAME_MAX);
+            if (keep_mapping)
+                s->rec[i].flags = (uint8_t)((s->rec[i].flags & ~KLIO_STORE_FLAG_ARMED) |
+                                            (old_flags & KLIO_STORE_FLAG_ARMED));
             return i;
         }
     }
@@ -105,6 +134,16 @@ int klio_store_put(klio_store_t *s, const klio_store_rec_t *r)
 
     s->rec[s->count] = *r;
     return s->count++;
+}
+
+int klio_store_put(klio_store_t *s, const klio_store_rec_t *r)
+{
+    return store_write(s, r, true);
+}
+
+int klio_store_replace(klio_store_t *s, const klio_store_rec_t *r)
+{
+    return store_write(s, r, false);
 }
 
 const klio_store_rec_t *klio_store_find(const klio_store_t *s, int slot)
@@ -227,11 +266,21 @@ int klio_store_decode(klio_store_t *s, const uint8_t *in, size_t len)
         goto fail;
     }
 
-    if (get16(in + 4) != KLIO_STORE_VERSION)
+    /* TWO VERSIONS ARE READABLE, AND THAT IS DELIBERATE. Version 1 is what this
+     * project wrote before a pattern could name an app. Refusing it would mean a
+     * wearer's existing gesture disappearing on the firmware that was supposed
+     * to keep it, which is exactly the failure persistence exists to prevent. A
+     * v1 file is read into the same struct with an empty name and armed clear --
+     * there was nothing to map it to, and a gesture should not start firing
+     * because the format grew. */
+    const uint16_t version = get16(in + 4);
+    if (version < KLIO_STORE_VERSION_MIN || version > KLIO_STORE_VERSION)
     {
         rc = KLIO_STORE_E_VERSION;
         goto fail;
     }
+    const size_t name_bytes = (version == 1) ? 16u : (size_t)KLIO_STORE_NAME_MAX;
+    const size_t record_fixed = 1 + 1 + 2 + name_bytes;
 
     /* CHECK THE CRC BEFORE TRUSTING ANY FIELD. The count and the lengths come
      * out of the same bytes the checksum covers, so a corrupted length cannot
@@ -256,7 +305,7 @@ int klio_store_decode(klio_store_t *s, const uint8_t *in, size_t len)
 
     for (int i = 0; i < count; i++)
     {
-        if (p + RECORD_FIXED_BYTES > end)
+        if (p + record_fixed > end)
         {
             rc = KLIO_STORE_E_RECORD;
             goto fail;
@@ -278,17 +327,20 @@ int klio_store_decode(klio_store_t *s, const uint8_t *in, size_t len)
          * array and the trailing-byte check below rejects the file anyway -- but
          * it reads past a caller's exact-size allocation, which is undefined
          * behaviour and is what the sanitised test target exists to catch. */
-        if (p + KLIO_STORE_NAME_MAX + r.len > end)
+        if (p + name_bytes + r.len > end)
         {
             rc = KLIO_STORE_E_RECORD;
             goto fail;
         }
 
-        memcpy(r.name, in + p, KLIO_STORE_NAME_MAX);
-        /* A name is a label, not data: make sure it is terminated whatever the
-         * file says, so nothing downstream can walk past it. */
+        /* THE NAME IS COPIED AT THE FILE'S OWN WIDTH and the rest of the field
+         * left as the memset put it, so a v1 file's 16 bytes land in the first
+         * 16 of a 24-byte field rather than being misread as 24. */
+        memcpy(r.name, in + p, name_bytes);
+        /* A name is an app name, not data: make sure it is terminated whatever
+         * the file says, so nothing downstream can walk past it. */
         r.name[KLIO_STORE_NAME_MAX - 1] = '\0';
-        p += KLIO_STORE_NAME_MAX;
+        p += name_bytes;
 
         memcpy(r.blob, in + p, r.len);
         p += r.len;

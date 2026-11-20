@@ -57,6 +57,11 @@
 
 static const char *TAG = "imu";
 
+/* Whether the gesture watch is running. Kept here rather than in klio.c because
+ * it is the IMU port's view of the part, and ops_stop() must not disarm something
+ * a window is still using. */
+static bool s_watching;
+
 /* DEFINED BY klio.c, WHICH THIS FILE MUST NOT DEPEND ON.
  *
  * The hook exists because the part's RAM does not survive a boot: klio.c keeps
@@ -1310,12 +1315,96 @@ static bool ops_latest(td_imu_t *out)
     return out->accel_valid || out->ori_valid;
 }
 
+/* ------------------------------------------------- what the gesture opens */
+
+/* The app the stored gesture opens. The store is the source of truth; this only
+ * presents it, because the mapping must read the same after a reboot as it did
+ * when the wearer set it. */
+static const char *ops_gapp(void)
+{
+    return klio_slot_app(0);
+}
+
+static bool ops_garmed(void)
+{
+    return klio_slot_armed(0);
+}
+
+static bool ops_gset(const char *app, bool armed)
+{
+    /* A LEARN PASS OWNS THE SENSORS WHILE IT RUNS, and rewriting the store does
+     * blocking I2C and a littlefs write. Deferred rather than refused would mean
+     * the wearer's choice silently not being kept, so this refuses and the
+     * window says so. */
+    if (klio_learn_active())
+        return false;
+
+    /* THE CALLER MAY PASS gapp() STRAIGHT BACK IN, which is a pointer into the
+     * store record that klio_slot_set is about to rewrite. Copying here keeps
+     * that harmless rather than relying on the order of two operations inside
+     * another function -- the same aliasing produced an empty app name in the
+     * host test's fake before it was fixed. */
+    char name[32];
+    snprintf(name, sizeof(name), "%s", app ? app : "");
+
+    if (!klio_slot_set(0, name, armed))
+        return false;
+
+    /* THE WATCH FOLLOWS THE SWITCH IMMEDIATELY. Changing the mapping while the
+     * engine is watching would otherwise take effect only after a reboot, and a
+     * checkbox that needs a reboot is a checkbox nobody trusts. Re-arming
+     * re-reads every record, so the new app and the new switch are both live. */
+    if (s_watching)
+    {
+        if (armed)
+        {
+            klio_arm_state_t a;
+            klio_arm(&a);
+        }
+        else
+        {
+            klio_disarm();
+            s_watching = false;
+        }
+    }
+    return true;
+}
+
+static void ops_arm(void)
+{
+    if (klio_learn_active())
+        return;
+    klio_arm_state_t a;
+    klio_arm(&a);
+    s_watching = a.active;
+}
+
+static void ops_disarm(void)
+{
+    klio_disarm();
+    s_watching = false;
+}
+
+static bool ops_detect(char *app_out, int cap)
+{
+    if (!s_watching || !app_out || cap <= 0)
+        return false;
+    int slot = -1;
+    return klio_detect_tick(app_out, (size_t)cap, &slot);
+}
+
 static const td_imu_ops_t s_imu_ops = {
     .start = ops_start,
     .stop = ops_stop,
     .latest = ops_latest,
     .learn_begin = klio_learn_begin,
     .learn_cancel = klio_learn_cancel,
+    .gapp = ops_gapp,
+    .garmed = ops_garmed,
+    .gset = ops_gset,
+    .arm = ops_arm,
+    .disarm = ops_disarm,
+    .detect = ops_detect,
 };
 
 const td_imu_ops_t *board_imu_ops(void)

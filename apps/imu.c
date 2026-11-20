@@ -48,12 +48,14 @@
 #define IMU_W 34
 #define IMU_H 14        /* without a learning engine */
 #define IMU_H_LEARN 19  /* with one: the gesture section needs five rows */
+#define IMU_H_MAP 25    /* plus the "opens" section: a title, a button, a box */
 #define TICK_MS 150     /* fast enough that a percent readout moves as you move */
 
 static td_window_t *s_win;
 static td_widget_t *s_part, *s_fw, *s_up, *s_head, *s_pitch, *s_roll;
 static td_widget_t *s_ax, *s_ay, *s_az, *s_count, *s_msg;
 static td_widget_t *s_learn_btn, *s_bar, *s_gmsg;
+static td_widget_t *s_app_btn, *s_arm_box, *s_ammap;
 
 /* True while a pass this window started is running. The port knows too, but a
  * window that has to guess from a tick whether it owns a pass will get it wrong
@@ -77,6 +79,16 @@ static bool can_learn(void)
 {
     const td_imu_ops_t *m = imu();
     return m && m->learn_begin && m->learn_cancel;
+}
+
+/* Whether this port can map a gesture to an app and watch for it. Separate from
+ * can_learn because they are different capabilities: a port could learn without
+ * being able to launch anything. */
+static bool can_map(void)
+{
+    const td_imu_ops_t *m = imu();
+    return m && m->gapp && m->garmed && m->gset && m->arm && m->disarm &&
+           m->detect;
 }
 
 static void on_draw(td_window_t *win, int w, int h)
@@ -126,6 +138,192 @@ static void on_learn(td_widget_t *w, void *user)
     td_widget_set_text(s_learn_btn, "Stop");
     td_progress_set(s_bar, 0);
     td_widget_set_text(s_gmsg, "repeat one gesture, the same way");
+}
+
+/* ------------------------------------------------------- the app picker */
+
+/* EVERY REGISTERED APP, plus "(none)" at the top to clear a mapping. Built from
+ * the registry rather than a list written here, because the registry is what the
+ * Start menu shows -- a hardcoded list would offer apps that do not exist on some
+ * build and miss the ones that do. */
+static int picker_index_to_app(int i)
+{
+    return i - 1;             /* 0 is "(none)" */
+}
+
+static const char *picker_item(td_widget_t *w, int i, int *fg, void *user)
+{
+    (void)w;
+    (void)user;
+    if (i < 0 || i >= td_app_count() + 1)
+        return "";
+    if (i == 0)
+    {
+        *fg = td_theme()->dim;
+        return "(none)";
+    }
+    *fg = td_theme()->win_fg;
+    return td_app_get(picker_index_to_app(i))->name;
+}
+
+static td_window_t *s_picker;
+
+static void on_pick_cancel(td_widget_t *w, void *user)
+{
+    (void)w;
+    (void)user;
+    if (s_picker)
+        td_win_close(s_picker);
+    s_picker = NULL;
+}
+
+static void picker_choose(td_widget_t *list, void *user)
+{
+    (void)user;
+    const td_imu_ops_t *m = imu();
+    if (!m || !can_map())
+        return;
+
+    const int i = td_list_selected(list);
+    const char *app = (i <= 0) ? "" : td_app_get(picker_index_to_app(i))->name;
+
+    /* KEEP THE EXISTING SWITCH when only the app changes. Clearing the mapping
+     * should not silently switch detection off, and choosing an app should not
+     * switch it on behind the wearer's back -- the checkbox is the control for
+     * that, and it is right there. */
+    if (!m->gset(app, m->garmed()))
+        td_widget_set_text(s_ammap, "could not save -- try again");
+    else
+        td_widget_set_text(s_ammap, app[0] ? "" : "opens nothing");
+
+    if (s_picker)
+        td_win_close(s_picker);
+    s_picker = NULL;
+    if (s_app_btn)
+        td_widget_set_text(s_app_btn, app[0] ? app : "(none)");
+}
+
+static void on_pick(td_widget_t *w, void *user)
+{
+    (void)w;
+    (void)user;
+    if (s_picker)
+    {
+        td_win_focus(s_picker);
+        return;
+    }
+
+    td_window_desc_t d = {0};
+    d.title = "Opens...";
+    d.rect = td_rect(-1, -1, 30, 14);
+    d.flags = TD_WIN_MOVABLE | TD_WIN_CLOSABLE;
+    s_picker = td_win_create(&d);
+    if (!s_picker)
+        return;
+
+    td_widget_t *list = td_list(s_picker, td_rect(1, 1, -2, -3), picker_item,
+                                picker_choose, NULL);
+    td_list_set_count(list, td_app_count() + 1);
+
+    /* START ON THE CURRENT MAPPING, so opening the picker shows where you are
+     * rather than always at the top. */
+    const char *cur = imu()->gapp();
+    int sel = 0;
+    for (int i = 0; cur && cur[0] && i < td_app_count(); i++)
+    {
+        if (!strcmp(td_app_get(i)->name, cur))
+        {
+            sel = i + 1;
+            break;
+        }
+    }
+    td_list_select(list, sel);
+    td_widget_focus(list);
+
+    td_button(s_picker, 1, -1, "Cancel", on_pick_cancel, NULL);
+}
+
+static void on_arm(td_widget_t *w, void *user)
+{
+    (void)user;
+    const td_imu_ops_t *m = imu();
+    if (!m || !can_map())
+        return;
+
+    const bool want = (w->value != 0);
+    if (!m->gset(m->gapp(), want))
+    {
+        /* PUT THE BOX BACK where it was. A checkbox that shows a state the store
+         * refused is a lie about what will happen at the next boot. */
+        td_checkbox_set(s_arm_box, !want);
+        td_widget_set_text(s_ammap, "could not save -- try again");
+        return;
+    }
+    td_widget_set_text(s_ammap, "");
+}
+
+/* Keep the mapping controls showing what the STORE says, not what was last
+ * clicked. The store is the truth and it can change underneath -- a failed save,
+ * a re-learn that kept the old mapping, or a reboot. */
+static void show_mapping(td_window_t *win, const td_imu_t *r)
+{
+    (void)win;
+    if (!s_app_btn)
+        return;
+
+    const td_imu_ops_t *m = imu();
+    const char *app = m->gapp ? m->gapp() : "";
+    td_widget_set_text(s_app_btn, app && app[0] ? app : "(none)");
+
+    /* NOT WHILE A PASS RUNS: the store cannot be written then, and flipping the
+     * box would show a state the port refused. */
+    if (!r->learn_active && s_arm_box)
+        td_checkbox_set(s_arm_box, m->garmed && m->garmed());
+
+    /* THE WATCH RUNS ONLY WHEN THERE IS SOMETHING TO WATCH FOR. Re-evaluated
+     * every tick because it depends on three things that can each change: a
+     * mapping existing, the switch being on, and a pass not owning the sensors.
+     *
+     * Stopping here rather than in on_close matters: the watch is why the sensors
+     * stay on while this window is open, and leaving it running after the wearer
+     * switches detection off would keep the part busy for nothing. */
+    if (!m->arm || !m->disarm)
+        return;
+
+    const bool want = app && app[0] && m->garmed() && !r->learn_active;
+    static bool running;
+    if (want && !running)
+    {
+        m->arm();
+        running = true;
+    }
+    else if (!want && running)
+    {
+        m->disarm();
+        running = false;
+    }
+}
+
+/* A GESTURE THAT HAS FIRED OPENS ITS APP. One line, because everything hard
+ * about it -- edges, debouncing, which slot -- is in the port. */
+static void show_fired(td_window_t *win)
+{
+    (void)win;
+    const td_imu_ops_t *m = imu();
+    if (!m->detect)
+        return;
+
+    char app[24];    /* longer than "On-screen keyboard" */
+    if (!m->detect(app, (int)sizeof(app)) || !app[0])
+        return;
+
+    /* LAUNCH FROM THE TICK, which is the window manager's own context -- the
+     * desktop composes and dispatches on this thread, so this is the same place
+     * a click would arrive from. That is the whole reason detection lives here
+     * for now: src/wm.c has no lock, so a background task calling td_app_launch
+     * would be a data race on the window array, not a slow path. */
+    td_app_launch(app);
+    td_widget_set_text(s_ammap, "opened");
 }
 
 /* The gesture section, from a reading. Split out of on_tick because it is the
@@ -283,6 +481,8 @@ static void on_tick(td_window_t *win)
     td_widget_set_text(s_count, buf);
 
     show_gesture(win, &r);
+    show_mapping(win, &r);
+    show_fired(win);
 
     td_win_invalidate(win);
 }
@@ -303,6 +503,12 @@ static void on_close(td_window_t *win)
         imu()->learn_cancel();
     s_was_learning = false;
 
+    /* AND THE WATCH STOPS WITH THE WINDOW, for the same reason: detection here is
+     * driven by this window's tick, so leaving the part armed would keep the
+     * sensors streaming with nothing to read them. */
+    if (imu()->disarm)
+        imu()->disarm();
+
     imu()->stop();      /* leave the part quiet; see the header comment */
 }
 
@@ -317,10 +523,12 @@ static void launch(void)
     }
 
     const bool learn = can_learn();
+    const bool map = can_map();
 
     td_window_desc_t d = {0};
     d.title = "IMU";
-    d.rect = td_rect(-1, -1, IMU_W, learn ? IMU_H_LEARN : IMU_H);
+    d.rect = td_rect(-1, -1, IMU_W,
+                     (learn && map) ? IMU_H_MAP : (learn ? IMU_H_LEARN : IMU_H));
     d.flags = TD_WIN_MOVABLE | TD_WIN_CLOSABLE;
     d.on_draw = on_draw;
     d.on_tick = on_tick;
@@ -372,6 +580,18 @@ static void launch(void)
         s_bar = td_progress(s_win, 1, y, IMU_W - 2);
         y += 1;
         s_gmsg = td_label(s_win, 1, y, IMU_W - 2, "press Learn to teach one");
+    }
+
+    if (map)
+    {
+        y += 2;
+        td_label(s_win, 1, y, 30, "Gesture opens");
+        y += 1;
+        s_app_btn = td_button(s_win, 1, y, "(none)", on_pick, NULL);
+        y += 1;
+        s_arm_box = td_checkbox(s_win, 1, y, "detect", imu()->garmed(), on_arm, NULL);
+        y += 1;
+        s_ammap = td_label(s_win, 1, y, IMU_W - 2, "");
     }
 
     on_tick(s_win);
