@@ -5,6 +5,7 @@
 #define KLIO_H
 
 #include <stdbool.h>
+#include <stdint.h>   /* uint32_t in klio_learn_state_t */
 
 /* Register the `klio` diagnostic command with the shell. */
 bool klio_register_command(void);
@@ -27,5 +28,28 @@ int klio_max_patterns(void);
  * from starting. Called by imu_start() through a weak symbol, so a build without
  * this file has no hook and needs no change. */
 void klio_after_boot(void);
+
+/* ---- learning a gesture, as a state machine the window can drive -----------
+ *
+ * A pass lasts as long as the wearer keeps repeating a motion, so it cannot be a
+ * blocking call: the window still has to draw and read touch. begin() starts
+ * one, tick() advances it and is cheap, cancel() abandons it. `klio learn` uses
+ * exactly these three, so the command and the button cannot drift apart.
+ */
+typedef struct
+{
+    bool active;          /* a pass is running */
+    bool succeeded;       /* the last finished pass produced a pattern */
+    bool got_frame;       /* the engine has sent at least one frame this pass */
+    int progress;         /* 0..100, and it CAN fall back to 0: see the note below */
+    int reason;           /* 0 progressing, 1 non-repetitive, 2 no movement */
+    int learnt_index;     /* the engine's index, -1 until a pattern is learnt */
+    uint32_t frames;      /* frames received since the pass began */
+} klio_learn_state_t;
+
+bool klio_learn_active(void);
+bool klio_learn_begin(void);
+void klio_learn_cancel(void);
+bool klio_learn_tick(klio_learn_state_t *out);
 
 #endif

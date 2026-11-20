@@ -555,6 +555,15 @@ if(TD_BUILD_TESTS)
     add_executable(test_native_apps tests/test_native_apps.c)
     target_link_libraries(test_native_apps PRIVATE tinydesk_apps)
     add_test(NAME test_native_apps COMMAND test_native_apps)
+    # The IMU window's gesture section: five added rows that must not clip, and
+    # a button/bar/status that must follow a pass through every state the port
+    # can report -- including progress falling back to 0, which the engine does
+    # on purpose and a UI must not paper over.
+    add_executable(test_imu_app tests/test_imu_app.c)
+    target_link_libraries(test_imu_app PRIVATE tinydesk_apps)
+    set_target_properties(test_imu_app PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+    target_compile_options(test_imu_app PRIVATE ${TD_WARNINGS})
+    add_test(NAME test_imu_app COMMAND test_imu_app)
     add_executable(test_task_snapshot tests/test_task_snapshot.c)
     target_include_directories(test_task_snapshot PRIVATE tests)
     target_link_libraries(test_task_snapshot PRIVATE tinydesk_core)

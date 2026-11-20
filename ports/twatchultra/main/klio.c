@@ -45,6 +45,7 @@
 #include "bhy2_klio.h"
 #include "bhy2_klio_defs.h"
 #include "imu.h"
+#include "klio.h"          /* its own declarations: the learn state machine */
 #include "klio_store.h"
 
 static const char *TAG = "klio";
@@ -103,6 +104,11 @@ static volatile float s_tilt = 0.1f;
 /* The index the engine assigned when it last learnt a pattern, so `detect` can
  * enable exactly that slot rather than guessing. -1 until something is learnt. */
 static int s_learnt = -1;
+
+/* The pass in progress, and where the last one started. See klio_learn_begin. */
+static klio_learn_state_t s_learn;
+static uint32_t s_learn_frames0;
+static int64_t  s_learn_t0;
 
 /* ---------------------------------------------------------- the callback */
 
@@ -458,6 +464,210 @@ void klio_after_boot(void)
     (void)store_restore_into_part(false);
 }
 
+/* ------------------------------------------------ learning, without blocking */
+
+/* A LEARNING PASS IS A STATE MACHINE, NOT A LOOP.
+ *
+ * `klio learn` was written as a blocking loop with a vTaskDelay in it, which is
+ * fine for a shell command and useless for a window: a pass lasts as long as the
+ * wearer keeps repeating a motion, so a tick that calls it would stop drawing --
+ * and stop reading the touch panel -- for as long as the gesture took.
+ *
+ * So the same sequencing lives here, in three calls the command and the window
+ * both use: begin(), tick(), cancel(). The command is refactored onto them below,
+ * because two copies of "enable the sensors, subscribe, reset, watch progress"
+ * would drift, and this project has already paid for that pattern once (the
+ * handoff notes it cost a cycle on `imu inject`).
+ *
+ * THE ENGINE'S OWN VOCABULARY IS PRESERVED RATHER THAN SUMMARISED. progress falls
+ * back to 0 when the engine judges the next repetition a different movement, and
+ * change_reason says which kind of interruption it saw. A UI that showed only a
+ * climbing bar would be misreporting the part. */
+
+#define KLIO_LEARN_TIMEOUT_MS 60000
+
+bool klio_learn_active(void)
+{
+    return s_learn.active;
+}
+
+bool klio_learn_begin(void)
+{
+    if (!imu_dev())
+        return false;
+    if (s_learn.active)
+        return true;
+
+    /* QUIESCE FIRST, and this is the difference between a learn pass that works
+     * and one that is interrupted by overflow: accel and gyro at 100 Hz plus the
+     * algorithm at 50 Hz is the mix that produced `meta 12 fifo overflow` in
+     * entries 73 and 74 when the FIFO was already carrying orientation samples.
+     * Emptying it first, and leaving orientation OFF for the duration, is the
+     * configuration that reached 100 percent. */
+    imu_quiesce();
+    change_state(0, 0, 0, 0);
+
+    /* ACCEL AT 100 Hz THROUGH imu_accel_enable, because that call also sets the
+     * port's own "a sensor is on, so imu_poll() may drain" flag. Configuring the
+     * sensor id directly would leave imu_poll() refusing and the FIFO filling. */
+    if (!imu_accel_enable(100.0f))
+        return false;
+    (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_GYRO, 100.0f, 20, imu_dev());
+    (void)bhy2_set_fifo_wmark_wkup(32, imu_dev());
+
+    /* Subscribe BEFORE enabling, or the first frames are missed. */
+    (void)bhy2_register_fifo_parse_callback(BHY2_SENSOR_ID_KLIO, on_klio, NULL,
+                                            imu_dev());
+    (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_KLIO, 50.0f, 20, imu_dev());
+
+    /* CLEAR THE LAST FRAME BEFORE STARTING, and this is not tidiness. The struct
+     * zero-initialises and learn_index defaults to 0, which a `>= 0` success
+     * test reads as "pattern 0 was learnt" -- the first run of this engine
+     * announced a pattern in under a second with no gesture at all. */
+    memset((void *)&s_last, 0, sizeof(s_last));
+    s_last.learn_index = -1;
+    s_last.recog_index = 255;
+    s_learn_frames0 = s_last.frames;
+    s_learn_t0 = esp_timer_get_time();
+
+    bhy2_klio_sensor_state_t st = {
+        .learning_enabled = 1,
+        .learning_reset = 1,      /* forget any half-trained pattern first */
+        .recognition_enabled = 0,
+        .recognition_reset = 0,
+    };
+    const int8_t rc = bhy2_klio_set_state(&st, imu_dev());
+    if (rc != BHY2_OK)
+    {
+        ESP_LOGW(TAG, "learning would not start: %s (%d)", rc_name(rc), rc);
+        imu_quiesce();
+        return false;
+    }
+
+    memset(&s_learn, 0, sizeof(s_learn));
+    s_learn.active = true;
+    s_learn.learnt_index = -1;
+    return true;
+}
+
+/* Stop the engine learning and put the sensors back the way a window expects
+ * them. Does NOT reset: a reset here would delete the pattern that was just
+ * learnt, which is the trap that makes people think learning never worked. */
+void klio_learn_cancel(void)
+{
+    if (!s_learn.active)
+        return;
+
+    bhy2_klio_sensor_state_t off = {0};
+    off.learning_reset = 0;
+    (void)bhy2_klio_set_state(&off, imu_dev());
+    (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_KLIO, 0.0f, 0, imu_dev());
+    imu_quiesce();
+
+    s_learn.active = false;
+    s_learn.succeeded = false;
+}
+
+/* THE PATTERN HAS TO BE TAKEN OUT OF THE ENGINE NOW OR IT IS LOST.
+ *
+ * `learning_reset` is set when a pass begins, and bhy2_klio.h says a reset
+ * "removes any patterns loaded for recognition" -- so a completed learn has
+ * ALREADY wiped every pattern restored at boot (IMU-011). This reads the new one
+ * out, files it in the bank at slot 0, writes the store, and then puts the whole
+ * table back. Skipping the last step would leave the wearer's earlier gestures
+ * gone with nothing to say why, and skipping the file write would lose this one
+ * at the next boot.
+ *
+ * It runs inside a UI tick and takes a few hundred milliseconds -- several I2C
+ * transactions and a 4 KB file write -- which is the same order as the very
+ * first start() on this part (a 3.2 s firmware upload), so a window tolerates
+ * it. */
+static void learn_keep_pattern(void)
+{
+    imu_quiesce();
+
+    uint8_t pattern[244];
+    uint16_t plen = sizeof(pattern);
+    const int8_t rc = bhy2_klio_read_pattern(0, pattern, &plen, imu_dev());
+    imu_drain_hard();
+
+    if (rc != BHY2_OK || plen == 0 || plen > sizeof(pattern))
+    {
+        ESP_LOGW(TAG, "learnt, but the pattern could not be read back: %s (%d)",
+                 rc_name(rc), rc);
+        return;
+    }
+
+    klio_store_t *bank = store();
+    if (!bank)
+        return;
+    if (bank->count == 0)
+        (void)store_load_file();        /* keep whatever else is on flash */
+
+    /* SLOT 0 IS THE LEARNT GESTURE. One button learns one gesture; the store
+     * still holds any others so they come back with it. */
+    klio_store_rec_t r;
+    memset(&r, 0, sizeof(r));
+    r.slot = 0;
+    r.flags = KLIO_STORE_FLAG_ENABLED;
+    r.len = plen;
+    memcpy(r.blob, pattern, plen);
+    (void)klio_store_put(bank, &r);
+
+    if (!store_save_file())
+        ESP_LOGW(TAG, "learnt, but %s could not be rewritten", KLIO_STORE_PATH);
+
+    /* And back into the engine, all of them, because the reset emptied it. */
+    (void)store_restore_into_part(false);
+}
+
+/* Advance the pass. Returns true while one is running; fills `out` with the
+ * current state whether or not it is -- so a caller that has just seen it end
+ * can read the result from the same call. */
+bool klio_learn_tick(klio_learn_state_t *out)
+{
+    if (s_learn.active)
+    {
+        (void)imu_poll();
+
+        s_learn.frames = s_last.frames - s_learn_frames0;
+        if (s_learn.frames > 0)
+        {
+            /* ONLY A FRAME THAT ACTUALLY ARRIVED MAY BE REPORTED. s_last is
+             * cleared before the pass, so reading it unconditionally would
+             * announce 0 percent from a struct no packet had touched. */
+            s_learn.got_frame = true;
+            s_learn.progress = (int)s_last.learn_progress;
+            s_learn.reason = (int)s_last.learn_reason;
+        }
+
+        if (s_learn.got_frame && s_last.learn_index >= 0 &&
+            s_last.learn_progress >= 100)
+        {
+            s_learn.learnt_index = s_last.learn_index;
+            s_learnt = s_learn.learnt_index;
+            s_learn.active = false;
+            s_learn.succeeded = true;
+
+            bhy2_klio_sensor_state_t off = {0};
+            (void)bhy2_klio_set_state(&off, imu_dev());
+            (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_KLIO, 0.0f, 0, imu_dev());
+            learn_keep_pattern();
+        }
+        else if (esp_timer_get_time() - s_learn_t0 >
+                 (int64_t)KLIO_LEARN_TIMEOUT_MS * 1000)
+        {
+            ESP_LOGI(TAG, "learn pass ended with no pattern after %d ms",
+                     KLIO_LEARN_TIMEOUT_MS);
+            klio_learn_cancel();
+        }
+    }
+
+    if (out)
+        *out = s_learn;
+    return s_learn.active;
+}
+
 /* ------------------------------------------------------------ the command */
 
 static int cmd_klio(tdsh_session_t *session, int argc, char **argv)
@@ -518,87 +728,42 @@ static int cmd_klio(tdsh_session_t *session, int argc, char **argv)
     /* ----------------------------------------------------------- learn */
     if (strcmp(sub, "learn") == 0)
     {
-        bhy2_klio_sensor_state_t st = {
-            .learning_enabled = 1,
-            .learning_reset = 1,      /* forget any half-trained pattern first */
-            .recognition_enabled = 0,
-            .recognition_reset = 0,
-        };
-
-        /* KLIO IS AN ALGORITHM, NOT A SENSOR -- IT CONSUMES THE PHYSICAL ONES.
+        /* THE SEQUENCING LIVES IN klio_learn_begin/tick/cancel, not here.
          *
-         * THE FIRST VERSION OF THIS PROBE ENABLED KLIO AND NOTHING ELSE, and the
-         * engine then reported zero frames for a whole minute of a human waving
-         * at it. The reason is obvious once stated: a classifier that learns
-         * from motion has no motion to look at unless the accelerometer and
-         * gyroscope are running and feeding it. Enabling them is not a
-         * workaround for a bug, it is the prerequisite.
-         *
-         * 100 Hz on both, which is the rate these algorithms expect; report
-         * latency 20 ms so samples arrive in a steady stream rather than in
-         * FIFO-sized lumps. */
-        (void)imu_stream_on(100.0f);
-        (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_GYRO, 100.0f, 20, imu_dev());
-
-        /* Subscribe BEFORE enabling, or the first frames are missed. */
-        (void)bhy2_register_fifo_parse_callback(BHY2_SENSOR_ID_KLIO, on_klio, NULL,
-                                                imu_dev());
-        (void)bhy2_set_virt_sensor_cfg(BHY2_SENSOR_ID_KLIO, 50.0f, 20, imu_dev());
-
-        /* CLEAR THE LAST FRAME BEFORE STARTING, and this is not tidiness. The
-         * struct zero-initialises, and learn_index defaults to 0 -- which the
-         * success test `>= 0` reads as "pattern 0 was learnt". The first run of
-         * this probe therefore announced a learnt pattern in under a second,
-         * with no gesture at all, which is exactly the sort of confident false
-         * positive a diagnostic must never produce. -1 means "nothing new". */
-        memset((void *)&s_last, 0, sizeof(s_last));
-        s_last.learn_index = -1;
-        s_last.recog_index = 255;
-        const uint32_t frames_before = s_last.frames;
-
-        say_rc("reset + learning on", bhy2_klio_set_state(&st, imu_dev()));
+         * It used to be a blocking loop in this command, which is fine for a
+         * shell and impossible for a window. The window needs the same thing, so
+         * there is one implementation and this is a thin front end onto it --
+         * two copies would drift, and this project has already lost a cycle to
+         * exactly that (the handoff records it for `imu inject`). */
+        if (!klio_learn_begin())
+        {
+            printf("klio: learning would not start\n");
+            return 1;
+        }
 
         printf("\nperform one gesture over and over -- the same motion each time.\n");
         printf("watch `progress` climb to 100, then press Ctrl+C.\n\n");
 
         int last_pct = -1;
-        int8_t learnt = -1;
-        for (int i = 0; i < 600; i++)      /* 600 x 100 ms = up to a minute */
-        {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            (void)imu_poll();
+        klio_learn_state_t ls;
+        memset(&ls, 0, sizeof(ls));
 
-            /* ONLY A REAL FRAME MAY PRINT PROGRESS. s_last is zeroed before the
-             * loop, so an unconditional first print announces 0% from a struct
-             * that no packet has touched -- the same false-confidence failure
-             * the learnt-index check had. */
-            if (s_last.frames != frames_before && s_last.learn_progress != last_pct)
+        while (klio_learn_tick(&ls))
+        {
+            if (ls.got_frame && ls.progress != last_pct)
             {
-                last_pct = s_last.learn_progress;
-                printf("  progress %3d%%%s\n", last_pct,
-                       s_last.learn_reason ? "  (interrupted)" : "");
+                last_pct = ls.progress;
+                printf("  progress %3d%%%s\n", ls.progress,
+                       ls.reason ? "  (interrupted)" : "");
             }
-            /* Only a FRAME THAT ACTUALLY ARRIVED may report a new pattern, and
-             * only once progress has been seen to reach 100. Both conditions,
-             * because either one alone can be satisfied by a stale field. */
-            if (s_last.frames != frames_before && s_last.learn_index >= 0 &&
-                s_last.learn_progress >= 100)
-            {
-                learnt = s_last.learn_index;
-                s_learnt = learnt;
-                break;
-            }
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
 
-        bhy2_klio_sensor_state_t off = {0};
-        off.learning_reset = 0;
-        (void)bhy2_klio_set_state(&off, imu_dev());
-
-        printf("\nframes from the engine: %lu\n",
-               (unsigned long)(s_last.frames - frames_before));
-        if (learnt >= 0)
-            printf("LEARNT pattern %d -- `klio detect` will recognise it now\n", learnt);
-        else if (s_last.frames == frames_before)
+        printf("\nframes from the engine: %lu\n", (unsigned long)ls.frames);
+        if (ls.succeeded)
+            printf("LEARNT pattern %d -- kept in slot 0, and it survives a reboot\n",
+                   ls.learnt_index);
+        else if (!ls.got_frame)
             printf("no frames at all: the engine is not reporting. It is configured\n"
                    "and subscribed, so the next thing to check is whether this\n"
                    "firmware routes KLIO output to the FIFO without an explicit\n"
@@ -606,8 +771,8 @@ static int cmd_klio(tdsh_session_t *session, int argc, char **argv)
         else
             printf("no pattern learnt. progress reached %u%% and stopped, so the\n"
                    "part did not see the motion as repetitive enough.\n",
-                   (unsigned)s_last.learn_progress);
-        return 0;
+                   (unsigned)ls.progress);
+        return ls.succeeded ? 0 : 1;
     }
 
     /* ------------------------------------------------------------ save */

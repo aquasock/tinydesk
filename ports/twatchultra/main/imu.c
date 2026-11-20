@@ -52,6 +52,7 @@
 #include "bhy2_klio_defs.h"
 #include "tinydesk/td_sysinfo.h"
 #include "imu.h"
+#include "klio.h"
 #include "power.h"
 
 static const char *TAG = "imu";
@@ -1215,6 +1216,15 @@ static bool ops_start(const char **why)
             *why = imu_why();
         return false;
     }
+    /* A LEARNING PASS OWNS THE SENSORS WHILE IT RUNS, and the window calls
+     * start() on every tick. Streaming them here as well would reconfigure the
+     * accelerometer back to 50 Hz and turn orientation back on -- two things the
+     * pass deliberately does not want: 100 Hz is what the engine expects, and
+     * orientation sharing the FIFO is what overflowed it in entries 73 and 74.
+     * The pass is authoritative, so this defers to it. */
+    if (klio_learn_active())
+        return true;
+
     /* 50 Hz is twice what a 4 Hz window needs and leaves room for a UI that
      * later wants to watch a tilt more closely. */
     if (!imu_stream_on(50.0f))
@@ -1251,7 +1261,14 @@ static bool ops_latest(td_imu_t *out)
      * nothing ever asked for them. The contract in td_sysinfo.h says the port
      * does the work and a window may call this every tick, so the drain belongs
      * here. */
-    (void)imu_poll();
+    /* THE PASS IS ADVANCED HERE, because this is the one call a window makes
+     * every tick and the pass needs exactly that: a drain, and a look at what
+     * the engine said. While a pass runs it does its own draining, so the extra
+     * poll below would be a second, pointless one. */
+    klio_learn_state_t ls;
+    const bool learning = klio_learn_tick(&ls);
+    if (!learning)
+        (void)imu_poll();
 
     out->accel_valid = imu_accel(&out->ax, &out->ay, &out->az, &out->accel_samples);
 
@@ -1279,6 +1296,17 @@ static bool ops_latest(td_imu_t *out)
     out->roll = s_roll;
     snprintf(out->part, sizeof(out->part), "BHI260AP");
     snprintf(out->version, sizeof(out->version), "%s", s_version);
+
+    /* ASKED OF THE PART, NOT ASSUMED. KLIO is a virtual sensor in the uploaded
+     * firmware, and this port uploads one image by default but the image is a
+     * choice -- a different one may not carry the engine at all. The answer is a
+     * cached bitmap in the SDK, so this costs no bus traffic per tick. */
+    out->learn_available = bhy2_is_sensor_available(BHY2_SENSOR_ID_KLIO, &s_bhy2);
+    out->learn_active = ls.active;
+    out->learn_ok = ls.succeeded;
+    out->learn_progress = ls.progress;
+    out->learn_reason = ls.reason;
+
     return out->accel_valid || out->ori_valid;
 }
 
@@ -1286,6 +1314,8 @@ static const td_imu_ops_t s_imu_ops = {
     .start = ops_start,
     .stop = ops_stop,
     .latest = ops_latest,
+    .learn_begin = klio_learn_begin,
+    .learn_cancel = klio_learn_cancel,
 };
 
 const td_imu_ops_t *board_imu_ops(void)

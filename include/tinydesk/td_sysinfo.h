@@ -394,6 +394,28 @@ typedef struct
     uint32_t accel_samples;   /* since start: a frozen count means a dead link */
     char part[24];            /* "BHI260AP" */
     char version[32];         /* firmware kernel version */
+
+      /* GESTURE LEARNING, when the port has a learning engine. A board without
+     * one leaves learn_available false and the window shows no gesture section
+     * at all, rather than a button that cannot work.
+     *
+     * PROGRESS IS NOT MONOTONIC and the reason says why. The engine counts
+     * repetitions of what it thinks is one movement, and when it decides the
+     * next repetition is a DIFFERENT movement it drops back to 0 -- so a bar
+     * that only climbs is lying, and a wearer watching it fall needs to be told
+     * that it means "that repetition did not match", not "the sensor broke".
+     * learn_reason carries the engine's own vocabulary: 0 progressing,
+     * 1 interrupted by a non-repetitive activity, 2 interrupted because no
+     * significant movement was detected.
+     *
+     * learn_ok is meaningful only once learn_active has gone back to false: it
+     * is the result of the pass that just finished, and it stays set until the
+     * next one begins. */
+    bool learn_available;
+    bool learn_active;        /* a learning pass is running now */
+    bool learn_ok;            /* the last pass produced a pattern */
+    int learn_progress;       /* 0..100 */
+    int learn_reason;         /* 0 progressing, 1 non-repetitive, 2 no movement */
 } td_imu_t;
 
 /*
@@ -417,8 +439,31 @@ typedef struct
     void (*stop)(void);
 
       /* Copy the latest reading. False when the sensor is not running or has
-     * not produced a sample yet. Cheap enough for a window's tick. */
+     * not produced a sample yet. Cheap enough for a window's tick.
+     *
+     * IT FILLS `out` WHETHER OR NOT IT RETURNS TRUE -- every field, zeroed where
+     * there is nothing to report. A caller must not have to tell "no reading"
+     * from "no news" to read the learning status: the tick that ends a learning
+     * pass takes the sensors down to write the pattern, so it can legitimately
+     * have a result to report and no sample to show, and a window that skipped
+     * the struct on a false return would strand its button on "Stop". */
     bool (*latest)(td_imu_t *out);
+
+      /* Learn a gesture from the wearer. OPTIONAL, and NULL on a board with no
+     * learning engine; the window then draws no Learn button.
+     *
+     * BOTH RETURN AT ONCE. A learning pass is a state machine the port advances
+     * inside latest(), not a blocking call, because a pass lasts as long as the
+     * wearer keeps repeating a motion -- seconds to a minute -- and the window
+     * cannot stop drawing for that. begin() returns false when there is no
+     * engine, the part refuses, or a pass is already running.
+     *
+     * cancel() abandons a pass in progress and leaves the sensor usable. It is
+     * what the Stop button calls, and what a window calls when it closes with a
+     * pass running -- a wearer who walks away from an open window must not leave
+     * the engine training in the background. */
+    bool (*learn_begin)(void);
+    void (*learn_cancel)(void);
 } td_imu_ops_t;
 
     /* --------------------------------------------------------- USB-C port */
