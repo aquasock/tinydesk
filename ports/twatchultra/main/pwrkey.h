@@ -17,6 +17,24 @@
 typedef void (*pwrkey_input_fn)(const char *data, int len);
 
 /*
+ * An application's answer to a short press: true when it has taken the press
+ * for itself and the Enter should NOT be injected.
+ *
+ * WHY THIS EXISTS. A short press means Enter to the desktop, which is right
+ * when the desktop is what is looking at the key. When an app has taken the
+ * glass -- the Game Boy, drawing pixels through its own frame loop -- Enter is
+ * not what a tap should mean, and the operator's request is that one tap closes
+ * the emulator and returns to the desktop.
+ *
+ * WHY IT IS SET ONCE AT INIT. Same reason as touch_set_app_touch(): a
+ * registration that is torn down with the app leaves this driver holding a
+ * pointer to something that has freed itself, and the press that arrives in
+ * that window is a jump into nothing. A handler that answers false when it is
+ * not running is the same behaviour with none of that risk.
+ */
+typedef bool (*pwrkey_app_key_fn)(void *user);
+
+/*
  * Clear anything the PMU is holding, enable the short-press interrupt, and
  * start watching GPIO 7; false when the PMU does not answer or the line could
  * not be made to work.
@@ -33,5 +51,15 @@ typedef void (*pwrkey_input_fn)(const char *data, int len);
  * is how to tell a key fault from a PMU fault.
  */
 bool pwrkey_init(pwrkey_input_fn input);
+
+/*
+ * Offer short presses to an application before they become Enter.
+ *
+ * Call it once, at init, and expect it to run on pwrkey_task (core 0, priority
+ * 3) rather than on the caller's task -- so a handler that stops an emulator
+ * blocks this driver for as long as that takes. See pwrkey.c for what that
+ * costs and why the press is still felt.
+ */
+void pwrkey_set_app_key(pwrkey_app_key_fn fn, void *user);
 
 #endif

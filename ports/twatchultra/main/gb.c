@@ -36,7 +36,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "gamepad.h"
-#include "gamepad.h"
+#include "pwrkey.h"
 #include "touch.h"
 #include "sdpaths.h"
 #include "tdsh.h"
@@ -174,6 +174,15 @@ static void gb_blit_task(void *arg)
         xQueueSend(s_free_q, &slot, 0);
     }
 
+    /* CLEAR THE HANDLE BEFORE LEAVING, which is what makes gb_stop()'s wait on
+     * it mean anything. The guest task has always done this (s_task = NULL
+     * before vTaskDeleteWithCaps); this one never did, so the wait loop could
+     * not observe the exit it was written to wait for and ran its full 100 x
+     * 10 ms every single time the emulator closed. Measured on hardware
+     * 2026-11-21: `gb stop` reported 1020 ms, of which about 1000 was this wait
+     * doing nothing. The loop's own comment -- "let the blitter drain the last
+     * frame and leave" -- describes behaviour that could not happen. */
+    s_blit_task = NULL;
     vTaskDelete(NULL);
 }
 
@@ -353,6 +362,31 @@ static void gb_audio_cb(void *buffer, size_t length)
 
 static char s_save_path[256];
 static bool s_saveable;               /* cartridge has battery-backed RAM    */
+
+/*
+ * THE LAST STOP'S SAVE OUTCOME, RECORDED RATHER THAN PRINTED.
+ *
+ * gb_stop() now has two callers in different tasks: the shell, and the Pusher
+ * A hook on pwrkey_task. This port has a measured rule that a command prints
+ * from the task that invoked it, because a foreign task's stdout does not
+ * survive the desktop's terminal capture -- pmbench.c records the run that
+ * established it, where a measurement completed and its output was simply not
+ * there. So the stop records what it did here, and whoever can print prints it:
+ * `gb stop` from the shell, and `gb status` afterwards from either path.
+ *
+ * A save that FAILED must stay findable, which is the whole reason this is not
+ * discarded along with the print that used to carry it.
+ */
+static char s_last_stop[24];
+
+/* How long the last stop took, in milliseconds, from the entry that began it
+ * to the save being on the card. THIS IS THE NUMBER THE PUSHER A HOOK OWES THE
+ * RECORD: the press is answered on pwrkey_task, which also owns the PMU
+ * interrupt, so this is a delay in seeing a cable event as well as in getting
+ * the desktop back. It is reported through `gb status` rather than through the
+ * log, because the log is not readable over the USB mirror once a picture has
+ * owned the panel -- and the emulator is exactly when it matters. */
+static uint32_t s_last_stop_ms;
 static uint32_t s_sram_saves;         /* writes that succeeded               */
 static uint32_t s_sram_us;            /* cost of the last write              */
 static uint32_t s_sram_snap_us;       /* cost of the last snapshot           */
@@ -1058,6 +1092,39 @@ static bool gb_app_touch(void *user, const touch_frame_t *f)
     return used;
 }
 
+/*
+ * PUSHER A WHILE THE EMULATOR IS UP: one tap closes it and returns to the
+ * desktop. That is the operator's request, and the press is claimed only while
+ * a guest is actually running -- with nothing running it is still Enter, which
+ * is how the desktop is driven in the first place.
+ *
+ * WHO CALLS THIS, AND WHY THAT SHAPES IT. It runs on pwrkey_task, not on the
+ * shell's task, so it must not print: this port has a measured rule that a
+ * foreign task's stdout does not survive the desktop's terminal capture (the
+ * run that established it is recorded in pmbench.c). Everything it touches is
+ * safe from a foreign task -- the display driver marshals its work to the
+ * painter and takes its own lock, which display_repaint_all() documents at
+ * length, and the emulator owns pixels rather than a window-manager window, so
+ * wm.c's unlocked state is not in reach here.
+ *
+ * gb_stop() saves SRAM before it tears anything down, so an accidental tap
+ * costs the session's position at worst and never the save file.
+ */
+static bool gb_app_key(void *user)
+{
+    (void)user;
+
+    if (!gb_running())
+        return false;              /* not ours: Enter passes through */
+
+    gb_stop();
+
+    /* Nothing is printed here on purpose: this runs on pwrkey_task, where a
+     * print is lost. What the stop did and what it cost are in s_last_stop and
+     * s_last_stop_ms, which `gb status` reports from a task that can print. */
+    return true;
+}
+
 /* --- start / stop -------------------------------------------------------- */
 
 bool gb_start(const char *rom_path)
@@ -1489,6 +1556,8 @@ void gb_stop(void)
     if (!s_task && !s_run)
         return;
 
+    const int64_t t0 = esp_timer_get_time();
+
     s_run = false;
 
     /* Before the tasks are waited on, so no late frame writes into a closed
@@ -1529,10 +1598,26 @@ void gb_stop(void)
         const size_t len = gnuboy_sram_snapshot(s_snap[0], GB_SRAM_SNAP_MAX);
 
         if (len && sram_write(s_save_path, s_snap[0], len) == 0)
-            printf("gb: saved %s\n", s_save_path);
+        {
+            snprintf(s_last_stop, sizeof s_last_stop, "saved");
+            ESP_LOGI(TAG, "saved %s", s_save_path);
+        }
         else
-            printf("gb: could not write %s\n", s_save_path);
+        {
+            snprintf(s_last_stop, sizeof s_last_stop, "SAVE FAILED");
+            ESP_LOGE(TAG, "could not write %s", s_save_path);
+        }
     }
+    else if (s_saveable)
+    {
+        snprintf(s_last_stop, sizeof s_last_stop, "clean");
+    }
+    else
+    {
+        snprintf(s_last_stop, sizeof s_last_stop, "no sram");
+    }
+
+    s_last_stop_ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
 
     if (s_snap_free)
     {
@@ -1624,8 +1709,19 @@ static int cmd_gb(tdsh_session_t *session, int argc, char **argv)
 
     if (strcmp(sub, "stop") == 0)
     {
+        /* Read before the call, and against the same condition gb_stop() itself
+         * returns on: with nothing running it changes nothing, and a stale
+         * "saved" from a previous session would otherwise be reported as this
+         * stop's outcome. */
+        const bool was_up = gb_running() || s_run;
+
         gb_stop();
-        printf("stopped, screen released\n");
+
+        printf("stopped, screen released");
+        if (was_up && s_last_stop[0])
+            printf(", %s in %lums", s_last_stop,
+                   (unsigned long)s_last_stop_ms);
+        printf("\n");
         return 0;
     }
 
@@ -1667,6 +1763,12 @@ static int cmd_gb(tdsh_session_t *session, int argc, char **argv)
                    (unsigned long)(s_sram_snap_us / 1000));
         else
             printf("sram none\n");
+
+        /* What the last stop saved, which is the only report a Pusher A close
+         * can give: it happens on the key task, where a print is lost. */
+        if (s_last_stop[0])
+            printf("last stop: %s in %lums\n", s_last_stop,
+                   (unsigned long)s_last_stop_ms);
 
         if (gb_running())
             printf("emu=%luus blit=%luus pad=%02x\n",
@@ -1756,6 +1858,13 @@ static const tdsh_command_t s_gb_cmd = {
 
 bool gb_register_command(void)
 {
+    /* THE KEY HOOK IS SET ONCE, HERE, and not per app, for the reason pwrkey.h
+     * gives: a registration torn down with the app leaves the driver holding a
+     * pointer to something that has freed itself. It answers false while no
+     * guest is running, so the desktop keeps its Enter and nothing else has to
+     * know this exists. */
+    pwrkey_set_app_key(gb_app_key, NULL);
+
     if (!touch_add_app_touch(gb_app_touch, NULL))
         ESP_LOGW(TAG, "gb touch consumer did not register");
 

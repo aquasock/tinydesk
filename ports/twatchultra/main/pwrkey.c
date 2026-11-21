@@ -87,6 +87,20 @@ static int s_pin = -1;
 static TaskHandle_t s_task;
 static volatile uint32_t s_presses;
 
+/* An application's claim on a short press, set once at init. NULL is the
+ * normal state and means every press is Enter, which is what the desktop
+ * wants. Read here and written only from pwrkey_set_app_key(), so neither
+ * side needs a lock: the pair is set before any press can arrive.
+ */
+static pwrkey_app_key_fn s_app_key;
+static void *s_app_key_user;
+
+void pwrkey_set_app_key(pwrkey_app_key_fn fn, void *user)
+{
+    s_app_key = fn;
+    s_app_key_user = user;
+}
+
 static void send_key(void)
 {
     if (s_input)
@@ -158,9 +172,39 @@ static void pwrkey_task(void *arg)
         if (st[1] & IRQ1_PEK_SHORT)
         {
             s_presses++;
-            send_key();
+
+            /*
+             * THE APP GETS FIRST REFUSAL, BEFORE THE KEY IS INJECTED.
+             *
+             * The handler runs HERE, on pwrkey_task, and not on whatever task
+             * the app would have preferred. That is deliberate and it is why
+             * the hook returns a bool rather than queueing anything: a press
+             * is a single synchronous decision, and queueing it would let the
+             * Enter and the app's action race each other into the same frame.
+             *
+             * THE COST IS THIS TASK'S, AND IT IS MEASURED. The Game Boy's stop
+             * waits for its guest, its blitter and its save writer, so the
+             * theoretical ceiling was four seconds of waits. On hardware the
+             * whole stop measures 30 to 40 ms -- the guest is priority 5 on
+             * this same core and both other tasks are on the other core, so
+             * they drain rather than stall behind us. A 1020 ms stop measured
+             * here on 2026-11-21 was a separate defect in that wait, since
+             * fixed: the blitter never cleared its own handle, so its loop
+             * always ran to its limit. charge_on_irq() below still runs
+             * afterwards, so a cable event arriving during the stop is
+             * reported late rather than lost.
+             */
+            const bool taken = s_app_key && s_app_key(s_app_key_user);
+
+            if (!taken)
+                send_key();
+
+            /* FELT EITHER WAY: the press happened, whatever it did. A buzz
+             * that only followed Enter would make the app's presses feel like
+             * a button that did nothing. */
             haptic_tap();
-            ESP_LOGI(TAG, "k%lu", (unsigned long)s_presses);
+            ESP_LOGI(TAG, "k%lu %s", (unsigned long)s_presses,
+                     taken ? "app" : "enter");
         }
 
         /* The cable and the charger are charge.c's business, not this file's:
