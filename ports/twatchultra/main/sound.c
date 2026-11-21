@@ -115,6 +115,11 @@ static void beep_samples(int16_t *out, int frames)
     }
 }
 
+/* The ring sound_init() actually allocated, after the descending-order
+ * fallback. Zero until audio is up. */
+static uint8_t s_ring_descs;
+static uint16_t s_ring_frames;
+
 bool sound_init(void)
 {
     i2s_chan_config_t chan = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
@@ -162,112 +167,139 @@ bool sound_init(void)
     }
 
     /*
-     * FOUR BUFFERS OF 256 FRAMES, NOT LILYGO'S 1024, AND THE ARITHMETIC IS THE
-     * WHOLE REASON.
+     * THREE TERMS DECIDE THIS, AND ONE OF THEM WAS MISSING FOR FOUR CYCLES.
      *
-     * LilyGo's number asks the driver for 1024 frames per descriptor in stereo
-     * 16-bit, and the driver clamps that to its 4092-byte ceiling: 4092 / 4
-     * bytes-per-frame = 1023 frames. Four of those is 16,368 bytes taken from
-     * `MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA` -- the scarcest pool on this board.
+     *   buffer size    a whole video frame must fit inside one descriptor, or a
+     *                  frame needs several hand-offs.
+     *   ring depth     total bytes, against a frame that takes too long.
+     *   queue depth    `desc_num - 1`: the driver builds its completion queue as
+     *                  `xQueueCreateWithCaps(desc_num - 1, ...)`, and with a zero
+     *                  timeout a missing finished buffer ends the write early
+     *                  and the remainder counts as dropped.
      *
-     * That is not affordable here. Measured with the emulator running: the DMA
-     * heap had 12,251 bytes free with a LARGEST CONTIGUOUS BLOCK OF 3,968, and
-     * each I2S buffer is allocated separately, so even one 4,092-byte buffer
-     * cannot be satisfied. The driver says so, twice, and the channel never
-     * finishes configuring:
+     * THE ARITHMETIC, because two of these were got wrong before they were
+     * measured. A Game Boy frame is 731.5 samples, stereo 16-bit, so 2,926 bytes.
+     * A descriptor holds `dma_frame_num * 4` bytes and the driver caps it at
+     * 4,092 (4 x 1023), so 1023 frames is the largest that exists.
      *
-     *   W i2s_common: dma frame num is out of dma buffer size, limited to 1023
-     *   E i2s_common: i2s_alloc_dma_buffer ... allocate DMA buffer failed
-     *   E i2s_std:    i2s_std_set_slot ...
-     *   E i2s_std:    i2s_channel_reconfigure ...
+     *   GEOMETRY   BUFFER   FRAME FITS   RING     DEPTH    TOTAL
+     *   8 x  320   1,280 B     no        2,560    58.6 ms  10,240 B
+     *   8 x  256   1,024 B     no        2,048    46.9 ms   8,192 B
+     *   3 x  900   3,600 B     yes       2,700    61.8 ms  10,800 B
+     *   3 x 1023   4,092 B     yes       3,069    70.2 ms  12,276 B
+     *   4 x 1023   4,092 B     yes       4,092    93.7 ms  16,368 B
      *
-     * 256 frames is 1,024 bytes per descriptor and 4,096 for the set, every
-     * allocation comfortably inside the largest free block.
+     * WHAT WAS MEASURED, in the order it happened, because the failures are the
+     * useful part. 4 x 256 dropped 0.62 percent. 8 x 256 dropped 0.054 percent,
+     * in bursts. 2 x 900 dropped 0.58 percent DESPITE better granularity and a
+     * similar ring -- the queue fell to one slot, which is how the third term was
+     * discovered. 8 x 320 dropped 0.014 percent, the best so far.
      *
-     * THE TWO SYMPTOMS THIS EXPLAINS, WHICH LOOKED LIKE SEPARATE FAULTS. The
-     * display's SPI bus also takes DMA from this same pool. Whether audio or the
-     * panel won the last block decided which one broke: a session where I2S took
-     * its 16 KB played sound with a frozen picture, and a session where it could
-     * not played a moving picture in silence. One scarce resource, two opposite
-     * failures, and freeing 12 KB here is what gives the display path room.
+     * BUT THE COMMENT THAT SHIPPED WITH 8 x 320 CLAIMED A WHOLE FRAME FIT IN ONE
+     * DESCRIPTOR. It does not: 1,280 bytes against 2,926. That measurement was
+     * real and its explanation was wrong, and it matters here because a 58.6 ms
+     * ring cannot ride out the worst stall this board has shown.
      *
-     * EIGHT BUFFERS OF 320 FRAMES: THREE TERMS, AND ONE OF THEM WAS MISSING.
+     * THE STALL IS WHY THIS CHANGED. A per-second log over a 104-second session
+     * recorded two CONSECUTIVE seconds where the frame itself took 52 and 42 ms
+     * against a normal 10-25, losing 2,221 and 4,743 samples -- the drop-out a
+     * wearer hears. A 52 ms stall needs 9,088 bytes of audio to ride out; the
+     * 46.9 ms ring held 8,192. So the ring is asked for deeper than the worst
+     * stall, and every candidate above that line also fits a whole frame.
      *
-     * `i2s_channel_write()` fills ONE DESCRIPTOR AT A TIME and takes a finished
-     * one from its message queue when the current one fills. With a zero
-     * timeout -- which a frame loop must use -- a missing descriptor ends the
-     * write early and the remainder is counted as dropped.
+     * WHAT THE FRAME TIME DOES NOT PROVE, stated because it was over-read once
+     * already: `emu_us` spans `gnuboy_run()`, so a task preempted during it is
+     * counted as emulation time too. It cannot distinguish "the game was slow"
+     * from "something took the CPU". Bluetooth was ruled out by the operator --
+     * nothing was connected -- and no flash writer runs during play, so the
+     * remaining candidates are the game's own heavy frames and cache stalls.
+     * A deeper ring covers all of them, which is why it is the fix regardless.
      *
-     * THE NUMBER OF DESCRIPTORS IS NOT JUST RING DEPTH. The driver builds its
-     * completion queue as
+     * THE CEILING IS THE DISPLAY'S, NOT THE ALLOCATOR'S, AND THAT COST A CYCLE.
      *
-     *     xQueueCreateWithCaps(desc_num - 1, sizeof(uint8_t *), ...)
+     * The first version of this list tried 4 x 1023 first -- 16,368 bytes, the
+     * deepest ring that exists. It ALLOCATED, and the picture froze within
+     * seconds. The arithmetic says why:
      *
-     * so eight descriptors give SEVEN queue slots and two give ONE. That is the
-     * term this file got wrong: an experiment with 2 x 900 frames -- better
-     * granularity and nearly the same ring -- dropped 254 samples a second, four
-     * times worse than 8 x 256, because it cut the queue to a single slot. The
-     * hypothesis was falsified by its own test and the arithmetic is recorded
-     * here so nobody repeats it.
+     *   DMA free before any audio:      ~24,951 B
+     *   4 x 1023 takes 16,368 -> leaves   8,583 B for the display   FROZE
+     *   8 x 320  takes 10,240 -> leaves  14,711 B for the display   ran 104 s
      *
-     * THE THREE TERMS, and what each wants:
+     * This is entry 82's two-sided trade arriving from the other direction, and
+     * it is the mistake that entry exists to warn about: the display's SPI bus
+     * draws on this same DMA pool, so an audio ring greedy enough to ride out
+     * every stall will starve the panel instead. `ring_try` therefore STOPS at a
+     * size that leaves the display the headroom it was measured to be happy
+     * with, and no candidate above that line is offered even when it would
+     * allocate.
      *
-     *   buffer size      one frame fits inside one descriptor, so a frame needs
-     *                    at most one hand-off. A Game Boy frame is 731.5
-     *                    samples = 2,926 bytes; 320 frames is 2,560 bytes, and
-     *                    900 would be 3,600 -- but see the next two terms.
-     *   ring depth       total bytes, against jitter in the frame loop.
-     *   queue depth      desc_num - 1, against the writer running out of
-     *                    finished descriptors to fill.
+     * WHY A LIST AT ALL, the other half of entry 82: free DMA depends on what
+     * else is running, so no single size is right on every boot. A failure
+     * deletes its channel and releases what it did get, and the next candidate
+     * is tried -- a tight pool then degrades the ring rather than losing audio.
      *
-     * THE BUDGET, all measured on the board rather than argued:
-     *
-     *   4 x 1023  16,368 B   4 descs  93.7 ms   never allocated -- 4,092 > 3,968
-     *   4 x  256   4,096 B   4 descs  23.4 ms   0.62% dropped
-     *   8 x  256   8,192 B   8 descs  46.9 ms   0.054% dropped, in bursts
-     *   2 x  900   7,200 B   2 descs  41.2 ms   0.58% dropped  <- queue starved
-     *   8 x  320  10,240 B   8 descs  46.9 ms   this
-     *
-     * This keeps the two terms that measured best -- eight descriptors and the
-     * 46.9 ms ring -- and improves the third: 2,560 bytes a descriptor against
-     * 1,024, so the emulator's 2,926-byte frame no longer straddles three
-     * buffers. 10,240 bytes is inside the 12,251 the DMA pool measured free,
-     * and 2,560 is inside the 3,968 largest block.
-     *
-     * IF THIS IS NOT ENOUGH, the next lever is ring depth alone at the same
-     * granularity -- 8 x 400 is 12,800 bytes, which does NOT fit, so it would
-     * have to be 6 x 400 at 9,600 -- but measure before assuming, because this
-     * file has now been wrong once by reasoning about one term at a time. */
-
-    chan.dma_desc_num = 8;
-    chan.dma_frame_num = 320;
-    chan.auto_clear_after_cb = true;
-
-    if (i2s_new_channel(&chan, &s_tx, NULL) != ESP_OK)
+     * 3 x 900 IS THE TOP ON PURPOSE: 61.8 ms, deeper than the 52 ms worst stall,
+     * a whole frame inside one descriptor, and 10,800 bytes -- within 640 bytes
+     * of the 8 x 320 that ran 104 seconds without freezing the display.
+     */
+    static const struct
     {
-        ESP_LOGE(TAG, "no i2s tx channel");
-        s_tx = NULL;
-        return false;
-    }
-    if (i2s_channel_init_std_mode(s_tx, &std) != ESP_OK)
+        uint8_t descs;
+        uint16_t frames;
+    } ring_try[] = {
+        { 3, 900 }, { 8, 320 }, { 8, 256 }, { 4, 256 },
+    };
+
+    for (size_t k = 0; k < sizeof(ring_try) / sizeof(ring_try[0]); k++)
     {
-        ESP_LOGE(TAG, "i2s std mode failed");
-        i2s_del_channel(s_tx);
-        s_tx = NULL;
-        return false;
-    }
-    if (i2s_channel_enable(s_tx) != ESP_OK)
-    {
-        ESP_LOGE(TAG, "i2s enable failed");
-        i2s_del_channel(s_tx);
-        s_tx = NULL;
-        return false;
+        chan.dma_desc_num = ring_try[k].descs;
+        chan.dma_frame_num = ring_try[k].frames;
+        chan.auto_clear_after_cb = true;
+
+        if (i2s_new_channel(&chan, &s_tx, NULL) != ESP_OK)
+        {
+            s_tx = NULL;
+            continue;
+        }
+        if (i2s_channel_init_std_mode(s_tx, &std) != ESP_OK ||
+            i2s_channel_enable(s_tx) != ESP_OK)
+        {
+            /* Deleting the channel releases the descriptors it did manage to
+             * allocate, so the next attempt starts from the same pool rather
+             * than inheriting a partial allocation. */
+            i2s_del_channel(s_tx);
+            s_tx = NULL;
+            continue;
+        }
+
+        s_ring_descs = ring_try[k].descs;
+        s_ring_frames = ring_try[k].frames;
+
+        /* Logged, because WHICH RING YOU GOT IS PART OF EVERY MEASUREMENT that
+         * follows: a drop rate from a 41 ms ring and one from a 94 ms ring are
+         * not comparable, and the status line has to say which is in force. */
+        ESP_LOGI(TAG, "i2s %dHz %ux%u = %u B, ring %u frames %u ms", SOUND_RATE_HZ,
+                 (unsigned)s_ring_descs, (unsigned)s_ring_frames,
+                 (unsigned)(s_ring_descs * s_ring_frames * 4),
+                 (unsigned)(s_ring_descs * s_ring_frames),
+                 (unsigned)(s_ring_descs * s_ring_frames) * 1000u / SOUND_RATE_HZ);
+        return true;
     }
 
-    /* Short enough for the Log Viewer's 40 columns. */
-    ESP_LOGI(TAG, "i2s %dHz philips st bclk%d ws%d dout%d", SOUND_RATE_HZ,
-             PIN_I2S_BCLK, PIN_I2S_WS, PIN_I2S_DOUT);
-    return true;
+    ESP_LOGE(TAG, "no i2s ring fitted; audio unavailable");
+    return false;
+}
+
+/* What was actually allocated, so a status line can say which ring a drop rate
+ * belongs to. 0 until sound_init() has succeeded. */
+uint32_t sound_ring_frames(void)
+{
+    return (uint32_t)s_ring_descs * s_ring_frames;
+}
+
+uint32_t sound_ring_bytes(void)
+{
+    return (uint32_t)s_ring_descs * s_ring_frames * 4u;
 }
 
 void sound_beep(void)
@@ -680,6 +712,7 @@ bool sound_play_wav(const char *path)
 static int16_t *s_stream;         /* PSRAM: touched once per frame, not per sample */
 static bool s_stream_open;
 static volatile uint32_t s_stream_drops;
+
 static volatile uint32_t s_stream_errors;   /* writes the driver REFUSED, not
                                              * writes that did not fit */
 

@@ -291,6 +291,8 @@ static bool s_audio;
  * a full ring is a clipped tick, while waiting for the DMA to drain is 16.8 ms of
  * stall on a 16.7 ms budget.
  */
+static volatile bool s_audio_short;   /* the last write did not take it all */
+
 static void gb_audio_cb(void *buffer, size_t length)
 {
     if (!s_audio || !buffer || !length)
@@ -299,7 +301,12 @@ static void gb_audio_cb(void *buffer, size_t length)
     if (length > GB_AUDIO_BUF)
         length = GB_AUDIO_BUF;
 
-    sound_stream_write((const int16_t *)buffer, (int)length);
+    /* THE RETURN VALUE IS THE WHOLE POINT OF THE HISTOGRAM. A short write is a
+     * frame of audio that was partly refused; recording that it happened, in
+     * the second it happened, is what tells a burst from a trickle. */
+    const size_t got = sound_stream_write((const int16_t *)buffer, (int)length);
+
+    s_audio_short = (got < (size_t)length);
 }
 
 /* --- save RAM ------------------------------------------------------------- */
@@ -471,6 +478,143 @@ static bool sram_snapshot_and_queue(void)
     return true;
 }
 
+/* --- the drop log, as a list of dirty seconds -----------------------------
+ *
+ * WHY A LIST AND NOT A BUCKET ARRAY, and the first version is the reason. Buckets
+ * indexed by second held 180 of them, so a session longer than three minutes
+ * silently stopped recording -- and on a 230-second run HALF THE DROPS ARRIVED
+ * AFTER THE ARRAY WAS FULL, 6,615 of 13,052, with no way to see their shape.
+ * That is an instrument that stops measuring exactly where the interesting part
+ * might be, which is the worst kind.
+ *
+ * So only seconds THAT HAD A DROP are recorded, up to 64 of them. A run with
+ * four dirty seconds in three minutes would need forty-five minutes to fill
+ * this, so the reach is effectively the whole session, and every burst is kept
+ * whenever it happens. The cost is that the total elapsed time is not implicit
+ * in the index any more, so each entry carries its own second number.
+ *
+ * WHAT IT RECORDS IS THE DISCRIMINATOR. A stall and a starved audio path both
+ * show up as drops, and they have different cures:
+ *
+ *   frames short + long worst frame  -> the guest loop stalled
+ *   frames normal + long worst frame -> something else held the CPU
+ *   frames normal + short worst frame -> the audio path itself
+ *
+ * `worst_blit_us` is recorded alongside because a 75 ms blit was observed in a
+ * status line against a normal 7-8 ms, and if blits and stalls coincide that is
+ * the cause rather than a coincidence.
+ *
+ * WRITTEN AT STOP, not during play: an SD write takes milliseconds and would
+ * perturb what is being measured, the same reason `gb save` snapshots to PSRAM
+ * and writes from another task.
+ */
+#define GB_HIST_EVENTS 64
+
+typedef struct
+{
+    uint16_t sec;           /* which second of the session               */
+    uint16_t frames;        /* video frames completed in that second     */
+    uint16_t drops;         /* audio samples the ring refused            */
+    uint16_t worst_us;      /* slowest single frame, microseconds        */
+    uint16_t worst_blit_us; /* slowest single blit, microseconds         */
+    uint16_t short_writes;  /* audio writes that did not take it all     */
+} gb_drop_ev_t;
+
+static gb_drop_ev_t *s_hist;       /* PSRAM: GB_HIST_EVENTS entries */
+static int s_hist_n;               /* entries used, saturating       */
+static uint32_t s_hist_total_sec;  /* seconds observed, for the report */
+static int64_t s_hist_sec_us;      /* the second the current bucket ends */
+static uint32_t s_hist_frames0, s_hist_drops0;
+static uint16_t s_hist_worst_us, s_hist_worst_blit;
+static uint16_t s_hist_short;
+
+/* Called once per frame from the guest task. Cheap: one comparison against a
+ * clock the loop has already read. */
+static void hist_frame(int64_t now_us, uint32_t frames, uint32_t drops,
+                       uint32_t frame_us, uint32_t blit_us, bool short_write)
+{
+    if (frame_us > s_hist_worst_us && frame_us < 65535)
+        s_hist_worst_us = (uint16_t)frame_us;
+    if (blit_us > s_hist_worst_blit && blit_us < 65535)
+        s_hist_worst_blit = (uint16_t)blit_us;
+    if (short_write)
+        s_hist_short++;
+
+    if (now_us < s_hist_sec_us)
+        return;
+
+    /* ONLY A SECOND WITH DROPS IS KEPT. Everything else is discarded at the end
+     * of its second, which is what makes the list reach the whole session. */
+    const uint32_t d = drops - s_hist_drops0;
+
+    if (d && s_hist && s_hist_n < GB_HIST_EVENTS)
+    {
+        gb_drop_ev_t *e = &s_hist[s_hist_n++];
+
+        e->sec = (uint16_t)(s_hist_total_sec < 65535 ? s_hist_total_sec : 65535);
+        e->frames = (uint16_t)(frames - s_hist_frames0);
+        e->drops = (uint16_t)(d > 65535 ? 65535 : d);
+        e->worst_us = s_hist_worst_us;
+        e->worst_blit_us = s_hist_worst_blit;
+        e->short_writes = s_hist_short;
+    }
+
+    s_hist_total_sec++;
+    s_hist_frames0 = frames;
+    s_hist_drops0 = drops;
+    s_hist_worst_us = 0;
+    s_hist_worst_blit = 0;
+    s_hist_short = 0;
+    s_hist_sec_us += 1000000;
+    if (now_us - s_hist_sec_us > 2000000)
+        s_hist_sec_us = now_us + 1000000;   /* stalled past a whole second */
+}
+
+/* Write the dirty seconds out as one line each. A file, because a 40-column
+ * screen cannot show a table and scrollback does not survive a repaint. */
+static void hist_dump(void)
+{
+    const char *path = sd_out("/sd/diag", "gbhist.txt");
+    FILE *f = fopen(path, "w");
+
+    if (!f)
+    {
+        printf("gb: cannot write %s\n", path);
+        return;
+    }
+
+    fprintf(f, "session %lu s, %d second(s) with drops\n",
+            (unsigned long)s_hist_total_sec, s_hist_n);
+    fprintf(f, "sec frames drops worstms blitms short\n");
+
+    for (int i = 0; i < s_hist_n; i++)
+        fprintf(f, "%3u %6u %5u %7u %6u %5u\n", (unsigned)s_hist[i].sec,
+                (unsigned)s_hist[i].frames, (unsigned)s_hist[i].drops,
+                (unsigned)s_hist[i].worst_us / 1000,
+                (unsigned)s_hist[i].worst_blit_us / 1000,
+                (unsigned)s_hist[i].short_writes);
+
+    if (s_hist_n == GB_HIST_EVENTS)
+        fprintf(f, "LIST FULL -- later dirty seconds were not recorded\n");
+
+    fclose(f);
+
+    /* The summary on screen says only what a 40-column line can hold: how many
+     * seconds were dirty out of how many, and the worst of them. */
+    unsigned worst = 0, worst_sec = 0;
+
+    for (int i = 0; i < s_hist_n; i++)
+        if (s_hist[i].drops > worst)
+        {
+            worst = s_hist[i].drops;
+            worst_sec = s_hist[i].sec;
+        }
+
+    printf("gb: %d of %lu s dirty, worst %u at sec %u\n", s_hist_n,
+           (unsigned long)s_hist_total_sec, worst, worst_sec);
+    printf("gb: %s\n", path);
+}
+
 /* --- the save writer, on core 1 alongside the blitter -------------------- */
 
 static void gb_sram_task(void *arg)
@@ -577,6 +721,13 @@ static void gb_task(void *arg)
                         s_sram_rc = -1;
                 }
             }
+        }
+
+        {
+            const int64_t now = esp_timer_get_time();
+
+            hist_frame(now, s_frames, sound_stream_dropped(), s_emu_us,
+                       s_blit_us, s_audio_short);
         }
 
         next += GB_FRAME_US;
@@ -994,6 +1145,24 @@ bool gb_start(const char *rom_path)
      */
     s_audio = sound_stream_open(GB_AUDIO_HZ);
 
+    /* Fresh buckets per session, so a histogram from one game is never mixed
+     * with another's. Allocated once and kept, like the frame buffers, because
+     * it is read for the whole session. */
+    if (!s_hist)
+    {
+        s_hist = heap_caps_calloc(GB_HIST_EVENTS, sizeof(gb_drop_ev_t),
+                                  MALLOC_CAP_SPIRAM);
+    }
+
+    s_hist_n = 0;
+    s_hist_total_sec = 0;
+    s_hist_sec_us = esp_timer_get_time() + 1000000;
+    s_hist_frames0 = s_frames;
+    s_hist_drops0 = sound_stream_dropped();
+    s_hist_worst_us = 0;
+    s_hist_worst_blit = 0;
+    s_hist_short = 0;
+
     if (!s_audio)
         printf("gb: no audio (amplifier did not come up)\n");
 
@@ -1122,7 +1291,36 @@ bool gb_start(const char *rom_path)
     s_pad = 0;
     s_run = true;
 
-    if (xTaskCreatePinnedToCore(gb_blit_task, "gbblit", 4096, NULL, 4,
+    /*
+     * ABOVE THE CELL PAINTER, WHICH IS THE OTHER PRIORITY-4 TASK ON CORE 1.
+     *
+     * `tdpaint` is pinned to core 1 at priority 4, exactly where this task used
+     * to be, so the two were peers and either could be preempted by the other.
+     * The desktop needs the painter whenever a cell changes -- a status-bar clock
+     * tick is once a minute, but a Terminal or a warning updates whenever it
+     * likes -- and a frame push interrupted part-way is a frame that misses its
+     * slot entirely.
+     *
+     * THE MEASUREMENT THAT MOTIVATED THIS, taken live while the operator moved
+     * between rooms in Zelda: a normal blit is 8.0 ms, but spikes to 18.9 ms
+     * against a 16.742 ms frame budget, while `emu` stayed a steady 10.9-12.4.
+     * Emulation and blitting are on separate cores with double buffering, so
+     * throughput is max(emu, blit): at 10.9/8.2 that is comfortable, and at
+     * 18.9 it is a dropped frame. Overall the port holds 58.9 fps against the
+     * Game Boy's 59.73, which is the 1.3 percent of frames that miss -- and the
+     * operator feels it as a small stutter on the screen changes, which are also
+     * the frames whose VRAM work makes the guest take longest.
+     *
+     * THE GUEST TASK IS AT 5, ON CORE 0, and is deliberately not changed: it
+     * must not outrank the painter, because a guest that starves the desktop
+     * would make the watch unresponsive. Only the blit is raised, and only above
+     * another task on its own core.
+     *
+     * THE COST IF THIS IS THE WRONG CALL: a desktop repaint waits up to one
+     * blit (8 ms typical) longer, which is a cell-level redraw nobody can see.
+     * Against a dropped game frame that is the right way round.
+     */
+    if (xTaskCreatePinnedToCore(gb_blit_task, "gbblit", 4096, NULL, 5,
                                 &s_blit_task, 1) != pdPASS)
     {
         printf("gb: no blit task\n");
@@ -1326,6 +1524,15 @@ void gb_stop(void)
     display_margins_set(DISPLAY_MARGINS_DESKTOP);
     display_pixels_claim(false);
     display_repaint_all();
+
+    /* THE HISTOGRAM IS WRITTEN HERE, ONCE THE SESSION IS OVER. A run too short
+     * to fill a single bucket is skipped rather than dumped as a one-line
+     * file, because it would say nothing and would overwrite a useful one. */
+    /* ALWAYS DUMPED, even with no drops at all: "zero of 210 seconds dirty" is
+     * a result, and it overwrites a previous session's file rather than leaving
+     * a stale one to be misread. */
+    if (s_hist_total_sec > 0)
+        hist_dump();
 }
 
 bool gb_running(void)
@@ -1368,6 +1575,11 @@ static int cmd_gb(tdsh_session_t *session, int argc, char **argv)
              * it was, and a broken channel announces itself. */
             if (sound_stream_errors())
                 printf(" errs=%lu", (unsigned long)sound_stream_errors());
+            /* WHICH RING THIS DROP RATE BELONGS TO. The fallback means the
+             * geometry varies with what else is running, so a bare drop count
+             * cannot be compared with another session's. */
+            if (sound_ring_frames())
+                printf(" ring=%lufr", (unsigned long)sound_ring_frames());
         }
 
         printf("\n");

@@ -96,6 +96,12 @@ uint32_t sound_stream_dropped(void);
  * a healthy session; non-zero means the drop count is reporting a fault. */
 uint32_t sound_stream_errors(void);
 
+/* The ring sound_init() actually got, after the descending-order fallback. A
+ * drop rate is only comparable with another from the same ring, so a status line
+ * has to report which one is in force. Both are 0 until audio is up. */
+uint32_t sound_ring_frames(void);
+uint32_t sound_ring_bytes(void);
+
 /*
  * Why the last sound_stream_open() failed, in words: the exact call and its
  * esp_err_t name. "no amplifier" covered four different faults, and when one
