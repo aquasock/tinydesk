@@ -790,8 +790,12 @@ static int pad_from_frame(const touch_frame_t *f)
 
         if (ctl == GP_NONE && f->p[i].region == EDGE_RIGHT)
         {
-            if (f->p[i].index == 0) pad |= GB_PAD_START;
+            /* SECOND AND THIRD SLOTS, BY THE OPERATOR'S DIRECTION: Select above
+             * Start, with the top slot left empty. Slot 0 therefore has no duty
+             * at all, and the pair that a thumb actually reaches for sits lower
+             * on the glass than it used to. */
             if (f->p[i].index == 1) pad |= GB_PAD_SELECT;
+            if (f->p[i].index == 2) pad |= GB_PAD_START;
         }
     }
 
@@ -816,7 +820,13 @@ static bool gb_app_touch(void *user, const touch_frame_t *f)
             if (gb_controls_hit(f->p[i].x, f->p[i].y) != GP_NONE)
                 used = true;
 
-            if (f->p[i].region == EDGE_RIGHT && f->p[i].index < 2 &&
+            /* SLOTS 1 AND 2, NOT 0 AND 1. This is the same predicate as the
+             * mapping above, written separately, and the two have to agree: a
+             * slot counted as live here but given no bit there would buzz
+             * without acting, and one given a bit but not counted live would
+             * act without being felt. */
+            if (f->p[i].region == EDGE_RIGHT && f->p[i].index >= 1 &&
+                f->p[i].index <= 2 &&
                 display_margin_slot_live(1, f->p[i].index))
                 used = true;
         }
@@ -1017,27 +1027,26 @@ bool gb_start(const char *rom_path)
         display_margin_label(0, s, " ");
     }
 
-    display_margin_label(1, 0, "Start");
-    display_margin_label(1, 1, "Select");
-
     /*
-     * SLOT 2 KEEPS ITS BOX, WITH NO WORD ON IT. This port reserves three column
-     * slots and draws all three, so the column reads as the same three-button stack
-     * as the other two emulators; the Game Boy has only two margin controls, so the
-     * third is furniture rather than a duty. It is NOT live -- `pad_from_frame()`
-     * answers only for slots 0 and 1 -- and a box that does nothing is honest, where
-     * blank glass that fires a button is the fault this project reported twice.
+     * THE RIGHT COLUMN: EMPTY, SELECT, START -- top to bottom.
      *
-     * THIS SLOT IS WHY THE SWAPPED INDEX IN paint_column() MATTERED. Before that was
-     * fixed, the painter consulted the LEFT column's chrome state for the right one,
-     * so this slot read the left column's slot 2 -- which carries "Save" and a box --
-     * and drew a box nobody had asked for. Fixing the index made the column honour
-     * its own state and the box vanished, which the operator noticed immediately.
-     * The box is therefore requested here explicitly rather than left to a bug: the
-     * line below is what says so, and slots 3 and 4 stay bare.
+     * Moved one slot down by the operator's direction from Start/Select/empty,
+     * so the pair a thumb reaches for sits lower on the glass and the vacant
+     * slot is now the TOP. All three keep their boxes, so the column still reads
+     * as the same three-button stack as the other two emulators, and only slots
+     * 1 and 2 have a duty: `pad_from_frame()` and `gb_app_touch()` answer for
+     * those two and nothing else. The top box does nothing, which is the
+     * pattern this file already accepted for the vacant slot before the move --
+     * a box that does nothing is honest, where blank glass that fires a button
+     * is the fault this project has reported twice.
+     *
+     * SET TOGETHER ON PURPOSE. A label and its duty lived in two places in this
+     * function once, which is how the swapped index in paint_column() went
+     * unnoticed; anything that moves a slot should move all three lines.
      */
-    display_margin_chrome(1, 2, true);
-    display_margin_label(1, 2, " ");
+    display_margin_label(1, 0, " ");
+    display_margin_label(1, 1, "Select");
+    display_margin_label(1, 2, "Start");
 
     /* The column slots past the drawn ones, and the whole bottom strip: blank and
      * not live, so blank glass cannot fire a button. The strip's touch area is
