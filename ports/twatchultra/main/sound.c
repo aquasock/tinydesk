@@ -191,10 +191,34 @@ bool sound_init(void)
      * not played a moving picture in silence. One scarce resource, two opposite
      * failures, and freeing 12 KB here is what gives the display path room.
      *
-     * THE COST IS LATENCY, and it is worth stating: four buffers of 256 frames is
-     * 1,024 frames, which is 23.4 ms at the emulators' 43,691 Hz and 21.3 ms at
-     * 48 kHz. That is the depth of the ring an underrun has to punch through. */
-    chan.dma_desc_num = 4;
+     * EIGHT BUFFERS OF 256 FRAMES, NOT FOUR, AND THE RING DEPTH IS WHY.
+     *
+     * Four was chosen against the allocation ceiling and it fixed the failure --
+     * the channel configures and audio plays. But it left the ring too shallow
+     * for anything that produces audio a video frame at a time. A Game Boy frame
+     * is 731.5 samples, which is 71 PERCENT OF A 1,024-frame ring: the ring
+     * drains almost to empty between writes, so any jitter in the frame loop
+     * overflows it and clips. Measured on the board over 76 seconds, 4,533
+     * frames ran at a correct 59.6 fps while 20,670 samples were dropped -- 272
+     * a second, 0.62 percent of the audio, and audible. The same build measured
+     * before this ring was reduced dropped 0.15 percent, so the drop rate rose
+     * with the shallowness rather than with anything else that changed.
+     *
+     * Eight keeps every allocation at 1,024 bytes, comfortably inside the
+     * 3,968-byte largest free block that forced the reduction in the first
+     * place, and doubles the ring to 2,048 frames -- 47 ms at 43,691 Hz, 43 ms
+     * at 48 kHz, about 2.8 video frames of slack instead of 1.4.
+     *
+     * THE BUDGET IN ONE PLACE, because this pool is shared with the display:
+     *
+     *   4 x 1023 (the original)  16,368 B   ring 93.7 ms   NEVER ALLOCATED
+     *   4 x  256  (the fix)       4,096 B   ring 23.4 ms   0.62% dropped
+     *   8 x  256  (this)          8,192 B   ring 46.9 ms   see the log entry
+     *
+     * Going wider still is possible -- 6 x 512 is 12,288 bytes and 68 ms -- but
+     * that sits against the 12,251 bytes the pool had free, and a ring that
+     * cannot be allocated is the failure this whole change exists to prevent. */
+    chan.dma_desc_num = 8;
     chan.dma_frame_num = 256;
     chan.auto_clear_after_cb = true;
 
