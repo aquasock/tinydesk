@@ -1352,8 +1352,14 @@ static int cmd_gb(tdsh_session_t *session, int argc, char **argv)
         printf("audio=%s", s_audio ? "on" : "off");
 
         if (s_audio)
+        {
             printf(" %dHz drops=%lu", GB_AUDIO_HZ,
                    (unsigned long)sound_stream_dropped());
+            /* Only when it is non-zero: a healthy session's line stays the width
+             * it was, and a broken channel announces itself. */
+            if (sound_stream_errors())
+                printf(" errs=%lu", (unsigned long)sound_stream_errors());
+        }
 
         printf("\n");
 

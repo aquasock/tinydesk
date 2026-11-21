@@ -92,6 +92,10 @@ void sound_stream_close(void);
 /* Frames dropped since the stream opened, for a status line. */
 uint32_t sound_stream_dropped(void);
 
+/* Writes the driver REFUSED, as distinct from frames that did not fit. Zero in
+ * a healthy session; non-zero means the drop count is reporting a fault. */
+uint32_t sound_stream_errors(void);
+
 /*
  * Why the last sound_stream_open() failed, in words: the exact call and its
  * esp_err_t name. "no amplifier" covered four different faults, and when one

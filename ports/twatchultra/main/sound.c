@@ -191,35 +191,56 @@ bool sound_init(void)
      * not played a moving picture in silence. One scarce resource, two opposite
      * failures, and freeing 12 KB here is what gives the display path room.
      *
-     * EIGHT BUFFERS OF 256 FRAMES, NOT FOUR, AND THE RING DEPTH IS WHY.
+     * EIGHT BUFFERS OF 320 FRAMES: THREE TERMS, AND ONE OF THEM WAS MISSING.
      *
-     * Four was chosen against the allocation ceiling and it fixed the failure --
-     * the channel configures and audio plays. But it left the ring too shallow
-     * for anything that produces audio a video frame at a time. A Game Boy frame
-     * is 731.5 samples, which is 71 PERCENT OF A 1,024-frame ring: the ring
-     * drains almost to empty between writes, so any jitter in the frame loop
-     * overflows it and clips. Measured on the board over 76 seconds, 4,533
-     * frames ran at a correct 59.6 fps while 20,670 samples were dropped -- 272
-     * a second, 0.62 percent of the audio, and audible. The same build measured
-     * before this ring was reduced dropped 0.15 percent, so the drop rate rose
-     * with the shallowness rather than with anything else that changed.
+     * `i2s_channel_write()` fills ONE DESCRIPTOR AT A TIME and takes a finished
+     * one from its message queue when the current one fills. With a zero
+     * timeout -- which a frame loop must use -- a missing descriptor ends the
+     * write early and the remainder is counted as dropped.
      *
-     * Eight keeps every allocation at 1,024 bytes, comfortably inside the
-     * 3,968-byte largest free block that forced the reduction in the first
-     * place, and doubles the ring to 2,048 frames -- 47 ms at 43,691 Hz, 43 ms
-     * at 48 kHz, about 2.8 video frames of slack instead of 1.4.
+     * THE NUMBER OF DESCRIPTORS IS NOT JUST RING DEPTH. The driver builds its
+     * completion queue as
      *
-     * THE BUDGET IN ONE PLACE, because this pool is shared with the display:
+     *     xQueueCreateWithCaps(desc_num - 1, sizeof(uint8_t *), ...)
      *
-     *   4 x 1023 (the original)  16,368 B   ring 93.7 ms   NEVER ALLOCATED
-     *   4 x  256  (the fix)       4,096 B   ring 23.4 ms   0.62% dropped
-     *   8 x  256  (this)          8,192 B   ring 46.9 ms   see the log entry
+     * so eight descriptors give SEVEN queue slots and two give ONE. That is the
+     * term this file got wrong: an experiment with 2 x 900 frames -- better
+     * granularity and nearly the same ring -- dropped 254 samples a second, four
+     * times worse than 8 x 256, because it cut the queue to a single slot. The
+     * hypothesis was falsified by its own test and the arithmetic is recorded
+     * here so nobody repeats it.
      *
-     * Going wider still is possible -- 6 x 512 is 12,288 bytes and 68 ms -- but
-     * that sits against the 12,251 bytes the pool had free, and a ring that
-     * cannot be allocated is the failure this whole change exists to prevent. */
+     * THE THREE TERMS, and what each wants:
+     *
+     *   buffer size      one frame fits inside one descriptor, so a frame needs
+     *                    at most one hand-off. A Game Boy frame is 731.5
+     *                    samples = 2,926 bytes; 320 frames is 2,560 bytes, and
+     *                    900 would be 3,600 -- but see the next two terms.
+     *   ring depth       total bytes, against jitter in the frame loop.
+     *   queue depth      desc_num - 1, against the writer running out of
+     *                    finished descriptors to fill.
+     *
+     * THE BUDGET, all measured on the board rather than argued:
+     *
+     *   4 x 1023  16,368 B   4 descs  93.7 ms   never allocated -- 4,092 > 3,968
+     *   4 x  256   4,096 B   4 descs  23.4 ms   0.62% dropped
+     *   8 x  256   8,192 B   8 descs  46.9 ms   0.054% dropped, in bursts
+     *   2 x  900   7,200 B   2 descs  41.2 ms   0.58% dropped  <- queue starved
+     *   8 x  320  10,240 B   8 descs  46.9 ms   this
+     *
+     * This keeps the two terms that measured best -- eight descriptors and the
+     * 46.9 ms ring -- and improves the third: 2,560 bytes a descriptor against
+     * 1,024, so the emulator's 2,926-byte frame no longer straddles three
+     * buffers. 10,240 bytes is inside the 12,251 the DMA pool measured free,
+     * and 2,560 is inside the 3,968 largest block.
+     *
+     * IF THIS IS NOT ENOUGH, the next lever is ring depth alone at the same
+     * granularity -- 8 x 400 is 12,800 bytes, which does NOT fit, so it would
+     * have to be 6 x 400 at 9,600 -- but measure before assuming, because this
+     * file has now been wrong once by reasoning about one term at a time. */
+
     chan.dma_desc_num = 8;
-    chan.dma_frame_num = 256;
+    chan.dma_frame_num = 320;
     chan.auto_clear_after_cb = true;
 
     if (i2s_new_channel(&chan, &s_tx, NULL) != ESP_OK)
@@ -659,6 +680,8 @@ bool sound_play_wav(const char *path)
 static int16_t *s_stream;         /* PSRAM: touched once per frame, not per sample */
 static bool s_stream_open;
 static volatile uint32_t s_stream_drops;
+static volatile uint32_t s_stream_errors;   /* writes the driver REFUSED, not
+                                             * writes that did not fit */
 
 
 
@@ -693,6 +716,7 @@ bool sound_stream_open(int rate)
     }
 
     s_stream_drops = 0;
+    s_stream_errors = 0;
     s_stream_open = true;
     return true;
 }
@@ -718,12 +742,23 @@ size_t sound_stream_write(const int16_t *mono, int frames)
 
     /* Timeout 0 by design -- see the note above. ESP_ERR_TIMEOUT here is the
      * normal full-ring case and not a failure. */
-    i2s_channel_write(s_tx, s_stream, want, &wrote, 0);
+    const esp_err_t rc = i2s_channel_write(s_tx, s_stream, want, &wrote, 0);
 
     const size_t got = wrote / (2 * sizeof(int16_t));
 
     if (got < (size_t)frames)
         s_stream_drops += (uint32_t)((size_t)frames - got);
+
+    /* A REFUSED CALL IS NOT A FULL RING, AND THE RETURN VALUE USED TO BE DROPPED.
+     *
+     * On any error i2s_channel_write() leaves `bytes_written` at 0, so a channel
+     * that is not enabled, or a write that failed outright, was counted as a
+     * whole frame of dropped samples and was indistinguishable in the status
+     * line from the ordinary "the ring was full" case. Those are different
+     * faults with different cures -- one is a tuning problem, the other is a
+     * broken channel -- so they are counted apart. */
+    if (rc != ESP_OK && rc != ESP_ERR_TIMEOUT)
+        s_stream_errors++;
 
     return got;
 }
@@ -796,6 +831,14 @@ void sound_stream_close(void)
 uint32_t sound_stream_dropped(void)
 {
     return s_stream_drops;
+}
+
+/* Writes the driver refused outright -- a disabled channel or a real error,
+ * as opposed to a ring that was merely full. Always 0 in a healthy session;
+ * a non-zero value means the counter above is reporting a fault as load. */
+uint32_t sound_stream_errors(void)
+{
+    return s_stream_errors;
 }
 
 /* The terminal's BEL. The user pointer exists because the vterm's callbacks all
