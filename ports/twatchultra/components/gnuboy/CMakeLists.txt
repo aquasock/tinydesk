@@ -22,4 +22,19 @@
 idf_component_register(
     SRCS "cpu.c" "gnuboy.c" "hw.c" "lcd.c" "sound.c"
     INCLUDE_DIRS "."
+    PRIV_REQUIRES esp_timer
 )
+
+# THE INTERPRETER IS COMPILED WITH JUMP TABLES, WHICH ESP-IDF DISABLES GLOBALLY.
+#
+# `gb_cpu_emulate()` is a 256-case switch over the opcode. ESP-IDF passes
+# `-fno-jump-tables -fno-tree-switch-conversion` on every compile line, so GCC
+# builds a decision tree for that switch instead of one indirect jump -- and for
+# 256 dense cases that is several comparisons and branches per DISPATCH, which
+# happens once per emulated instruction.
+#
+# THIS IS APPLIED TO cpu.c ONLY and changes no source, so the component stays
+# verbatim against Escapement's third_party/gnuboy. Per-file compile options are
+# appended after the global ones, so these win.
+set_source_files_properties(cpu.c PROPERTIES COMPILE_OPTIONS
+    "-fjump-tables;-ftree-switch-conversion")

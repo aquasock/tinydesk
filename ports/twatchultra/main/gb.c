@@ -54,6 +54,7 @@
 
 #include "gnuboy.h"
 
+
 static const char *TAG = "gb";
 
 /* Two frame buffers: the guest renders into one while core 1 pushes the other.
@@ -515,7 +516,8 @@ typedef struct
     uint16_t sec;           /* which second of the session               */
     uint16_t frames;        /* video frames completed in that second     */
     uint16_t drops;         /* audio samples the ring refused            */
-    uint16_t worst_us;      /* slowest single frame, microseconds        */
+    uint16_t worst_us;      /* slowest single frame, WALL microseconds   */
+    uint16_t worst_cpu_us;  /* CPU that same frame actually consumed     */
     uint16_t worst_blit_us; /* slowest single blit, microseconds         */
     uint16_t short_writes;  /* audio writes that did not take it all     */
 } gb_drop_ev_t;
@@ -525,16 +527,51 @@ static int s_hist_n;               /* entries used, saturating       */
 static uint32_t s_hist_total_sec;  /* seconds observed, for the report */
 static int64_t s_hist_sec_us;      /* the second the current bucket ends */
 static uint32_t s_hist_frames0, s_hist_drops0;
-static uint16_t s_hist_worst_us, s_hist_worst_blit;
+static uint16_t s_hist_worst_us, s_hist_worst_cpu, s_hist_worst_blit;
+
+/* Per-iteration timing carried to the next iteration, because the kernel's
+ * run-time counter only settles when the task switches out. */
+static configRUN_TIME_COUNTER_TYPE s_cpu_prev;
+static int64_t s_work_start_prev, s_work_end_prev;
+static bool s_have_prev;
 static uint16_t s_hist_short;
+
+/* THIS TASK'S CUMULATIVE CPU TIME, in microseconds.
+ *
+ * `ulTaskGetRunTimeCounter()` does not exist in this kernel build -- only the
+ * SMP variant has it -- so the value is read out of the task's own status block,
+ * which `vTaskGetInfo()` fills from `ulRunTimeCounter`. That field is
+ * accumulated by the kernel when a task switches out, using the esp_timer at
+ * 1 MHz, so it is exact to the microsecond for the interval being measured.
+ *
+ * `pdFALSE` for the stack figure: the high-water mark is not wanted here and
+ * computing it walks the stack. */
+static configRUN_TIME_COUNTER_TYPE cpu_time_us(void)
+{
+    TaskStatus_t st;
+
+    if (!s_task)
+        return 0;
+
+    vTaskGetInfo(s_task, &st, pdFALSE, eRunning);
+    return st.ulRunTimeCounter;
+}
 
 /* Called once per frame from the guest task. Cheap: one comparison against a
  * clock the loop has already read. */
 static void hist_frame(int64_t now_us, uint32_t frames, uint32_t drops,
-                       uint32_t frame_us, uint32_t blit_us, bool short_write)
+                       uint32_t frame_us, uint32_t frame_cpu_us,
+                       uint32_t blit_us, bool short_write)
 {
+    /* THE WORST FRAME IS TRACKED BY WALL TIME, AND ITS CPU TIME IS KEPT WITH IT.
+     * Those two numbers together are the whole point: a 52 ms frame that used
+     * 50 ms of CPU is slow work, and the same frame using 12 ms of CPU was off
+     * the processor for 40 ms. Nothing else in this file can tell them apart. */
     if (frame_us > s_hist_worst_us && frame_us < 65535)
+    {
         s_hist_worst_us = (uint16_t)frame_us;
+        s_hist_worst_cpu = (frame_cpu_us < 65535) ? (uint16_t)frame_cpu_us : 65534;
+    }
     if (blit_us > s_hist_worst_blit && blit_us < 65535)
         s_hist_worst_blit = (uint16_t)blit_us;
     if (short_write)
@@ -555,6 +592,7 @@ static void hist_frame(int64_t now_us, uint32_t frames, uint32_t drops,
         e->frames = (uint16_t)(frames - s_hist_frames0);
         e->drops = (uint16_t)(d > 65535 ? 65535 : d);
         e->worst_us = s_hist_worst_us;
+        e->worst_cpu_us = s_hist_worst_cpu;
         e->worst_blit_us = s_hist_worst_blit;
         e->short_writes = s_hist_short;
     }
@@ -563,6 +601,8 @@ static void hist_frame(int64_t now_us, uint32_t frames, uint32_t drops,
     s_hist_frames0 = frames;
     s_hist_drops0 = drops;
     s_hist_worst_us = 0;
+    s_hist_worst_cpu = 0;
+    s_have_prev = false;
     s_hist_worst_blit = 0;
     s_hist_short = 0;
     s_hist_sec_us += 1000000;
@@ -585,12 +625,13 @@ static void hist_dump(void)
 
     fprintf(f, "session %lu s, %d second(s) with drops\n",
             (unsigned long)s_hist_total_sec, s_hist_n);
-    fprintf(f, "sec frames drops worstms blitms short\n");
+    fprintf(f, "sec frames drops wallms cpums blitms short\n");
 
     for (int i = 0; i < s_hist_n; i++)
-        fprintf(f, "%3u %6u %5u %7u %6u %5u\n", (unsigned)s_hist[i].sec,
+        fprintf(f, "%3u %6u %5u %6u %5u %6u %5u\n", (unsigned)s_hist[i].sec,
                 (unsigned)s_hist[i].frames, (unsigned)s_hist[i].drops,
                 (unsigned)s_hist[i].worst_us / 1000,
+                (unsigned)s_hist[i].worst_cpu_us / 1000,
                 (unsigned)s_hist[i].worst_blit_us / 1000,
                 (unsigned)s_hist[i].short_writes);
 
@@ -663,7 +704,40 @@ static void gb_task(void *arg)
 
     while (s_run)
     {
+        /*
+         * SETTLE THE PREVIOUS ITERATION, HERE AND NOT WHERE IT ENDED.
+         *
+         * The kernel adds to a task's run-time counter WHEN IT SWITCHES OUT, so
+         * a reading taken mid-frame does not yet include the work in progress.
+         * At the top of this iteration -- after last iteration's delay switched
+         * us out and the timer switched us back in -- the counter is exact for
+         * the interval that just finished.
+         *
+         * THE TWO NUMBERS MUST COVER THE SAME INTERVAL OR THE COMPARISON IS
+         * MEANINGLESS. Wall is therefore WORK time only, from this point to the
+         * moment the work ended, and it deliberately EXCLUDES the delay: the
+         * delay is ~5.7 ms of intentional sleep on every frame, and including it
+         * would make every frame look partly preempted. A 52 ms frame that used
+         * 50 ms of CPU was doing slow work; the same frame using 12 ms was off
+         * the processor for 40 ms. That is the whole question this measures.
+         */
+        {
+            const configRUN_TIME_COUNTER_TYPE cpu = cpu_time_us();
+
+            if (s_have_prev)
+                hist_frame(esp_timer_get_time(), s_frames,
+                           sound_stream_dropped(),
+                           (uint32_t)(s_work_end_prev - s_work_start_prev),
+                           (uint32_t)(cpu - s_cpu_prev), s_blit_us,
+                           s_audio_short);
+
+            s_cpu_prev = cpu;
+            s_have_prev = true;
+        }
+
         const int64_t t0 = esp_timer_get_time();
+
+        s_work_start_prev = t0;
 
         /*
          * RECOVER A DRY POOL HERE AS WELL AS IN THE CALLBACK. The callback is the
@@ -723,12 +797,9 @@ static void gb_task(void *arg)
             }
         }
 
-        {
-            const int64_t now = esp_timer_get_time();
-
-            hist_frame(now, s_frames, sound_stream_dropped(), s_emu_us,
-                       s_blit_us, s_audio_short);
-        }
+        /* Where the work ended. The delay that follows is not part of the
+         * measurement -- see the top of the loop. */
+        s_work_end_prev = esp_timer_get_time();
 
         next += GB_FRAME_US;
         const int64_t now = esp_timer_get_time();
@@ -1292,35 +1363,35 @@ bool gb_start(const char *rom_path)
     s_run = true;
 
     /*
-     * ABOVE THE CELL PAINTER, WHICH IS THE OTHER PRIORITY-4 TASK ON CORE 1.
+     * THE SAME PRIORITY AS THE CELL PAINTER, AND RAISING IT ABOVE THE PAINTER
+     * HUNG THE PICTURE -- which is the reason this comment exists.
      *
-     * `tdpaint` is pinned to core 1 at priority 4, exactly where this task used
-     * to be, so the two were peers and either could be preempted by the other.
-     * The desktop needs the painter whenever a cell changes -- a status-bar clock
-     * tick is once a minute, but a Terminal or a warning updates whenever it
-     * likes -- and a frame push interrupted part-way is a frame that misses its
-     * slot entirely.
+     * Both tasks push to the panel through `spi_device_acquire_bus(s_spi,
+     * portMAX_DELAY)`: the painter at display.c's band loop, this one through
+     * display_picture_rows(). They are peers at priority 4 on core 1, and that
+     * is LOAD-BEARING. At priority 5 this task preempts the painter while the
+     * painter holds the bus, blocks on an acquire with an INFINITE timeout, and
+     * the painter never runs again to release it. The blitter then holds a frame
+     * buffer for ever, the pool runs dry, `s_render_target` goes NULL, the guest
+     * renders nothing, and the glass keeps the last frame it was given.
      *
-     * THE MEASUREMENT THAT MOTIVATED THIS, taken live while the operator moved
-     * between rooms in Zelda: a normal blit is 8.0 ms, but spikes to 18.9 ms
-     * against a 16.742 ms frame budget, while `emu` stayed a steady 10.9-12.4.
-     * Emulation and blitting are on separate cores with double buffering, so
-     * throughput is max(emu, blit): at 10.9/8.2 that is comfortable, and at
-     * 18.9 it is a dropped frame. Overall the port holds 58.9 fps against the
-     * Game Boy's 59.73, which is the 1.3 percent of frames that miss -- and the
-     * operator feels it as a small stutter on the screen changes, which are also
-     * the frames whose VRAM work makes the guest take longest.
+     * THE SIGNATURE IS IN THE COUNTERS AND NOWHERE ELSE: `frames=17288 blits=1165
+     * dropped=0`. The guest ran the whole session, the blitter stopped after
+     * about nineteen seconds, and `dropped` stayed zero because once the pool is
+     * dry nothing is published to the queue that counter watches. A frozen
+     * picture with a live emulator reads as a display fault; it is not one.
      *
-     * THE GUEST TASK IS AT 5, ON CORE 0, and is deliberately not changed: it
-     * must not outrank the painter, because a guest that starves the desktop
-     * would make the watch unresponsive. Only the blit is raised, and only above
-     * another task on its own core.
+     * WHAT THE RAISE WAS FOR IS STILL UNPROVEN. It was intended to stop blits
+     * spiking to 18.9 ms against a 16.742 ms budget, attributed to painter
+     * contention. Nothing established that attribution -- a long frame may simply
+     * be a frame with many dirty rows -- and a hang is a far worse fault than a
+     * stutter, so the bump is reverted rather than kept behind a condition.
      *
-     * THE COST IF THIS IS THE WRONG CALL: a desktop repaint waits up to one
-     * blit (8 ms typical) longer, which is a cell-level redraw nobody can see.
-     * Against a dropped game frame that is the right way round.
+     * IF THIS IS EVER RAISED AGAIN, the bus acquisition has to change first: a
+     * bounded timeout that counts misses, or one arbiter ordering both writers.
+     * Priority alone cannot fix two blocking writers on one bus.
      */
-    if (xTaskCreatePinnedToCore(gb_blit_task, "gbblit", 4096, NULL, 5,
+    if (xTaskCreatePinnedToCore(gb_blit_task, "gbblit", 4096, NULL, 4,
                                 &s_blit_task, 1) != pdPASS)
     {
         printf("gb: no blit task\n");
