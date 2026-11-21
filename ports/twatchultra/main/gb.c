@@ -37,6 +37,7 @@
 #include "freertos/task.h"
 #include "gamepad.h"
 #include "pwrkey.h"
+#include "statusbar.h"
 #include "touch.h"
 #include "sdpaths.h"
 #include "tdsh.h"
@@ -70,6 +71,19 @@ static size_t s_rom_len;
 static volatile bool s_run;
 static TaskHandle_t s_task;
 static TaskHandle_t s_blit_task;
+
+/* The worst single blit since this session started. A blitter that stops
+ * part-way through a session shows here and in the display driver's bus wait,
+ * and nowhere else: `blits` merely stops climbing. */
+static uint32_t s_blit_max_us;
+
+/* When the last blit completed. A blitter that stops mid-session is dated by
+ * this rather than by the shared push phase, which any other writer can update. */
+static volatile int64_t s_blit_last_us;
+
+/* Frames the guest could not render because no buffer was free. Non-zero means
+ * the frame pool ran dry -- the state that stops blits while emulation runs. */
+static uint32_t s_starved;
 
 /* Which buffer the guest may render into next, and which holds a finished
  * frame. Depth 1 each is enough: the guest cannot produce faster than core 1
@@ -158,7 +172,7 @@ static void gb_blit_task(void *arg)
         if (slot < 0 || slot >= GB_VBUF_N)
             continue;                    /* a garbage index must not reach s_fb[] */
 
-        const int64_t t0 = esp_timer_get_time();
+        const int64_t t_blit = esp_timer_get_time();
 
         /* The cache belongs to this task alone, so a band boundary that lands
          * mid-row cannot leave a stale expansion behind. */
@@ -168,7 +182,12 @@ static void gb_blit_task(void *arg)
                              GB_WIDTH * GB_SCALE, GB_HEIGHT * GB_SCALE,
                              gb_fill_row);
 
-        s_blit_us = (uint32_t)(esp_timer_get_time() - t0);
+        s_blit_us = (uint32_t)(esp_timer_get_time() - t_blit);
+
+        if (s_blit_us > s_blit_max_us)
+            s_blit_max_us = s_blit_us;
+
+        s_blit_last_us = esp_timer_get_time();
         s_blits++;
 
         xQueueSend(s_free_q, &slot, 0);
@@ -237,7 +256,15 @@ static void gb_video_cb(void *buffer)
         if (xQueueReceive(s_free_q, &next, 0) == pdTRUE)
             s_render_target = s_fb[next];
         else
+        {
+            /* COUNTED, because this is the state that looks like a dead blitter
+             * from outside: the guest keeps emulating, publishes nothing, and the
+             * blitter waits on an empty queue for ever. Entry 87's `frames=17288
+             * blits=1165` was this, and until now the only way to see it after
+             * the fact was the frames-minus-blits gap. */
+            s_starved++;
             s_render_target = NULL;  /* renders nothing until one comes back */
+        }
     }
 }
 
@@ -387,6 +414,35 @@ static char s_last_stop[24];
  * log, because the log is not readable over the USB mirror once a picture has
  * owned the panel -- and the emulator is exactly when it matters. */
 static uint32_t s_last_stop_ms;
+
+/*
+ * WHERE THE STOP'S TIME GOES, phase by phase, for the last stop.
+ *
+ * A single total could not say which of three independent waits had run to its
+ * limit, and all three were capped at a round number of milliseconds -- so a
+ * 1000 ms stop could be any of them. These are the same numbers that separated
+ * a real stall from a stale reading on 2026-11-21.
+ */
+static uint16_t s_stop_guest_ms, s_stop_blit_ms, s_stop_sram_ms, s_stop_save_ms;
+
+/* Set when a stop had to abandon a blitter that would not exit, so the frames
+ * it may still hold were leaked rather than freed. Cleared by the next start. */
+static bool s_blit_leak;
+
+/* Where the panel push was, and how long it had been there, when that happened.
+ * Meaningless unless s_blit_leak is set. */
+static uint8_t s_blit_stuck_phase;
+static int64_t s_blit_stuck_ms;
+static int64_t s_blit_stuck_strip_ms;
+
+/* What FreeRTOS reported for the blitter's task when a stop gave up on it:
+ * ready, blocked, suspended or deleted. Three different faults, one number. */
+static int s_blit_stuck_state;
+
+/* The frame pool when that happened: how many buffers were free, how many were
+ * waiting to be blitted, and how many frames the guest had failed to render. */
+static uint16_t s_blit_stuck_free, s_blit_stuck_filled;
+static uint32_t s_blit_stuck_starved;
 static uint32_t s_sram_saves;         /* writes that succeeded               */
 static uint32_t s_sram_us;            /* cost of the last write              */
 static uint32_t s_sram_snap_us;       /* cost of the last snapshot           */
@@ -688,6 +744,47 @@ static void hist_dump(void)
     printf("gb: %d of %lu s dirty, worst %u at sec %u\n", s_hist_n,
            (unsigned long)s_hist_total_sec, worst, worst_sec);
     printf("gb: %s\n", path);
+}
+
+/*
+ * Write what is known about a blitter that would not exit, to a file.
+ *
+ * THE MIRROR CANNOT CARRY THIS. A wedged blitter only happens while a picture
+ * owns the panel, and that is exactly when the USB mirror is stale (DSP-003), so
+ * a host polling the screen sees nothing and a console line is unreadable. The
+ * card survives the session, so this is written once and read later.
+ *
+ * The fields answer the three questions in order: what the task is doing
+ * (state), where the last panel push got to (phase and age), and whether the
+ * frame pool had run dry (free/filled/starved). Those are different faults and
+ * telling them apart from one line is the point of the file.
+ */
+static void wedge_dump(void)
+{
+    const char *path = sd_out("/sd/diag", "gbwedge.txt");
+    FILE *f = fopen(path, "w");
+
+    if (!f)
+        return;
+
+    fprintf(f, "blitter wedged at stop\n");
+    fprintf(f, "frames %lu blits %lu dropped %lu starved %lu\n",
+            (unsigned long)s_frames, (unsigned long)s_blits,
+            (unsigned long)s_dropped, (unsigned long)s_starved);
+    /* eRunning 0, eReady 1, eBlocked 2, eSuspended 3, eDeleted 4. */
+    fprintf(f, "task state %d (0 run 1 ready 2 blocked 3 susp 4 deleted)\n",
+            s_blit_stuck_state);
+    /* 0 idle, 1 acquiring, 2 acquired, 3 window, 4 stream, 5 done. */
+    fprintf(f, "push phase %u (0 idle 1 acq 2 got 3 win 4 stream 5 done)\n",
+            (unsigned)s_blit_stuck_phase);
+    fprintf(f, "ms since last blit %lld\n", (long long)s_blit_stuck_ms);
+    fprintf(f, "pool free %u filled %u (capacity %d)\n",
+            (unsigned)s_blit_stuck_free, (unsigned)s_blit_stuck_filled,
+            GB_VBUF_N);
+    fprintf(f, "ms since strip push %lld\n",
+            (long long)s_blit_stuck_strip_ms);
+
+    fclose(f);
 }
 
 /* --- the save writer, on core 1 alongside the blitter -------------------- */
@@ -1129,6 +1226,21 @@ static bool gb_app_key(void *user)
 
 bool gb_start(const char *rom_path)
 {
+    /*
+     * A WEDGED BLITTER CLOSES THE EMULATOR UNTIL THE WATCH IS REBOOTED.
+     *
+     * If a previous stop could not get its blitter to exit, that task is still
+     * alive with pointers to the frame queues and the frame buffers. Starting
+     * again would allocate a new set and hand the old task a world it was never
+     * synchronised with, which is a race with no good outcome. Refusing is the
+     * honest state: it is reported, it is not a crash, and a reboot clears it.
+     */
+    if (s_blit_leak)
+    {
+        printf("gb: a blitter from the last session never exited -- reboot\n");
+        return false;
+    }
+
     if (s_run)
     {
         printf("gb: already running -- gb stop first\n");
@@ -1425,9 +1537,27 @@ bool gb_start(const char *rom_path)
     }
 
     s_frames = s_blits = s_dropped = 0;
+    s_starved = 0;
     s_emu_us = s_blit_us = 0;
+    s_blit_max_us = 0;
+    s_blit_last_us = 0;
+    s_blit_stuck_state = -1;
     s_pad = 0;
     s_run = true;
+
+    /* THE LAST STOP'S RECORD IS CLEARED HERE, AT THE START OF A SESSION.
+     *
+     * It used to survive a start, so a `gb status` after a start that FAILED --
+     * leaving s_run false and both task handles NULL -- reported the PREVIOUS
+     * session's outcome and cost. That is how a stale `clean in 1020ms` read as
+     * a fresh measurement on 2026-11-21 and briefly looked like a fourth stall.
+     * An outcome belongs to one session, so it is born and dies with it. */
+    s_last_stop[0] = 0;
+    s_last_stop_ms = 0;
+    s_stop_guest_ms = s_stop_blit_ms = s_stop_sram_ms = s_stop_save_ms = 0;
+
+    /* Per-session, so a worst case belongs to the run that produced it. */
+    display_push_stats_reset();
 
     /*
      * THE SAME PRIORITY AS THE CELL PAINTER, AND RAISING IT ABOVE THE PAINTER
@@ -1571,10 +1701,69 @@ void gb_stop(void)
     for (int i = 0; i < 100 && s_task; i++)
         vTaskDelay(pdMS_TO_TICKS(10));
 
+    const int64_t t_guest = esp_timer_get_time();
+
     /* Let the blitter drain the last frame and leave, so it is not writing into
      * a framebuffer that is about to be released. */
     for (int i = 0; i < 100 && s_blit_task; i++)
         vTaskDelay(pdMS_TO_TICKS(10));
+
+    const int64_t t_blit = esp_timer_get_time();
+
+    /*
+     * IF THE BLITTER IS STILL ALIVE, NOTHING MAY BE FREED OR DELETED.
+     *
+     * This wait is bounded, so it can time out -- and what follows then frees
+     * s_fb[] and deletes the frame queues that a live blitter still holds. That
+     * is a use-after-free whose symptom arrives later and somewhere else. The
+     * task cannot be reached any more, so the only safe thing to do with what it
+     * holds is to leave it allocated and say so: a leak that is named beats
+     * corruption that is not. gb_start() then refuses to run until a reboot, so
+     * an orphan can never race a new session.
+     */
+    const bool blit_alive = s_blit_task != NULL;
+
+    if (blit_alive)
+    {
+        s_blit_leak = true;
+
+        /* WHERE IT WAS WHEN WE GAVE UP, captured now because the pusher cannot
+         * report from inside a call that never returns. */
+        s_blit_stuck_phase = display_bus_phase(&s_blit_stuck_ms);
+
+        /* WHAT THE SCHEDULER THINKS: ready, blocked, suspended or deleted. A
+         * blocked blitter on nothing, a starved one and a dead one are three
+         * different faults and this is the line that tells them apart. */
+        s_blit_stuck_state = (int)eTaskGetState(s_blit_task);
+
+        s_blit_stuck_free = s_free_q ? (uint16_t)uxQueueMessagesWaiting(s_free_q) : 0;
+        s_blit_stuck_filled = s_filled_q ? (uint16_t)uxQueueMessagesWaiting(s_filled_q) : 0;
+        s_blit_stuck_starved = s_starved;
+
+        /* AND HOW LONG SINCE IT ACTUALLY BLITTED, which is the real start of the
+         * stall rather than the age of the shared push phase. */
+        if (s_blit_last_us)
+            s_blit_stuck_ms = (esp_timer_get_time() - s_blit_last_us) / 1000;
+
+        /* AND HOW LONG SINCE THE STRIP TOUCHED THE BUS. The strip pushes once a
+         * minute from its own task, so it is the one other writer that could
+         * plausibly hold the blitter up. A small number here means the two
+         * coincided; a large one clears it. */
+        {
+            uint32_t sp = 0, spms = 0;
+
+            statusbar_push_stats(&sp, &spms, &s_blit_stuck_strip_ms);
+        }
+
+        /* TO A FILE, BECAUSE THE MIRROR IS GONE BY THIS POINT. Once a picture
+         * owns the panel the USB mirror goes stale (DSP-003), so a host cannot
+         * poll for this and a console print is not readable either. A run whose
+         * emulator is played normally will produce the file on the card, and it
+         * is still there afterwards. */
+        wedge_dump();
+
+        ESP_LOGE(TAG, "blitter did not exit; frames leaked, not freed");
+    }
 
     s_blit_task = NULL;
     s_task = NULL;
@@ -1592,6 +1781,8 @@ void gb_stop(void)
         vTaskDelay(pdMS_TO_TICKS(10));
 
     s_sram_task = NULL;
+
+    const int64_t t_sram = esp_timer_get_time();
 
     if (s_saveable && gnuboy_sram_dirty())
     {
@@ -1619,6 +1810,13 @@ void gb_stop(void)
 
     s_last_stop_ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
 
+    /* Each wait measured where it ends, so a stall names its own phase instead
+     * of being bounded by whichever cap it happens to equal. */
+    s_stop_guest_ms = (uint16_t)((t_guest - t0) / 1000);
+    s_stop_blit_ms = (uint16_t)((t_blit - t_guest) / 1000);
+    s_stop_sram_ms = (uint16_t)((t_sram - t_blit) / 1000);
+    s_stop_save_ms = (uint16_t)((esp_timer_get_time() - t_sram) / 1000);
+
     if (s_snap_free)
     {
         vQueueDelete(s_snap_free);
@@ -1632,21 +1830,28 @@ void gb_stop(void)
 
     if (s_free_q)
     {
-        vQueueDelete(s_free_q);
-        s_free_q = NULL;
+        if (!blit_alive)
+        {
+            vQueueDelete(s_free_q);
+            s_free_q = NULL;
+        }
     }
     if (s_filled_q)
     {
-        vQueueDelete(s_filled_q);
-        s_filled_q = NULL;
+        if (!blit_alive)
+        {
+            vQueueDelete(s_filled_q);
+            s_filled_q = NULL;
+        }
     }
 
     gnuboy_free_rom();
     gnuboy_free_bios();
 
+    /* THE FRAME BUFFERS ARE NOT FREED WHILE A BLITTER MAY STILL HOLD THEM. */
     for (int i = 0; i < GB_VBUF_N; i++)
     {
-        if (s_fb[i])
+        if (s_fb[i] && !blit_alive)
         {
             heap_caps_free(s_fb[i]);
             s_fb[i] = NULL;
@@ -1770,10 +1975,52 @@ static int cmd_gb(tdsh_session_t *session, int argc, char **argv)
             printf("last stop: %s in %lums\n", s_last_stop,
                    (unsigned long)s_last_stop_ms);
 
+        /* WHERE THAT LAST STOP SPENT ITS TIME, by phase. Three waits with round
+         * caps made a total ambiguous; these three lines are what told a real
+         * stall from a stale reading. */
+        if (s_last_stop[0])
+            printf("  guest=%ums blit=%ums sram=%ums save=%ums\n",
+                   (unsigned)s_stop_guest_ms, (unsigned)s_stop_blit_ms,
+                   (unsigned)s_stop_sram_ms, (unsigned)s_stop_save_ms);
+
+        /* THE DISPLAY DRIVER'S OWN NUMBERS. buswait is the worst single wait for
+         * the SPI panel bus, in milliseconds, and miss is how many bands were
+         * skipped because another writer held it. The top strip pushes on its
+         * own task once a minute, so a buswait that reaches hundreds names the
+         * bus as the cause of a stall rather than leaving it to a theory. */
+        {
+            uint32_t miss = 0, waitmax = 0;
+
+            display_bus_stats(&miss, &waitmax);
+            printf("bus: waitmax=%lums miss=%lu\n",
+                   (unsigned long)waitmax, (unsigned long)miss);
+        }
+
+        if (s_blit_leak)
+            printf("blitter wedged -- frames leaked, reboot to clear\n");
+
+        if (s_blit_leak)
+            printf("  stuck: phase=%u for %lldms state=%d\n",
+                   (unsigned)s_blit_stuck_phase, (long long)s_blit_stuck_ms,
+                   s_blit_stuck_state);
+
+        if (s_blit_leak)
+            printf("  pool was free=%u filled=%u starved=%lu\n",
+                   (unsigned)s_blit_stuck_free, (unsigned)s_blit_stuck_filled,
+                   (unsigned long)s_blit_stuck_starved);
+
         if (gb_running())
-            printf("emu=%luus blit=%luus pad=%02x\n",
+            printf("emu=%luus blit=%luus max=%luus pad=%02x\n",
                    (unsigned long)s_emu_us, (unsigned long)s_blit_us,
-                   (unsigned)s_pad);
+                   (unsigned long)s_blit_max_us, (unsigned)s_pad);
+
+        /* THE POOL, which is the only other way blits stop while frames keep
+         * coming: a guest that cannot get a buffer renders nothing, and a
+         * blitter waiting for a frame looks exactly like a dead one. */
+        printf("pool: free=%u filled=%u starved=%lu\n",
+               s_free_q ? (unsigned)uxQueueMessagesWaiting(s_free_q) : 0,
+               s_filled_q ? (unsigned)uxQueueMessagesWaiting(s_filled_q) : 0,
+               (unsigned long)s_starved);
 
         return 0;
     }

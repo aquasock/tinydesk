@@ -25,6 +25,7 @@
 
 #include "display.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -334,11 +335,64 @@ static uint32_t s_pushes;
  * starving the other. */
 static uint32_t s_bus_misses;
 
+/*
+ * HOW LONG THE WORST WAIT FOR THE SPI BUS WAS, AND WHO WAITED FOR IT.
+ *
+ * A blit that stops part-way through an emulator session has no signature in
+ * the counters except a growing frames-minus-blits gap, and the question that
+ * gap raises is whether the stall is this driver's bus or something else. The
+ * strip task (statusbar.c) pushes its own bands once a minute on the same
+ * `s_spi`, so contention with it is a real candidate rather than a theory:
+ * measuring the wait is how that stops being a guess.
+ *
+ * The counter is the worst single acquisition since the last reset, because a
+ * stall is one incident and an average would hide it.
+ */
+static uint32_t s_bus_wait_max_us;
+
+/*
+ * WHERE THE PANEL PUSH IS, AND WHEN IT GOT THERE.
+ *
+ * A task blocked inside this function cannot report anything, so the phase is
+ * recorded here and read from another task. This exists because a blitter that
+ * stopped mid-session left no trace: the counters said frames kept coming and
+ * blits stopped, and a blocked task looks identical to an exited one from every
+ * other angle.
+ *
+ * A FINITE WAIT IS NOT AVAILABLE ON THIS DRIVER. The first attempt at this used
+ * spi_device_acquire_bus(s_spi, pdMS_TO_TICKS(100)) and every single acquisition
+ * failed: ESP-IDF 5.3.1 begins that function with
+ * SPI_CHECK(wait == portMAX_DELAY, "acquire finite time not supported now."),
+ * so a finite wait returns ESP_ERR_INVALID_ARG without even trying the lock.
+ * The miss count went from 29 to 43,680 in one build, which is how fast the
+ * instrument caught its own mistake. So the acquisition stays infinite and the
+ * phase markers are what make a hang visible instead.
+ */
+enum {
+    BUS_PH_IDLE = 0,
+    BUS_PH_ACQUIRE,     /* waiting for the device lock */
+    BUS_PH_ACQUIRED,    /* lock held, before the window write */
+    BUS_PH_WINDOW,      /* window programmed, before the pixel stream */
+    BUS_PH_STREAM,      /* inside the pixel stream */
+    BUS_PH_DONE,
+};
+
+static volatile uint8_t s_bus_phase = BUS_PH_IDLE;
+static volatile int64_t s_bus_phase_us;
+
 void display_push_stats_reset(void)
 {
     s_us_window = s_us_xmit = 0;
     s_pushes = 0;
     s_us_convert = 0;
+
+    /* The bus counters belong with the rest: a worst-case wait is only
+     * meaningful for the session that produced it, and a caller resetting these
+     * is starting one. */
+    s_bus_misses = 0;
+    s_bus_wait_max_us = 0;
+    s_bus_phase = BUS_PH_IDLE;
+    s_bus_phase_us = esp_timer_get_time();
 }
 
 int64_t display_convert_us(void)
@@ -354,6 +408,23 @@ void display_push_stats(int64_t *us_window, int64_t *us_xmit, uint32_t *pushes)
         *us_xmit = s_us_xmit;
     if (pushes)
         *pushes = s_pushes;
+}
+
+void display_bus_stats(uint32_t *misses, uint32_t *wait_max_us)
+{
+    if (misses)
+        *misses = s_bus_misses;
+    if (wait_max_us)
+        *wait_max_us = s_bus_wait_max_us;
+}
+
+uint8_t display_bus_phase(int64_t *age_ms)
+{
+    const uint8_t ph = s_bus_phase;
+
+    if (age_ms)
+        *age_ms = (esp_timer_get_time() - s_bus_phase_us) / 1000;
+    return ph;
 }
 
 /*
@@ -528,11 +599,29 @@ static void push_pixels_raw_buf(int cx, int cy, int w, int h, uint16_t *buf)
      * cannot reboot the watch. s_bus_misses counts it, so the rate is
      * observable rather than assumed.
      */
+    const int64_t t_bus = esp_timer_get_time();
+
+    s_bus_phase = BUS_PH_ACQUIRE;
+    s_bus_phase_us = t_bus;
+
     if (spi_device_acquire_bus(s_spi, portMAX_DELAY) != ESP_OK)
     {
         s_bus_misses++;
+        s_bus_phase = BUS_PH_IDLE;
         return;
     }
+
+    {
+        /* Recorded on the SUCCESSFUL path too, because the wait that matters
+         * is the one that eventually got the bus. */
+        const uint32_t waited = (uint32_t)((esp_timer_get_time() - t_bus) / 1000);
+
+        if (waited > s_bus_wait_max_us)
+            s_bus_wait_max_us = waited;
+    }
+
+    s_bus_phase = BUS_PH_ACQUIRED;
+    s_bus_phase_us = esp_timer_get_time();
 
     int64_t t_w0 = esp_timer_get_time();
     uint8_t cas[4] = { (uint8_t)((cx >> 8) & 0xFF), (uint8_t)(cx & 0xFF),
@@ -556,12 +645,20 @@ static void push_pixels_raw_buf(int cx, int cy, int w, int h, uint16_t *buf)
      * the transfer succeeded -- the only evidence was looking at the screen. */
     gpio_set_level(LCD_CS, 0);
 
+    s_bus_phase = BUS_PH_WINDOW;
+    s_bus_phase_us = esp_timer_get_time();
+
     int64_t t_x0 = esp_timer_get_time();
 
     while (remaining)
     {
         size_t chunk = remaining > PIX_CHUNK ? PIX_CHUNK : remaining;
         spi_transaction_ext_t t = { 0 };
+
+        /* STREAM is the phase that matters if nothing ever comes back: it says
+         * the blocking wait was in a transfer rather than in the lock. */
+        s_bus_phase = BUS_PH_STREAM;
+        s_bus_phase_us = esp_timer_get_time();
 
         if (first)
         {
@@ -595,6 +692,8 @@ static void push_pixels_raw_buf(int cx, int cy, int w, int h, uint16_t *buf)
     gpio_set_level(LCD_CS, 1);
     spi_device_release_bus(s_spi);
     s_us_xmit += esp_timer_get_time() - t_x0;
+    s_bus_phase = BUS_PH_DONE;
+    s_bus_phase_us = esp_timer_get_time();
 }
 
 static void push_pixels_raw(int cx, int cy, int w, int h)

@@ -195,6 +195,17 @@ static char s_shown[SB_KEY_MAX];
 static volatile uint32_t s_pushed;
 static volatile uint32_t s_ticks;
 
+/*
+ * WHEN THE LAST PUSH FINISHED, AND HOW LONG IT TOOK.
+ *
+ * The strip writes the panel on its own task, once a minute, through the same
+ * SPI bus the emulator's blitter uses. A blitter that stops part-way through a
+ * session therefore has one obvious suspect, and this is the instrument that
+ * can confirm or clear it: the time since that push, read from outside.
+ */
+static volatile int64_t s_last_push_us;
+static volatile uint32_t s_last_push_ms;
+
 /* The user's UTC offset, cached in this task. See sb_build() for why the strip
  * does not ask the desktop's side on every tick. */
 static long s_tz;
@@ -569,6 +580,9 @@ static void sb_task(void *arg)
                 last_minute = minute;
                 s_pushed++;
 
+                s_last_push_us = esp_timer_get_time();
+                s_last_push_ms = (uint32_t)((s_last_push_us - t0) / 1000);
+
                 ESP_LOGI(TAG, "%s %s pushed in %lld us (#%lu)", f[0].text, f[1].text,
                          (long long)(esp_timer_get_time() - t0),
                          (unsigned long)s_pushed);
@@ -683,6 +697,17 @@ static const tdsh_command_t s_sb_cmd = {
     cmd_statusbar,
     TDSH_CMD_INTERACTIVE,
 };
+
+void statusbar_push_stats(uint32_t *pushes, uint32_t *last_ms, int64_t *since_ms)
+{
+    if (pushes)
+        *pushes = s_pushed;
+    if (last_ms)
+        *last_ms = s_last_push_ms;
+    if (since_ms)
+        *since_ms = s_last_push_us ?
+                   (esp_timer_get_time() - s_last_push_us) / 1000 : -1;
+}
 
 bool statusbar_start(void)
 {

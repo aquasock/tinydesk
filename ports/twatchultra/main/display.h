@@ -124,6 +124,26 @@ bool display_picture_rows(void *ctx, int x, int y, int w, int h, display_row_fn 
  * numbers. Reset before a measurement, read after it. */
 void display_push_stats_reset(void);
 
+/*
+ * Bands the driver skipped because another writer held the SPI bus, and the
+ * worst single wait for that bus in milliseconds. Both are cumulative since the
+ * last display_push_stats_reset().
+ *
+ * A refusal costs one band of one frame. A LONG WAIT is the interesting one: it
+ * is what a stalled blitter would show, and it names the bus rather than leaving
+ * a lost second unexplained. The strip in the panel's top rows pushes on its own
+ * task once a minute, so this is the instrument that answers whether a stall and
+ * the strip coincide.
+ */
+void display_bus_stats(uint32_t *misses, uint32_t *wait_max_us);
+
+/* Where the most recent panel push is, and how long ago it got there.
+ *
+ * 0 idle, 1 waiting for the device lock, 2 lock held, 3 window programmed,
+ * 4 inside the pixel stream, 5 finished. Read from a task other than the pusher,
+ * which is the only way to see a hang inside a call that never returns. */
+uint8_t display_bus_phase(int64_t *age_ms);
+
 /* Microseconds spent inside the row callback by display_picture_rows() since the
  * last reset. The conversion cost measured directly, rather than inferred by
  * subtracting the push from the blit. */
