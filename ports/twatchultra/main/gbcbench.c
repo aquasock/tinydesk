@@ -41,6 +41,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "sdpaths.h"
 #include "tdsh.h"
 
 #include "gnuboy.h"
@@ -141,6 +142,40 @@ static int run_one(const char *path, int frames, bool cpu_only)
     printf("renders=%lu\n", (unsigned long)s_render_calls);
     printf("blit_model=%.0fus frame_us=%.0f frame_fps=%.1f\n",
            blit_us, frame_us, 1e6 / frame_us);
+
+    /*
+     * THE RESULT IS ALSO WRITTEN TO THE CARD, AND THAT IS NOT A CONVENIENCE.
+     *
+     * Loading a Game Boy cartridge prints one line per bank, several hundred of
+     * them, and this panel shows 26 rows with no scrollback -- so the four result
+     * lines are pushed off the glass by the time they are printed and cannot be
+     * read back. The USB mirror does not help: it carries the same floods and a
+     * capture only ever sees its tail.
+     *
+     * Same shape as gbhist.txt and gbwedge.txt: an instrument whose answer must
+     * survive the screen it was printed on.
+     */
+    {
+        const char *out = sd_out("/sd/diag", "gbcbench.txt");
+        FILE *f = fopen(out, "w+");
+
+        if (f)
+        {
+            fprintf(f, "rom=%s\n", path);
+            fprintf(f, "mode=%s frames=%d\n", cpu_only ? "cpu" : "render", frames);
+            fprintf(f, "run_us=%.0f fps=%.1f realtime=%.3f\n",
+                    per_frame, fps, realtime);
+            fprintf(f, "renders=%lu\n", (unsigned long)s_render_calls);
+            fprintf(f, "blit_model=%.0fus frame_us=%.0f frame_fps=%.1f\n",
+                    blit_us, frame_us, 1e6 / frame_us);
+            fprintf(f, "heap_internal_free=%u\n",
+                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+            fprintf(f, "heap_internal_min=%u\n",
+                    (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+            fclose(f);
+            printf("gbcbench: %s\n", out);
+        }
+    }
 
     return 0;
 }

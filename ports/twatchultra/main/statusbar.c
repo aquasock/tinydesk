@@ -189,6 +189,30 @@ static bool s_prev_valid;
 #define SB_KEY_MAX     32
 static char s_shown[SB_KEY_MAX];
 
+/*
+ * THE TASK'S STACK, IN ONE PLACE, AND ITS HANDLE.
+ *
+ * The size is used by the create call and reported by `statusbar`, so the
+ * figure on the glass is always the figure that was asked for. The handle is
+ * kept for the same reason: an 8 KB stack chosen to stop a panic is not the
+ * same thing as an 8 KB stack that is needed, and the only way to tell them
+ * apart is uxTaskGetStackHighWaterMark() -- never-touched bytes at the deepest
+ * point the task has ever reached.
+ */
+#define SB_STACK       8192
+static TaskHandle_t s_task;
+
+/*
+ * WHICH HALF OF THE TICK IS DEEP, measured separately.
+ *
+ * sb_build() ends in the platform's get_tz(), which opens a file on the card,
+ * so it carries the FATFS and VFS call chain; sb_paint() ends in a pixel push,
+ * so it carries the SPI driver's. Both are deep and neither is obvious, and
+ * the size this task needs is set by the deeper of the two -- so each records
+ * its own minimum free stack and `statusbar` prints both.
+ */
+static uint32_t s_wm_build, s_wm_paint;
+
 /* Counters for the `statusbar` command. `s_pushed` is how many times the strip
  * has actually written the panel, which is the number that matters when asking
  * whether the strip is behind something that happens once a minute. */
@@ -566,6 +590,14 @@ static void sb_task(void *arg)
         char key[SB_KEY_MAX];
 
         sb_build(f, &minute);
+
+        {
+            const uint32_t wm = (uint32_t)uxTaskGetStackHighWaterMark(NULL);
+
+            if (!s_wm_build || wm < s_wm_build)
+                s_wm_build = wm;
+        }
+
         sb_layout(f, left, top);
 
         snprintf(key, sizeof(key), "%s|%s", f[0].text, f[1].text);
@@ -574,7 +606,16 @@ static void sb_task(void *arg)
         {
             const int64_t t0 = esp_timer_get_time();
 
-            if (sb_paint(f, left, top))
+            const bool painted = sb_paint(f, left, top);
+
+            {
+                const uint32_t wm = (uint32_t)uxTaskGetStackHighWaterMark(NULL);
+
+                if (!s_wm_paint || wm < s_wm_paint)
+                    s_wm_paint = wm;
+            }
+
+            if (painted)
             {
                 memcpy(s_shown, key, sizeof(s_shown));
                 last_minute = minute;
@@ -664,6 +705,28 @@ static int cmd_statusbar(tdsh_session_t *session, int argc, char **argv)
     printf("display pushes=%lu\n", (unsigned long)dpush);
 
     /*
+     * WHAT THE STACK ACTUALLY USED, at its deepest point ever.
+     *
+     * `free` is never-touched bytes from the current stack pointer to the end
+     * of the stack, so it is a high-water mark rather than an instantaneous
+     * reading -- a value that only shrinks. Read from THIS task, which is the
+     * shell's, not the strip's: asking a task about its own stack would measure
+     * whatever depth the query itself reached.
+     *
+     * An 8192-byte stack was chosen because 3072 panicked, which is a ceiling
+     * and not a requirement. This line is what makes the difference visible.
+     */
+    if (s_task)
+    {
+        printf("stack free=%u of %d\n",
+               (unsigned)uxTaskGetStackHighWaterMark(s_task), SB_STACK);
+        printf(" deep: build<=%u paint<=%u\n",
+               (unsigned)s_wm_build, (unsigned)s_wm_paint);
+    }
+    else
+        printf("stack none -- no task\n");
+
+    /*
      * THE PATH `get_tz()` WOULD BUILD, AND WHETHER IT CAN BE OPENED.
      *
      * Added after the first sample showed `tz=0` with `-25200` sitting in
@@ -745,7 +808,8 @@ bool statusbar_start(void)
      * reboot rather than an error. Priority 1 so it never competes with an
      * emulator: a strip that appears a few milliseconds late is invisible.
      */
-    if (xTaskCreatePinnedToCore(sb_task, "statusbar", 8192, NULL, 1, NULL, 0) != pdPASS)
+    if (xTaskCreatePinnedToCore(sb_task, "statusbar", SB_STACK, NULL, 1,
+                                &s_task, 0) != pdPASS)
     {
         ESP_LOGE(TAG, "no task");
         return false;
