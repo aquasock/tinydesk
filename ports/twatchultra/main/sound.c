@@ -161,10 +161,41 @@ bool sound_init(void)
         return false;
     }
 
-    /* Four buffers of 1024 samples, as LilyGo configures it, so a beep fits in
-     * one buffer and the DMA never underruns mid-tone. */
+    /*
+     * FOUR BUFFERS OF 256 FRAMES, NOT LILYGO'S 1024, AND THE ARITHMETIC IS THE
+     * WHOLE REASON.
+     *
+     * LilyGo's number asks the driver for 1024 frames per descriptor in stereo
+     * 16-bit, and the driver clamps that to its 4092-byte ceiling: 4092 / 4
+     * bytes-per-frame = 1023 frames. Four of those is 16,368 bytes taken from
+     * `MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA` -- the scarcest pool on this board.
+     *
+     * That is not affordable here. Measured with the emulator running: the DMA
+     * heap had 12,251 bytes free with a LARGEST CONTIGUOUS BLOCK OF 3,968, and
+     * each I2S buffer is allocated separately, so even one 4,092-byte buffer
+     * cannot be satisfied. The driver says so, twice, and the channel never
+     * finishes configuring:
+     *
+     *   W i2s_common: dma frame num is out of dma buffer size, limited to 1023
+     *   E i2s_common: i2s_alloc_dma_buffer ... allocate DMA buffer failed
+     *   E i2s_std:    i2s_std_set_slot ...
+     *   E i2s_std:    i2s_channel_reconfigure ...
+     *
+     * 256 frames is 1,024 bytes per descriptor and 4,096 for the set, every
+     * allocation comfortably inside the largest free block.
+     *
+     * THE TWO SYMPTOMS THIS EXPLAINS, WHICH LOOKED LIKE SEPARATE FAULTS. The
+     * display's SPI bus also takes DMA from this same pool. Whether audio or the
+     * panel won the last block decided which one broke: a session where I2S took
+     * its 16 KB played sound with a frozen picture, and a session where it could
+     * not played a moving picture in silence. One scarce resource, two opposite
+     * failures, and freeing 12 KB here is what gives the display path room.
+     *
+     * THE COST IS LATENCY, and it is worth stating: four buffers of 256 frames is
+     * 1,024 frames, which is 23.4 ms at the emulators' 43,691 Hz and 21.3 ms at
+     * 48 kHz. That is the depth of the ring an underrun has to punch through. */
     chan.dma_desc_num = 4;
-    chan.dma_frame_num = 1024;
+    chan.dma_frame_num = 256;
     chan.auto_clear_after_cb = true;
 
     if (i2s_new_channel(&chan, &s_tx, NULL) != ESP_OK)

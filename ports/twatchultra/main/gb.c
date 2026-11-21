@@ -503,7 +503,10 @@ static void gb_sram_task(void *arg)
     }
 
     s_sram_task = NULL;
-    vTaskDelete(NULL);
+    /* The stack came from PSRAM, so the caps-aware delete is required: plain
+     * vTaskDelete() leaves the idle task to free a TCB it did not allocate and
+     * leaks the PSRAM stack. Same trap as the guest task's. */
+    vTaskDeleteWithCaps(NULL);
 }
 
 /* --- the guest task, on core 0 ------------------------------------------- */
@@ -899,13 +902,21 @@ bool gb_start(const char *rom_path)
     gnuboy_set_soundbuffer(s_snd, GB_AUDIO_BUF);
 
     /*
-     * CGB HARDWARE FOR EVERY CARTRIDGE, including DMG ones, because that is what
-     * a Game Boy Color does with them: a DMG cartridge in a CGB runs in
-     * compatibility mode and gets the CGB's palette selection. The header at
-     * 0x143 says 0x80 for "compatible" and 0xC0 for "only", so the core honours
-     * the cartridge either way; what this sets is the machine, not the game.
-     */
-    gnuboy_set_hwtype(GB_HW_CGB);
+     * THE MACHINE TYPE COMES FROM THE CARTRIDGE, AND THIS PORT DOES NOT CHOOSE
+     * IT. `gnuboy_load_rom()` below reads header byte 0x143 on the way in and
+     * sets GB_HW_CGB for 0x80 or 0xC0, GB_HW_SGB for 0x146 == 3, and GB_HW_DMG
+     * otherwise -- so it OVERWRITES whatever was set before it.
+     *
+     * There used to be a `gnuboy_set_hwtype(GB_HW_CGB)` here, with a comment
+     * saying it gave every cartridge CGB hardware. It never did: it ran before
+     * the load and was replaced a few lines later, so a DMG cartridge has always
+     * run as a DMG. The behaviour was right and the comment was wrong, which is
+     * the same failure this project has hit twice before -- a claim in a comment
+     * that nobody had checked against the code beside it. Removed rather than
+     * moved, because forcing CGB on a DMG cartridge is not what the hardware
+     * this port models does with one.
+     *
+     * The palette is still set explicitly: it is not overwritten by the load. */
     gnuboy_set_palette(GB_PALETTE_CGB);
 
     if (gnuboy_load_rom(s_rom, s_rom_len) != 0)
@@ -1122,8 +1133,7 @@ bool gb_start(const char *rom_path)
      * Safe here for a specific reason rather than by luck: this task runs
      * gnuboy and nothing else. The cartridge and both frame buffers are PSRAM,
      * it opens no file, and it maps no partition -- so it never disables the
-     * cache that a PSRAM stack lives behind. The save task, which does write to
-     * /fs, is left on internal RAM deliberately.
+     * cache that a PSRAM stack lives behind.
      */
     if (xTaskCreatePinnedToCoreWithCaps(gb_task, "gb", 8192, NULL, 5,
                                         &s_task, 0,
@@ -1140,8 +1150,30 @@ bool gb_start(const char *rom_path)
      * the write finishes in about 121 ms and the blitter is the one that waits --
      * which costs painted frames, not emulated ones, because the guest keeps
      * running and simply renders nothing while both buffers are held. */
-    if (xTaskCreatePinnedToCore(gb_sram_task, "gbsram", 4096, NULL, 6,
-                                &s_sram_task, 1) != pdPASS)
+    /* THE WRITER'S STACK COMES FROM PSRAM TOO, AND THE REASON THIS USED TO SAY
+     * OTHERWISE WAS SIMPLY WRONG ABOUT ITS OWN CODE.
+     *
+     * It was pinned to internal DRAM because it "does write to /fs" -- and the
+     * constraint it was reasoning about is real, because a littlefs write to the
+     * `storage` partition goes through spi_flash and spi_flash disables the cache,
+     * which a PSRAM stack cannot survive. But THIS TASK NEVER TOUCHES /fs: the
+     * save goes to `/sd/saves/gbc/` on the card, through the SDSPI driver, which
+     * is the SPI peripheral and not the flash controller. The cache stays on, so
+     * a PSRAM stack is safe -- and the general rule is that the hazard is
+     * INTERNAL FLASH, not files.
+     *
+     * It matters because internal DRAM ran out. On the build the feature was
+     * written for, this allocation succeeded; the app has grown since, and on
+     * 2026-11-20 `gb start` reported `gb: no save task -- running without
+     * autosave`, which is a quiet way of saying NOTHING COULD BE SAVED AT ALL:
+     * `gb save` waits on this task's queue, and the save on stop goes through
+     * it too. A cartridge could be played and every byte of progress lost.
+     *
+     * If this ever does start touching internal flash, it must come back to
+     * internal DRAM -- that is the one thing this comment is here to protect. */
+    if (xTaskCreatePinnedToCoreWithCaps(gb_sram_task, "gbsram", 4096, NULL, 6,
+                                        &s_sram_task, 1,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS)
     {
         printf("gb: no save task -- running without autosave\n");
         s_saveable = false;
