@@ -397,6 +397,28 @@ static void slotb_run(const char *board_conf)
         ESP_LOGW(TAG, "Pusher A did not arm; the only way out is a power cycle");
     pwrkey_set_app_key(slotb_key, NULL);
 
+    /*
+     * THE BLITTER STAYS ON CORE 1, AND THAT IS A MEASURED DECISION RATHER THAN
+     * A DEFAULT LEFT ALONE. Core 0 is idle in slot B, so moving the blit there
+     * was the obvious next step once the desktop was gone. It was tried and it
+     * is WORSE (core-log entry 96):
+     *
+     *   core 1  frames=4185  blits=4185  starved=0     wall=10661 us
+     *   core 0  frames=4199  blits=3621  starved=3749  wall=9836 us
+     *
+     * On core 0 the guest got 7.7 per cent faster and the PICTURE LOST 14 per
+     * cent of its frames, with the buffer pool running dry 3749 times. The
+     * likely cause is that the framebuffer lives in PSRAM: on core 1 the guest
+     * and the blitter alternate and never touch PSRAM at the same moment, while
+     * on core 0 they run concurrently and contend for it. The guest's own cache
+     * benefit shows up as the lower wall figure and is more than cancelled by
+     * the blit falling behind.
+     *
+     * blits == frames with starved == 0 is the property worth keeping, so the
+     * blitter stays where the guest can preempt it.
+     */
+    gb_set_blit_core(1);
+
     /* No argument: the operator chose a cartridge on the glass. Falls back to
      * gb_start()'s own default only if the picker could not run at all. */
     {

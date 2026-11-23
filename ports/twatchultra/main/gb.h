@@ -61,6 +61,20 @@ bool gb_start(const char *rom_path);
 void gb_stop(void);
 bool gb_running(void);
 
+/*
+ * Which core the blitter runs on. Default 1.
+ *
+ * THE DESKTOP AND SLOT B WANT DIFFERENT ANSWERS, which is why this is not a
+ * constant. On the desktop the blitter shares core 1 with the cell painter and
+ * they are peers at priority 4 on purpose -- the comment at the create call
+ * explains the hang that came from raising it. In slot B there is no painter, the
+ * other core is idle, and the blit is 8 to 13 ms of POLLING SPI that can run
+ * concurrently with the guest instead of in the guest's end-of-frame sleep.
+ *
+ * Set it before gb_start(); it is read once, at task creation.
+ */
+void gb_set_blit_core(int core);
+
 /* Registers the `gb` shell command. */
 bool gb_register_command(void);
 

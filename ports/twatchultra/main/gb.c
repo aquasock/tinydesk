@@ -98,6 +98,14 @@ static volatile uint32_t s_emu_us;
 static volatile uint32_t s_blit_us;
 static int s_pad;
 
+/* Set before gb_start(); see gb_set_blit_core(). */
+static int s_blit_core = 1;
+
+void gb_set_blit_core(int core)
+{
+    s_blit_core = (core == 0) ? 0 : 1;
+}
+
 /* --- the row scaler ------------------------------------------------------- */
 
 /*
@@ -619,6 +627,28 @@ static int64_t s_hist_sec_us;      /* the second the current bucket ends */
 static uint32_t s_hist_frames0, s_hist_drops0;
 static uint16_t s_hist_worst_us, s_hist_worst_cpu, s_hist_worst_blit;
 
+/*
+ * WHOLE-SESSION TOTALS, WHICH IS THE FRAME-TIME INSTRUMENT.
+ *
+ * The per-second list above is a DROP detector: `hist_frame` keeps a bucket only
+ * in a second where the audio ring refused a sample. A healthy session therefore
+ * reports an empty list, and a healthy session is exactly what has to be measured
+ * to answer whether slot B runs the emulator faster than the desktop does.
+ *
+ * These totals are accumulated every frame and are what make the comparison
+ * possible. The quantity that answers the question is `wall - cpu`: the guest's
+ * WORK wall time minus the CPU it actually got. That difference is time the guest
+ * had work to do and was not on a processor, which is contention and nothing else.
+ * A guest sampled every 16.742 ms with wall == cpu is being starved by nobody; one
+ * whose frames use 20 ms of wall for 14 ms of CPU is losing 6 ms a frame to
+ * something else on its core.
+ *
+ * `over` counts frames that exceeded the console's own frame budget, which is the
+ * player-visible version of the same thing.
+ */
+static uint64_t s_tot_frames, s_tot_wall_us, s_tot_cpu_us;
+static uint32_t s_tot_over;
+
 /* Per-iteration timing carried to the next iteration, because the kernel's
  * run-time counter only settles when the task switches out. */
 static configRUN_TIME_COUNTER_TYPE s_cpu_prev;
@@ -653,6 +683,13 @@ static void hist_frame(int64_t now_us, uint32_t frames, uint32_t drops,
                        uint32_t frame_us, uint32_t frame_cpu_us,
                        uint32_t blit_us, bool short_write)
 {
+    /* EVERY frame, not every dirty second: see the note on s_tot_frames. */
+    s_tot_frames++;
+    s_tot_wall_us += frame_us;
+    s_tot_cpu_us += frame_cpu_us;
+    if (frame_us > GB_FRAME_US)
+        s_tot_over++;
+
     /* THE WORST FRAME IS TRACKED BY WALL TIME, AND ITS CPU TIME IS KEPT WITH IT.
      * Those two numbers together are the whole point: a 52 ms frame that used
      * 50 ms of CPU is slow work, and the same frame using 12 ms of CPU was off
@@ -715,6 +752,57 @@ static void hist_dump(void)
 
     fprintf(f, "session %lu s, %d second(s) with drops\n",
             (unsigned long)s_hist_total_sec, s_hist_n);
+
+    /* THE ANSWER, FIRST, so it survives even if the bucket list is empty. */
+    if (s_tot_frames)
+    {
+        const unsigned long n = (unsigned long)s_tot_frames;
+        const unsigned long wall = (unsigned long)(s_tot_wall_us / s_tot_frames);
+        const unsigned long cpu = (unsigned long)(s_tot_cpu_us / s_tot_frames);
+        const unsigned long lost = wall > cpu ? wall - cpu : 0;
+
+        fprintf(f, "frames=%lu avg_wall_us=%lu avg_cpu_us=%lu lost_us=%lu over=%lu\n",
+                n, wall, cpu, lost, (unsigned long)s_tot_over);
+        fprintf(f, "core_pct=%lu\n", wall ? (cpu * 100) / wall : 0);
+
+        /*
+         * THE SAME THREE LINES IN THEIR OWN FILE, and this exists because of a
+         * limit in the shell that reads it rather than in the measurement.
+         *
+         * `cat` is the only whole-file reader tdsh has here, and the USB mirror
+         * shows a terminal's last 26 rows -- so reading a file long enough to
+         * hold per-second buckets can never show its first lines, which is where
+         * the summary is. `head -n` is not honoured. A four-line file fits on the
+         * glass whole, so the totals are always readable without touching the
+         * longer record beside them.
+         */
+        char sum[64];
+        snprintf(sum, sizeof(sum), "%s", sd_out("/sd/diag", "gbtime.txt"));
+        FILE *g = fopen(sum, "w");
+
+        if (g)
+        {
+            fprintf(g, "frames=%lu wall=%lu cpu=%lu lost=%lu\n",
+                    n, wall, cpu, lost);
+            fprintf(g, "over=%lu core_pct=%lu secs=%lu\n",
+                    (unsigned long)s_tot_over, wall ? (cpu * 100) / wall : 0,
+                    (unsigned long)s_hist_total_sec);
+            /* BLITS AGAINST GUEST FRAMES: the frame counter alone cannot tell a
+             * picture that keeps up from one that is producing frames nobody
+             * sees, so the ratio is recorded beside the timings. `starved` is the
+             * pool-dry count, which is the same question asked from the other
+             * side. */
+            fprintf(g, "blits=%lu starved=%lu maxblit_us=%lu\n",
+                    (unsigned long)s_blits, (unsigned long)s_starved,
+                    (unsigned long)s_blit_max_us);
+            fclose(g);
+        }
+    }
+    else
+    {
+        fprintf(f, "frames=0 (no frame ever completed)\n");
+    }
+
     fprintf(f, "sec frames drops wallms cpums blitms short\n");
 
     for (int i = 0; i < s_hist_n; i++)
@@ -743,6 +831,12 @@ static void hist_dump(void)
 
     printf("gb: %d of %lu s dirty, worst %u at sec %u\n", s_hist_n,
            (unsigned long)s_hist_total_sec, worst, worst_sec);
+    if (s_tot_frames)
+        printf("gb: %lu frames, %lu us wall, %lu us cpu, %lu lost\n",
+               (unsigned long)s_tot_frames,
+               (unsigned long)(s_tot_wall_us / s_tot_frames),
+               (unsigned long)(s_tot_cpu_us / s_tot_frames),
+               (unsigned long)((s_tot_wall_us - s_tot_cpu_us) / s_tot_frames));
     printf("gb: %s\n", path);
 }
 
@@ -1413,6 +1507,11 @@ bool gb_start(const char *rom_path)
     s_hist_worst_blit = 0;
     s_hist_short = 0;
 
+    /* The frame-time totals are per session too, for the same reason: a number
+     * that outlives its run is a number that lies about the next one. */
+    s_tot_frames = s_tot_wall_us = s_tot_cpu_us = 0;
+    s_tot_over = 0;
+
     if (!s_audio)
         printf("gb: no audio (amplifier did not come up)\n");
 
@@ -1589,7 +1688,7 @@ bool gb_start(const char *rom_path)
      * Priority alone cannot fix two blocking writers on one bus.
      */
     if (xTaskCreatePinnedToCore(gb_blit_task, "gbblit", 4096, NULL, 4,
-                                &s_blit_task, 1) != pdPASS)
+                                &s_blit_task, s_blit_core) != pdPASS)
     {
         printf("gb: no blit task\n");
         s_run = false;
