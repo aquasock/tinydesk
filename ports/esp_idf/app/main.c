@@ -794,6 +794,24 @@ __attribute__((weak)) void board_apps_register(void) {}
 /* Weak too: a port with an inertial sensor returns its table here. */
 __attribute__((weak)) const td_imu_ops_t *board_imu_ops(void) { return NULL; }
 
+/*
+ * A PORT MAY TAKE OVER THE WHOLE BOOT.
+ *
+ * Called once, after NVS is available and BEFORE the network stack, the shell
+ * or the desktop exist. A port that returns true has handled startup itself and
+ * app_main stops there.
+ *
+ * The T-Watch Ultra uses this for its second boot personality: the same image
+ * lives in both OTA slots, and the slot the bootloader picked decides whether
+ * the desktop or a bare Game Boy firmware runs. See ports/twatchultra/main/slotb.c
+ * for why that is one image rather than two.
+ *
+ * Weak, so every other board in this tree links unchanged.
+ */
+bool board_startup_override(void);
+
+__attribute__((weak)) bool board_startup_override(void) { return false; }
+
 static void ui_task(void *arg)
 {
     (void)arg;
@@ -980,6 +998,12 @@ void app_main(void)
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
+
+    /* A port's alternate boot path, taken once NVS is up and before the network
+     * stack, the shell or the desktop are created. Returns true when the port
+     * has run the whole boot itself. */
+    if (board_startup_override())
+        return;
 
           /* The TCP/IP stack and the default event loop, up front: the desktop's
      * Telnet listener (and MQTT, Modbus TCP...) open sockets before any

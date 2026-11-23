@@ -5,7 +5,7 @@
 include("${CMAKE_CURRENT_LIST_DIR}/../../esp_idf/app/app.cmake")
 
 idf_component_register(
-    SRCS "link_twatch.c" "display.c" "touch.c" "pusher.c" "pwrkey.c" "charge.c" "nfc.c" "nfc_scan.cpp" "gps.c" "nmea.c" "ts_convert.c" "power.c" "rtc.c" "haptic.c" "sound.c" "wav.c" "font8x16.c" "sdpaths.c" "gamepad.c" "statusbar.c" "usbdiag.c" "bleuart.c" "uac2.c" "usbhost.c"  "modload.c" "modhost.c" "music_player.c" "music_ui.c" "tama.c" "tama_ui.c" "nes.c" "pmbench.c" "gbcbench.c" "gb.c" "pm.c" "memdiag.c" "imu.c" "imu_posture.c" "klio.c" "klio_store.c" ${TD_ESP_APP_SRCS}
+    SRCS "link_twatch.c" "display.c" "touch.c" "pusher.c" "pwrkey.c" "charge.c" "nfc.c" "nfc_scan.cpp" "gps.c" "nmea.c" "ts_convert.c" "power.c" "rtc.c" "haptic.c" "sound.c" "wav.c" "font8x16.c" "sdpaths.c" "gamepad.c" "statusbar.c" "usbdiag.c" "bleuart.c" "uac2.c" "usbhost.c"  "modload.c" "modhost.c" "music_player.c" "music_ui.c" "tama.c" "tama_ui.c" "nes.c" "pmbench.c" "gbcbench.c" "gb.c" "slotb.c" "pm.c" "memdiag.c" "imu.c" "imu_posture.c" "klio.c" "klio_store.c" ${TD_ESP_APP_SRCS}
     EMBED_TXTFILES "${TD_BOARD_BUILTIN_CONF}"
     INCLUDE_DIRS "." "${TD_ESP_APP_DIR}"
     LDFRAGMENTS "extram.lf"
@@ -14,6 +14,12 @@ idf_component_register(
              esp_driver_i2s esp_driver_uart esp_driver_usb_serial_jtag
 )
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Wextra -Werror)
+
+# Pull slotb.o out of libmain.a even though nothing apparently needs it. main.c's
+# board_startup_override() is WEAK, so without this the linker is satisfied by
+# the weak no-op and never fetches the strong definition -- a silent no-op that
+# looks like slot B running. See slotb.c.
+target_link_options(${COMPONENT_LIB} PUBLIC "-Wl,--undefined=slotb_force_link")
 
 # DIAGNOSTIC BUILD ONLY. Defines a Music-window self-test that runs at boot and
 # leaves its answer in /fs/root/musicboot.txt, because the display mirror and a
