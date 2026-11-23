@@ -224,11 +224,16 @@ static void slotb_sink(const char *data, int len)
  *     expander holds it in reset until something drives the pin;
  *   - the haptic rail raised before haptic_init(), because the DRV2605 answers
  *     I2C without its supply and probes as healthy while never moving -- the
- *     failure BRD-005 records. This one had a visible cause on the first run:
- *     the XL9555 LATCH SURVIVES AN MCU RESET, so P07 was still high from the
- *     desktop's last boot and the panel lit up by luck, while P06 had never been
- *     raised by anyone and the motor was silent. On a cold boot slot B would
- *     have been dark as well as silent;
+ *     failure BRD-005 records. The rail is the smaller half of it, though, and
+ *     the first run showed why: haptic_init() is what selects a library and
+ *     writes a wave sequence, and without it the chip sits in internal-trigger
+ *     mode replaying an empty sequence, so it answers I2C and never moves. On
+ *     that run the rail happened to be up already -- the XL9555's CONFIG and
+ *     LATCH registers survive an MCU reset, so a warm reboot leaves the pins
+ *     driven at their previous levels -- and the motor was still silent. On a
+ *     COLD boot every expander pin is an input (power.c says so at
+ *     board_touch_reset_release), so the panel would have been dark too; the
+ *     panel working was therefore luck as well as the rail being set.
  *   - the charger's interrupts armed before pwrkey_init(), which clears the PMU
  *     status and refuses to arm on a line that is still low.
  */
