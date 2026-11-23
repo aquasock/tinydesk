@@ -39,6 +39,7 @@
 #include "display.h"
 #include "charge.h"
 #include "gb.h"
+#include "gbpick.h"
 #include "haptic.h"
 #include "power.h"
 #include "pwrkey.h"
@@ -66,7 +67,6 @@ static const char *TAG = "slotb";
  * instrument that survives a reset.
  */
 #define SLOTB_MARK_ADDR  0x1A000u   /* slot B's stage trail */
-#define SLOTB_BOOT_ADDR  0x1B000u   /* which slot this boot came from */
 #define SLOTB_MARK_MAGIC 0x53424C53u   /* "SLBS" */
 
 typedef struct
@@ -114,11 +114,9 @@ const int slotb_force_link = 1;
 #define SLOTB_FAIL_SD       92
 #define SLOTB_FAIL_NO_ROM   93
 
-/* DIAGNOSTIC: stage 200 + the running partition's subtype, recorded on EVERY
- * boot including the desktop's, so a host read names which slot booted and
- * whether esp_ota_set_boot_partition() actually wrote otadata. Subtypes are
- * 0x00 factory, 0x10 ota_0, 0x11 ota_1. Remove once the switch is proved. */
-#define SLOTB_STAGE_SLOT_BASE 200
+/* DIAGNOSTIC: the boot-slot mark that used to live in a second sector is gone.
+ * It is kept here only as a note so a reader who finds 0x1B000 stale on a board
+ * knows what wrote it: a sector per desktop boot, removed in core-log entry 93. */
 
 static void slotb_mark_at(uint32_t addr, uint32_t stage)
 {
@@ -129,22 +127,22 @@ static void slotb_mark_at(uint32_t addr, uint32_t stage)
     esp_flash_write(esp_flash_default_chip, &m, addr, sizeof(m));
 }
 
-/* Slot B's own trail, in its own sector so nothing that boots later can erase it. */
-static void slotb_mark(uint32_t stage) { slotb_mark_at(SLOTB_MARK_ADDR, stage); }
-
 /*
- * WHICH SLOT THIS BOOT CAME FROM, IN A SECOND SECTOR.
+ * Slot B's own trail, in its own sector so nothing that boots later can erase it.
  *
- * These were one sector at first, and that was wrong in a way worth recording:
- * whichever OS boots AFTER slot B writes the sector too, so the desktop's own
- * boot mark overwrote slot B's trail and the evidence of how far slot B got
- * was gone by the time a host could read it. Two sectors, one writer each.
+ * THE DESKTOP'S BOOT MARK IS GONE. It used to write a sector on EVERY boot, slot
+ * A's included, purely to record which slot had booted -- a flash erase-and-write
+ * on every power-up of a watch, for a number that only mattered while the switch
+ * was unproven. It is removed, and the picker's text on the glass replaces it
+ * for the failures a person needs to see.
+ *
+ * The trail below survives for slot B sessions only, and its remaining use is the
+ * case the glass cannot show: a hang. A stage value with no later stage after it
+ * is the one thing that distinguishes "stopped here" from "never started" when a
+ * picture has killed the mirror. Remove it when slot B has been through a few
+ * cycles without one.
  */
-static void slotb_boot_mark(const esp_partition_t *run)
-{
-    slotb_mark_at(SLOTB_BOOT_ADDR,
-                  SLOTB_STAGE_SLOT_BASE + (run ? (uint32_t)run->subtype : 0xFFu));
-}
+static void slotb_mark(uint32_t stage) { slotb_mark_at(SLOTB_MARK_ADDR, stage); }
 
 /* How long an error screen is held before handing the watch back. Long enough
  * to be read, short enough that a missing ROM does not look like a hang. */
@@ -346,6 +344,7 @@ static void slotb_run(const char *board_conf)
     if (tdsh_sdcard_mount() != ESP_OK)
     {
         ESP_LOGE(TAG, "the card did not mount");
+        gbpick_message("SD card did not mount", "check the card is seated");
         slotb_fail(SLOTB_FAIL_SD, 0xF800);        /* red */
         return;
     }
@@ -357,17 +356,33 @@ static void slotb_run(const char *board_conf)
      * save before it reboots. */
     gb_install_touch_hook();
 
-    /* Pusher A last, once the poll task that will service it exists. */
+    /* Pusher A last, once the poll task that will service it exists. Armed
+     * BEFORE the picker so the press can also abandon the picker. */
     if (!pwrkey_init(slotb_sink))
         ESP_LOGW(TAG, "Pusher A did not arm; the only way out is a power cycle");
     pwrkey_set_app_key(slotb_key, NULL);
 
-    /* No argument: gb_start() falls back to GB_ROM_DEFAULT, then GB_ROM_FLAT. */
-    if (!gb_start(NULL))
+    /* No argument: the operator chose a cartridge on the glass. Falls back to
+     * gb_start()'s own default only if the picker could not run at all. */
     {
-        ESP_LOGE(TAG, "the emulator did not start");
-        slotb_fail(SLOTB_FAIL_NO_ROM, 0xF800);
-        return;
+        static char s_rom[96];
+
+        if (!gbpick_run(s_rom, sizeof(s_rom), &s_exit_req))
+        {
+            ESP_LOGE(TAG, "no cartridge chosen");
+            slotb_mark(SLOTB_FAIL_NO_ROM);
+            return;
+        }
+
+        ESP_LOGI(TAG, "playing %s", s_rom);
+
+        if (!gb_start(s_rom))
+        {
+            ESP_LOGE(TAG, "the emulator did not start");
+            gbpick_message("The emulator did not start", s_rom);
+            slotb_fail(SLOTB_FAIL_NO_ROM, 0xF800);
+            return;
+        }
     }
     slotb_mark(SLOTB_STAGE_EMU_START);
 
@@ -393,9 +408,6 @@ static void slotb_run(const char *board_conf)
 bool board_startup_override(const char *board_conf)
 {
     const esp_partition_t *run = esp_ota_get_running_partition();
-
-    /* Record which slot booted, on every boot, before deciding anything. */
-    slotb_boot_mark(run);
 
     /* Not slot B: the desktop boots exactly as it always has. */
     if (!run || run->subtype != ESP_PARTITION_SUBTYPE_APP_OTA_1)
