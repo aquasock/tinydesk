@@ -168,33 +168,34 @@ void slotb_confirm(void)
  *
  * WHY ERASE RATHER THAN esp_ota_set_boot_partition(ota_0).
  *
- * Setting the boot partition writes an otadata entry for ota_0 in state NEW, and
- * with CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE the bootloader turns that into
- * PENDING_VERIFY on the next boot. That is normally fine, because the app then
- * confirms itself -- and ON THIS BUILD THE DESKTOP'S CONFIRM DOES NOT FIRE.
- * Measured 2026-11-23: with the desktop confirmed drawing on the glass and left
- * running 45 s, otadata still read PENDING_VERIFY. OTA-001 records the same
- * confirm working on 2026-11-12 in the pre-repartition layout, so this is a
- * regression of unestablished cause, not a design property.
+ * With rollback protection enabled, setting the boot partition writes a NEW
+ * otadata entry for ota_0, and the bootloader turns that into PENDING_VERIFY on
+ * the next boot. The app then confirms itself and the entry becomes VALID.
  *
- * Erasing instead produces a different and better-known end state, measured the
- * same day by the contrast between two reads: straight after `otatool
- * erase_otadata` both otadata entries read 0xffffffff, and after ONE BOOT they
- * read a single entry, seq 1, PENDING_VERIFY, naming ota_0. So the bootloader
- * itself records the app it booted when otadata is empty. Erasing therefore does
- * NOT leave "nothing to roll back from" -- an earlier version of this comment
- * said that and was wrong -- but it does leave the boot target chosen by the
- * bootloader from the partition table rather than by a sequence number written
- * on top of another slot's pending entry.
+ * THAT CONFIRM WORKS, and an earlier version of this comment said it did not --
+ * that was a misread, not a defect. The reader had the state enum shifted by one
+ * (ESP_OTA_IMG_VALID is 0x2, not PENDING_VERIFY), so a confirmed desktop was
+ * printed as pending. Measured correctly on 2026-11-23: a desktop left running
+ * 45 s reads back VALID.
  *
- * What that buys is empirical and was confirmed by the operator across several
- * sessions: exit slot B, and the next boot is the desktop, every time. The
- * mechanism of the ONE observed failure of the previous approach (leave the
- * emulator, reset, land in the emulator again) is NOT established; what is
- * established is that it has not recurred with this one.
+ * The real behaviour is rollback protection doing its job, and it is what the
+ * operator hit on 2026-11-23: exit the emulator with Pusher A, reset within the
+ * 30-second trial, and the bootloader sees PENDING_VERIFY on the second boot,
+ * marks it ABORTED, and falls back to the OTHER valid image -- which after a game
+ * session is slot B. Landing in the emulator when you meant to be at the desktop
+ * is correct firmware behaviour and bad user experience.
  *
- * The cost is that the desktop's `ota status` shows no sequence number after an
- * exit. That is a report, not a behaviour, and a reliable boot wins.
+ * Erasing otadata removes the alternative rather than the trial. The bootloader
+ * then records the first app partition itself, and with the other entry UNDEFINED
+ * there is no second valid image for a rollback to choose. Measured: after an
+ * erase, a reset at t=12 s -- inside the trial -- still came up on the desktop and
+ * the entry read VALID afterwards. That is the property this exit needs, because
+ * a wearer putting the watch down after a game is exactly the person who power
+ * cycles within 30 s.
+ *
+ * The cost is that `ota status` reports no sequence number after an exit. That is
+ * a report, not a behaviour, and a boot that cannot land in the wrong personality
+ * wins.
  */
 void slotb_return_to_desktop(void)
 {
