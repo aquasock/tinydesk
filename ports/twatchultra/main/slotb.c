@@ -25,6 +25,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "esp_err.h"
 #include "esp_flash.h"
@@ -44,6 +45,7 @@
 #include "power.h"
 #include "pwrkey.h"
 #include "slotb.h"
+#include "tdsh.h"
 #include "tdsh_board.h"
 #include "tdsh_espidf.h"
 #include "touch.h"
@@ -161,25 +163,57 @@ void slotb_confirm(void)
     }
 }
 
+/*
+ * Hand the boot back to the desktop: forget the slot switch and restart.
+ *
+ * WHY ERASE RATHER THAN esp_ota_set_boot_partition(ota_0).
+ *
+ * Setting the boot partition writes an otadata entry for ota_0 in state NEW, and
+ * with CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE the bootloader turns that into
+ * PENDING_VERIFY on the next boot. That is normally fine, because the app then
+ * confirms itself -- and ON THIS BUILD THE DESKTOP'S CONFIRM DOES NOT FIRE.
+ * Measured 2026-11-23: with the desktop confirmed drawing on the glass and left
+ * running 45 s, otadata still read PENDING_VERIFY. OTA-001 records the same
+ * confirm working on 2026-11-12 in the pre-repartition layout, so this is a
+ * regression of unestablished cause, not a design property.
+ *
+ * Erasing instead produces a different and better-known end state, measured the
+ * same day by the contrast between two reads: straight after `otatool
+ * erase_otadata` both otadata entries read 0xffffffff, and after ONE BOOT they
+ * read a single entry, seq 1, PENDING_VERIFY, naming ota_0. So the bootloader
+ * itself records the app it booted when otadata is empty. Erasing therefore does
+ * NOT leave "nothing to roll back from" -- an earlier version of this comment
+ * said that and was wrong -- but it does leave the boot target chosen by the
+ * bootloader from the partition table rather than by a sequence number written
+ * on top of another slot's pending entry.
+ *
+ * What that buys is empirical and was confirmed by the operator across several
+ * sessions: exit slot B, and the next boot is the desktop, every time. The
+ * mechanism of the ONE observed failure of the previous approach (leave the
+ * emulator, reset, land in the emulator again) is NOT established; what is
+ * established is that it has not recurred with this one.
+ *
+ * The cost is that the desktop's `ota status` shows no sequence number after an
+ * exit. That is a report, not a behaviour, and a reliable boot wins.
+ */
 void slotb_return_to_desktop(void)
 {
-    const esp_partition_t *desk = esp_partition_find_first(
-        ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL);
+    ESP_LOGI(TAG, "returning to the desktop");
+    slotb_mark(SLOTB_STAGE_RETURN);
 
-    if (!desk)
+    const esp_partition_t *ota = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_OTA, NULL);
+
+    if (!ota)
     {
-        /* Nothing to return to. Rebooting would simply boot slot B again, so
-         * say so and stay put rather than reset-loop. */
-        ESP_LOGE(TAG, "no ota_0 partition to return to");
+        ESP_LOGE(TAG, "no otadata partition; staying in slot B");
+        slotb_mark(SLOTB_STAGE_SETBOOT_FAILED);
         return;
     }
 
-    ESP_LOGI(TAG, "returning the boot to %s", desk->label);
-    slotb_mark(SLOTB_STAGE_RETURN);
-
-    if (esp_ota_set_boot_partition(desk) != ESP_OK)
+    if (esp_partition_erase_range(ota, 0, ota->size) != ESP_OK)
     {
-        ESP_LOGE(TAG, "could not set the boot partition; staying in slot B");
+        ESP_LOGE(TAG, "could not erase otadata; staying in slot B");
         slotb_mark(SLOTB_STAGE_SETBOOT_FAILED);
         return;
     }
@@ -426,4 +460,96 @@ bool board_startup_override(const char *board_conf)
     /* Unreachable: slotb_return_to_desktop() restarts. Returning true anyway
      * keeps the contract honest if a future change makes it return. */
     return true;
+}
+
+/* ------------------------------------------------------------ shell command */
+
+/*
+ * `slotb` - enter the emulator-only personality.
+ *
+ * This is what the Start menu's launcher runs. It is deliberately not
+ * `ota rollback`: that command means "the other slot", which is true only by
+ * coincidence, and it marks the running image invalid when that image is
+ * pending verification -- so running it from the desktop within 30 s of boot
+ * would condemn the desktop it is about to leave.
+ *
+ * The check that matters is that ota_1 actually HOLDS an image. Switching to an
+ * empty slot would reboot into nothing, which from the outside is a brick.
+ */
+static int cmd_slotb(tdsh_session_t *session, int argc, char **argv)
+{
+    (void)session;
+
+    const esp_partition_t *run = esp_ota_get_running_partition();
+    const esp_partition_t *sb = esp_partition_find_first(
+        ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, NULL);
+
+    const char *sub = argc >= 2 ? argv[1] : NULL;
+
+    if (sub && !strcmp(sub, "status"))
+    {
+        esp_app_desc_t d;
+
+        printf("running: %s\n", run ? run->label : "unknown");
+        if (sb && esp_ota_get_partition_description(sb, &d) == ESP_OK)
+            printf("slot B:  %s, version %s\n", sb->label, d.version);
+        else
+            printf("slot B:  empty -- no image to boot\n");
+        return 0;
+    }
+
+    if (sub && strcmp(sub, "start") != 0)
+    {
+        printf("slotb [start | status]\n");
+        printf("  start   reboot into slot B: the Game Boy with no desktop\n");
+        return 1;
+    }
+
+    if (!sb)
+    {
+        printf("slotb: no ota_1 partition in this table\n");
+        return 1;
+    }
+
+    esp_app_desc_t d;
+    if (esp_ota_get_partition_description(sb, &d) != ESP_OK)
+    {
+        printf("slotb: slot B is empty -- flash an image to %s first\n", sb->label);
+        return 1;
+    }
+
+    if (run && run->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_1)
+    {
+        printf("slotb: already running from slot B\n");
+        return 0;
+    }
+
+    printf("slotb: rebooting into %s (%s)\n", sb->label, d.version);
+    fflush(stdout);
+
+    if (esp_ota_set_boot_partition(sb) != ESP_OK)
+    {
+        printf("slotb: could not set the boot partition\n");
+        return 1;
+    }
+
+    /* Long enough for the line above to reach the terminal, which is the only
+     * report the operator gets -- the screen is about to become a reboot. */
+    vTaskDelay(pdMS_TO_TICKS(400));
+    esp_restart();
+    return 0;
+}
+
+static const tdsh_command_t s_slotb_cmd = {
+    "slotb",
+    "slotb [start | status]",
+    "Slot B: the bare Game Boy personality",
+    cmd_slotb,
+    0,
+};
+
+void slotb_register_command(void)
+{
+    if (tdsh_register_command(&s_slotb_cmd) != 0)
+        ESP_LOGW(TAG, "slotb command did not register");
 }

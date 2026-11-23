@@ -56,6 +56,7 @@
 #include "pmbench.h"
 #include "gbcbench.h"
 #include "gb.h"
+#include "slotb.h"
 #include "statusbar.h"
 #include "pm.h"
 #include "hal_mux.h"
@@ -664,6 +665,9 @@ bool link_init(void)
 
     if (!gb_register_command())
         ESP_LOGW(TAG, "gb command did not register");
+
+    /* The launcher's command. See slotb.h. */
+    slotb_register_command();
 
     if (!pmini_register_command())
         ESP_LOGW(TAG, "pm command did not register");

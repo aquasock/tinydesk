@@ -66,4 +66,16 @@ void slotb_confirm(void);
  */
 void slotb_return_to_desktop(void);
 
+/*
+ * The `slotb` shell command: enter slot B on purpose.
+ *
+ * This is what the Start menu's launcher calls. It is a command rather than
+ * the desktop's own `ota rollback` for two reasons: `rollback` means "the other
+ * slot", which is true only by accident and would break the day the slots are
+ * used for anything else; and `ota rollback` has a branch that MARKS THE
+ * RUNNING IMAGE INVALID when it is pending verification, which is not what a
+ * person who wants to play a game is asking for.
+ */
+void slotb_register_command(void);
+
 #endif /* TWATCH_SLOTB_H */
