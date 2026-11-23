@@ -2103,7 +2103,13 @@ static const tdsh_command_t s_gb_cmd = {
     TDSH_CMD_INTERACTIVE,
 };
 
-bool gb_register_command(void)
+void gb_install_touch_hook(void)
+{
+    if (!touch_add_app_touch(gb_app_touch, NULL))
+        ESP_LOGW(TAG, "gb touch consumer did not register");
+}
+
+void gb_install_key_hook(void)
 {
     /* THE KEY HOOK IS SET ONCE, HERE, and not per app, for the reason pwrkey.h
      * gives: a registration torn down with the app leaves the driver holding a
@@ -2111,9 +2117,12 @@ bool gb_register_command(void)
      * guest is running, so the desktop keeps its Enter and nothing else has to
      * know this exists. */
     pwrkey_set_app_key(gb_app_key, NULL);
+}
 
-    if (!touch_add_app_touch(gb_app_touch, NULL))
-        ESP_LOGW(TAG, "gb touch consumer did not register");
+bool gb_register_command(void)
+{
+    gb_install_key_hook();
+    gb_install_touch_hook();
 
     return tdsh_register_command(&s_gb_cmd) == 0;
 }

@@ -3,32 +3,30 @@
  *
  * The header explains the architecture. This file is the boot path itself.
  *
- * THIS FIRST INCREMENT DOES NOT RUN THE EMULATOR YET, AND THAT IS DELIBERATE.
- * The emulator is a lot of new code sitting on top of a switching mechanism
- * nobody has proved on this board. So the mechanism is proved first, on its
- * own, because a fault here is indistinguishable from a fault in the emulator
- * and would cost a session to separate. What this runs:
+ * WHAT RUNS HERE: the port's own Game Boy emulator and nothing else. No desktop,
+ * no shell, no status strip, no WiFi, no SSH -- so the only tasks on either core
+ * are the ones gb_start() creates. The panel, the SD card and the input hooks are
+ * the port's existing drivers, called directly, not copies of them.
  *
- *   - takes over the boot when, and only when, the running slot is ota_1,
- *   - brings up the panel through the port's own display_init() -- the same
- *     driver the desktop uses, not a copy,
- *   - claims the framebuffer exactly as the emulators do, so the desktop
- *     painter (which display_init starts) idles instead of drawing,
- *   - pushes a picture through display_panel_push(), which is the exact call
- *     the emulator's blitter will make from core 0,
- *   - holds it long enough to be unmistakable on the glass, then
- *   - sets ota_0 as the boot partition and restarts, returning to the desktop.
+ * THE EMULATOR IS `gb.c`, NOT A SECOND VERSION OF IT. gb.c is 2100 lines of
+ * frame pool, blitter, audio, save RAM and diagnostics with several hard-won
+ * defects fixed inside it, and a slot-B-local copy would be the duplication this
+ * project has already paid for elsewhere. Its only contact with the shell is
+ * gb_register_command(), which slot B does not call: it installs the two input
+ * hooks itself and never registers a command, because there is no shell here to
+ * register into.
  *
- * If the panel shows the pattern and the desktop comes back, every part of the
- * switch works: boot from ota_1, the display driver, pixel ownership, the
- * picture path, and the return. The emulator then replaces the hold-and-return
- * without touching any of it.
+ * LEAVING IS PUSHER A. slot B installs its own key hook rather than gb.c's,
+ * because gb.c's handler calls gb_stop() from the key task and then a slot B
+ * that returned to the desktop would be racing the save it had just started.
+ * Here the press only raises a flag; the boot task calls gb_stop() itself, so the
+ * save finishes before the reboot, in one ordered sequence.
  */
 
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "esp_heap_caps.h"
+#include "esp_err.h"
 #include "esp_flash.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
@@ -39,7 +37,15 @@
 #include "freertos/task.h"
 
 #include "display.h"
+#include "charge.h"
+#include "gb.h"
+#include "haptic.h"
+#include "power.h"
+#include "pwrkey.h"
 #include "slotb.h"
+#include "tdsh_board.h"
+#include "tdsh_espidf.h"
+#include "touch.h"
 
 static const char *TAG = "slotb";
 
@@ -90,20 +96,28 @@ void board_power_rails_preinit(void);   /* defined in the port's power.c */
  */
 const int slotb_force_link = 1;
 
-/* Stages, in order. A reading of N means stage N was reached and N+1 was not. */
-#define SLOTB_STAGE_ENTER   1
-#define SLOTB_STAGE_RAILS   2
-#define SLOTB_STAGE_DISPLAY 3
-#define SLOTB_STAGE_PAINT   4
-#define SLOTB_STAGE_HOLD    5
-#define SLOTB_STAGE_RETURN  6
-#define SLOTB_STAGE_SETBOOT_FAILED 7
-#define SLOTB_STAGE_FAILED  99
+/* Stages, in order. A reading of N means stage N was reached and N+1 was not.
+ * The FAIL_* codes are separate so a read names WHICH step failed rather than
+ * "somewhere in slot B". */
+#define SLOTB_STAGE_ENTER      1
+#define SLOTB_STAGE_RAILS      2
+#define SLOTB_STAGE_DISPLAY    3
+#define SLOTB_STAGE_BOARDCFG   4
+#define SLOTB_STAGE_SD         5
+#define SLOTB_STAGE_EMU_START  6
+#define SLOTB_STAGE_EMU_STOP   7
+#define SLOTB_STAGE_RETURN     8
+#define SLOTB_STAGE_SETBOOT_FAILED 9
+
+#define SLOTB_FAIL_DISPLAY  90
+#define SLOTB_FAIL_BOARDCFG 91
+#define SLOTB_FAIL_SD       92
+#define SLOTB_FAIL_NO_ROM   93
 
 /* DIAGNOSTIC: stage 200 + the running partition's subtype, recorded on EVERY
  * boot including the desktop's, so a host read names which slot booted and
  * whether esp_ota_set_boot_partition() actually wrote otadata. Subtypes are
- * 0x00 factory, 0x10 ota_0, 0x11 ota_1. Remove once the switch is proven. */
+ * 0x00 factory, 0x10 ota_0, 0x11 ota_1. Remove once the switch is proved. */
 #define SLOTB_STAGE_SLOT_BASE 200
 
 static void slotb_mark_at(uint32_t addr, uint32_t stage)
@@ -132,9 +146,9 @@ static void slotb_boot_mark(const esp_partition_t *run)
                   SLOTB_STAGE_SLOT_BASE + (run ? (uint32_t)run->subtype : 0xFFu));
 }
 
-/* How long the proving picture is held before handing back. Long enough that a
- * sighted operator cannot miss it, short enough not to be a nuisance. */
-#define SLOTB_HOLD_MS 4000
+/* How long an error screen is held before handing the watch back. Long enough
+ * to be read, short enough that a missing ROM does not look like a hang. */
+#define SLOTB_ERR_HOLD_MS 4000
 
 void slotb_confirm(void)
 {
@@ -176,47 +190,121 @@ void slotb_return_to_desktop(void)
 }
 
 /*
- * Push a solid rectangle through the picture path.
+ * Where a key press would go if anything wanted it.
  *
- * display_panel_push() is the call the emulator's blitter makes, so exercising
- * it here proves the same thing the emulator will depend on. It refuses unless
- * the framebuffer has been claimed, which is why the claim precedes it.
+ * touch_init() and pwrkey_init() take a callback that types into the desktop's
+ * terminal, and slot B has no terminal. The on-glass d-pad reaches the emulator
+ * through the app-touch hook instead (gb_app_touch), and Pusher A through the
+ * app-key hook, so nothing a real user can press depends on this sink. It exists
+ * because the drivers require a callback to start at all.
  */
-static void push_block(int cx, int cy, int w, int h, uint16_t colour)
+static void slotb_sink(const char *data, int len)
 {
-    const size_t n = (size_t)w * (size_t)h;
-    uint16_t *px = heap_caps_malloc(n * sizeof(*px), MALLOC_CAP_SPIRAM);
-
-    if (!px)
-    {
-        ESP_LOGW(TAG, "no PSRAM for a %dx%d block", w, h);
-        return;
-    }
-
-    for (size_t i = 0; i < n; i++)
-        px[i] = colour;
-
-    display_panel_push(cx, cy, w, h, px);
-    heap_caps_free(px);
+    (void)data;
+    (void)len;
 }
 
 /*
- * The proving sequence. Returns only if the panel never came up, in which case
- * there is nothing to wait for and the caller hands back to the desktop at once
- * -- a slot B with no display must not become a black watch.
+ * Bring up the four peripherals the emulator needs, in the desktop's order.
+ *
+ * EACH OF THESE WAS MISSING FROM THE FIRST RUN, AND THE OPERATOR FOUND ALL
+ * THREE: haptics, touch and Pusher A were dead while picture, audio and sound
+ * were perfect. The cause was one mistake repeated: slot B registered HOOKS into
+ * drivers whose TASKS HAD NEVER BEEN STARTED. touch_add_app_touch() and
+ * pwrkey_set_app_key() install a consumer into an existing poll loop; the loop
+ * itself is created by touch_init() and pwrkey_init(), which only the desktop's
+ * link_init() was calling. Audio escaped because sound_stream_open() calls
+ * sound_init() itself.
+ *
+ * THE ORDER HERE IS THE DESKTOP'S AND IT MATTERS:
+ *
+ *   - the panel's rail and its expander switch before display_init() touches the
+ *     bus, or the driver drives a dark panel;
+ *   - the touch controller's reset released before touch_init(), because the
+ *     expander holds it in reset until something drives the pin;
+ *   - the haptic rail raised before haptic_init(), because the DRV2605 answers
+ *     I2C without its supply and probes as healthy while never moving -- the
+ *     failure BRD-005 records. This one had a visible cause on the first run:
+ *     the XL9555 LATCH SURVIVES AN MCU RESET, so P07 was still high from the
+ *     desktop's last boot and the panel lit up by luck, while P06 had never been
+ *     raised by anyone and the motor was silent. On a cold boot slot B would
+ *     have been dark as well as silent;
+ *   - the charger's interrupts armed before pwrkey_init(), which clears the PMU
+ *     status and refuses to arm on a line that is still low.
  */
-static void slotb_prove(void)
+static void slotb_peripherals(void)
+{
+    /* The expander's latches outlive a reset, so this is usually a no-op -- but
+     * "usually" is not a reason to skip the step that makes a cold boot work. */
+    if (!board_display_power_on())
+        ESP_LOGW(TAG, "panel power did not come up");
+
+    board_touch_reset_release();
+
+    if (touch_init(slotb_sink))
+        ESP_LOGI(TAG, "touch polling");
+    else
+        ESP_LOGW(TAG, "no touch controller");
+
+    if (!board_haptic_power_on())
+        ESP_LOGW(TAG, "haptic rail failed");
+    else if (!haptic_init())
+        ESP_LOGW(TAG, "no DRV2605");
+
+    charge_watch_enable();
+}
+
+/*
+ * PUSHER A LEAVES SLOT B.
+ *
+ * A flag and nothing else, because the caller has to be the task that then calls
+ * gb_stop() and the restart: gb.c's own handler calls gb_stop() from the key
+ * task, and a slot B that returned on top of that would reboot while the save it
+ * had just started was still running. Claiming the press also stops an Enter
+ * reaching anything, which is what makes the desktop's behaviour unchanged.
+ */
+static volatile bool s_exit_req;
+
+static bool slotb_key(void *user)
+{
+    (void)user;
+    s_exit_req = true;
+    return true;
+}
+
+/*
+ * Say what failed, on the glass, then hand the watch back.
+ *
+ * A slot B that failed to find a cartridge must not become a black watch that
+ * only a reflash recovers: the colour and the marker both name the step, and the
+ * boot returns to the desktop by itself a few seconds later.
+ */
+static void slotb_fail(uint32_t stage, uint16_t colour)
+{
+    slotb_mark(stage);
+    display_fill(colour);
+    vTaskDelay(pdMS_TO_TICKS(SLOTB_ERR_HOLD_MS));
+}
+
+/*
+ * The whole of slot B.
+ *
+ * Order matters here and each step depends on the one before it: the rails
+ * before the panel, the panel before the card is worth trying, the board config
+ * before the card's pins are known, and the cartridges before the emulator.
+ */
+static void slotb_run(const char *board_conf)
 {
     slotb_mark(SLOTB_STAGE_ENTER);
 
-    /* THE PANEL NEEDS ITS POWER RAIL, AND slot B RUNS BEFORE app_main REACHES
-     * THE CALL THAT ENABLES IT.
+    /* THE PANEL AND THE CARD BOTH NEED RAILS, AND slot B RUNS BEFORE app_main
+     * REACHES THE CALL THAT RAISES THEM.
      *
-     * board_startup_override() is called before board_power_rails_preinit(),
-     * because the override has to happen before the shell and the desktop
-     * exist. That means slot B must bring the rails up itself -- on this board
-     * the AMOLED sits behind a switched regulator, so display_init() against a
-     * dead rail is not a slow boot, it is no boot. */
+     * board_power_rails_preinit() is the port's own hook: it raises ALDO1 (the SD
+     * card's supply), raises the IMU rail, and parks the NFC and LoRa chip selects
+     * high, which BRD-004 records as the difference between a card that answers
+     * and one that does not, because MISO is shared. It runs from app_main after
+     * this override returns, so slot B calls it here. */
     board_power_rails_preinit();
     slotb_mark(SLOTB_STAGE_RAILS);
 
@@ -224,37 +312,80 @@ static void slotb_prove(void)
      * answer a terminal query for. */
     if (!display_init(NULL))
     {
-        ESP_LOGE(TAG, "the panel did not come up; returning to the desktop");
-        slotb_mark(SLOTB_STAGE_FAILED);
+        ESP_LOGE(TAG, "the panel did not come up");
+        slotb_mark(SLOTB_FAIL_DISPLAY);
         return;
     }
     slotb_mark(SLOTB_STAGE_DISPLAY);
 
-    /* Stop the painter display_init() just started. Claiming twice is
-     * idempotent, and releasing it is what the emulators do on exit. */
+    /* Take the glass away from the painter display_init() just started, so the
+     * emulator's frames are not drawn over by a terminal nobody is reading. */
     display_pixels_claim(true);
-    slotb_mark(SLOTB_STAGE_PAINT);
 
-    /* Green, so the whole glass is unmistakably not the desktop. */
-    display_fill(0x07E0);
+    /* Touch, haptics and Pusher A. Without this the emulator is a picture with
+     * no way to play it -- measured, not assumed: see the note on
+     * slotb_peripherals(). */
+    slotb_peripherals();
 
-    /* Then a white block through the picture path, centred. If the panel is
-     * green but the block is missing or misplaced, the fault is in the picture
-     * transfer specifically, which is a much smaller thing to chase. */
-    push_block((DISPLAY_W - 80) / 2, (DISPLAY_H - 80) / 2, 80, 80, 0xFFFF);
+    /* The SD pins live in board.conf, and the shell that normally loads it does
+     * not exist here. main.c passes the built-in text down for exactly this.
+     * NULL file path: the device copy at /etc/board.conf is on the littlefs the
+     * shell would have mounted, and BRD-004 confirms the built-in pin set is the
+     * correct one for this board (the card is on SPI3, host value 2). */
+    if (tdsh_board_load(board_conf, NULL) != 0)
+    {
+        ESP_LOGW(TAG, "board.conf had a bad line; using what parsed");
+    }
+    slotb_mark(SLOTB_STAGE_BOARDCFG);
 
-    vTaskDelay(pdMS_TO_TICKS(SLOTB_HOLD_MS));
-    slotb_mark(SLOTB_STAGE_HOLD);
+    if (tdsh_sdcard_mount() != ESP_OK)
+    {
+        ESP_LOGE(TAG, "the card did not mount");
+        slotb_fail(SLOTB_FAIL_SD, 0xF800);        /* red */
+        return;
+    }
+    slotb_mark(SLOTB_STAGE_SD);
 
-    /* Blue for a second phase: a panel stuck on the first colour reads as a
-     * frozen driver, while a clean change proves the path is live. */
-    display_fill(0x001F);
-    vTaskDelay(pdMS_TO_TICKS(SLOTB_HOLD_MS));
+    /* The emulator's own input hook, minus its shell command: gb.c installs the
+     * on-glass d-pad and A/B through this. The key hook is slot B's own, below,
+     * because gb.c's handler stops the emulator on the key task and slot B has to
+     * save before it reboots. */
+    gb_install_touch_hook();
+
+    /* Pusher A last, once the poll task that will service it exists. */
+    if (!pwrkey_init(slotb_sink))
+        ESP_LOGW(TAG, "Pusher A did not arm; the only way out is a power cycle");
+    pwrkey_set_app_key(slotb_key, NULL);
+
+    /* No argument: gb_start() falls back to GB_ROM_DEFAULT, then GB_ROM_FLAT. */
+    if (!gb_start(NULL))
+    {
+        ESP_LOGE(TAG, "the emulator did not start");
+        slotb_fail(SLOTB_FAIL_NO_ROM, 0xF800);
+        return;
+    }
+    slotb_mark(SLOTB_STAGE_EMU_START);
+
+    /* The firmware is demonstrably working, so take it off the bootloader's
+     * trial list. Until this the next reset would roll back to the desktop;
+     * after it a power cycle comes back here, which is what a game console
+     * should do. */
+    slotb_confirm();
+
+    while (gb_running() && !s_exit_req)
+        vTaskDelay(pdMS_TO_TICKS(100));
+
+    /* THE STOP HAPPENS HERE, ON THIS TASK, NOT ON THE KEY TASK.
+     * gb_stop() writes SRAM before it releases anything and then waits for its
+     * own tasks to leave; doing it here means the save has finished before the
+     * restart below, in one ordered sequence. */
+    gb_stop();
+    slotb_mark(SLOTB_STAGE_EMU_STOP);
 
     display_pixels_claim(false);
 }
 
-bool board_startup_override(void)
+bool board_startup_override(const char *board_conf)
 {
     const esp_partition_t *run = esp_ota_get_running_partition();
 
@@ -268,10 +399,11 @@ bool board_startup_override(void)
     ESP_LOGI(TAG, "booting slot B from %s (%u bytes)", run->label,
              (unsigned)run->size);
 
-    slotb_prove();
+    s_exit_req = false;
+    slotb_run(board_conf);
 
-    /* The switch is proved once the picture has been held; if the panel failed
-     * we are here immediately, which is the correct time to hand back. */
+    /* Every path above ends here: the emulator was left by Pusher A, or a step
+     * failed and said so on the glass. Either way the next boot is the desktop. */
     slotb_return_to_desktop();
 
     /* Unreachable: slotb_return_to_desktop() restarts. Returning true anyway

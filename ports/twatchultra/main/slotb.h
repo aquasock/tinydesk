@@ -6,9 +6,10 @@
  *
  *   ota_0   the desktop. Unchanged: this module returns false and app_main
  *           carries on exactly as it always has.
- *   ota_1   slot B. A bare Game Boy firmware with no desktop, no shell, no
- *           WiFi and no SSH -- nothing on either core but the emulator and the
- *           tasks it needs.
+ *   ota_1   slot B. A bare Game Boy firmware -- the port's own emulator and the
+ *           display, touch, audio and card drivers it needs, and nothing else:
+ *           no desktop, no shell, no status strip, no WiFi and no SSH. Both
+ *           cores carry only what the emulator creates.
  *
  * WHY ONE IMAGE AND TWO SLOTS, RATHER THAN A SECOND FIRMWARE.
  *
@@ -44,10 +45,13 @@
 /*
  * The board hook main.c calls. Defined here and declared weak there.
  *
+ * `board_conf` is the built-in board.conf text, so slot B can mount the SD card
+ * without the shell that normally loads that configuration.
+ *
  * Returns true when this module has taken over the boot -- that is, when the
  * running slot is ota_1. On ota_0 it returns false without touching anything.
  */
-bool board_startup_override(void);
+bool board_startup_override(const char *board_conf);
 
 /*
  * Mark the running slot as good, cancelling the bootloader's automatic rollback.

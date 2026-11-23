@@ -801,6 +801,11 @@ __attribute__((weak)) const td_imu_ops_t *board_imu_ops(void) { return NULL; }
  * or the desktop exist. A port that returns true has handled startup itself and
  * app_main stops there.
  *
+ * `board_conf` is the built-in board.conf text (the board_builtin_conf blob), so
+ * an override that needs the board's pins -- slot B, which mounts the SD card
+ * itself because the shell that normally does it does not exist yet -- does not
+ * have to reach for a linker symbol main.c owns. It is NULL-safe.
+ *
  * The T-Watch Ultra uses this for its second boot personality: the same image
  * lives in both OTA slots, and the slot the bootloader picked decides whether
  * the desktop or a bare Game Boy firmware runs. See ports/twatchultra/main/slotb.c
@@ -808,9 +813,13 @@ __attribute__((weak)) const td_imu_ops_t *board_imu_ops(void) { return NULL; }
  *
  * Weak, so every other board in this tree links unchanged.
  */
-bool board_startup_override(void);
+bool board_startup_override(const char *board_conf);
 
-__attribute__((weak)) bool board_startup_override(void) { return false; }
+__attribute__((weak)) bool board_startup_override(const char *board_conf)
+{
+    (void)board_conf;
+    return false;
+}
 
 static void ui_task(void *arg)
 {
@@ -1002,7 +1011,7 @@ void app_main(void)
     /* A port's alternate boot path, taken once NVS is up and before the network
      * stack, the shell or the desktop are created. Returns true when the port
      * has run the whole boot itself. */
-    if (board_startup_override())
+    if (board_startup_override(s_board_builtin))
         return;
 
           /* The TCP/IP stack and the default event loop, up front: the desktop's

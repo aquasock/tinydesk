@@ -64,4 +64,16 @@ bool gb_running(void);
 /* Registers the `gb` shell command. */
 bool gb_register_command(void);
 
+/*
+ * THE TWO INPUT HOOKS, SPLIT OUT FROM THE COMMAND.
+ *
+ * `gb_register_command()` used to install both, which meant a caller that wanted
+ * the on-glass controls but not the shell -- slot B, which has no shell -- had no
+ * way to get them. These are the same two registrations with the command left
+ * out, and `gb_register_command()` now calls both of them so there is still one
+ * place that decides what is registered.
+ */
+void gb_install_touch_hook(void);   /* the on-glass d-pad and A/B on the margins */
+void gb_install_key_hook(void);     /* Pusher A closes the emulator            */
+
 #endif /* TWATCH_GB_H */
