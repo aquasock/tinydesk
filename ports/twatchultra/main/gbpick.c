@@ -1,14 +1,16 @@
 /*
- * gbpick.c - the cartridge picker, drawn on the glass.
+ * gbpick.c - a list on the glass, driven by the margin buttons.
  *
- * The header says why it exists. This file is the scan, the drawing and the
- * touch handling.
+ * THE LIST IS THE MECHANISM; THE CARTRIDGE PICKER IS ITS FIRST USER. Slot B
+ * needs two lists -- which cartridge, and which app -- and a third copy of the
+ * touch handling would be the third chance to reintroduce the fault that made
+ * one tap move the highlight five rows (see the touch section below). So the
+ * drawing, the margin setup and the edge detection live here once, and
+ * gbpick_list_run() takes a title and an array of labels.
  *
- * IT IS ALSO THE FAILURE REPORT NOW. Slot B has no console (CONFIG_ESP_CONSOLE_NONE)
- * and a picture kills the USB mirror (DSP-003), so "no cartridge found" and "the
- * card did not mount" used to be undiagnosable without a flash marker. Text on
- * the glass says the same thing to the person holding the watch, which is where
- * a failure needs to be legible.
+ * Touch only ever reached this list through a finger hitting a 16-row band,
+ * which the operator could not do reliably; the buttons are the real interface
+ * and the tap is the fallback.
  */
 
 #include <dirent.h>
@@ -39,23 +41,25 @@
 #define PK_MAX_ROM  64
 #define PK_NAME_MAX 96
 
-static char s_roms[PK_MAX_ROM][PK_NAME_MAX];
-static int s_rom_n;
-static int s_sel = -1;        /* index of the tapped row, -1 for none */
+/* ------------------------------------------------------------- list state */
+
+static const char *const *s_items;   /* labels to draw                       */
+static int s_item_n;
+static char s_title[48];
+static int s_sel = -1;
+static int s_page;
+static volatile bool s_done;
+static int *s_sel_out;
+static bool s_registered;
 
 /*
  * EDGE STATE, BECAUSE THE CONTROLLER RE-REPORTS A HELD FINGER.
  *
  * The CST9217 re-sends its report about every 66 ms while a finger stays down --
  * the same fact that makes the haptic fire on the press transition only, and
- * recorded with it. The picker acted on every report, so one tap on the down
- * arrow moved the highlight five to eight rows: the operator's own count, and
- * the first thing they said about it.
- *
- * The same fault was also in the tap-to-commit path and would have been worse
- * there: "tap a row, tap it again" is two presses, and a single held tap looks
- * like two reports 66 ms apart, so ONE tap could have selected and started a
- * cartridge. Nobody had hit it yet only because the arrows were unusable.
+ * recorded with it (TCH, HAP-001). Acting on every report moved the highlight
+ * five to eight rows per tap, and in the tap-to-commit path ONE held tap looked
+ * like two presses, so a single tap could have selected and started a cartridge.
  *
  * So each control is acted on when it goes DOWN, never while it stays down, and
  * a row is acted on only by a finger that was not on that row in the previous
@@ -63,13 +67,9 @@ static int s_sel = -1;        /* index of the tapped row, -1 for none */
  */
 static bool s_prev_up, s_prev_down, s_prev_enter;
 static int s_prev_row = -1;
-static int s_page;
-static volatile bool s_done;
-static char *s_out;
-static size_t s_out_cap;
 
-/* One row's worth of pixels, PSRAM because 10 KB doubled per draw is not a
- * budget to spend from internal DRAM on this board. */
+/* One row's worth of pixels, PSRAM: 10 KB doubled per draw is not a budget to
+ * spend from this board's internal DRAM. */
 static uint16_t *s_rowbuf;
 
 /* ---------------------------------------------------------------- scanning */
@@ -83,13 +83,15 @@ static bool is_rom(const char *name)
     return !strcasecmp(dot, ".gbc") || !strcasecmp(dot, ".gb");
 }
 
+static char s_roms[PK_MAX_ROM][PK_NAME_MAX];
+static int s_rom_n;
+static const char *s_labels[PK_MAX_ROM];
+
 static void add_rom(const char *path)
 {
     if (s_rom_n >= PK_MAX_ROM || strlen(path) >= PK_NAME_MAX)
         return;
 
-    /* Skip duplicates: the fallback scan of /sd can reach a directory the first
-     * pass already walked. */
     for (int i = 0; i < s_rom_n; i++)
         if (!strcmp(s_roms[i], path))
             return;
@@ -98,8 +100,6 @@ static void add_rom(const char *path)
     s_rom_n++;
 }
 
-/* Read one directory for cartridges, and recurse into subdirectories to `depth`.
- * Depth 0 reads only the named directory. */
 static void scan_dir(const char *dir, int depth)
 {
     DIR *d = opendir(dir);
@@ -125,8 +125,6 @@ static void scan_dir(const char *dir, int depth)
             continue;
         }
 
-        /* d_type is not reliable on every VFS, so a directory is confirmed by
-         * opening it rather than trusted from the entry. */
         if (depth > 0)
         {
             DIR *probe = opendir(path);
@@ -147,17 +145,21 @@ static int by_name(const void *a, const void *b)
     return strcasecmp((const char *)a, (const char *)b);
 }
 
+static const char *base_name(const char *path)
+{
+    const char *slash = strrchr(path, '/');
+
+    return slash ? slash + 1 : path;
+}
+
 static int scan_roms(void)
 {
     s_rom_n = 0;
 
-    /*
-     * THE ORDER MATTERS. /sd/media/gbc is where this project's cards keep
-     * cartridges (GB_ROM_DEFAULT lives under it), so it is walked two levels
-     * deep -- the cartridge sits in a `homebrew` subdirectory, which is one.
-     * Only if that turns up nothing is the card's root walked, which catches a
-     * card organised by hand.
-     */
+    /* /sd/media/gbc is where this project's cards keep cartridges
+     * (GB_ROM_DEFAULT lives under it), so it is walked two levels deep -- the
+     * cartridge sits in a `homebrew` subdirectory, which is one. Only if that
+     * turns up nothing is the card's root walked. */
     scan_dir("/sd/media/gbc", 2);
 
     if (s_rom_n == 0)
@@ -207,20 +209,12 @@ static void draw_row(int row, const char *s, bool sel)
     display_picture_rgb(NULL, 0, PK_LIST_Y + row * PK_ROW_H, s_rowbuf, PK_W, PK_ROW_H);
 }
 
-static const char *base_name(const char *path)
-{
-    const char *slash = strrchr(path, '/');
-
-    return slash ? slash + 1 : path;
-}
-
 static void draw_screen(void)
 {
     display_fill(0x0000);
 
-    row_pixels(s_rowbuf, "Game Boy - select a cartridge", false);
-    /* Title in green, centred by the same 8-px cell the list uses. */
-    for (int i = 0; i < PK_W * PK_ROW_H; i++)
+    row_pixels(s_rowbuf, s_title, false);
+    for (int i = 0; i < PK_W * PK_ROW_H; i++)      /* title in green */
         if (s_rowbuf[i])
             s_rowbuf[i] = 0x07E0;
     display_picture_rgb(NULL, 0, PK_TITLE_Y, s_rowbuf, PK_W, PK_ROW_H);
@@ -231,20 +225,18 @@ static void draw_screen(void)
     {
         const int idx = first + i;
 
-        if (idx >= s_rom_n)
+        if (idx >= s_item_n)
             break;
 
-        draw_row(i, base_name(s_roms[idx]), idx == s_sel);
+        draw_row(i, s_items[idx], idx == s_sel);
     }
 
-    /* Footer. It names the BUTTONS, because that is what a person can find
-     * without being told: the arrows are drawn on the glass beside the list and
-     * Enter is in the bottom strip. The row count is here so a long list does not
-     * look truncated. */
+    /* Footer names the BUTTONS, because that is what a person can find: the
+     * arrows are drawn on the glass beside the list and Enter is in the strip. */
     char foot[64];
 
     snprintf(foot, sizeof(foot), "arrows: move  enter: start  %d/%d",
-             s_sel >= 0 ? s_sel + 1 : 0, s_rom_n);
+             s_sel >= 0 ? s_sel + 1 : 0, s_item_n);
 
     row_pixels(s_rowbuf, foot, false);
     for (int i = 0; i < PK_W * PK_ROW_H; i++)
@@ -255,7 +247,8 @@ static void draw_screen(void)
 
 /*
  * A message covering the whole picture, for the case where there is nothing to
- * tap. Kept here because the caller has no other way to speak.
+ * tap. The caller has no other way to speak: no console, and a picture kills
+ * the USB mirror.
  */
 void gbpick_message(const char *line1, const char *line2)
 {
@@ -286,22 +279,18 @@ void gbpick_message(const char *line1, const char *line2)
  *
  * The right column already carries U+2191 and U+2193 at indices 3 and 4, and the
  * bottom strip already carries Enter at index 1, so the furniture for this
- * existed and was merely unused. setup_margins() makes the glass say so and
- * blanks the other ten buttons, which do nothing here -- an F10 button that
- * sends nothing is the label/duty disagreement edges.h was written to prevent.
+ * existed and was merely unused. The other ten buttons are blanked and their
+ * chrome removed, because they do nothing here -- an F10 button that sends
+ * nothing is the label/duty disagreement edges.h was written to prevent.
  */
 static void setup_margins(void)
 {
-    /* The left column is the app's five verbs on the desktop; none of them apply
-     * to a list, so all five go. */
     for (int i = 0; i < COL_N; i++)
     {
         display_margin_chrome(0, i, false);
         display_margin_label(0, i, " ");
     }
 
-    /* Right column: the reserved slot, the left arrow and the right arrow have
-     * no duty; the up and down arrows do. */
     for (int i = 0; i <= 2; i++)
     {
         display_margin_chrome(1, i, false);
@@ -313,7 +302,6 @@ static void setup_margins(void)
     display_margin_chrome(1, 4, true);
     display_margin_label(1, 4, "\xe2\x86\x93");   /* U+2193 down */
 
-    /* Bottom strip: Enter in the middle, which is where it already is. */
     display_margin_chrome(2, 0, false);
     display_margin_btn_label(0, " ");
     display_margin_chrome(2, 1, true);
@@ -329,45 +317,45 @@ static void setup_margins(void)
 
 static void move_sel(int delta)
 {
-    if (s_rom_n == 0)
+    if (s_item_n == 0)
         return;
 
     if (s_sel < 0)
-        s_sel = delta > 0 ? 0 : s_rom_n - 1;
+        s_sel = delta > 0 ? 0 : s_item_n - 1;
     else
         s_sel += delta;
 
     if (s_sel < 0)
         s_sel = 0;
-    if (s_sel >= s_rom_n)
-        s_sel = s_rom_n - 1;
+    if (s_sel >= s_item_n)
+        s_sel = s_item_n - 1;
 
-    /* The page follows the selection, so the arrows can walk the whole list
-     * without a separate paging step. */
+    /* The page follows the selection, so the arrows walk the whole list without
+     * a separate paging step. */
     s_page = s_sel / PK_ROWS;
     draw_screen();
 }
 
 static void commit_sel(void)
 {
-    if (s_sel < 0 || s_sel >= s_rom_n)
+    if (s_sel < 0 || s_sel >= s_item_n)
         return;                     /* nothing highlighted: Enter does nothing */
 
-    snprintf(s_out, s_out_cap, "%s", s_roms[s_sel]);
+    if (s_sel_out)
+        *s_sel_out = s_sel;
     s_done = true;
 }
 
-static bool picker_touch(void *user, const touch_frame_t *f)
+static bool list_touch(void *user, const touch_frame_t *f)
 {
     (void)user;
 
     if (s_done)
         return false;
 
-    /* ONE PASS TO CLASSIFY, THEN ONE PASS TO ACT.
-     *
-     * Mixing the two would make the result depend on the order the controller
-     * happened to list the points in, and a frame can carry two fingers. */
+    /* ONE PASS TO CLASSIFY, THEN ONE PASS TO ACT: mixing them would make the
+     * result depend on the order the controller listed the points in, and a
+     * frame can carry two fingers. */
     bool up = false, down = false, enter = false;
     int row = -1;
 
@@ -394,9 +382,9 @@ static bool picker_touch(void *user, const touch_frame_t *f)
             if (f->p[i].region != EDGE_NONE)
                 continue;           /* the left column and the top margin are inert */
 
-            /* Panel coordinates to framebuffer coordinates: the touch controller
-             * reports the glass, and the framebuffer is that window offset by the
-             * origin. gb.c's own hit test does the same subtraction. */
+            /* Panel coordinates to framebuffer coordinates: the controller
+             * reports the glass, and the framebuffer is that window offset by
+             * the origin. */
             const int fx = f->p[i].x - DISPLAY_ORIGIN_X;
             const int fy = f->p[i].y - DISPLAY_ORIGIN_Y;
 
@@ -406,7 +394,7 @@ static bool picker_touch(void *user, const touch_frame_t *f)
             const int r = (fy - PK_LIST_Y) / PK_ROW_H;
             const int idx = s_page * PK_ROWS + r;
 
-            if (r < PK_ROWS && idx < s_rom_n)
+            if (r < PK_ROWS && idx < s_item_n)
                 row = idx;
         }
     }
@@ -440,7 +428,7 @@ static bool picker_touch(void *user, const touch_frame_t *f)
     if (fire_row)
     {
         /* A finger that lands on a row highlights it; a NEW press on the row
-         * that is already highlighted starts it. Because repeats are filtered
+         * that is already highlighted chooses it. Because repeats are filtered
          * out above, one physical tap can no longer do both. */
         if (row == s_sel)
             commit_sel();
@@ -452,26 +440,16 @@ static bool picker_touch(void *user, const touch_frame_t *f)
         return true;
     }
 
-    /* A press that was consumed as a repeat still counts as "used" so the touch
-     * driver does not buzz for it. */
     return up || down || enter || row >= 0;
 }
 
 /* -------------------------------------------------------------------- entry */
 
-bool gbpick_run(char *out, size_t cap, const volatile bool *abort)
+bool gbpick_list_run(const char *title, const char *const *labels, int n,
+                     int *sel_out, const volatile bool *abort)
 {
-    if (!out || cap == 0)
+    if (!labels || n <= 0)
         return false;
-
-    s_out = out;
-    s_out_cap = cap;
-    s_done = false;
-    s_sel = -1;
-    s_page = 0;
-    s_prev_up = s_prev_down = s_prev_enter = false;
-    s_prev_row = -1;
-    out[0] = '\0';
 
     if (!s_rowbuf)
     {
@@ -481,17 +459,32 @@ bool gbpick_run(char *out, size_t cap, const volatile bool *abort)
             return false;
     }
 
-    if (scan_roms() == 0)
-    {
-        gbpick_message("No cartridge found",
-                       "looked in /sd/media/gbc");
-        return false;
-    }
+    s_items = labels;
+    s_item_n = n;
+    s_sel_out = sel_out;
+    s_done = false;
+    s_sel = -1;
+    s_page = 0;
+    s_prev_up = s_prev_down = s_prev_enter = false;
+    s_prev_row = -1;
+    snprintf(s_title, sizeof(s_title), "%s", title ? title : "");
 
-    if (!touch_add_app_touch(picker_touch, NULL))
+    if (sel_out)
+        *sel_out = -1;
+
+    /* REGISTERED ONCE, NOT PER CALL. Slot B shows this list again every time an
+     * app exits, and `touch_add_app_touch()` APPENDS -- so registering on each
+     * launch would fill the consumer table and leave later lists deaf. The
+     * consumer itself is stateless between lists, so one registration serves
+     * every one. */
+    if (!s_registered)
     {
-        gbpick_message("Touch did not register", "");
-        return false;
+        if (!touch_add_app_touch(list_touch, NULL))
+        {
+            gbpick_message("Touch did not register", "");
+            return false;
+        }
+        s_registered = true;
     }
 
     setup_margins();
@@ -504,5 +497,39 @@ bool gbpick_run(char *out, size_t cap, const volatile bool *abort)
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 
+    return sel_out && *sel_out >= 0;
+}
+
+bool gbpick_run(char *out, size_t cap, const volatile bool *abort)
+{
+    if (!out || cap == 0)
+        return false;
+
+    out[0] = '\0';
+
+    if (!s_rowbuf)
+    {
+        s_rowbuf = heap_caps_malloc((size_t)PK_W * PK_ROW_H * sizeof(uint16_t),
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_rowbuf)
+            return false;
+    }
+
+    if (scan_roms() == 0)
+    {
+        gbpick_message("No cartridge found", "looked in /sd/media/gbc");
+        return false;
+    }
+
+    for (int i = 0; i < s_rom_n; i++)
+        s_labels[i] = base_name(s_roms[i]);
+
+    int sel = -1;
+
+    if (!gbpick_list_run("Game Boy - select a cartridge", s_labels, s_rom_n,
+                         &sel, abort))
+        return false;
+
+    snprintf(out, cap, "%s", s_roms[sel]);
     return out[0] != '\0';
 }

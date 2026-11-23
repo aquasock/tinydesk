@@ -48,6 +48,7 @@ void pmini_stop(void);
 bool pmini_running(void);
 
 /* Registers the `pm` shell command. */
+void pm_install_touch_hook(void);    /* on-glass controls, no shell command needed */
 bool pmini_register_command(void);
 
 #endif /* TWATCH_PM_H */

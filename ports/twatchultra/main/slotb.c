@@ -25,6 +25,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "esp_err.h"
@@ -41,6 +42,8 @@
 #include "charge.h"
 #include "gb.h"
 #include "gbpick.h"
+#include "nes.h"
+#include "pm.h"
 #include "haptic.h"
 #include "power.h"
 #include "pwrkey.h"
@@ -303,6 +306,64 @@ static void slotb_peripherals(void)
  */
 static volatile bool s_exit_req;
 
+/*
+ * THE APPS SLOT B CAN RUN.
+ *
+ * Slot B was written around one emulator. This table is the whole of what makes
+ * it a "performance slot" with a menu: an entry per app, and the run loop below
+ * needs nothing else. Adding a fourth app is a row here plus its own touch-hook
+ * split (nes_install_touch_hook() and pm_install_touch_hook() exist for exactly
+ * that reason -- see gb_install_touch_hook()).
+ *
+ * WHY THIS AND NOT AN IMAGE PER APP. The three emulators are already in this
+ * binary and share the display, touch, audio and card drivers. A separate 3 MB
+ * image per app would store the same code four times to change a core assignment,
+ * and every launch would rewrite a flash slot that has to survive power loss.
+ * The desktop, Python, Bluetooth, TLS and TCP/IP are most of the image and slot B
+ * never calls any of them, so the dead weight is flash rather than CPU -- and
+ * there are 900-odd KB free in the slot.
+ *
+ * Each app's touch consumer is installed ONCE, below, because they are additive
+ * and each declines unless it is the one running.
+ */
+typedef struct
+{
+    const char *label;
+    bool (*start)(const char *rom);      /* NULL rom means the app's default */
+    void (*stop)(void);
+    bool (*running)(void);
+} slotb_app_t;
+
+/*
+ * Game Boy is the one app with a cartridge chooser, so its start is a wrapper:
+ * pick a cartridge, then start. Abandoning the picker returns false and the menu
+ * comes back rather than the whole personality going dark.
+ */
+static char s_gb_rom[96];
+
+static bool slotb_start_gb(const char *rom)
+{
+    (void)rom;
+
+    /* THE BLITTER STAYS ON THE GUEST'S CORE; gb_set_blit_core() carries the
+     * measurement that decided it. */
+    gb_set_blit_core(1);
+
+    if (!gbpick_run(s_gb_rom, sizeof(s_gb_rom), &s_exit_req))
+        return false;
+
+    return gb_start(s_gb_rom);
+}
+
+static const slotb_app_t s_apps[] = {
+    { "Game Boy Color", slotb_start_gb, gb_stop, gb_running },
+    { "NES",            nes_start,      nes_stop, nes_running },
+    { "Pokemon Mini",   pmini_start,    pmini_stop, pmini_running },
+};
+
+#define SLOTB_APP_N ((int)(sizeof(s_apps) / sizeof(s_apps[0])))
+
+
 static bool slotb_key(void *user)
 {
     (void)user;
@@ -389,75 +450,87 @@ static void slotb_run(const char *board_conf)
      * on-glass d-pad and A/B through this. The key hook is slot B's own, below,
      * because gb.c's handler stops the emulator on the key task and slot B has to
      * save before it reboots. */
+    /* EVERY APP'S TOUCH CONSUMER, INSTALLED ONCE. They are additive and each
+     * declines unless it is the one running, which is what lets the menu hand
+     * the glass between apps without touching the drivers again. */
     gb_install_touch_hook();
+    nes_install_touch_hook();
+    pm_install_touch_hook();
 
-    /* Pusher A last, once the poll task that will service it exists. Armed
-     * BEFORE the picker so the press can also abandon the picker. */
+    /* Pusher A, armed before the menu so the press can leave slot B from the
+     * menu itself. */
     if (!pwrkey_init(slotb_sink))
         ESP_LOGW(TAG, "Pusher A did not arm; the only way out is a power cycle");
     pwrkey_set_app_key(slotb_key, NULL);
 
     /*
-     * THE BLITTER STAYS ON CORE 1, AND THAT IS A MEASURED DECISION RATHER THAN
-     * A DEFAULT LEFT ALONE. Core 0 is idle in slot B, so moving the blit there
-     * was the obvious next step once the desktop was gone. It was tried and it
-     * is WORSE (core-log entry 96):
+     * THE MENU IS THE WHOLE OF SLOT B, and this loop is the reason it is worth
+     * having: back out of a game and the menu returns instead of the watch
+     * rebooting to the desktop, so changing games costs a tap and not a boot.
      *
-     *   core 1  frames=4185  blits=4185  starved=0     wall=10661 us
-     *   core 0  frames=4199  blits=3621  starved=3749  wall=9836 us
-     *
-     * On core 0 the guest got 7.7 per cent faster and the PICTURE LOST 14 per
-     * cent of its frames, with the buffer pool running dry 3749 times. The
-     * likely cause is that the framebuffer lives in PSRAM: on core 1 the guest
-     * and the blitter alternate and never touch PSRAM at the same moment, while
-     * on core 0 they run concurrently and contend for it. The guest's own cache
-     * benefit shows up as the lower wall figure and is more than cancelled by
-     * the blit falling behind.
-     *
-     * blits == frames with starved == 0 is the property worth keeping, so the
-     * blitter stays where the guest can preempt it.
+     * PUSHER A MEANS "BACK" -- in the menu it leaves slot B for the desktop, and
+     * inside an app it stops the app and returns here. That is the behaviour of a
+     * machine that has a shell it drops into, which is what this is; the press
+     * that ends a game should not also end the session.
      */
-    gb_set_blit_core(1);
-
-    /* No argument: the operator chose a cartridge on the glass. Falls back to
-     * gb_start()'s own default only if the picker could not run at all. */
     {
-        static char s_rom[96];
+        static const char *labels[SLOTB_APP_N];
 
-        if (!gbpick_run(s_rom, sizeof(s_rom), &s_exit_req))
+        for (int i = 0; i < SLOTB_APP_N; i++)
+            labels[i] = s_apps[i].label;
+
+        for (;;)
         {
-            ESP_LOGE(TAG, "no cartridge chosen");
-            slotb_mark(SLOTB_FAIL_NO_ROM);
-            return;
-        }
+            int sel = -1;
 
-        ESP_LOGI(TAG, "playing %s", s_rom);
+            display_pixels_claim(true);
 
-        if (!gb_start(s_rom))
-        {
-            ESP_LOGE(TAG, "the emulator did not start");
-            gbpick_message("The emulator did not start", s_rom);
-            slotb_fail(SLOTB_FAIL_NO_ROM, 0xF800);
-            return;
+            if (!gbpick_list_run("Slot B - select an app", labels, SLOTB_APP_N,
+                                 &sel, &s_exit_req))
+                break;                       /* Pusher A in the menu: leave */
+
+            if (sel < 0 || sel >= SLOTB_APP_N)
+                continue;
+
+            const slotb_app_t *app = &s_apps[sel];
+
+            if (!app->start(NULL))
+            {
+                /* SAY SO ON THE GLASS. An app that cannot start has only its own
+                 * printf, and there is no console here -- so without this the
+                 * menu simply reappears and the wearer has no idea why. The
+                 * commonest cause is the one worth naming: no cartridge. */
+                char l1[40];
+
+                snprintf(l1, sizeof(l1), "%s did not start", app->label);
+                gbpick_message(l1, "no ROM? put one in /sd/media");
+                ESP_LOGW(TAG, "%s did not start", app->label);
+                vTaskDelay(pdMS_TO_TICKS(SLOTB_ERR_HOLD_MS));
+                continue;
+            }
+
+            ESP_LOGI(TAG, "running %s", app->label);
+            slotb_mark(SLOTB_STAGE_EMU_START);
+
+            /* The firmware is demonstrably working, so take it off the
+             * bootloader's trial list. */
+            slotb_confirm();
+
+            while (app->running() && !s_exit_req)
+                vTaskDelay(pdMS_TO_TICKS(100));
+
+            /* THE STOP HAPPENS HERE, ON THIS TASK, NOT ON THE KEY TASK. An app's
+             * stop writes SRAM before it releases anything and then waits for its
+             * own tasks to leave; doing it here means the save has finished
+             * before the next app claims the amplifier or the glass. */
+            app->stop();
+            slotb_mark(SLOTB_STAGE_EMU_STOP);
+
+            /* The press that closed the app returns us to the menu rather than
+             * out of slot B; `app->stop()` has already released the pixels. */
+            s_exit_req = false;
         }
     }
-    slotb_mark(SLOTB_STAGE_EMU_START);
-
-    /* The firmware is demonstrably working, so take it off the bootloader's
-     * trial list. Until this the next reset would roll back to the desktop;
-     * after it a power cycle comes back here, which is what a game console
-     * should do. */
-    slotb_confirm();
-
-    while (gb_running() && !s_exit_req)
-        vTaskDelay(pdMS_TO_TICKS(100));
-
-    /* THE STOP HAPPENS HERE, ON THIS TASK, NOT ON THE KEY TASK.
-     * gb_stop() writes SRAM before it releases anything and then waits for its
-     * own tasks to leave; doing it here means the save has finished before the
-     * restart below, in one ordered sequence. */
-    gb_stop();
-    slotb_mark(SLOTB_STAGE_EMU_STOP);
 
     display_pixels_claim(false);
 }

@@ -68,6 +68,7 @@ void nes_pause(bool paused);
 bool nes_paused(void);
 
 /* Registers the `nes` shell command. */
+void nes_install_touch_hook(void);   /* on-glass controls, no shell command needed */
 bool nes_register_command(void);
 
 #endif /* TWATCH_NES_H */

@@ -2667,10 +2667,16 @@ static const tdsh_command_t s_pm_cmd = {
     TDSH_CMD_INTERACTIVE,
 };
 
-bool pmini_register_command(void)
+/* The touch consumer without the shell command; see nes_install_touch_hook(). */
+void pm_install_touch_hook(void)
 {
     if (!touch_add_app_touch(pm_app_touch, NULL))
         ESP_LOGW(TAG, "pm touch consumer did not register");
+}
+
+bool pmini_register_command(void)
+{
+    pm_install_touch_hook();
 
     return tdsh_register_command(&s_pm_cmd) == 0;
 }

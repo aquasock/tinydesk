@@ -2240,13 +2240,23 @@ static const tdsh_command_t s_nes_cmd = {
     TDSH_CMD_INTERACTIVE,
 };
 
-bool nes_register_command(void)
+/*
+ * THE TOUCH CONSUMER WITHOUT THE SHELL COMMAND, so a caller with no shell --
+ * slot B -- can still drive the on-glass controls. Same split, and for the same
+ * reason, as gb_register_command()'s (core-log entry 92).
+ */
+void nes_install_touch_hook(void)
 {
     /* The margins belong to whichever app owns the screen, and only one app can
      * own it, so the sink is registered once and both apps decline when they are
      * not running. */
     if (!touch_add_app_touch(nes_app_touch, NULL))
         ESP_LOGW(TAG, "touch consumer table full");
+}
+
+bool nes_register_command(void)
+{
+    nes_install_touch_hook();
 
     return tdsh_register_command(&s_nes_cmd) == 0;
 }

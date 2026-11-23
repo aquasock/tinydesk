@@ -39,4 +39,19 @@ bool gbpick_run(char *out, size_t cap, const volatile bool *abort);
  */
 void gbpick_message(const char *line1, const char *line2);
 
+/*
+ * A list on the glass, driven by the margin buttons -- the mechanism behind both
+ * the cartridge picker and slot B's app menu.
+ *
+ * Draws `title` and `labels`, moves the highlight on the right column's up and
+ * down arrows, chooses on the bottom strip's Enter, and also accepts a tap on a
+ * row (once to highlight, a second separate tap to choose).
+ *
+ * Returns true when a row was chosen and writes its index to `sel_out`; false
+ * when `*abort` went true or the list was empty. Requires the same preconditions
+ * as gbpick_run().
+ */
+bool gbpick_list_run(const char *title, const char *const *labels, int n,
+                     int *sel_out, const volatile bool *abort);
+
 #endif /* TWATCH_GBPICK_H */

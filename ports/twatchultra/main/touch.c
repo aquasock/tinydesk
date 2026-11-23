@@ -1018,7 +1018,20 @@ static void poll_task(void *arg)
     }
 }
 
-#define APP_TOUCH_MAX 4
+/*
+ * HOW MANY SCREEN-OWNING CONSUMERS CAN REGISTER.
+ *
+ * Each app registers once and declines when it is not running, so the table has
+ * to hold every one that can exist, not merely the one that is active: Game Boy,
+ * NES, Pokemon Mini and the Tamagotchi on the desktop, plus slot B's own list
+ * (the cartridge picker and the app menu). That is five against a limit of four,
+ * which failed SILENTLY -- `touch_add_app_touch()` logs a warning nobody reads on
+ * a console with no console. Raised with headroom rather than trimmed to fit, so
+ * the next screen-owning app does not rediscover this.
+ *
+ * The cost is a few pointers: 8 slots rather than 4, in .bss.
+ */
+#define APP_TOUCH_MAX 8
 static touch_app_touch_fn s_app_touch_extra[APP_TOUCH_MAX];
 static void *s_app_touch_extra_user[APP_TOUCH_MAX];
 
