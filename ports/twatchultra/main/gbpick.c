@@ -29,6 +29,7 @@
 #include "edges.h"
 #include "font8x16.h"
 #include "gbpick.h"
+#include "slotb.h"
 #include "touch.h"
 
 /* The glass, in framebuffer terms: 320x416 at 8x16. */
@@ -89,6 +90,21 @@ static uint16_t *s_rowbuf;
  * built. Internal DRAM is this board's scarce resource. */
 static char *s_tagged;
 
+
+/*
+ * EVERY FAILURE IN HERE IS RECORDED, NOT ONLY SHOWN.
+ *
+ * The picker can refuse for five reasons and only one of them has a name the
+ * wearer can act on; the rest reach the glass as "did not start / no ROM?", which
+ * is a guess. slotb_record() puts the reason and the path in flash where a host
+ * can read them back after a reset, which is the only way to find out why a
+ * cartridge that is visibly on the card would not open.
+ */
+static void pick_fail(const char *why, const char *path)
+{
+    slotb_record(why, path);
+}
+
 /* ---------------------------------------------------------------- scanning */
 
 static bool is_rom(const char *name)
@@ -133,6 +149,7 @@ static char *s_cwd;
 static int s_ent_n;
 static bool s_truncated;
 static const char *s_labels[PK_MAX_ENT];
+
 
 static void ent_init(void)
 {
@@ -297,6 +314,23 @@ static const struct
 };
 
 #define PK_ROOT_N ((int)(sizeof(k_roots) / sizeof(k_roots[0])))
+
+/*
+ * THE CONSOLE LIST HAS ITS OWN LABEL STORAGE, AND IT HAS TO.
+ *
+ * `s_labels` belongs to the directory listing: list_dir() overwrites entries
+ * 0..n-1 on every pass. The console list was borrowing that array, so on the
+ * second trip -- after Up at a console's root -- it drew two CARTRIDGE OR FOLDER
+ * names left over from the tree that had just been left, while Enter went to
+ * whichever console the row really named. The operator hit it directly: back out
+ * of Game Boy and the screen shows names that are not consoles, and Enter
+ * appears to open the wrong one.
+ *
+ * Two arrays, because they are two different lists and sharing one storage was
+ * the whole fault. Declared here because PK_ROOT_N is not known until k_roots.
+ */
+static char s_root_lbl[PK_ROOT_N][24];
+static const char *s_root_ptr[PK_ROOT_N];
 
 /* ----------------------------------------------------------------- drawing */
 
@@ -644,6 +678,7 @@ bool gbpick_list_run(const char *title, const char *const *labels, int n,
     {
         if (!touch_add_app_touch(list_touch, NULL))
         {
+            pick_fail("touch did not register", title);
             gbpick_message("Touch did not register", "");
             return false;
         }
@@ -684,6 +719,7 @@ bool gbpick_run(char *out, size_t cap, const volatile bool *abort)
 
     if (!s_rowbuf || !s_ent || !s_cwd || !s_tagged)
     {
+        pick_fail("out of memory", NULL);
         gbpick_message("Out of memory", "cannot build the list");
         return false;
     }
@@ -696,7 +732,6 @@ bool gbpick_run(char *out, size_t cap, const volatile bool *abort)
      * `/sd/media/gbc` for a card that only had Game Boy. */
     int root_n = 0;
     int root_ix[PK_ROOT_N];
-    char root_labels[PK_ROOT_N][24];
 
     for (int i = 0; i < PK_ROOT_N; i++)
     {
@@ -707,14 +742,15 @@ bool gbpick_run(char *out, size_t cap, const volatile bool *abort)
 
         closedir(d);
         root_ix[root_n] = i;
-        snprintf(root_labels[root_n], sizeof(root_labels[0]), "%s",
+        snprintf(s_root_lbl[root_n], sizeof(s_root_lbl[0]), "%s",
                  k_roots[i].label);
-        s_labels[root_n] = root_labels[root_n];
+        s_root_ptr[root_n] = s_root_lbl[root_n];
         root_n++;
     }
 
     if (root_n == 0)
     {
+        pick_fail("no console directories", "/sd/media");
         gbpick_message("No cartridges found", "looked in /sd/media");
         return false;
     }
@@ -747,8 +783,8 @@ bool gbpick_run(char *out, size_t cap, const volatile bool *abort)
         {
             int sel = -1;
 
-            if (!gbpick_list_run("Game Boy - select a console", s_labels, root_n,
-                                 false, cur, &sel, NULL, abort))
+            if (!gbpick_list_run("Game Boy - select a console", s_root_ptr,
+                                 root_n, false, cur, &sel, NULL, abort))
                 return false;
 
             if (sel < 0 || sel >= root_n)
@@ -758,21 +794,39 @@ bool gbpick_run(char *out, size_t cap, const volatile bool *abort)
         }
 
         snprintf(s_cwd, PK_PATH_MAX, "%s", k_roots[root_ix[cur]].path);
-        /* `root_labels` and `console` are both 24 bytes, so the copy cannot
+        /* `s_root_lbl` and `console` are both 24 bytes, so the copy cannot
          * truncate -- but the compiler only knows the SOURCE is at most 24 and
          * the destination exactly 24, so the width is stated. */
         snprintf(console, sizeof(console), "%.*s", (int)sizeof(console) - 1,
-                 root_labels[cur]);
+                 s_root_lbl[cur]);
         snprintf(root_base, sizeof(root_base), "%s", s_cwd);
 
         /* THE NAVIGATION LOOP. Each pass lists the current directory and acts on
          * one choice: a folder descends, Up climbs, a cartridge ends the picker. */
         for (;;)
         {
+            /*
+             * THE LIST IS ONLY EVER BUILT UNDER root_base, AND THAT IS A GUARD
+             * RATHER THAN A COMMENT.
+             *
+             * Up climbs with path_up(), and path_up() will happily walk out of
+             * the console's directory into /sd, / and beyond if anything ever
+             * makes at_root() answer false when s_cwd is already at the root --
+             * and a picker browsing /sd and / is a picker that lists folders the
+             * wearer has no business in and can build paths nothing can open.
+             * The comparison here makes that unreachable instead of unlikely: a
+             * path outside the tree is snapped back to the tree.
+             */
+            const size_t rb = strlen(root_base);
+            if (strncmp(s_cwd, root_base, rb) != 0 ||
+                (s_cwd[rb] != '\0' && s_cwd[rb] != '/'))
+                snprintf(s_cwd, PK_PATH_MAX, "%s", root_base);
+
             const bool at_root = (strcmp(s_cwd, root_base) == 0);
 
             if (list_dir(s_cwd) == 0)
             {
+                pick_fail("empty directory", s_cwd);
                 gbpick_message("No cartridges here", base_name(s_cwd));
                 return false;
             }
@@ -837,6 +891,7 @@ bool gbpick_run(char *out, size_t cap, const volatile bool *abort)
 
             if (need < 0 || (size_t)need >= cap)
             {
+                pick_fail("path too long", chosen->name);
                 gbpick_message("Path too long", chosen->name);
                 return false;
             }

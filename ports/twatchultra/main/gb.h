@@ -75,6 +75,15 @@ bool gb_running(void);
 const char *gb_last_error(void);
 
 /*
+ * The path the last gb_start() tried to open, whether it succeeded or not.
+ *
+ * Kept apart from the error because the two answer different questions -- "why"
+ * and "which" -- and the failure that costs the most time is a path that looks
+ * right on the glass and opens nothing. Empty before the first start.
+ */
+const char *gb_last_path(void);
+
+/*
  * Which core the blitter runs on. Default 1.
  *
  * THE DESKTOP AND SLOT B WANT DIFFERENT ANSWERS, which is why this is not a

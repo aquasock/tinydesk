@@ -156,6 +156,45 @@ static void slotb_mark_at(uint32_t addr, uint32_t stage)
  */
 static void slotb_mark(uint32_t stage) { slotb_mark_at(SLOTB_MARK_ADDR, stage); }
 
+/*
+ * WHAT THE PICKER CHOSE, AND WHAT THE EMULATOR FAILED TO OPEN.
+ *
+ * A cartridge that will not open is the one failure whose message on the glass
+ * cannot carry enough: the reason is short but the PATH is what decides the
+ * answer, and a path is 40 to 130 characters against a 38-character row. The
+ * wearer can read "cannot open the cartridge" and still not know which of 1,143
+ * it meant, and a picture kills the mirror so nothing else can be asked.
+ *
+ * So it goes to flash, in the sector the old boot mark used to occupy, and a
+ * four-second `esptool read_flash` answers it exactly. Written once per launch
+ * (the chosen path) and once per failure (the path and the reason).
+ */
+#define SLOTB_REC_ADDR  0x1B000u
+#define SLOTB_REC_MAGIC 0x53425243u   /* "SBRC" */
+
+typedef struct
+{
+    uint32_t magic;
+    uint32_t uptime_ms;
+    char     why[48];
+    char     path[256];
+} slotb_rec_t;
+
+void slotb_record(const char *why, const char *path)
+{
+    slotb_rec_t r;
+
+    memset(&r, 0, sizeof(r));
+    r.magic = SLOTB_REC_MAGIC;
+    r.uptime_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    snprintf(r.why, sizeof(r.why), "%s", why ? why : "");
+    snprintf(r.path, sizeof(r.path), "%s", path ? path : "");
+
+    if (esp_flash_erase_region(esp_flash_default_chip, SLOTB_REC_ADDR, 0x1000) != ESP_OK)
+        return;
+    esp_flash_write(esp_flash_default_chip, &r, SLOTB_REC_ADDR, sizeof(r));
+}
+
 /* How long an error screen is held before handing the watch back. Long enough
  * to be read, short enough that a missing ROM does not look like a hang. */
 #define SLOTB_ERR_HOLD_MS 4000
@@ -366,7 +405,17 @@ static bool slotb_start_gb(const char *rom)
     if (!gbpick_run(s_gb_rom, sizeof(s_gb_rom), &s_exit_req))
         return false;
 
-    return gb_start(s_gb_rom);
+    /* WHICH CARTRIDGE THE PICKER HANDED OVER, recorded before the emulator gets
+     * a chance to refuse it. The pair of records -- this and the failure below
+     * -- says whether a "not found" was a bad path or a bad file. */
+    slotb_record("pick", s_gb_rom);
+
+    const bool ok = gb_start(s_gb_rom);
+
+    if (!ok)
+        slotb_record(gb_last_error(), gb_last_path());
+
+    return ok;
 }
 
 static const slotb_app_t s_apps[] = {

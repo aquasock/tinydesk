@@ -456,6 +456,15 @@ const char *gb_last_error(void)
     return s_err;
 }
 
+/* The path the last start attempted. Separate from s_err because the failure
+ * worth naming most is "this path opened nothing", and that needs the path. */
+static char s_path_tried[256];
+
+const char *gb_last_path(void)
+{
+    return s_path_tried;
+}
+
 /* Where the panel push was, and how long it had been there, when that happened.
  * Meaningless unless s_blit_leak is set. */
 static uint8_t s_blit_stuck_phase;
@@ -1375,6 +1384,11 @@ bool gb_start(const char *rom_path)
     const char *path = rom_path && *rom_path ? rom_path
                                              : sd_media(GB_ROM_DEFAULT,
                                                         sd_media(GB_ROM_HB, GB_ROM_FLAT));
+
+    /* Recorded before the first thing that can fail, so a failure always has a
+     * path beside it rather than leaving the caller to guess which cartridge it
+     * meant. */
+    snprintf(s_path_tried, sizeof(s_path_tried), "%s", path);
 
     FILE *fp = fopen(path, "rb");
     if (!fp)

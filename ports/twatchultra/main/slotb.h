@@ -95,4 +95,17 @@ bool slotb_launch(const char *key);
  */
 void slotb_register_command(void);
 
+/*
+ * Record what the picker chose, or what an app failed on, into flash.
+ *
+ * For the one failure the glass cannot carry: a cartridge that will not open.
+ * "cannot open the cartridge" is 26 characters and the path that decides the
+ * answer is 40 to 130, against a 38-character row and no console. Two strings
+ * survive a reset in the sector the old boot mark used to occupy, and
+ * `esptool read_flash 0x1B000 4K` reads them back.
+ *
+ * Both may be NULL. Safe to call at any point after flash init.
+ */
+void slotb_record(const char *why, const char *path);
+
 #endif /* TWATCH_SLOTB_H */
