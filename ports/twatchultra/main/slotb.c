@@ -684,6 +684,67 @@ bool board_startup_override(const char *board_conf)
     return true;
 }
 
+/* ------------------------------------------------- slot B from the start menu */
+
+/*
+ * BOOT SLOT B WITHOUT SHOWING THE MACHINERY.
+ *
+ * The Start menu entry for a slot B app used to be a `.tdlink` naming a Python
+ * script. The desktop opens a script by running it in a TERMINAL, so the wearer
+ * saw a terminal window, the echoed command, a two-line script and the line
+ * "rebooting into ota_1" before the reboot -- for a menu item whose only visible
+ * outcome is a game.
+ *
+ * Two things are wrong with that beyond the cosmetics. `td_script_run()` is the
+ * only path a `.py` target has, and it is a terminal by construction. And the
+ * launcher lived on the card's littlefs, so a full-image flash or a factory
+ * restore deleted it -- the handover notes had to carry the three `echo` lines
+ * that recreate them.
+ *
+ * A native app has neither problem: it is in the image, and it draws nothing.
+ *
+ * EVERYTHING THAT CAN FAIL HAPPENS BEFORE THE PANEL IS BLANKED. Writing the NVS
+ * key and setting the boot partition are the fallible steps, and doing them
+ * first means a failure leaves a desktop the wearer can still use, with a message
+ * from the caller, rather than a black screen and nothing to press.
+ */
+bool slotb_launch(const char *key)
+{
+    const esp_partition_t *sb = esp_partition_find_first(
+        ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, NULL);
+
+    esp_app_desc_t d;
+
+    if (!sb || esp_ota_get_partition_description(sb, &d) != ESP_OK)
+        return false;                   /* slot B is empty: nothing to boot */
+
+    if (key && *key && slotb_app_index(key) < 0)
+        return false;                   /* not an app this table knows */
+
+    slotb_app_set(key);
+
+    if (esp_ota_set_boot_partition(sb) != ESP_OK)
+    {
+        /* Leave the key cleared so a later entry into slot B shows the menu
+         * rather than an app nobody asked for. */
+        slotb_app_set(NULL);
+        return false;
+    }
+
+    /*
+     * NOW BLANK IT. Claiming the pixels stops the desktop repainting over the
+     * black, and `display_fill()` pushes synchronously, so the panel is already
+     * black when the restart happens. The short delay is for the last band to
+     * leave the SPI engine -- the panel is write-only and cannot be asked.
+     */
+    display_pixels_claim(true);
+    display_fill(0x0000);
+
+    vTaskDelay(pdMS_TO_TICKS(150));
+    esp_restart();
+    return true;                        /* not reached */
+}
+
 /* ------------------------------------------------------------ shell command */
 
 /*

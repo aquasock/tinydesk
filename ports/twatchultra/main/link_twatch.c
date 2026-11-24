@@ -57,6 +57,7 @@
 #include "gbcbench.h"
 #include "gb.h"
 #include "slotb.h"
+#include "td_apps.h"
 #include "statusbar.h"
 #include "pm.h"
 #include "hal_mux.h"
@@ -797,9 +798,48 @@ int link_write(const uint8_t *buf, int len)
  * board's apps land at the end of the app list, immediately before the
  * separator and the user's own emulator .tdlink entries.
  */
+/* ------------------------------------------------- slot B from the start menu */
+
+/*
+ * THE THREE SLOT B APPS ARE NATIVE APPS, NOT CARD-SIDE SCRIPTS.
+ *
+ * See slotb_launch(): a `.tdlink` naming a Python script is opened by running it
+ * in a TERMINAL, so the menu item showed a terminal, the echoed command and the
+ * "rebooting into ota_1" line before the reboot. It also lived on the card, so a
+ * full flash deleted it. These are registered here instead -- in the image, and
+ * silent apart from the panel going black.
+ *
+ * A FAILED LAUNCH SAYS SO. Reaching this menu with slot B empty is possible after
+ * an interrupted install, and a menu item that quietly does nothing is worse than
+ * one that explains itself.
+ */
+static void slotb_launch_or_say(const char *key)
+{
+    if (!slotb_launch(key))
+        td_msgbox("Slot B", "Slot B has no image to boot.", "OK", NULL, NULL);
+}
+
+static void launch_slotb_gb(void)  { slotb_launch_or_say("gb"); }
+static void launch_slotb_nes(void) { slotb_launch_or_say("nes"); }
+static void launch_slotb_pm(void)  { slotb_launch_or_say("pm"); }
+
+/* The names match what the card-side launchers were called, so nothing the
+ * operator learned about the menu changes; "(B)" stays on the Pokemon Mini
+ * because the desktop has its own Pokemon Mini entry beside it. */
+static const td_app_t s_app_gb  = { "Game Boy Color",   launch_slotb_gb,  "GB" };
+static const td_app_t s_app_nes = { "NES",              launch_slotb_nes, "NE" };
+static const td_app_t s_app_pm  = { "Pokemon Mini (B)", launch_slotb_pm,  "PM" };
+
 void board_apps_register(void)
 {
     music_ui_register();
+
+    /* Registration order is start-menu order, and this hook runs after the
+     * built-in apps, so these sit at the end beside Music and the user's own
+     * entries -- which is where the card-side shortcuts used to be. */
+    td_app_register(&s_app_gb);
+    td_app_register(&s_app_nes);
+    td_app_register(&s_app_pm);
 }
 
 const char *board_platform(void)

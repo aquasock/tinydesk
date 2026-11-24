@@ -67,6 +67,23 @@ void slotb_confirm(void);
 void slotb_return_to_desktop(void);
 
 /*
+ * Boot slot B directly into one of its apps, blanking the panel first.
+ *
+ * THIS IS THE START MENU'S PATH AND IT EXISTS SO THE WEARER SEES A GAME RATHER
+ * THAN A REBOOT. The menu entry used to be a `.tdlink` pointing at a Python
+ * script, which the desktop opens by running `py "<path>"` IN A TERMINAL -- so
+ * launching a game put a terminal window on the glass, echoed the command, ran a
+ * two-line script and printed "rebooting into ota_1" before anything happened.
+ * A native app calls this instead and nothing is shown but black.
+ *
+ * `key` names the app (see the table in slotb.c) or is NULL for slot B's menu.
+ * Returns false when slot B holds no image or the key is not an app, and in that
+ * case NOTHING IS CHANGED -- the caller can still put a message on the glass.
+ * On success this does not return.
+ */
+bool slotb_launch(const char *key);
+
+/*
  * The `slotb` shell command: enter slot B on purpose.
  *
  * This is what the Start menu's launcher calls. It is a command rather than
