@@ -252,19 +252,22 @@ static int list_dir(const char *dir, bool parent)
         }
         else
         {
-            if (s_tagged)
-            {
-                const bool dmg = strstr(dir, "/media/gb") != NULL &&
-                                 strstr(dir, "/media/gbc") == NULL;
-                char *slot = s_tagged + (size_t)i * PK_LABEL_MAX;
-                snprintf(slot, PK_LABEL_MAX, "%s %s", dmg ? "GB  " : "GBC ",
-                         s_ent[i].name);
-                s_labels[i] = slot;
-            }
-            else
-            {
-                s_labels[i] = s_ent[i].name;
-            }
+            /*
+             * NO CONSOLE PREFIX ON A CARTRIDGE ROW. The operator's correction,
+             * and the prefix had stopped earning its four characters: the list
+             * is entered through the console it belongs to, so "GBC " on every
+             * row repeated what the navigation had already said. Four characters
+             * of a 38-character row is 10.5 per cent of the line handed back to
+             * the filename, which is the only part of these rows that varies.
+             *
+             * What identifies the console now: the branch that was chosen to get
+             * here, and the extension at the end of the name. The one case the
+             * prefix would still have flagged -- a .gb cartridge sitting inside
+             * the colour tree -- is a cartridge the firmware runs as GB_HW_CGB
+             * because it lives there, so the row was describing the directory
+             * rather than the file and was not adding information anyway.
+             */
+            s_labels[i] = s_ent[i].name;
         }
     }
 
@@ -679,11 +682,13 @@ bool gbpick_run(char *out, size_t cap, const volatile bool *abort)
     }
 
     char root_base[PK_PATH_MAX];
+    char console[24];
 
     /* One console only: do not make the wearer choose from a list of one. */
     if (root_n == 1)
     {
         snprintf(s_cwd, PK_PATH_MAX, "%s", k_roots[0].path);
+        snprintf(console, sizeof(console), "%s", root_labels[0]);
     }
     else
     {
@@ -694,6 +699,7 @@ bool gbpick_run(char *out, size_t cap, const volatile bool *abort)
             return false;
 
         snprintf(s_cwd, PK_PATH_MAX, "%s", k_roots[sel].path);
+        snprintf(console, sizeof(console), "%s", root_labels[sel]);
     }
 
     snprintf(root_base, sizeof(root_base), "%s", s_cwd);
@@ -712,9 +718,24 @@ bool gbpick_run(char *out, size_t cap, const volatile bool *abort)
             return false;
         }
 
-        /* The title names where we are, so a bucket list is not mistaken for the
-         * whole card. */
-        const char *where = at_root ? base_name(s_cwd) : base_name(s_cwd);
+        /*
+         * THE TITLE CARRIES THE CONSOLE, ONCE. The cartridge rows used to repeat
+         * "GBC " or "GB  " four characters deep on every line, which was the
+         * operator's complaint: the console is already known from the branch
+         * that was chosen, and repeating it 22 times per screen spends filename
+         * space on something the wearer selected a moment ago. Stated once in the
+         * title it keeps the context and costs the rows nothing.
+         *
+         * The title shows where in the tree the list is: the console alone at its
+         * root, then "Game Boy Color - retail", then "Game Boy Color - A".
+         */
+        char where[48];
+
+        if (at_root)
+            snprintf(where, sizeof(where), "%s", console);
+        else
+            snprintf(where, sizeof(where), "%s - %s", console, base_name(s_cwd));
+
         int sel = -1;
 
         if (!gbpick_list_run(where, s_labels, s_ent_n, &sel, abort))
