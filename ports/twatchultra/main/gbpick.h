@@ -51,15 +51,25 @@ void gbpick_message(const char *line1, const char *line2);
  * that is Ctrl+Q on the desktop, where it closes a window -- meaningless in slot
  * B, which has neither). Where it is drawn, pressing it ends the list and writes
  * true to `up_out`, for a caller that has a parent directory to climb to. Where
- * there is no parent, pass false and the bar is blanked and inert. `up_out` may
- * be NULL only when `can_go_up` is false.
+ * there is no parent, pass false and the bar is drawn blank like the other
+ * unused slots. `up_out` may be NULL only when `can_go_up` is false.
+ *
+ * `sel_init` is the row highlighted when the list appears, or -1 for none. It is
+ * for a list a wearer comes back to -- the console chooser -- where the choice
+ * they made last time is the best first guess, and an unhighlighted list makes
+ * the first tap do nothing at all.
+ *
+ * EVERY MARGIN SLOT IS DRAWN, including the ones this list does not use: pulled
+ * chrome left a frame with bites out of it and read as broken rather than
+ * complete. A blank box is not a button -- presses are classified by the list
+ * itself, and an unused slot neither acts nor buzzes.
  *
  * Returns true when a row was chosen and writes its index to `sel_out`; false
  * when `*abort` went true, when the Up bar was pressed, or when the list was
  * empty. Requires the same preconditions as gbpick_run().
  */
 bool gbpick_list_run(const char *title, const char *const *labels, int n,
-                     bool can_go_up, int *sel_out, bool *up_out,
+                     bool can_go_up, int sel_init, int *sel_out, bool *up_out,
                      const volatile bool *abort);
 
 #endif /* TWATCH_GBPICK_H */

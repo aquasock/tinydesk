@@ -691,7 +691,8 @@ static void slotb_run(const char *board_conf)
                 slotb_mark(SLOTB_STAGE_MENU);
 
                 if (!gbpick_list_run("Slot B - select an app", labels,
-                                     SLOTB_APP_N, false, &sel, NULL, &s_exit_req))
+                                     SLOTB_APP_N, false, -1, &sel, NULL,
+                                     &s_exit_req))
                     break;                   /* Pusher A in the menu: leave */
 
                 if (sel < 0 || sel >= SLOTB_APP_N)

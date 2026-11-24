@@ -407,26 +407,30 @@ void gbpick_message(const char *line1, const char *line2)
  * own correction after trying to use the picker: a finger cannot reliably hit a
  * 16-row band, and a list you can only tap is a list you scroll by accident.
  *
- * The right column already carries U+2191 and U+2193 at indices 3 and 4, and the
- * bottom strip already carries Enter at index 1 and Ctrl+Q at index 2, so the
- * furniture for this existed and was merely unused. Ctrl+Q is the window
- * manager's close key and means nothing in slot B, which has no shell and no
- * window to close; it is relabelled "Up" and made the way out of a folder. The
- * other two buttons are blanked and their chrome removed, because they do
- * nothing here -- an F10 button that sends nothing is the label/duty
- * disagreement edges.h was written to prevent.
+ * The right column carries U+2191 and U+2193 at indices 3 and 4, and the bottom
+ * strip carries Enter at index 1 and Ctrl+Q at index 2, so the furniture for this
+ * existed and was merely unused. Ctrl+Q is the window manager's close key and
+ * means nothing in slot B, which has no shell and no window to close; it is
+ * relabelled "Up" and made the way out of a folder.
+ *
+ * EVERY OTHER SLOT IS DRAWN AND LEFT BLANK, which is the operator's correction
+ * after using it: pulled chrome left a frame with bites out of it, so the list
+ * looked broken rather than complete. A blank box is not a promise to act --
+ * this list owns the glass, so its presses are classified in list_touch() below,
+ * where an unhandled slot falls through and neither acts nor buzzes. The
+ * key-sending path in touch.c never runs while the pixels are claimed.
  */
 static void setup_margins(bool can_up)
 {
     for (int i = 0; i < COL_N; i++)
     {
-        display_margin_chrome(0, i, false);
+        display_margin_chrome(0, i, true);
         display_margin_label(0, i, " ");
     }
 
     for (int i = 0; i <= 2; i++)
     {
-        display_margin_chrome(1, i, false);
+        display_margin_chrome(1, i, true);
         display_margin_label(1, i, " ");
     }
 
@@ -435,15 +439,15 @@ static void setup_margins(bool can_up)
     display_margin_chrome(1, 4, true);
     display_margin_label(1, 4, "\xe2\x86\x93");   /* U+2193 down */
 
-    display_margin_chrome(2, 0, false);
+    display_margin_chrome(2, 0, true);
     display_margin_btn_label(0, " ");
     display_margin_chrome(2, 1, true);
     display_margin_btn_label(1, "Enter");
 
-    /* THE THIRD BAR IS UP, AND ONLY WHERE THERE IS SOMEWHERE TO CLIMB TO. At
-     * the console root it is blanked and inert exactly like the other two, so a
-     * press there neither acts nor buzzes. */
-    display_margin_chrome(2, 2, can_up);
+    /* THE THIRD BAR IS UP WHERE THERE IS SOMEWHERE TO CLIMB TO, AND BLANK WHERE
+     * THERE IS NOT -- a drawn box with no word on it, which is what the other
+     * blank slots are. */
+    display_margin_chrome(2, 2, true);
     display_margin_btn_label(2, can_up ? "Up" : " ");
 
     /* The overrides only take effect in APP mode; in desktop mode display.c
@@ -595,7 +599,7 @@ static bool list_touch(void *user, const touch_frame_t *f)
 /* -------------------------------------------------------------------- entry */
 
 bool gbpick_list_run(const char *title, const char *const *labels, int n,
-                     bool can_go_up, int *sel_out, bool *up_out,
+                     bool can_go_up, int sel_init, int *sel_out, bool *up_out,
                      const volatile bool *abort)
 {
     if (!labels || n <= 0)
@@ -620,8 +624,8 @@ bool gbpick_list_run(const char *title, const char *const *labels, int n,
     s_up_out = up_out;
     s_can_up = can_go_up;
     s_done = false;
-    s_sel = -1;
-    s_page = 0;
+    s_sel = (sel_init >= 0 && sel_init < n) ? sel_init : -1;
+    s_page = s_sel >= 0 ? s_sel / PK_ROWS : 0;
     s_prev_up = s_prev_down = s_prev_enter = s_prev_back = false;
     s_prev_row = -1;
     snprintf(s_title, sizeof(s_title), "%s", title ? title : "");
@@ -685,8 +689,13 @@ bool gbpick_run(char *out, size_t cap, const volatile bool *abort)
     }
 
     /* THE ROOT LIST IS THE CONSOLES THAT ARE ACTUALLY THERE, so a card with only
-     * Game Boy does not offer a Colour branch that opens on nothing. */
+     * Game Boy does not offer a Colour branch that opens on nothing. `root_ix`
+     * maps a row of this list back to k_roots: the rows are compacted, so the row
+     * number is NOT the console index when the first directory is missing -- the
+     * previous version used the row number for k_roots and would have opened
+     * `/sd/media/gbc` for a card that only had Game Boy. */
     int root_n = 0;
+    int root_ix[PK_ROOT_N];
     char root_labels[PK_ROOT_N][24];
 
     for (int i = 0; i < PK_ROOT_N; i++)
@@ -697,6 +706,7 @@ bool gbpick_run(char *out, size_t cap, const volatile bool *abort)
             continue;
 
         closedir(d);
+        root_ix[root_n] = i;
         snprintf(root_labels[root_n], sizeof(root_labels[0]), "%s",
                  k_roots[i].label);
         s_labels[root_n] = root_labels[root_n];
@@ -711,95 +721,128 @@ bool gbpick_run(char *out, size_t cap, const volatile bool *abort)
 
     char root_base[PK_PATH_MAX];
     char console[24];
+    int cur = -1;                        /* which console, as a root row */
 
-    /* One console only: do not make the wearer choose from a list of one. */
-    if (root_n == 1)
-    {
-        snprintf(s_cwd, PK_PATH_MAX, "%s", k_roots[0].path);
-        snprintf(console, sizeof(console), "%s", root_labels[0]);
-    }
-    else
-    {
-        int sel = -1;
-
-        if (!gbpick_list_run("Game Boy - select a console", s_labels, root_n,
-                             false, &sel, NULL, abort))
-            return false;
-
-        snprintf(s_cwd, PK_PATH_MAX, "%s", k_roots[sel].path);
-        snprintf(console, sizeof(console), "%s", root_labels[sel]);
-    }
-
-    snprintf(root_base, sizeof(root_base), "%s", s_cwd);
-
-    /* THE NAVIGATION LOOP. Each pass lists the current directory and acts on one
-     * choice: a folder descends, Up climbs, a cartridge ends the picker. */
+    /*
+     * TWO LEVELS, AND THE CONSOLE LIST IS ABOVE THE CARTDRIDGE TREE.
+     *
+     * It began as a screen shown once, on the way in, with the console's own
+     * directory as the top of the tree and no way back to the other console. The
+     * operator asked for Up to work there too, which makes it the top of the
+     * navigation rather than a preamble: Up at the console's root now returns to
+     * the console list, with the console you were in already highlighted, so
+     * switching between Game Boy and Game Boy Color is a press and not a relaunch.
+     *
+     * With ONE console on the card there is nothing above the root, the console
+     * list is skipped, and Up stays blank there -- the same rule as before.
+     */
     for (;;)
     {
-        /* The console directory is as far up as this picker goes, so its list
-         * has no Up bar -- there is nowhere useful to climb to. */
-        const bool at_root = (strcmp(s_cwd, root_base) == 0);
-
-        if (list_dir(s_cwd) == 0)
+        /* One console only: do not make the wearer choose from a list of one. */
+        if (root_n == 1)
         {
-            gbpick_message("No cartridges here", base_name(s_cwd));
-            return false;
+            cur = 0;
+        }
+        else
+        {
+            int sel = -1;
+
+            if (!gbpick_list_run("Game Boy - select a console", s_labels, root_n,
+                                 false, cur, &sel, NULL, abort))
+                return false;
+
+            if (sel < 0 || sel >= root_n)
+                return false;
+
+            cur = sel;
         }
 
-        /*
-         * THE TITLE CARRIES THE CONSOLE, ONCE. The cartridge rows used to repeat
-         * "GBC " or "GB  " four characters deep on every line, which was the
-         * operator's complaint: the console is already known from the branch
-         * that was chosen, and repeating it 22 times per screen spends filename
-         * space on something the wearer selected a moment ago. Stated once in the
-         * title it keeps the context and costs the rows nothing.
-         *
-         * The title shows where in the tree the list is: the console alone at its
-         * root, then "Game Boy Color - retail", then "Game Boy Color - A".
-         */
-        char where[48];
+        snprintf(s_cwd, PK_PATH_MAX, "%s", k_roots[root_ix[cur]].path);
+        /* `root_labels` and `console` are both 24 bytes, so the copy cannot
+         * truncate -- but the compiler only knows the SOURCE is at most 24 and
+         * the destination exactly 24, so the width is stated. */
+        snprintf(console, sizeof(console), "%.*s", (int)sizeof(console) - 1,
+                 root_labels[cur]);
+        snprintf(root_base, sizeof(root_base), "%s", s_cwd);
 
-        if (at_root)
-            snprintf(where, sizeof(where), "%s", console);
-        else
-            snprintf(where, sizeof(where), "%s - %s", console, base_name(s_cwd));
-
-        int sel = -1;
-        bool climb = false;
-
-        if (!gbpick_list_run(where, s_labels, s_ent_n, !at_root, &sel, &climb,
-                             abort))
+        /* THE NAVIGATION LOOP. Each pass lists the current directory and acts on
+         * one choice: a folder descends, Up climbs, a cartridge ends the picker. */
+        for (;;)
         {
-            if (climb)
+            const bool at_root = (strcmp(s_cwd, root_base) == 0);
+
+            if (list_dir(s_cwd) == 0)
             {
-                path_up(s_cwd);
+                gbpick_message("No cartridges here", base_name(s_cwd));
+                return false;
+            }
+
+            /*
+             * THE TITLE CARRIES THE CONSOLE, ONCE. The cartridge rows used to
+             * repeat "GBC " or "GB  " four characters deep on every line, which
+             * was the operator's complaint: the console is already known from the
+             * branch that was chosen, and repeating it 22 times per screen spends
+             * filename space on something the wearer selected a moment ago.
+             * Stated once in the title it keeps the context and costs the rows
+             * nothing.
+             *
+             * The title shows where in the tree the list is: the console alone at
+             * its root, then "Game Boy Color - retail", then "Game Boy Color - A".
+             */
+            char where[48];
+
+            if (at_root)
+                snprintf(where, sizeof(where), "%s", console);
+            else
+                snprintf(where, sizeof(where), "%s - %s", console,
+                         base_name(s_cwd));
+
+            /* Up is drawn wherever it leads somewhere: out of a folder, or --
+             * at the console's root -- back to the console list, when there is
+             * more than one console to return to. */
+            const bool can_up = !at_root || root_n > 1;
+
+            int sel = -1;
+            bool climb = false;
+
+            if (!gbpick_list_run(where, s_labels, s_ent_n, can_up, -1, &sel,
+                                 &climb, abort))
+            {
+                if (!climb)
+                    return false;           /* Pusher A: out of the picker */
+
+                if (!at_root)
+                {
+                    path_up(s_cwd);
+                    continue;
+                }
+
+                break;                      /* Up at the root: console list */
+            }
+
+            if (sel < 0 || sel >= s_ent_n)
+                return false;
+
+            pk_ent_t *chosen = &s_ent[sel];
+
+            if (chosen->is_dir)
+            {
+                char next[PK_PATH_MAX];
+                snprintf(next, sizeof(next), "%s/%s", s_cwd, chosen->name);
+                snprintf(s_cwd, PK_PATH_MAX, "%s", next);
                 continue;
             }
-            return false;                   /* Pusher A: out of the picker */
+
+            const int need = snprintf(NULL, 0, "%s/%s", s_cwd, chosen->name);
+
+            if (need < 0 || (size_t)need >= cap)
+            {
+                gbpick_message("Path too long", chosen->name);
+                return false;
+            }
+
+            snprintf(out, cap, "%s/%s", s_cwd, chosen->name);
+            return out[0] != '\0';
         }
-
-        if (sel < 0 || sel >= s_ent_n)
-            return false;
-
-        pk_ent_t *chosen = &s_ent[sel];
-
-        if (chosen->is_dir)
-        {
-            char next[PK_PATH_MAX];
-            snprintf(next, sizeof(next), "%s/%s", s_cwd, chosen->name);
-            snprintf(s_cwd, PK_PATH_MAX, "%s", next);
-            continue;
-        }
-
-        const int need = snprintf(NULL, 0, "%s/%s", s_cwd, chosen->name);
-
-        if (need < 0 || (size_t)need >= cap)
-        {
-            gbpick_message("Path too long", chosen->name);
-            return false;
-        }
-
-        snprintf(out, cap, "%s/%s", s_cwd, chosen->name);
-        return out[0] != '\0';
     }
 }
