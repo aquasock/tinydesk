@@ -15,7 +15,9 @@ path, and the time. This reads it back and decodes it, because the struct is 312
 bytes with a 256-byte path and reading those offsets by hand is how a confident
 wrong answer happens.
 
-    magic       "SBRC"          -- anything else means no record was written
+    magic       0x53425243      -- "SBRC" as a number; its BYTES in flash are
+                                   b"CRBS", because the field is a little-endian
+                                   uint32 and this chip writes low byte first
     uptime_ms   milliseconds since slot B started
     why[48]     the reason, as the emulator or the picker worded it
     path[256]   the cartridge (or directory) it was about
@@ -28,19 +30,36 @@ WHAT IS WRITTEN, and this is what makes the pair worth reading:
 A `pick` with no failure record after it means the cartridge opened; a `pick`
 followed by a failure names the path that would not open. Both survive a reset,
 so the record can be read after the watch has already rebooted to the desktop.
+
+LAST WRITE WINS, and that is a limitation worth knowing before reading it: the
+sector holds ONE record, so playing a working cartridge after a failing one
+erases the evidence. Read it before trying anything else, or accept that a
+`pick` with a long path is the last thing that was attempted and not necessarily
+the thing that went wrong.
 """
 import argparse
 import os
-import re
 import struct
 import subprocess
 import sys
 
 ADDR = 0x1B000
 SIZE = 512
-MAGIC = b"SBRC"
+#
+# THE MAGIC IS A uint32 IN FLASH, SO ITS BYTES ARE LITTLE-ENDIAN.
+#
+# 0x53425243 spells "SBRC" read as a number, but the struct stores it as a uint32
+# and this chip writes multi-byte fields low byte first -- so the first four bytes
+# in flash are "CRBS". The first version of this tool compared those bytes against
+# b"SBRC", rejected every real record as absent, and reported "no record" on a
+# sector that held a perfectly good one. Compare the NUMBER; keep the literal for
+# prose only.
+#
 WHY_LEN = 48
 PATH_LEN = 256
+
+# "SBRC" as a number. Its BYTES in flash are b"CRBS" -- see the note above.
+MAGIC = 0x53425243
 
 
 def find_port():
@@ -90,7 +109,7 @@ def main():
         raw = f.read()
     os.unlink(tmp)
 
-    if raw[:4] != MAGIC:
+    if len(raw) < 8 + WHY_LEN + PATH_LEN or struct.unpack_from("<I", raw, 0)[0] != MAGIC:
         blank = raw[:4] == b"\xff\xff\xff\xff"
         print(f"no record at {hex(ADDR)}: "
               f"{'sector is erased' if blank else 'holds ' + repr(raw[:4])}")
