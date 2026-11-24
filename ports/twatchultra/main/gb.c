@@ -437,6 +437,25 @@ static uint16_t s_stop_guest_ms, s_stop_blit_ms, s_stop_sram_ms, s_stop_save_ms;
  * it may still hold were leaked rather than freed. Cleared by the next start. */
 static bool s_blit_leak;
 
+/* WHY THE LAST gb_start() REFUSED, for a caller with no console.
+ *
+ * Every refusal also has a printf beside it, and slot B has no console to put
+ * that on: the wearer saw a message that guessed ("no ROM?") at a cause that
+ * could just as easily be a bad cartridge, a full heap or a leaked blitter.
+ * Cleared at the top of every start, so a caller reads the reason for THIS
+ * attempt. Kept under 38 characters, which is what a picker row can draw. */
+static char s_err[48];
+
+static void gb_err(const char *why)
+{
+    snprintf(s_err, sizeof(s_err), "%s", why);
+}
+
+const char *gb_last_error(void)
+{
+    return s_err;
+}
+
 /* Where the panel push was, and how long it had been there, when that happened.
  * Meaningless unless s_blit_leak is set. */
 static uint8_t s_blit_stuck_phase;
@@ -1320,6 +1339,16 @@ static bool gb_app_key(void *user)
 
 bool gb_start(const char *rom_path)
 {
+    /* WHY THE LAST START REFUSED, FOR A CALLER WITH NO CONSOLE.
+     *
+     * Every refusal below has a printf beside it, and in slot B there is no
+     * console to put it on -- so a failed launch left the wearer looking at a
+     * message that guessed ("no ROM?") at a cause that could just as easily be
+     * a bad cartridge, a full heap or a leaked blitter. The string is set at each
+     * refusal and cleared at the top of a start that gets past the two early
+     * ones, so a caller reads the reason for THIS attempt and not an older one. */
+    s_err[0] = '\0';
+
     /*
      * A WEDGED BLITTER CLOSES THE EMULATOR UNTIL THE WATCH IS REBOOTED.
      *
@@ -1331,12 +1360,14 @@ bool gb_start(const char *rom_path)
      */
     if (s_blit_leak)
     {
+        gb_err("a blitter never exited");
         printf("gb: a blitter from the last session never exited -- reboot\n");
         return false;
     }
 
     if (s_run)
     {
+        gb_err("already running");
         printf("gb: already running -- gb stop first\n");
         return false;
     }
@@ -1348,6 +1379,7 @@ bool gb_start(const char *rom_path)
     FILE *fp = fopen(path, "rb");
     if (!fp)
     {
+        gb_err("cannot open the cartridge");
         printf("gb: cannot open %s\n", path);
         return false;
     }
@@ -1358,6 +1390,7 @@ bool gb_start(const char *rom_path)
 
     if (len <= 0 || len > (4L << 20))
     {
+        gb_err("not a cartridge (size)");
         printf("gb: %s is %ld bytes -- not a cartridge\n", path, len);
         fclose(fp);
         return false;
@@ -1370,6 +1403,7 @@ bool gb_start(const char *rom_path)
     s_rom = (uint8_t *)heap_caps_malloc((size_t)len, MALLOC_CAP_SPIRAM);
     if (!s_rom)
     {
+        gb_err("no PSRAM for the cartridge");
         printf("gb: no PSRAM for a %ld-byte cartridge\n", len);
         fclose(fp);
         return false;
@@ -1379,6 +1413,7 @@ bool gb_start(const char *rom_path)
 
     if (fread(s_rom, 1, s_rom_len, fp) != s_rom_len)
     {
+        gb_err("the card returned a short read");
         printf("gb: short read on %s\n", path);
         fclose(fp);
         goto fail_rom;
@@ -1393,6 +1428,7 @@ bool gb_start(const char *rom_path)
 
         if (!s_fb[i])
         {
+            gb_err("no PSRAM for the frame");
             printf("gb: no PSRAM for frame buffer %d\n", i);
             goto fail_fb;
         }
@@ -1401,6 +1437,7 @@ bool gb_start(const char *rom_path)
     if (gnuboy_init(GB_AUDIO_HZ, GB_AUDIO_MONO_S16, GB_PIXEL_565_BE,
                     gb_video_cb, gb_audio_cb) != 0)
     {
+        gb_err("the emulator core did not init");
         printf("gb: gnuboy_init failed\n");
         goto fail_fb;
     }
@@ -1427,6 +1464,7 @@ bool gb_start(const char *rom_path)
 
     if (gnuboy_load_rom(s_rom, s_rom_len) != 0)
     {
+        gb_err("unsupported cartridge or mapper");
         printf("gb: %s: unsupported cartridge or mapper\n", path);
         gnuboy_free_rom();
         goto fail_fb;

@@ -115,6 +115,12 @@ const int slotb_force_link = 1;
 #define SLOTB_STAGE_RETURN     8
 #define SLOTB_STAGE_SETBOOT_FAILED 9
 
+/* THE APP MENU WAS DRAWN. Not part of the linear trail -- it can repeat, and it
+ * is written every time the menu appears. It answers the one question the trail
+ * could not: when slot B is found sitting on the app menu, did the boot arrive
+ * there (no launch key) or did something inside the loop fall back to it? */
+#define SLOTB_STAGE_MENU       10
+
 #define SLOTB_FAIL_DISPLAY  90
 #define SLOTB_FAIL_BOARDCFG 91
 #define SLOTB_FAIL_SD       92
@@ -334,12 +340,14 @@ typedef struct
     bool (*start)(const char *rom);      /* NULL rom means the app's default */
     void (*stop)(void);
     bool (*running)(void);
+    const char *(*why)(void);            /* why the last start refused, or NULL */
 } slotb_app_t;
 
 /*
  * Game Boy is the one app with a cartridge chooser, so its start is a wrapper:
- * pick a cartridge, then start. Abandoning the picker returns false and the menu
- * comes back rather than the whole personality going dark.
+ * pick a cartridge, then start. Abandoning the picker returns false with the exit
+ * flag set, and where that leads is slotb_app_go()'s decision -- desktop or menu
+ * -- because it depends on how slot B was entered, not on how the app ended.
  */
 /* Big enough for a full card path. A bucket plus a 110-character cartridge
  * name is over 130 bytes, and the default cartridge's own path is 120, so
@@ -362,9 +370,9 @@ static bool slotb_start_gb(const char *rom)
 }
 
 static const slotb_app_t s_apps[] = {
-    { "Game Boy Color", "gb",  slotb_start_gb, gb_stop,    gb_running    },
-    { "NES",            "nes", nes_start,      nes_stop,   nes_running   },
-    { "Pokemon Mini",   "pm",  pmini_start,    pmini_stop, pmini_running },
+    { "Game Boy Color", "gb",  slotb_start_gb, gb_stop,    gb_running,    gb_last_error },
+    { "NES",            "nes", nes_start,      nes_stop,   nes_running,   NULL },
+    { "Pokemon Mini",   "pm",  pmini_start,    pmini_stop, pmini_running, NULL },
 };
 
 #define SLOTB_APP_N ((int)(sizeof(s_apps) / sizeof(s_apps[0])))
@@ -469,6 +477,78 @@ static int slotb_app_index(const char *key)
     return -1;
 }
 
+/*
+ * Run one app from start to stop. Returns true when slot B should leave for the
+ * desktop.
+ *
+ * `direct` says how slot B was entered, and it is the ONLY thing that decides
+ * where every exit goes: from a desktop shortcut, every way out is the desktop,
+ * because that is where the wearer came from. From the menu, every way out but
+ * the deliberate one is the menu again, so another game is a tap away.
+ *
+ * It is a parameter rather than a flag the caller resets, because the previous
+ * version carried a `launched_direct` local inside the loop and a path that lost
+ * it -- which is how a wearer who tapped "Game Boy Color" and picked a cartridge
+ * ended up looking at the app menu.
+ */
+static bool slotb_app_go(int sel, bool direct)
+{
+    const slotb_app_t *app = &s_apps[sel];
+
+    if (!app->start(NULL))
+    {
+        /*
+         * BACKING OUT IS NOT A FAILURE, and the two arrive through the same
+         * return value: Game Boy's start is the cartridge picker, so Pusher A in
+         * it returns false with the exit flag set. Reporting that as "did not
+         * start" would be a lie printed to the wearer's face.
+         */
+        if (s_exit_req)
+        {
+            s_exit_req = false;
+            return direct;
+        }
+
+        /*
+         * SAY WHY, IN THE APP'S OWN WORDS WHERE IT HAS THEM. An app that cannot
+         * start has only its own printf, and there is no console here. "no ROM?"
+         * was a guess, and a bad cartridge, a full heap and a leaked blitter all
+         * produced it.
+         */
+        const char *why = app->why ? app->why() : NULL;
+        const bool have_why = why && *why;
+        char l1[48];
+
+        snprintf(l1, sizeof(l1), "%s did not start", app->label);
+        gbpick_message(l1, have_why ? why : "no ROM? put one in /sd/media");
+        ESP_LOGW(TAG, "%s did not start%s%s", app->label,
+                 have_why ? ": " : "", have_why ? why : "");
+        vTaskDelay(pdMS_TO_TICKS(SLOTB_ERR_HOLD_MS));
+
+        return direct;
+    }
+
+    ESP_LOGI(TAG, "running %s", app->label);
+    slotb_mark(SLOTB_STAGE_EMU_START);
+
+    /* The firmware is demonstrably working, so take it off the bootloader's
+     * trial list. */
+    slotb_confirm();
+
+    while (app->running() && !s_exit_req)
+        vTaskDelay(pdMS_TO_TICKS(100));
+
+    /* THE STOP HAPPENS HERE, ON THIS TASK, NOT ON THE KEY TASK. An app's stop
+     * writes SRAM before it releases anything and then waits for its own tasks to
+     * leave; doing it here means the save has finished before the next app claims
+     * the amplifier or the glass. */
+    app->stop();
+    slotb_mark(SLOTB_STAGE_EMU_STOP);
+
+    s_exit_req = false;
+    return direct;
+}
+
 static void slotb_run(const char *board_conf)
 {
     slotb_mark(SLOTB_STAGE_ENTER);
@@ -558,14 +638,14 @@ static void slotb_run(const char *board_conf)
     pwrkey_set_app_key(slotb_key, NULL);
 
     /*
-     * THE MENU IS THE WHOLE OF SLOT B, and this loop is the reason it is worth
-     * having: back out of a game and the menu returns instead of the watch
-     * rebooting to the desktop, so changing games costs a tap and not a boot.
+     * THE MENU IS ONE WAY INTO AN APP, NOT THE ONLY ONE, and this loop is why it
+     * is worth having when it IS the way in: back out of a game and the menu
+     * returns instead of the watch rebooting to the desktop, so changing games
+     * costs a tap and not a boot.
      *
      * PUSHER A MEANS "BACK" -- in the menu it leaves slot B for the desktop, and
-     * inside an app it stops the app and returns here. That is the behaviour of a
-     * machine that has a shell it drops into, which is what this is; the press
-     * that ends a game should not also end the session.
+     * inside an app it stops the app and goes back one step: to the menu when the
+     * menu is where the wearer came from, and to the desktop when a shortcut is.
      */
     {
         static const char *labels[SLOTB_APP_N];
@@ -580,99 +660,46 @@ static void slotb_run(const char *board_conf)
         char want[16];
 
         slotb_app_get(want, sizeof(want));
-        int direct = slotb_app_index(want);
+        const int direct = slotb_app_index(want);
 
         if (direct >= 0)
         {
             slotb_app_set(NULL);
             ESP_LOGI(TAG, "booting straight into %s", s_apps[direct].label);
+
+            /*
+             * NO MENU IN THIS PATH, AT ALL -- and the reason has to be structural
+             * rather than a promise.
+             *
+             * The shortcut said "Game Boy Color". A menu listing three apps was
+             * never part of that instruction, and it used to be reachable from
+             * here: a cartridge that would not load -- a bad dump, a full heap, a
+             * leaked blitter -- fell through to the menu, so a wearer who had
+             * tapped a game and picked a cartridge could end up looking at a
+             * choice they had already made. The menu is not drawn on this path and
+             * there is nothing here that can draw it.
+             */
+            slotb_app_go(direct, true);
         }
-
-        for (;;)
+        else
         {
-            int sel = -1;
-            bool launched_direct = false;
-            bool have_choice = true;
+            for (;;)
+            {
+                int sel = -1;
 
-            if (direct >= 0)
-            {
-                sel = direct;
-                launched_direct = true;
-                direct = -1;                 /* first pass only */
-            }
-            else
-            {
                 display_pixels_claim(true);
+                slotb_mark(SLOTB_STAGE_MENU);
 
-                have_choice = gbpick_list_run("Slot B - select an app", labels,
-                                              SLOTB_APP_N, false, &sel, NULL,
-                                              &s_exit_req);
-            }
+                if (!gbpick_list_run("Slot B - select an app", labels,
+                                     SLOTB_APP_N, false, &sel, NULL, &s_exit_req))
+                    break;                   /* Pusher A in the menu: leave */
 
-            if (!have_choice)
-                break;                       /* Pusher A in the menu: leave */
-
-            if (sel < 0 || sel >= SLOTB_APP_N)
-                continue;
-
-            const slotb_app_t *app = &s_apps[sel];
-
-            if (!app->start(NULL))
-            {
-                /* BACKING OUT IS NOT A FAILURE, and the two arrive here through
-                 * the same return value. Game Boy's start is the cartridge
-                 * picker and nothing else; pressing Pusher A in it sets the exit
-                 * flag and returns false. Reporting that as "Game Boy Color did
-                 * not start / no ROM?" would be a lie printed to the wearer's
-                 * face, so the flag is checked first. */
-                if (s_exit_req)
-                {
-                    if (launched_direct)
-                        break;               /* back to the desktop, where they came from */
-
-                    s_exit_req = false;      /* back to the menu */
+                if (sel < 0 || sel >= SLOTB_APP_N)
                     continue;
-                }
 
-                /* SAY SO ON THE GLASS. An app that cannot start has only its own
-                 * printf, and there is no console here -- so without this the
-                 * menu simply reappears and the wearer has no idea why. The
-                 * commonest cause is the one worth naming: no cartridge. */
-                char l1[40];
-
-                snprintf(l1, sizeof(l1), "%s did not start", app->label);
-                gbpick_message(l1, "no ROM? put one in /sd/media");
-                ESP_LOGW(TAG, "%s did not start", app->label);
-                vTaskDelay(pdMS_TO_TICKS(SLOTB_ERR_HOLD_MS));
-                continue;
+                if (slotb_app_go(sel, false))
+                    break;
             }
-
-            ESP_LOGI(TAG, "running %s", app->label);
-            slotb_mark(SLOTB_STAGE_EMU_START);
-
-            /* The firmware is demonstrably working, so take it off the
-             * bootloader's trial list. */
-            slotb_confirm();
-
-            while (app->running() && !s_exit_req)
-                vTaskDelay(pdMS_TO_TICKS(100));
-
-            /* THE STOP HAPPENS HERE, ON THIS TASK, NOT ON THE KEY TASK. An app's
-             * stop writes SRAM before it releases anything and then waits for its
-             * own tasks to leave; doing it here means the save has finished
-             * before the next app claims the amplifier or the glass. */
-            app->stop();
-            slotb_mark(SLOTB_STAGE_EMU_STOP);
-
-            /* A DIRECT LAUNCH GOES BACK TO THE DESKTOP, because that is where the
-             * wearer came from -- the shortcut said "Game Boy", not "slot B", and
-             * a second press to leave would be one press too many. A launch from
-             * the menu returns to the menu instead, so another game is one tap
-             * away. `app->stop()` has already released the pixels either way. */
-            if (launched_direct)
-                break;
-
-            s_exit_req = false;
         }
     }
 

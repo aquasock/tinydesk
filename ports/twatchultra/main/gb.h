@@ -65,6 +65,16 @@ void gb_stop(void);
 bool gb_running(void);
 
 /*
+ * Why the last gb_start() refused, in a few words, or an empty string when it
+ * started.
+ *
+ * The refusal has always been printed, and a caller with no console -- slot B --
+ * had no way to repeat it: it could only guess at the cause, and guessed wrong.
+ * Gives back a pointer to static storage; valid until the next gb_start().
+ */
+const char *gb_last_error(void);
+
+/*
  * Which core the blitter runs on. Default 1.
  *
  * THE DESKTOP AND SLOT B WANT DIFFERENT ANSWERS, which is why this is not a
