@@ -47,11 +47,19 @@ void gbpick_message(const char *line1, const char *line2);
  * down arrows, chooses on the bottom strip's Enter, and also accepts a tap on a
  * row (once to highlight, a second separate tap to choose).
  *
+ * `can_go_up` draws an "Up" bar on the bottom strip, right of Enter (the slot
+ * that is Ctrl+Q on the desktop, where it closes a window -- meaningless in slot
+ * B, which has neither). Where it is drawn, pressing it ends the list and writes
+ * true to `up_out`, for a caller that has a parent directory to climb to. Where
+ * there is no parent, pass false and the bar is blanked and inert. `up_out` may
+ * be NULL only when `can_go_up` is false.
+ *
  * Returns true when a row was chosen and writes its index to `sel_out`; false
- * when `*abort` went true or the list was empty. Requires the same preconditions
- * as gbpick_run().
+ * when `*abort` went true, when the Up bar was pressed, or when the list was
+ * empty. Requires the same preconditions as gbpick_run().
  */
 bool gbpick_list_run(const char *title, const char *const *labels, int n,
-                     int *sel_out, const volatile bool *abort);
+                     bool can_go_up, int *sel_out, bool *up_out,
+                     const volatile bool *abort);
 
 #endif /* TWATCH_GBPICK_H */

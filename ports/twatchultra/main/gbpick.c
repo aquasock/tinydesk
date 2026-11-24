@@ -72,8 +72,14 @@ static bool s_registered;
  * a row is acted on only by a finger that was not on that row in the previous
  * report. A release arrives as a frame with no points, which clears all of it.
  */
-static bool s_prev_up, s_prev_down, s_prev_enter;
+static bool s_prev_up, s_prev_down, s_prev_enter, s_prev_back;
 static int s_prev_row = -1;
+
+/* Whether this run draws the bottom strip's "Up" bar, and where to say so when
+ * it is pressed. Only the cartridge navigator has a parent to climb to; the app
+ * menu and the console chooser are single screens. */
+static bool s_can_up;
+static bool *s_up_out;
 
 /* One row's worth of pixels, PSRAM: 10 KB doubled per draw is not a budget to
  * spend from this board's internal DRAM. */
@@ -106,8 +112,9 @@ static bool is_rom(const char *name)
  *
  * So the list is one directory at a time: subdirectories are drawn first with a
  * trailing slash, then cartridges, and Enter descends into a folder or launches
- * a cartridge. `..` goes up. That gives the whole library in two or three taps
- * and needs no more memory than one screen already used.
+ * a cartridge. The bottom strip's "Up" bar climbs out of a folder. That gives
+ * the whole library in two or three taps and needs no more memory than one
+ * screen already used.
  */
 #define PK_MAX_ENT  64
 
@@ -157,29 +164,24 @@ static const char *base_name(const char *path)
 }
 
 /*
- * Fill s_ent from one directory. `parent` adds a `..` row at the top, and is
- * false at the root where there is nowhere to go up to.
+ * Fill s_ent from one directory: its folders, then its cartridges.
+ *
+ * THERE IS NO `..` ROW ANY MORE. Climbing used to be a row at the top of the
+ * list, spending one of the 22 lines on screen to say something the bottom
+ * strip says for nothing: the third bar is "Up" whenever there is a parent to
+ * climb to, and blank where there is not. A row that exists only to be left is
+ * one more line to read past on every screen of a 1,143-cartridge library.
  */
-static int list_dir(const char *dir, bool parent)
+static int list_dir(const char *dir)
 {
     s_ent_n = 0;
     s_truncated = false;
 
-    if (parent && s_ent_n < PK_MAX_ENT)
-    {
-        snprintf(s_ent[s_ent_n].name, PK_NAME_MAX, "..");
-        s_ent[s_ent_n].is_dir = true;
-        s_ent_n++;
-    }
-
     DIR *d = opendir(dir);
 
     if (!d)
-        return s_ent_n;
+        return 0;
 
-    /* `..` is collected with the rest and then sorted to the top by hand, so
-     * that it does not compete alphabetically with a real folder. */
-    int first_real = s_ent_n;
     struct dirent *e;
 
     while ((e = readdir(d)) != NULL)
@@ -224,18 +226,12 @@ static int list_dir(const char *dir, bool parent)
 
     closedir(d);
 
-    const int real = s_ent_n - first_real;
-
-    if (real > 1)
-        qsort(s_ent + first_real, (size_t)real, sizeof(s_ent[0]), by_name);
+    if (s_ent_n > 1)
+        qsort(s_ent, (size_t)s_ent_n, sizeof(s_ent[0]), by_name);
 
     for (int i = 0; i < s_ent_n; i++)
     {
-        if (s_ent[i].is_dir && strcmp(s_ent[i].name, "..") == 0)
-        {
-            s_labels[i] = "..  (back)";
-        }
-        else if (s_ent[i].is_dir)
+        if (s_ent[i].is_dir)
         {
             /* A folder is shown with a trailing slash so the distinction from a
              * cartridge is visible rather than inferred. */
@@ -363,10 +359,13 @@ static void draw_screen(void)
     }
 
     /* Footer names the BUTTONS, because that is what a person can find: the
-     * arrows are drawn on the glass beside the list and Enter is in the strip. */
+     * arrows are drawn on the glass beside the list, Enter and Up are in the
+     * strip. Up is named only where it exists -- a footer that advertises a
+     * blanked bar is the label/duty disagreement edges.h was written against. */
     char foot[64];
 
-    snprintf(foot, sizeof(foot), "arrows: move  enter: start  %d/%d",
+    snprintf(foot, sizeof(foot), "arrows:move enter:start %s%d/%d",
+             s_can_up ? "up:back " : "",
              s_sel >= 0 ? s_sel + 1 : 0, s_item_n);
 
     row_pixels(s_rowbuf, foot, false);
@@ -409,12 +408,15 @@ void gbpick_message(const char *line1, const char *line2)
  * 16-row band, and a list you can only tap is a list you scroll by accident.
  *
  * The right column already carries U+2191 and U+2193 at indices 3 and 4, and the
- * bottom strip already carries Enter at index 1, so the furniture for this
- * existed and was merely unused. The other ten buttons are blanked and their
- * chrome removed, because they do nothing here -- an F10 button that sends
- * nothing is the label/duty disagreement edges.h was written to prevent.
+ * bottom strip already carries Enter at index 1 and Ctrl+Q at index 2, so the
+ * furniture for this existed and was merely unused. Ctrl+Q is the window
+ * manager's close key and means nothing in slot B, which has no shell and no
+ * window to close; it is relabelled "Up" and made the way out of a folder. The
+ * other two buttons are blanked and their chrome removed, because they do
+ * nothing here -- an F10 button that sends nothing is the label/duty
+ * disagreement edges.h was written to prevent.
  */
-static void setup_margins(void)
+static void setup_margins(bool can_up)
 {
     for (int i = 0; i < COL_N; i++)
     {
@@ -437,8 +439,12 @@ static void setup_margins(void)
     display_margin_btn_label(0, " ");
     display_margin_chrome(2, 1, true);
     display_margin_btn_label(1, "Enter");
-    display_margin_chrome(2, 2, false);
-    display_margin_btn_label(2, " ");
+
+    /* THE THIRD BAR IS UP, AND ONLY WHERE THERE IS SOMEWHERE TO CLIMB TO. At
+     * the console root it is blanked and inert exactly like the other two, so a
+     * press there neither acts nor buzzes. */
+    display_margin_chrome(2, 2, can_up);
+    display_margin_btn_label(2, can_up ? "Up" : " ");
 
     /* The overrides only take effect in APP mode; in desktop mode display.c
      * deliberately ignores them so an app cannot paint over the desktop's own
@@ -487,7 +493,7 @@ static bool list_touch(void *user, const touch_frame_t *f)
     /* ONE PASS TO CLASSIFY, THEN ONE PASS TO ACT: mixing them would make the
      * result depend on the order the controller listed the points in, and a
      * frame can carry two fingers. */
-    bool up = false, down = false, enter = false;
+    bool up = false, down = false, enter = false, back = false;
     int row = -1;
 
     if (f && f->n > 0)
@@ -507,6 +513,8 @@ static bool list_touch(void *user, const touch_frame_t *f)
             {
                 if (f->p[i].index == 1)
                     enter = true;
+                else if (f->p[i].index == 2 && s_can_up)
+                    back = true;
                 continue;
             }
 
@@ -534,11 +542,13 @@ static bool list_touch(void *user, const touch_frame_t *f)
     const bool fire_up = up && !s_prev_up;
     const bool fire_down = down && !s_prev_down;
     const bool fire_enter = enter && !s_prev_enter;
+    const bool fire_back = back && !s_prev_back;
     const bool fire_row = row >= 0 && row != s_prev_row;
 
     s_prev_up = up;
     s_prev_down = down;
     s_prev_enter = enter;
+    s_prev_back = back;
     s_prev_row = row;
 
     if (fire_up)
@@ -556,6 +566,14 @@ static bool list_touch(void *user, const touch_frame_t *f)
         commit_sel();
         return true;
     }
+    if (fire_back)
+    {
+        /* Not a choice, so the list ends without a selection: the caller reads
+         * this as "climb one level" and re-lists the parent. */
+        *s_up_out = true;
+        s_done = true;
+        return true;
+    }
     if (fire_row)
     {
         /* A finger that lands on a row highlights it; a NEW press on the row
@@ -571,15 +589,21 @@ static bool list_touch(void *user, const touch_frame_t *f)
         return true;
     }
 
-    return up || down || enter || row >= 0;
+    return up || down || enter || back || row >= 0;
 }
 
 /* -------------------------------------------------------------------- entry */
 
 bool gbpick_list_run(const char *title, const char *const *labels, int n,
-                     int *sel_out, const volatile bool *abort)
+                     bool can_go_up, int *sel_out, bool *up_out,
+                     const volatile bool *abort)
 {
     if (!labels || n <= 0)
+        return false;
+
+    /* A programming error, not a runtime condition: asking for an Up bar with
+     * nowhere to report the press would draw a button that does nothing. */
+    if (can_go_up && !up_out)
         return false;
 
     if (!s_rowbuf)
@@ -593,15 +617,19 @@ bool gbpick_list_run(const char *title, const char *const *labels, int n,
     s_items = labels;
     s_item_n = n;
     s_sel_out = sel_out;
+    s_up_out = up_out;
+    s_can_up = can_go_up;
     s_done = false;
     s_sel = -1;
     s_page = 0;
-    s_prev_up = s_prev_down = s_prev_enter = false;
+    s_prev_up = s_prev_down = s_prev_enter = s_prev_back = false;
     s_prev_row = -1;
     snprintf(s_title, sizeof(s_title), "%s", title ? title : "");
 
     if (sel_out)
         *sel_out = -1;
+    if (up_out)
+        *up_out = false;
 
     /* REGISTERED ONCE, NOT PER CALL. Slot B shows this list again every time an
      * app exits, and `touch_add_app_touch()` APPENDS -- so registering on each
@@ -618,7 +646,7 @@ bool gbpick_list_run(const char *title, const char *const *labels, int n,
         s_registered = true;
     }
 
-    setup_margins();
+    setup_margins(s_can_up);
     draw_screen();
 
     while (!s_done)
@@ -695,7 +723,7 @@ bool gbpick_run(char *out, size_t cap, const volatile bool *abort)
         int sel = -1;
 
         if (!gbpick_list_run("Game Boy - select a console", s_labels, root_n,
-                             &sel, abort))
+                             false, &sel, NULL, abort))
             return false;
 
         snprintf(s_cwd, PK_PATH_MAX, "%s", k_roots[sel].path);
@@ -705,14 +733,14 @@ bool gbpick_run(char *out, size_t cap, const volatile bool *abort)
     snprintf(root_base, sizeof(root_base), "%s", s_cwd);
 
     /* THE NAVIGATION LOOP. Each pass lists the current directory and acts on one
-     * choice: a folder descends, `..` climbs, a cartridge ends the picker. */
+     * choice: a folder descends, Up climbs, a cartridge ends the picker. */
     for (;;)
     {
         /* The console directory is as far up as this picker goes, so its list
-         * has no `..` -- there is nowhere useful to climb to. */
+         * has no Up bar -- there is nowhere useful to climb to. */
         const bool at_root = (strcmp(s_cwd, root_base) == 0);
 
-        if (list_dir(s_cwd, !at_root) == 0)
+        if (list_dir(s_cwd) == 0)
         {
             gbpick_message("No cartridges here", base_name(s_cwd));
             return false;
@@ -737,20 +765,23 @@ bool gbpick_run(char *out, size_t cap, const volatile bool *abort)
             snprintf(where, sizeof(where), "%s - %s", console, base_name(s_cwd));
 
         int sel = -1;
+        bool climb = false;
 
-        if (!gbpick_list_run(where, s_labels, s_ent_n, &sel, abort))
+        if (!gbpick_list_run(where, s_labels, s_ent_n, !at_root, &sel, &climb,
+                             abort))
+        {
+            if (climb)
+            {
+                path_up(s_cwd);
+                continue;
+            }
             return false;                   /* Pusher A: out of the picker */
+        }
 
         if (sel < 0 || sel >= s_ent_n)
             return false;
 
         pk_ent_t *chosen = &s_ent[sel];
-
-        if (strcmp(chosen->name, "..") == 0)
-        {
-            path_up(s_cwd);
-            continue;
-        }
 
         if (chosen->is_dir)
         {

@@ -605,7 +605,8 @@ static void slotb_run(const char *board_conf)
                 display_pixels_claim(true);
 
                 have_choice = gbpick_list_run("Slot B - select an app", labels,
-                                              SLOTB_APP_N, &sel, &s_exit_req);
+                                              SLOTB_APP_N, false, &sel, NULL,
+                                              &s_exit_req);
             }
 
             if (!have_choice)
