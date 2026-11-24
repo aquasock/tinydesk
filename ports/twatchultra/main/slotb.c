@@ -484,6 +484,16 @@ static void slotb_run(const char *board_conf)
     board_power_rails_preinit();
     slotb_mark(SLOTB_STAGE_RAILS);
 
+    /*
+     * NO RGB BOOT BANDS HERE. display_init() draws them and then blacks the panel
+     * a moment later, so they show for about a hundred milliseconds at every
+     * boot -- useful while the panel was being brought up, and noise now. Slot B
+     * goes from a blanked screen straight to its own first paint, which is the
+     * picker, so the bands would be a colour flash in the middle of a clean boot.
+     * The operator reported exactly that.
+     */
+    display_boot_pattern(false);
+
     /* NULL reply hook: display_init() guards it, and slot B has no desktop to
      * answer a terminal query for. */
     if (!display_init(NULL))

@@ -75,6 +75,25 @@ typedef void (*display_reply_fn)(const char *data, int len);
 /* Panel, terminal and painting task; false on error. */
 bool display_init(display_reply_fn reply);
 
+/*
+ * Whether display_init() draws the red/green/blue boot bands. Default ON.
+ *
+ * THE BANDS ARE A BRING-UP INSTRUMENT, not decoration: they prove the panel is
+ * lit before anything else paints, which is the only way to tell a dark panel
+ * apart from a controller that is drawing into memory nobody can see. Three
+ * display faults in this project reported success while drawing nothing, so the
+ * bands earn their place.
+ *
+ * But they FLASH: display_init() pushes them, then `panel_fill(0)` blacks the
+ * whole panel a moment later, so the wearer sees roughly a hundred milliseconds
+ * of colour at every boot. A personality that goes straight from a blanked
+ * screen to its own first paint -- slot B, whose picker is the first thing it
+ * draws -- does not want that, and turns it off here.
+ *
+ * Call before display_init().
+ */
+void display_boot_pattern(bool on);
+
 /* What to call when the terminal receives a BEL.
  *
  * The renderer owns the vterm, so it is the only thing that can install this;

@@ -160,6 +160,10 @@ static int s_cols, s_rows;
  */
 static bool s_pixel_owner;
 
+/* Whether display_init() pushes its RGB bring-up bands; see display_boot_pattern().
+ * Default on, because that is what every existing caller expects. */
+static bool s_boot_pattern = true;
+
 /* How many frames the painter actually drew, and how many it skipped because
  * something else owned the pixels. Counters rather than a flag because the
  * question "is the painter being suppressed?" cannot be answered by looking at
@@ -2358,6 +2362,11 @@ void display_set_bell(void (*fn)(void *user), void *user)
     }
 }
 
+void display_boot_pattern(bool on)
+{
+    s_boot_pattern = on;
+}
+
 bool display_init(display_reply_fn reply)
 {
     spi_bus_config_t bus = {
@@ -2417,22 +2426,39 @@ bool display_init(display_reply_fn reply)
     }
 
     /*
+     * THE FRAMEBUFFER IS ZEROED FIRST WHETHER OR NOT THE BANDS ARE DRAWN. It is
+     * fresh PSRAM, so without this a later partial flush could put whatever was
+     * in that memory onto the glass; a black framebuffer means a partial flush
+     * shows black.
+     */
+    memset(s_fb, 0, (size_t)DISPLAY_W * DISPLAY_H * 2);
+
+    /*
      * A test pattern before anything else. This is the only way to tell a
      * dark panel apart from a panel that is lit but showing a desktop which
      * never painted: three bands of solid colour that survive until the
      * first real paint. If these do not appear, the problem is power or the
      * QSPI framing, and the desktop is irrelevant.
+     *
+     * OPTIONAL, because they are visible. display_init() pushes them and
+     * `panel_fill(0)` blacks the panel a moment later, so they show for about a
+     * hundred milliseconds at every boot -- a diagnostic flash on a device that
+     * has nothing left to diagnose about its panel. Slot B turns them off; see
+     * display_boot_pattern() in display.h.
      */
-    for (int y = 0; y < DISPLAY_H; y++)
+    if (s_boot_pattern)
     {
-        uint16_t c = (y < DISPLAY_H / 3) ? 0xF800        /* red   */
-                   : (y < 2 * DISPLAY_H / 3) ? 0x07E0    /* green */
-                   : 0x001F;                             /* blue  */
-        for (int x = 0; x < DISPLAY_W; x++)
-            s_fb[(size_t)y * DISPLAY_W + x] = c;
+        for (int y = 0; y < DISPLAY_H; y++)
+        {
+            uint16_t c = (y < DISPLAY_H / 3) ? 0xF800        /* red   */
+                       : (y < 2 * DISPLAY_H / 3) ? 0x07E0    /* green */
+                       : 0x001F;                             /* blue  */
+            for (int x = 0; x < DISPLAY_W; x++)
+                s_fb[(size_t)y * DISPLAY_W + x] = c;
+        }
+        flush_rect(0, 0, DISPLAY_W, DISPLAY_H);
+        ESP_LOGI(TAG, "test pattern written: %dx%d", DISPLAY_W, DISPLAY_H);
     }
-    flush_rect(0, 0, DISPLAY_W, DISPLAY_H);
-    ESP_LOGI(TAG, "test pattern written: %dx%d", DISPLAY_W, DISPLAY_H);
 
     /* Then wipe the margins this port never writes, which still hold whatever
      * the previous firmware left in the controller's RAM. */
