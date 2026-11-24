@@ -485,14 +485,27 @@ static void slotb_run(const char *board_conf)
     slotb_mark(SLOTB_STAGE_RAILS);
 
     /*
-     * NO RGB BOOT BANDS HERE. display_init() draws them and then blacks the panel
-     * a moment later, so they show for about a hundred milliseconds at every
-     * boot -- useful while the panel was being brought up, and noise now. Slot B
-     * goes from a blanked screen straight to its own first paint, which is the
-     * picker, so the bands would be a colour flash in the middle of a clean boot.
-     * The operator reported exactly that.
+     * THE BOARD CONFIGURATION IS LOADED HERE, BEFORE THE PANEL, because the panel
+     * settings now come from it. The SD card's pins are the reason this file
+     * exists, but `lcd.boot_pattern` is read at the same moment and would be
+     * useless if the load happened after display_init() as it used to.
+     *
+     * NULL file path: the device copy at /etc/board.conf is on the littlefs the
+     * shell would have mounted, and BRD-004 confirms the built-in pin set is the
+     * correct one for this board (the card is on SPI3, host value 2).
      */
-    display_boot_pattern(false);
+    if (tdsh_board_load(board_conf, NULL) != 0)
+        ESP_LOGW(TAG, "board.conf had a bad line; using what parsed");
+    slotb_mark(SLOTB_STAGE_BOARDCFG);
+
+    /*
+     * THE BOOT BANDS FOLLOW THE SAME SETTING THE DESKTOP USES, so a panel fault
+     * is diagnosed identically on both personalities. The default is OFF --
+     * display_init() pushes the bands and then blacks the panel a moment later,
+     * which is a colour flash at every boot -- and `lcd.boot_pattern = 1` in
+     * board.conf turns them back on without a rebuild.
+     */
+    display_boot_pattern(tdsh_board_int("lcd.boot_pattern", 0) != 0);
 
     /* NULL reply hook: display_init() guards it, and slot B has no desktop to
      * answer a terminal query for. */
@@ -518,12 +531,6 @@ static void slotb_run(const char *board_conf)
      * NULL file path: the device copy at /etc/board.conf is on the littlefs the
      * shell would have mounted, and BRD-004 confirms the built-in pin set is the
      * correct one for this board (the card is on SPI3, host value 2). */
-    if (tdsh_board_load(board_conf, NULL) != 0)
-    {
-        ESP_LOGW(TAG, "board.conf had a bad line; using what parsed");
-    }
-    slotb_mark(SLOTB_STAGE_BOARDCFG);
-
     if (tdsh_sdcard_mount() != ESP_OK)
     {
         ESP_LOGE(TAG, "the card did not mount");

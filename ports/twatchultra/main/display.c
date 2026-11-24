@@ -161,8 +161,10 @@ static int s_cols, s_rows;
 static bool s_pixel_owner;
 
 /* Whether display_init() pushes its RGB bring-up bands; see display_boot_pattern().
- * Default on, because that is what every existing caller expects. */
-static bool s_boot_pattern = true;
+ * Default OFF: the panel is proven on both personalities and the bands are
+ * visible for ~100 ms at every boot. A panel fault is diagnosed by turning them
+ * back on through board.conf, not by editing this default. */
+static bool s_boot_pattern = false;
 
 /* How many frames the painter actually drew, and how many it skipped because
  * something else owned the pixels. Counters rather than a flag because the

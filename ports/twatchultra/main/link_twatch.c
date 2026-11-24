@@ -447,6 +447,27 @@ bool link_init(void)
     s_mirror = tdsh_board_int("lcd.mirror", 1) != 0;
 
     /*
+     * THE RGB BOOT BANDS, OFF BY DEFAULT AND RE-ENABLABLE FROM board.conf.
+     *
+     * They are a bring-up instrument -- three solid colours pushed to the panel
+     * prove it is lit before anything else paints, which is how a dark panel is
+     * told apart from a controller drawing into memory nobody can see. Three
+     * display faults in this project reported success while drawing nothing, so
+     * the instrument earned its place.
+     *
+     * THEY ARE VISIBLE THOUGH, and now that both personalities boot cleanly they
+     * are noise on both paths: display_init() pushes them and then blacks the
+     * whole panel a moment later, which is about a hundred milliseconds of colour
+     * at every boot. Slot B turned them off in entry 6; the operator then saw the
+     * same flash coming the other way, when Pusher A returns from a game to the
+     * desktop. So the default is now OFF for this board, and a panel fault is
+     * diagnosed by putting `lcd.boot_pattern = 1` in board.conf rather than by
+     * rebuilding the firmware -- the instrument stays reachable, which is the
+     * point of keeping it.
+     */
+    display_boot_pattern(tdsh_board_int("lcd.boot_pattern", 0) != 0);
+
+    /*
      * Power the panel BEFORE touching its bus. The AMOLED's rail is switched
      * by XL9555 P07, and on a cold boot the expander has every pin an input,
      * so the panel is unpowered until this runs. Doing it after display_init()

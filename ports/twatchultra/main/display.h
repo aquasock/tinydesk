@@ -76,7 +76,7 @@ typedef void (*display_reply_fn)(const char *data, int len);
 bool display_init(display_reply_fn reply);
 
 /*
- * Whether display_init() draws the red/green/blue boot bands. Default ON.
+ * Whether display_init() draws the red/green/blue boot bands. Default OFF.
  *
  * THE BANDS ARE A BRING-UP INSTRUMENT, not decoration: they prove the panel is
  * lit before anything else paints, which is the only way to tell a dark panel
@@ -86,9 +86,9 @@ bool display_init(display_reply_fn reply);
  *
  * But they FLASH: display_init() pushes them, then `panel_fill(0)` blacks the
  * whole panel a moment later, so the wearer sees roughly a hundred milliseconds
- * of colour at every boot. A personality that goes straight from a blanked
- * screen to its own first paint -- slot B, whose picker is the first thing it
- * draws -- does not want that, and turns it off here.
+ * of colour at every boot. Now that both personalities boot cleanly they are
+ * noise on both paths, so the default is OFF and `board.conf`'s
+ * `lcd.boot_pattern = 1` turns them back on for a panel fault -- no rebuild.
  *
  * Call before display_init().
  */
