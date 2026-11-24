@@ -341,7 +341,11 @@ typedef struct
  * pick a cartridge, then start. Abandoning the picker returns false and the menu
  * comes back rather than the whole personality going dark.
  */
-static char s_gb_rom[96];
+/* Big enough for a full card path. A bucket plus a 110-character cartridge
+ * name is over 130 bytes, and the default cartridge's own path is 120, so
+ * the 96 that used to be here could not name the cartridge the firmware
+ * itself prefers. */
+static char s_gb_rom[256];
 
 static bool slotb_start_gb(const char *rom)
 {
@@ -597,6 +601,21 @@ static void slotb_run(const char *board_conf)
 
             if (!app->start(NULL))
             {
+                /* BACKING OUT IS NOT A FAILURE, and the two arrive here through
+                 * the same return value. Game Boy's start is the cartridge
+                 * picker and nothing else; pressing Pusher A in it sets the exit
+                 * flag and returns false. Reporting that as "Game Boy Color did
+                 * not start / no ROM?" would be a lie printed to the wearer's
+                 * face, so the flag is checked first. */
+                if (s_exit_req)
+                {
+                    if (launched_direct)
+                        break;               /* back to the desktop, where they came from */
+
+                    s_exit_req = false;      /* back to the menu */
+                    continue;
+                }
+
                 /* SAY SO ON THE GLASS. An app that cannot start has only its own
                  * printf, and there is no console here -- so without this the
                  * menu simply reappears and the wearer has no idea why. The
