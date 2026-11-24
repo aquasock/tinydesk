@@ -740,6 +740,7 @@ static const char *const s_vol_name[] = { "Mute", "25%", "50%", "75%", "Max" };
 /* Written from the touch task, read from whichever task is feeding the stream. */
 static volatile int s_vol_ix;
 static bool s_vol_was_down;         /* touch task only */
+static volatile bool s_vol_label_dirty;
 
 /*
  * WHETHER THE ON-GLASS CONTROL GOVERNS THIS STREAM AT ALL.
@@ -762,6 +763,7 @@ void sound_volume_reset(void)
 {
     s_vol_ix = 0;
     s_vol_was_down = false;
+    s_vol_label_dirty = false;
 }
 
 void sound_volume_apply(bool on)
@@ -789,6 +791,16 @@ bool sound_volume_cycle_on_press(bool held)
         return false;
 
     s_vol_ix = (s_vol_ix + 1) % VOL_N;
+    s_vol_label_dirty = true;
+    return true;
+}
+
+bool sound_volume_take_label_change(void)
+{
+    if (!s_vol_label_dirty)
+        return false;
+
+    s_vol_label_dirty = false;
     return true;
 }
 

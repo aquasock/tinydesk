@@ -58,6 +58,16 @@
 
 static const char *TAG = "gb";
 
+/*
+ * WHICH LEFT-COLUMN SLOT CARRIES THE VOLUME.
+ *
+ * At the top of the file because `gb_blit_task()`, which does the relabel, is the
+ * first function below -- and the index is named rather than written as `2` in each
+ * place that mentions it, so a slot that moves cannot leave one of them sending a
+ * press to the wrong box.
+ */
+#define VOL_SLOT 2
+
 /* Two frame buffers: the guest renders into one while core 1 pushes the other.
  * 160x144 at 2 bytes is 46,080 bytes each. Both in PSRAM, because the guest
  * writes them every frame and PSRAM is where the NES and PM keep theirs. */
@@ -175,7 +185,25 @@ static void gb_blit_task(void *arg)
         int slot = -1;
 
         if (xQueueReceive(s_filled_q, &slot, pdMS_TO_TICKS(50)) != pdTRUE)
+        {
+            /*
+             * THE VOLUME LABEL, AND THIS IS THE ONLY TASK THAT MAY PAINT IT.
+             *
+             * `gb_blit_task` owns the panel's transmit path; the touch callback only
+             * records the state. Relabelling from the touch task was a second writer
+             * on the SPI bus and panicked the watch on the button's first press -- see
+             * sound_volume_take_label_change() for the coredump.
+             *
+             * THE IDLE BRANCH IS NOT A FALLBACK. A paused or idle cartridge produces
+             * no frames, so a label that waited for the next blit would sit stale for
+             * as long as nothing was moving -- which is exactly when a person reaches
+             * for the volume.
+             */
+            if (sound_volume_take_label_change())
+                display_margin_label(0, VOL_SLOT, sound_volume_label());
+
             continue;
+        }
 
         if (slot < 0 || slot >= GB_VBUF_N)
             continue;                    /* a garbage index must not reach s_fb[] */
@@ -199,6 +227,12 @@ static void gb_blit_task(void *arg)
         s_blits++;
 
         xQueueSend(s_free_q, &slot, 0);
+
+        /* And on the busy path, after the push has completed and the bus released.
+         * Without this a running cartridge -- which always has a frame waiting --
+         * would never reach the idle branch above. */
+        if (sound_volume_take_label_change())
+            display_margin_label(0, VOL_SLOT, sound_volume_label());
     }
 
     /* CLEAR THE HANDLE BEFORE LEAVING, which is what makes gb_stop()'s wait on
@@ -1157,13 +1191,6 @@ static void gb_task(void *arg)
 #define GB_COL_SLOTS    3
 #define GB_COL_BOT      (COL_Y0 + (GB_COL_SLOTS * (COL_Y1 - COL_Y0 + 1)) / COL_N - 1)
 
-/* WHICH LEFT-COLUMN SLOT CARRIES THE VOLUME, and it is named rather than written
- * as `2` in three places. The label, the hit test and the relabel all read this,
- * which is the rule this file already states for the right column: a slot that
- * moves must move in every line that mentions it, or one of them is left sending
- * a press to the wrong box. */
-#define VOL_SLOT        2
-
 static const gamepad_t s_gp = {
     .cx = GB_DPAD_X + GB_DPAD_S / 2,
     .cy = GB_DPAD_Y + GB_DPAD_S / 2,
@@ -1327,10 +1354,12 @@ static bool gb_app_touch(void *user, const touch_frame_t *f)
      * debounce because the controller re-reports a held finger every 66 ms and a
      * held button that cycled five positions would land wherever the thumb left it.
      *
-     * The relabel is what makes the button honest: the word on the glass is read
-     * back from the same state the multiply uses. */
+     * THE LABEL IS NOT PAINTED HERE. `display_margin_label()` from this callback is a
+     * second writer on the SPI bus while the blit task is mid polling-transaction,
+     * and that panicked the watch on the first press -- see
+     * sound_volume_take_label_change() for the coredump. The frame loop relabels. */
     if (sound_volume_cycle_on_press(vol))
-        display_margin_label(0, VOL_SLOT, sound_volume_label());
+        used = true;
 
     if (vol)
         used = true;

@@ -436,13 +436,30 @@ static void pm_blit_task(void *arg)
         int idx;
 
         if (xQueueReceive(s_filled_q, &idx, pdMS_TO_TICKS(50)) != pdTRUE)
+        {
+            /* THE VOLUME LABEL, ON THE IDLE PATH AS WELL AS THE BUSY ONE.
+             *
+             * This is the task that owns the panel's transmit path, so it is the one
+             * that may relabel a margin slot; the touch callback only records the
+             * state. The idle branch is where a press lands when the picture is not
+             * changing -- a paused or sleeping cartridge produces no frames at all, and
+             * a label that waited for the next blit would sit stale for ever. */
+            if (sound_volume_take_label_change())
+                display_margin_label(0, VOL_SLOT, sound_volume_label());
+
             continue;
+        }
 
         blit_one(s_dot[idx]);
 
         /* Return the buffer even if the loop is about to end, so a stop cannot
          * strand one. */
         xQueueSend(s_free_q, &idx, 0);
+
+        /* And on the busy path, after the push has completed and the bus is
+         * released. */
+        if (sound_volume_take_label_change())
+            display_margin_label(0, VOL_SLOT, sound_volume_label());
     }
 
     s_blit_task = NULL;
@@ -591,6 +608,11 @@ static bool pm_app_touch(void *user, const touch_frame_t *f)
      *
      * This column used to buzz for every live slot and act for none of them, so a
      * press here now does something rather than only feeling like it did.
+     *
+     * THE LABEL IS NOT PAINTED HERE. This is the touch task, and `pm_blit_task` is
+     * the task that owns the panel's transmit path; painting the column from here is
+     * a second writer on the SPI bus and panicked the watch on the first press (see
+     * sound_volume_take_label_change()). The blit task relabels.
      */
     bool vol = false;
 
@@ -602,10 +624,15 @@ static bool pm_app_touch(void *user, const touch_frame_t *f)
     }
 
     if (sound_volume_cycle_on_press(vol))
-        display_margin_label(0, VOL_SLOT, sound_volume_label());
+    {
+        /* The button acted. It is also FELT: return true unconditionally, because
+         * `vol` is what the driver's haptic follows and a volume press whose first
+         * frame is swallowed would step silently. */
+        return true;
+    }
 
     if (vol)
-        return true;            /* felt AND acted, which is the whole rule */
+        return true;            /* a repeat report of the same held press */
 
     for (int i = 0; i < f->n && i < TOUCH_POINTS; i++)
     {

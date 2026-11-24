@@ -528,7 +528,20 @@ static void nes_blit_task(void *arg)
         int idx;
 
         if (xQueueReceive(s_filled_q, &idx, pdMS_TO_TICKS(50)) != pdTRUE)
+        {
+            /* THE VOLUME LABEL, FROM THE TASK THAT OWNS THE TRANSMIT PATH. The touch
+             * callback only records the state: painting the column from it was a
+             * second writer on the SPI bus and panicked the watch on the first press
+             * (see sound_volume_take_label_change()).
+             *
+             * The idle branch matters because a paused or idle cartridge produces no
+             * frames, and a label waiting for the next blit would sit stale exactly
+             * when a person is reaching for the control. */
+            if (sound_volume_take_label_change())
+                display_margin_label(0, VOL_SLOT, sound_volume_label());
+
             continue;
+        }
 
         blit_one(s_vb[idx]);
         s_blit_done++;
@@ -536,6 +549,12 @@ static void nes_blit_task(void *arg)
         /* The renderer may be waiting for a buffer; give this one back even if
          * the loop is about to end, so a stop cannot strand it. */
         xQueueSend(s_free_q, &idx, 0);
+
+        /* And on the busy path, after the push and the bus release: a running
+         * cartridge always has a frame waiting, so it never reaches the branch
+         * above. */
+        if (sound_volume_take_label_change())
+            display_margin_label(0, VOL_SLOT, sound_volume_label());
     }
 
     s_blit_task = NULL;
@@ -815,11 +834,14 @@ static bool nes_app_touch(void *user, const touch_frame_t *f)
     }
 
     /* ONE PRESS, ONE STEP: the debounce lives in sound.c with the state, because
-     * the controller re-reports a held finger every 66 ms. The relabel reads the
-     * word back from the same state the gain uses, so the glass cannot say 50%
-     * while the multiply says something else. */
+     * the controller re-reports a held finger every 66 ms.
+     *
+     * THE LABEL IS NOT PAINTED HERE -- this callback runs on the touch task, and
+     * painting the column from it is a second writer on the SPI bus while the blit
+     * task is mid polling-transaction. That panicked the watch on the first press;
+     * see sound_volume_take_label_change(). The frame loop relabels. */
     if (sound_volume_cycle_on_press(vol))
-        display_margin_label(0, VOL_SLOT, sound_volume_label());
+        used = true;
 
     if (vol)
         used = true;

@@ -152,6 +152,28 @@ int sound_volume_index(void);
 bool sound_volume_cycle_on_press(bool held);
 
 /*
+ * True once, immediately after the volume changed.
+ *
+ * THE LABEL IS PAINTED FROM THE TASK THAT OWNS THE GLASS, NOT FROM THE TOUCH TASK,
+ * and this latch is how that is arranged. Painting the column from the touch
+ * callback is a SECOND WRITER on the SPI bus, which DSP-005 forbids: the emulator's
+ * blit task is mid polling-transaction on the same device, so
+ * `spi_device_acquire_bus()` returns ESP_ERR_INVALID_STATE -- "cannot acquire bus
+ * when a polling transaction is in progress" -- and `spi_device_release_bus()` then
+ * asserts because nothing was acquired. That was a measured panic, not a theory:
+ * the first press of the button froze the watch with
+ * `assert failed: spi_device_release_bus`, and the coredump named `tdtouch` calling
+ * `display_margin_label()` from `paint_column()`.
+ *
+ * So the touch task records the state and nothing else, and each emulator's frame
+ * loop drains this once a frame. The Tamagotchi has done exactly this since its
+ * toggles were written -- its actions go through a queue the guest task drains
+ * (EMU-019) -- and this is the same shape with one boolean instead of a queue,
+ * because a volume has no order to preserve.
+ */
+bool sound_volume_take_label_change(void);
+
+/*
  * Put the on-glass control in charge of a stream, or take it out again.
  *
  * True from an emulator that DRAWS the volume button (slot B's three); a stream
