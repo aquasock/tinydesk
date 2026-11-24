@@ -32,6 +32,7 @@
 #include "esp_flash.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
+#include "nvs.h"
 #include "esp_partition.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -329,6 +330,7 @@ static volatile bool s_exit_req;
 typedef struct
 {
     const char *label;
+    const char *key;                     /* the name `slotb play <key>` takes */
     bool (*start)(const char *rom);      /* NULL rom means the app's default */
     void (*stop)(void);
     bool (*running)(void);
@@ -356,9 +358,9 @@ static bool slotb_start_gb(const char *rom)
 }
 
 static const slotb_app_t s_apps[] = {
-    { "Game Boy Color", slotb_start_gb, gb_stop, gb_running },
-    { "NES",            nes_start,      nes_stop, nes_running },
-    { "Pokemon Mini",   pmini_start,    pmini_stop, pmini_running },
+    { "Game Boy Color", "gb",  slotb_start_gb, gb_stop,    gb_running    },
+    { "NES",            "nes", nes_start,      nes_stop,   nes_running   },
+    { "Pokemon Mini",   "pm",  pmini_start,    pmini_stop, pmini_running },
 };
 
 #define SLOTB_APP_N ((int)(sizeof(s_apps) / sizeof(s_apps[0])))
@@ -392,6 +394,77 @@ static void slotb_fail(uint32_t stage, uint16_t colour)
  * before the panel, the panel before the card is worth trying, the board config
  * before the card's pins are known, and the cartridges before the emulator.
  */
+/* ------------------------------------------------------- the app handoff */
+
+/*
+ * WHICH APP TO START, CARRIED ACROSS THE REBOOT IN NVS.
+ *
+ * The desktop's Start menu is the natural place to launch an app, and a shortcut
+ * that says "Game Boy" should boot straight into the Game Boy -- not into slot B
+ * and then a menu asking which app, which is two choices where the wearer made
+ * one. The choice has to survive a reboot, so it goes in NVS: `nvs_flash_init()`
+ * has already run by the time board_startup_override() is called, and the value
+ * is a dozen bytes in a wear-levelled partition.
+ *
+ * `slotb start` with no app CLEARS the key, so entering slot B that way always
+ * gives the menu. Otherwise a stale key from an earlier launch would run that app
+ * again every time slot B was entered, including after a fresh boot.
+ *
+ * A key that no longer names an app -- an app removed from the table, or
+ * corrupted -- falls back to the menu rather than failing, because a menu is
+ * always a usable answer and a refused boot is not.
+ */
+#define SLOTB_NVS_NS   "slotb"
+#define SLOTB_NVS_KEY  "app"
+
+static void slotb_app_set(const char *key)
+{
+    nvs_handle_t h;
+
+    if (nvs_open(SLOTB_NVS_NS, NVS_READWRITE, &h) != ESP_OK)
+    {
+        ESP_LOGW(TAG, "nvs: open failed; the next boot will show the menu");
+        return;
+    }
+
+    if (key && *key)
+        nvs_set_str(h, SLOTB_NVS_KEY, key);
+    else
+        nvs_erase_key(h, SLOTB_NVS_KEY);
+
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+/* Returns the stored key, or an empty string. */
+static void slotb_app_get(char *out, size_t cap)
+{
+    nvs_handle_t h;
+    size_t len = cap;
+
+    out[0] = '\0';
+
+    if (nvs_open(SLOTB_NVS_NS, NVS_READONLY, &h) != ESP_OK)
+        return;
+
+    if (nvs_get_str(h, SLOTB_NVS_KEY, out, &len) != ESP_OK)
+        out[0] = '\0';
+
+    nvs_close(h);
+}
+
+static int slotb_app_index(const char *key)
+{
+    if (!key || !*key)
+        return -1;
+
+    for (int i = 0; i < SLOTB_APP_N; i++)
+        if (!strcmp(s_apps[i].key, key))
+            return i;
+
+    return -1;
+}
+
 static void slotb_run(const char *board_conf)
 {
     slotb_mark(SLOTB_STAGE_ENTER);
@@ -479,14 +552,42 @@ static void slotb_run(const char *board_conf)
         for (int i = 0; i < SLOTB_APP_N; i++)
             labels[i] = s_apps[i].label;
 
+        /* A SHORTCUT ON THE DESKTOP ARRIVES HERE AS A NAME, so the wearer who
+         * tapped "Game Boy" gets the Game Boy and not a menu asking which app.
+         * Cleared as it is read: it is a one-shot instruction, and leaving it set
+         * would make every later entry into slot B start that app. */
+        char want[16];
+
+        slotb_app_get(want, sizeof(want));
+        int direct = slotb_app_index(want);
+
+        if (direct >= 0)
+        {
+            slotb_app_set(NULL);
+            ESP_LOGI(TAG, "booting straight into %s", s_apps[direct].label);
+        }
+
         for (;;)
         {
             int sel = -1;
+            bool launched_direct = false;
+            bool have_choice = true;
 
-            display_pixels_claim(true);
+            if (direct >= 0)
+            {
+                sel = direct;
+                launched_direct = true;
+                direct = -1;                 /* first pass only */
+            }
+            else
+            {
+                display_pixels_claim(true);
 
-            if (!gbpick_list_run("Slot B - select an app", labels, SLOTB_APP_N,
-                                 &sel, &s_exit_req))
+                have_choice = gbpick_list_run("Slot B - select an app", labels,
+                                              SLOTB_APP_N, &sel, &s_exit_req);
+            }
+
+            if (!have_choice)
                 break;                       /* Pusher A in the menu: leave */
 
             if (sel < 0 || sel >= SLOTB_APP_N)
@@ -526,8 +627,14 @@ static void slotb_run(const char *board_conf)
             app->stop();
             slotb_mark(SLOTB_STAGE_EMU_STOP);
 
-            /* The press that closed the app returns us to the menu rather than
-             * out of slot B; `app->stop()` has already released the pixels. */
+            /* A DIRECT LAUNCH GOES BACK TO THE DESKTOP, because that is where the
+             * wearer came from -- the shortcut said "Game Boy", not "slot B", and
+             * a second press to leave would be one press too many. A launch from
+             * the menu returns to the menu instead, so another game is one tap
+             * away. `app->stop()` has already released the pixels either way. */
+            if (launched_direct)
+                break;
+
             s_exit_req = false;
         }
     }
@@ -594,10 +701,30 @@ static int cmd_slotb(tdsh_session_t *session, int argc, char **argv)
         return 0;
     }
 
-    if (sub && strcmp(sub, "start") != 0)
+    /* `play <key>`: boot slot B straight into one app. `start`: slot B's menu. */
+    const char *play = NULL;
+
+    if (sub && !strcmp(sub, "play"))
     {
-        printf("slotb [start | status]\n");
-        printf("  start   reboot into slot B: the Game Boy with no desktop\n");
+        play = argc >= 3 ? argv[2] : NULL;
+
+        if (slotb_app_index(play) < 0)
+        {
+            printf("slotb play <app>   apps:");
+            for (int i = 0; i < SLOTB_APP_N; i++)
+                printf(" %s", s_apps[i].key);
+            printf("\n");
+            return 1;
+        }
+    }
+    else if (sub && strcmp(sub, "start") != 0)
+    {
+        printf("slotb [start | play <app> | status]\n");
+        printf("  start       reboot into slot B's app menu\n");
+        printf("  play <app>  reboot into one app:");
+        for (int i = 0; i < SLOTB_APP_N; i++)
+            printf(" %s", s_apps[i].key);
+        printf("\n");
         return 1;
     }
 
@@ -620,7 +747,19 @@ static int cmd_slotb(tdsh_session_t *session, int argc, char **argv)
         return 0;
     }
 
-    printf("slotb: rebooting into %s (%s)\n", sb->label, d.version);
+    /* The key is written BEFORE the boot partition, so a switch that succeeds
+     * but whose write failed is still a coherent state -- it lands on the menu. */
+    slotb_app_set(play);
+
+    if (play)
+    {
+        int idx = slotb_app_index(play);
+        printf("slotb: rebooting into %s, running %s\n", sb->label, s_apps[idx].label);
+    }
+    else
+    {
+        printf("slotb: rebooting into %s (%s)\n", sb->label, d.version);
+    }
     fflush(stdout);
 
     if (esp_ota_set_boot_partition(sb) != ESP_OK)
