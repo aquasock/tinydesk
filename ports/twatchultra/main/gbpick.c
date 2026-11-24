@@ -40,6 +40,33 @@
 #define PK_ROWS    ((DISPLAY_H - PK_LIST_Y - PK_ROW_H - 8) / PK_ROW_H)  /* 22 */
 
 /*
+ * THE SCREEN IS SIX BANDS, AND THEY MUST TILE IT EXACTLY.
+ *
+ * The picker used to open every draw with display_fill(0x0000), which writes all
+ * 320x416 of the framebuffer and PUSHES THE WHOLE PANEL -- about 100 ms of black
+ * on the glass at the port's own measured cost -- and then painted the title, the
+ * 22 rows and the footer back on top of it. Every arrow press therefore cost a
+ * black frame followed by the list returning, which is the flash the operator
+ * reported.
+ *
+ * So the black is no longer a separate thing that happens first: it is what the
+ * gap bands and the unused row slots contain. Every band carries its final
+ * content, no frame exists in which the screen is empty, and a move repaints
+ * only the bands a move changes.
+ */
+#define PK_FOOT_Y (PK_LIST_Y + PK_ROWS * PK_ROW_H)               /* 392 */
+#define PK_GAP_TOP  PK_TITLE_Y                                  /*  8 */
+#define PK_GAP_MID  (PK_LIST_Y - (PK_TITLE_Y + PK_ROW_H))        /* 16 */
+#define PK_GAP_BOT  (DISPLAY_H - (PK_FOOT_Y + PK_ROW_H))        /*  8 */
+
+/* A gap that nothing paints is a row of whatever the last screen left in the
+ * framebuffer, and with no fill left to cover for it that would be a permanent
+ * stripe rather than a flicker. */
+_Static_assert(PK_GAP_TOP + PK_ROW_H + PK_GAP_MID + PK_ROWS * PK_ROW_H +
+               PK_ROW_H + PK_GAP_BOT == DISPLAY_H,
+               "picker bands must tile the framebuffer");
+
+/*
  * LONG ENOUGH FOR THE REAL NAMES. The default cartridge's filename alone is 110
  * characters -- "Legend of Zelda, The - Link's Awakening DX (USA, Europe) (Rev 2)
  * (SGB Enhanced) (GB Compatible).gbc" -- so a 96-byte field truncated it, and a
@@ -370,32 +397,37 @@ static void draw_row(int row, const char *s, bool sel)
     display_picture_rgb(NULL, 0, PK_LIST_Y + row * PK_ROW_H, s_rowbuf, PK_W, PK_ROW_H);
 }
 
-static void draw_screen(void)
+/* A band of background. Shorter than a row for the two gaps, which is why the
+ * height is a parameter rather than PK_ROW_H. */
+static void paint_black(int y, int h)
 {
-    display_fill(0x0000);
+    if (h <= 0)
+        return;
 
+    if (h > PK_ROW_H)
+        h = PK_ROW_H;
+
+    for (int i = 0; i < PK_W * h; i++)
+        s_rowbuf[i] = 0x0000;
+
+    display_picture_rgb(NULL, 0, y, s_rowbuf, PK_W, h);
+}
+
+static void draw_title(void)
+{
     row_pixels(s_rowbuf, s_title, false);
     for (int i = 0; i < PK_W * PK_ROW_H; i++)      /* title in green */
         if (s_rowbuf[i])
             s_rowbuf[i] = 0x07E0;
     display_picture_rgb(NULL, 0, PK_TITLE_Y, s_rowbuf, PK_W, PK_ROW_H);
+}
 
-    const int first = s_page * PK_ROWS;
-
-    for (int i = 0; i < PK_ROWS; i++)
-    {
-        const int idx = first + i;
-
-        if (idx >= s_item_n)
-            break;
-
-        draw_row(i, s_items[idx], idx == s_sel);
-    }
-
-    /* Footer names the BUTTONS, because that is what a person can find: the
-     * arrows are drawn on the glass beside the list, Enter and Up are in the
-     * strip. Up is named only where it exists -- a footer that advertises a
-     * blanked bar is the label/duty disagreement edges.h was written against. */
+/* Footer names the BUTTONS, because that is what a person can find: the arrows
+ * are drawn on the glass beside the list, Enter and Up are in the strip. Up is
+ * named only where it exists -- a footer that advertises a blanked bar is the
+ * label/duty disagreement edges.h was written against. */
+static void draw_footer(void)
+{
     char foot[64];
 
     snprintf(foot, sizeof(foot), "arrows:move enter:start %s%d/%d",
@@ -406,7 +438,70 @@ static void draw_screen(void)
     for (int i = 0; i < PK_W * PK_ROW_H; i++)
         if (s_rowbuf[i])
             s_rowbuf[i] = 0x7BEF;
-    display_picture_rgb(NULL, 0, PK_LIST_Y + PK_ROWS * PK_ROW_H, s_rowbuf, PK_W, PK_ROW_H);
+    display_picture_rgb(NULL, 0, PK_FOOT_Y, s_rowbuf, PK_W, PK_ROW_H);
+}
+
+/* One screen row of the list, by SLOT (0..PK_ROWS-1) rather than by index: a
+ * slot past the end of the list is painted empty, which is what the fill used to
+ * do for the whole screen. */
+static void draw_row_slot(int slot)
+{
+    const int idx = s_page * PK_ROWS + slot;
+
+    if (idx >= 0 && idx < s_item_n)
+        draw_row(slot, s_items[idx], idx == s_sel);
+    else
+        paint_black(PK_LIST_Y + slot * PK_ROW_H, PK_ROW_H);
+}
+
+static void draw_body(void)
+{
+    for (int i = 0; i < PK_ROWS; i++)
+        draw_row_slot(i);
+}
+
+/*
+ * A FULL PAINT, AND IT NO LONGER STARTS WITH A BLACK FRAME.
+ *
+ * The bands go down top to bottom with their real content, so the glass never
+ * shows an empty screen between two states. Used when the list appears and when
+ * the page changes; a move inside a page uses redraw_sel().
+ */
+static void draw_screen(void)
+{
+    paint_black(0, PK_GAP_TOP);
+    draw_title();
+    paint_black(PK_TITLE_Y + PK_ROW_H, PK_GAP_MID);
+    draw_body();
+    draw_footer();
+    paint_black(PK_FOOT_Y + PK_ROW_H, PK_GAP_BOT);
+}
+
+/*
+ * WHAT A MOVE ACTUALLY CHANGES: two rows and the counter.
+ *
+ * The row that lost the highlight, the row that gained it, and the footer --
+ * whose n/m changes on every step. Three bands is about 11 ms of panel time
+ * against the ~190 ms a fill-plus-full-repaint cost, and none of it is blank.
+ * A page change really does change every row, so that case falls back to the
+ * body and the footer.
+ */
+static void redraw_sel(int old_sel, int old_page)
+{
+    if (s_page != old_page)
+    {
+        draw_body();
+        draw_footer();
+        return;
+    }
+
+    if (old_sel >= 0 && old_sel != s_sel)
+        draw_row_slot(old_sel - s_page * PK_ROWS);
+
+    if (s_sel >= 0)
+        draw_row_slot(s_sel - s_page * PK_ROWS);
+
+    draw_footer();
 }
 
 /*
@@ -495,6 +590,9 @@ static void move_sel(int delta)
     if (s_item_n == 0)
         return;
 
+    const int old_sel = s_sel;
+    const int old_page = s_page;
+
     if (s_sel < 0)
         s_sel = delta > 0 ? 0 : s_item_n - 1;
     else
@@ -508,7 +606,8 @@ static void move_sel(int delta)
     /* The page follows the selection, so the arrows walk the whole list without
      * a separate paging step. */
     s_page = s_sel / PK_ROWS;
-    draw_screen();
+
+    redraw_sel(old_sel, old_page);
 }
 
 static void commit_sel(void)
@@ -621,8 +720,12 @@ static bool list_touch(void *user, const touch_frame_t *f)
             commit_sel();
         else
         {
+            /* A tap is on a row that is already on screen, so the page cannot
+             * have changed and this is the same two-band repaint a move gets. */
+            const int old_sel = s_sel;
+
             s_sel = row;
-            draw_screen();
+            redraw_sel(old_sel, s_page);
         }
         return true;
     }
