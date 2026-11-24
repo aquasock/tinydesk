@@ -96,6 +96,12 @@ extern unsigned long g_exec_count;
 #define PM_SAMPLES_PER_FRAME \
     ((int)(((int64_t)PM_AUDIO_HZ * PM_FRAME_CYCLES) / PM_CLOCK_HZ))
 
+/* THE LEFT COLUMN'S THIRD BUTTON IS THE VOLUME. Declared up here rather than beside
+ * PM_LEFT because the touch handler -- which reads it -- is earlier in the file than
+ * the label table, and an index written as a bare `2` in one place and a named
+ * constant in the other is how a press ends up on the wrong box. */
+#define VOL_SLOT   2
+
 /* More sub-slices than this and the frame budget is spent on slicing rather
  * than on sound; the ceiling exists so a mistyped argument cannot thrash the
  * core with one timer read per instruction. */
@@ -574,6 +580,33 @@ static bool pm_app_touch(void *user, const touch_frame_t *f)
     if (!f)
         return false;
 
+    /*
+     * THE VOLUME, LEFT COLUMN SLOT 2, AND IT RUNS BEFORE THE DRAWN CONTROLS.
+     *
+     * The drawn-control loop below returns early when it hits the pad, so a volume
+     * press counted after it would be missed by any frame that also touched the
+     * d-pad -- and a missed frame is not just a lost press: the debounce in sound.c
+     * would not see the finger, so the NEXT report of the same held press would look
+     * like a fresh one and step again. Ordering it first makes a chord harmless.
+     *
+     * This column used to buzz for every live slot and act for none of them, so a
+     * press here now does something rather than only feeling like it did.
+     */
+    bool vol = false;
+
+    for (int i = 0; i < f->n && i < TOUCH_POINTS; i++)
+    {
+        if (f->p[i].region == EDGE_LEFT && f->p[i].index == VOL_SLOT &&
+            display_margin_slot_live(0, VOL_SLOT))
+            vol = true;
+    }
+
+    if (sound_volume_cycle_on_press(vol))
+        display_margin_label(0, VOL_SLOT, sound_volume_label());
+
+    if (vol)
+        return true;            /* felt AND acted, which is the whole rule */
+
     for (int i = 0; i < f->n && i < TOUCH_POINTS; i++)
     {
         if (pm_button_at(f->p[i].x, f->p[i].y) != GP_NONE)
@@ -584,7 +617,7 @@ static bool pm_app_touch(void *user, const touch_frame_t *f)
      * used to be three near-identical lines with the constants written out, which
      * is how a wrong index survives: nothing ties them to pad_from_frame()'s
      * switch. */
-    for (int i = 0; i < f->n && i < TOUCH_POINTS; i++)
+    for (int i = 0; f && i < f->n && i < TOUCH_POINTS; i++)
     {
         int col;
 
@@ -1702,7 +1735,23 @@ static bool pm_draw_dpad(void)
  * nothing is drawn. */
 #define PM_BLANK " "
 
-static const char *const PM_LEFT[COL_N]  = { "Exit", "Save", "Load", PM_BLANK, PM_BLANK };
+/*
+ * THE THIRD LEFT BUTTON IS THE VOLUME, WHERE "LOAD" USED TO BE.
+ *
+ * None of this column's three actions is implemented -- `pm_app_touch()` returns
+ * true for any live margin slot, so Exit, Save and Load BUZZ AND DO NOTHING, which
+ * is the exact fault the bottom strip's invisible C was fixed for. "Load" is the
+ * one of the three that gives way, because a volume control is used every session
+ * and a save-state load is a shell command (`pm load`).
+ *
+ * The label is a constant here rather than `sound_volume_label()`, so it can sit in
+ * this table; `pm_label_margins()` writes the live word over it. The table entry
+ * still matters -- it is what the slot falls back to, and leaving a stale "Load"
+ * there is how a slot ends up describing a duty it no longer has.
+ */
+#define VOL_LABEL  "Mute"
+
+static const char *const PM_LEFT[COL_N]  = { "Exit", "Save", VOL_LABEL, PM_BLANK, PM_BLANK };
 static const char *const PM_RIGHT[COL_N] = { "Hold", "Sound", "C", PM_BLANK, PM_BLANK };
 static const char *const PM_BOTTOM[BTN_N] = { PM_BLANK, PM_BLANK, PM_BLANK };
 
@@ -1736,6 +1785,11 @@ static void pm_label_margins(void)
         display_margin_label(0, i, PM_LEFT[i]);
         display_margin_label(1, i, PM_RIGHT[i]);
     }
+
+    /* THE LIVE WORD OVER THE TABLE'S FALLBACK, after the loop that wrote it, so the
+     * repaint `display_margin_label()` does carries the state the multiply is
+     * actually using. */
+    display_margin_label(0, VOL_SLOT, sound_volume_label());
 
     for (int i = 0; i < BTN_N; i++)
         display_margin_btn_label(i, PM_BOTTOM[i]);
@@ -1899,7 +1953,12 @@ bool pmini_start(const char *rom_path)
      * that claim to mean anything. Set before the margins are painted. */
     display_margin_column_slots(3);
 
-    /* Labels first, then the single paint that shows them. */
+    /* Labels first, then the single paint that shows them. The volume is reset
+     * BEFORE the labels, because the label is painted from the state and the screen
+     * must agree with the multiply at the moment of painting. */
+    sound_volume_reset();
+    sound_volume_apply(true);
+
     pm_label_margins();
     display_margins_set(DISPLAY_MARGINS_APP);
 

@@ -92,6 +92,76 @@ void sound_stream_close(void);
 /* Frames dropped since the stream opened, for a status line. */
 uint32_t sound_stream_dropped(void);
 
+/*
+ * THE EMULATOR'S VOLUME: FIVE POSITIONS ON ONE BUTTON, STARTING MUTED.
+ *
+ * One control rather than a slider, because the glass has no room for a slider and
+ * a thumb on a 45-pixel column button cannot hit a continuous range anyway. The
+ * positions are Mute, 25%, 50%, 75% and Max, and pressing the button steps to the
+ * next one and wraps.
+ *
+ * THE PERCENTAGES ARE LOUDNESS, NOT AMPLITUDE. A quarter of the amplitude is not
+ * a quarter as loud; it is about 12 dB quieter, which a person hears as less than
+ * half. So the steps are a cubic law -- gain = level cubed -- which is the audio
+ * taper a 15A pot gives and which VLC also uses, and it puts half at -18 dB. That
+ * is the convention this project already recorded as the answer to "what should a
+ * volume control's taper law be" (AUD-001 in core-reference.md), so the labels and
+ * the sound agree instead of the label being a number nothing implements.
+ *
+ * EVERY STREAM STARTS MUTED BY CALLING sound_volume_reset() WHEN IT OPENS, so a
+ * watch that boots into an emulator is silent until someone asks for sound. That
+ * is the operator's instruction, and it also means the start-up audio burst is
+ * not heard unless it is asked for.
+ *
+ * WHAT THE RESET CANNOT KNOW: whether a finger is already on the glass. The state
+ * it clears is sound.c's memory of the last report it saw, and at the moment an
+ * emulator starts there has been none -- so a thumb resting on the volume button as
+ * the picture comes up reads as a fresh press and steps once. The alternative was
+ * worse: starting with the button assumed held would swallow the first real tap
+ * entirely, since the driver sends nothing until something is touched. One step is
+ * recoverable by pressing again, so it is recorded rather than engineered around.
+ *
+ * The gain is applied in sound_stream_write(), which is the one funnel every
+ * emulator's mono audio passes through (Game Boy, NES, Pokemon Mini and the
+ * Tamagotchi). The music player is deliberately NOT affected: it writes through
+ * sound_stream_write_stereo_wait() with its own player and its own volume story,
+ * and this control belongs to the emulator on the glass.
+ */
+void sound_volume_reset(void);
+
+/* What to write on the button: "Mute", "25%", "50%", "75%" or "Max". */
+const char *sound_volume_label(void);
+
+/* The position, 0 (Mute) to 4 (Max), for a status line. */
+int sound_volume_index(void);
+
+/*
+ * One press, one step. `held` is whether the glass is under a finger on this
+ * frame; the step happens on the transition from not-held to held and nowhere
+ * else.
+ *
+ * THE DEBOUNCE BELONGS HERE RATHER THAN IN EACH EMULATOR. The CST9217 re-reports
+ * a held finger about every 66 ms (TCH-012), so acting on every report would spin
+ * a held press through all five positions and land on whichever one the finger
+ * happened to leave on. The picker already paid for this lesson once, where a
+ * single tap moved the highlight five rows.
+ *
+ * Returns true when this call changed the volume, so the caller knows to relabel.
+ * Called from the touch task only.
+ */
+bool sound_volume_cycle_on_press(bool held);
+
+/*
+ * Put the on-glass control in charge of a stream, or take it out again.
+ *
+ * True from an emulator that DRAWS the volume button (slot B's three); a stream
+ * that never calls this is played at unity and is exactly as it was before the
+ * control existed. sound_stream_close() clears it, so the control's lifetime is
+ * the stream's and a slot B emulator cannot leave the watch muted for an emulator
+ * that has no button to undo it.
+ */
+void sound_volume_apply(bool on);
+
 /* Writes the driver REFUSED, as distinct from frames that did not fit. Zero in
  * a healthy session; non-zero means the drop count is reporting a fault. */
 uint32_t sound_stream_errors(void);

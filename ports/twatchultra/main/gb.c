@@ -1157,6 +1157,13 @@ static void gb_task(void *arg)
 #define GB_COL_SLOTS    3
 #define GB_COL_BOT      (COL_Y0 + (GB_COL_SLOTS * (COL_Y1 - COL_Y0 + 1)) / COL_N - 1)
 
+/* WHICH LEFT-COLUMN SLOT CARRIES THE VOLUME, and it is named rather than written
+ * as `2` in three places. The label, the hit test and the relabel all read this,
+ * which is the rule this file already states for the right column: a slot that
+ * moves must move in every line that mentions it, or one of them is left sending
+ * a press to the wrong box. */
+#define VOL_SLOT        2
+
 static const gamepad_t s_gp = {
     .cx = GB_DPAD_X + GB_DPAD_S / 2,
     .cy = GB_DPAD_Y + GB_DPAD_S / 2,
@@ -1285,6 +1292,7 @@ static bool gb_app_touch(void *user, const touch_frame_t *f)
         return false;
 
     bool used = false;
+    bool vol = false;
 
     if (f)
     {
@@ -1294,6 +1302,14 @@ static bool gb_app_touch(void *user, const touch_frame_t *f)
         {
             if (gb_controls_hit(f->p[i].x, f->p[i].y) != GP_NONE)
                 used = true;
+
+            /* THE VOLUME BUTTON, LEFT COLUMN SLOT 2. Collected here and acted on
+             * AFTER the loop, so one frame is one decision whatever order the
+             * controller listed its points in -- the same reason the picker
+             * classifies a frame before it acts on it. */
+            if (f->p[i].region == EDGE_LEFT && f->p[i].index == VOL_SLOT &&
+                display_margin_slot_live(0, VOL_SLOT))
+                vol = true;
 
             /* SLOTS 1 AND 2, NOT 0 AND 1. This is the same predicate as the
              * mapping above, written separately, and the two have to agree: a
@@ -1306,6 +1322,18 @@ static bool gb_app_touch(void *user, const touch_frame_t *f)
                 used = true;
         }
     }
+
+    /* ONE PRESS, ONE STEP -- see sound_volume_cycle_on_press(), which owns the
+     * debounce because the controller re-reports a held finger every 66 ms and a
+     * held button that cycled five positions would land wherever the thumb left it.
+     *
+     * The relabel is what makes the button honest: the word on the glass is read
+     * back from the same state the multiply uses. */
+    if (sound_volume_cycle_on_press(vol))
+        display_margin_label(0, VOL_SLOT, sound_volume_label());
+
+    if (vol)
+        used = true;
 
     s_pad = pad_from_frame(f);
     return used;
@@ -1588,9 +1616,31 @@ bool gb_start(const char *rom_path)
      */
     display_margin_column_slots(GB_COL_SLOTS);
 
+    /*
+     * THE THIRD LEFT BUTTON IS THE VOLUME, AND IT WAS A DEAD LABEL BEFORE IT.
+     *
+     * `gb.c` has never handled `EDGE_LEFT` -- the left column has carried "Pause",
+     * "Reset" and "Save" since the port was written and not one of them was wired
+     * to anything, so those three boxes were the label/duty disagreement this
+     * project has written two records against: a drawn button that neither acted
+     * nor buzzed. Rather than leave a fourth label with no duty, the slot that had
+     * the least claim on a wearer's thumb -- Save, which is not implemented and has
+     * a shell command behind it -- now carries the one control a person reaches for
+     * while playing.
+     *
+     * THE OTHER TWO ARE LEFT ALONE AND STILL OWE THEIR DUTY. They are reported
+     * rather than quietly relabelled, because removing "Pause" and "Reset" would
+     * take away the promise that they are coming.
+     *
+     * RESET BEFORE THE LABEL, not after: the label is painted from the state, so the
+     * screen and the audio have to agree at the moment of painting.
+     */
+    sound_volume_reset();
+    sound_volume_apply(true);
+
     display_margin_label(0, 0, "Pause");
     display_margin_label(0, 1, "Reset");
-    display_margin_label(0, 2, "Save");
+    display_margin_label(0, 2, sound_volume_label());
 
     for (int s = 3; s < COL_N; s++)
     {

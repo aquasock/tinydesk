@@ -256,6 +256,12 @@ static const int16_t *s_aud_buf;/* the APU's own output buffer, once found */
 #define NES_AUDIO_HZ   44172
 #define NES_AUD_MAX    736
 
+/* THE LEFT COLUMN'S THIRD BUTTON IS THE VOLUME. Declared here rather than beside
+ * NES_COL_SLOTS because the touch handler that reads it comes earlier in the file,
+ * and an index spelled `2` at the label and VOL_SLOT at the hit test is how a press
+ * ends up on the wrong box. */
+#define VOL_SLOT       2
+
 static int16_t s_pcm[NES_AUD_MAX];
 
 /*
@@ -784,6 +790,7 @@ static bool nes_app_touch(void *user, const touch_frame_t *f)
 
     int pad = 0;
     bool used = false;
+    bool vol = false;
 
     if (f)
     {
@@ -792,6 +799,13 @@ static bool nes_app_touch(void *user, const touch_frame_t *f)
             if (nes_controls_hit(f->p[i].x, f->p[i].y) != GP_NONE)
                 used = true;
 
+            /* THE VOLUME, LEFT COLUMN SLOT 2, collected here and acted on after
+             * the loop so one frame is one decision whatever order the controller
+             * listed its points in. */
+            if (f->p[i].region == EDGE_LEFT && f->p[i].index == VOL_SLOT &&
+                display_margin_slot_live(0, VOL_SLOT))
+                vol = true;
+
             if (f->p[i].region == EDGE_RIGHT &&
                 display_margin_slot_live(1, f->p[i].index))
                 used = true;
@@ -799,6 +813,16 @@ static bool nes_app_touch(void *user, const touch_frame_t *f)
 
         pad = pad_from_frame(f);
     }
+
+    /* ONE PRESS, ONE STEP: the debounce lives in sound.c with the state, because
+     * the controller re-reports a held finger every 66 ms. The relabel reads the
+     * word back from the same state the gain uses, so the glass cannot say 50%
+     * while the multiply says something else. */
+    if (sound_volume_cycle_on_press(vol))
+        display_margin_label(0, VOL_SLOT, sound_volume_label());
+
+    if (vol)
+        used = true;
 
     s_pad = pad;
     return used;
@@ -1358,7 +1382,23 @@ bool nes_start(const char *rom_path)
      */
     display_margin_label(0, 0, "Pause");
     display_margin_label(0, 1, "Reset");
-    display_margin_label(0, 2, "Save");
+
+    /*
+     * THE THIRD LEFT BUTTON IS THE VOLUME.
+     *
+     * The NES has no more handled the left column than the Game Boy has: `nes.c`
+     * never mentions `EDGE_LEFT`, so these are drawn boxes whose labels describe a
+     * duty nobody wrote. "Save" was the third of them and is not implemented, so it
+     * is the one that gives way to a control a person uses while playing; "Pause"
+     * and "Reset" stay where they are and still owe their duty.
+     *
+     * RESET BEFORE THE LABEL, because the label is painted from the state and the
+     * two have to agree at the moment of painting.
+     */
+    sound_volume_reset();
+    sound_volume_apply(true);
+
+    display_margin_label(0, 2, sound_volume_label());
 
     display_margin_label(1, 0, "Start");
     display_margin_label(1, 1, "Select");

@@ -713,6 +713,85 @@ static int16_t *s_stream;         /* PSRAM: touched once per frame, not per samp
 static bool s_stream_open;
 static volatile uint32_t s_stream_drops;
 
+/* ---------------------------------------------------------------- volume */
+
+/*
+ * THE TAPER, AS Q16 GAINS RATHER THAN AS A LOOKUP AT RUNTIME.
+ *
+ * level^3 for level = 0, 1/4, 1/2, 3/4, 1, times 65536:
+ *
+ *   Mute  0                    0
+ *   25%   0.25^3  = 0.015625   1024    -36.1 dB
+ *   50%   0.5^3   = 0.125      8192    -18.1 dB
+ *   75%   0.75^3  = 0.421875  27648     -7.5 dB
+ *   Max   1        = 1        65536      0.0 dB
+ *
+ * Cubed, not linear, because these numbers are heard. AUD-001 records the three
+ * conventions in use and -18 dB at half as the audio-taper answer; a linear 25%
+ * would be -12 dB and would read as "barely quieter than half", which is the
+ * fault the record exists to avoid. The values are writable as integers so the
+ * intent is checkable by eye: 0.25^3 * 65536 is exactly 1024.
+ */
+static const int32_t s_vol_gain_q16[] = { 0, 1024, 8192, 27648, 65536 };
+static const char *const s_vol_name[] = { "Mute", "25%", "50%", "75%", "Max" };
+
+#define VOL_N ((int)(sizeof(s_vol_gain_q16) / sizeof(s_vol_gain_q16[0])))
+
+/* Written from the touch task, read from whichever task is feeding the stream. */
+static volatile int s_vol_ix;
+static bool s_vol_was_down;         /* touch task only */
+
+/*
+ * WHETHER THE ON-GLASS CONTROL GOVERNS THIS STREAM AT ALL.
+ *
+ * The button is drawn on slot B's three emulators, and it must not reach an
+ * emulator that has no such button -- the Tamagotchi keeps its own Sound toggle
+ * from the desktop, and if it inherited a Mute it could not undo there would be no
+ * way to get sound back on the watch without launching slot B first. So an
+ * emulator that draws the control ENABLES it, and one that does not simply leaves
+ * it alone: off means gain is unity, which is exactly the behaviour before this
+ * control existed.
+ *
+ * SOUND_STREAM_CLOSE() CLEARS IT, so the lifetime is the stream's rather than a
+ * rule every emulator has to remember on its way out. Every emulator in the port
+ * closes its stream when it stops, so a slot B emulator cannot leave the watch mute
+ * for something that never had a volume button.
+ */
+static volatile bool s_vol_applies;
+void sound_volume_reset(void)
+{
+    s_vol_ix = 0;
+    s_vol_was_down = false;
+}
+
+void sound_volume_apply(bool on)
+{
+    s_vol_applies = on;
+}
+
+const char *sound_volume_label(void)
+{
+    return s_vol_name[s_vol_ix];
+}
+
+int sound_volume_index(void)
+{
+    return s_vol_ix;
+}
+
+bool sound_volume_cycle_on_press(bool held)
+{
+    const bool edge = held && !s_vol_was_down;
+
+    s_vol_was_down = held;
+
+    if (!edge)
+        return false;
+
+    s_vol_ix = (s_vol_ix + 1) % VOL_N;
+    return true;
+}
+
 static volatile uint32_t s_stream_errors;   /* writes the driver REFUSED, not
                                              * writes that did not fit */
 
@@ -764,10 +843,42 @@ size_t sound_stream_write(const int16_t *mono, int frames)
     if (frames > STREAM_FRAMES)
         frames = STREAM_FRAMES;
 
-    for (int i = 0; i < frames; i++)
+    /*
+     * THE VOLUME, APPLIED WHERE EVERY EMULATOR'S SAMPLES MEET.
+     *
+     * Two of the five positions are handled by not doing the multiply at all, and
+     * that is a property worth having rather than a micro-optimisation: Max leaves
+     * the samples BYTE-FOR-BYTE what they were before this control existed, so a
+     * report that "sound at Max is unchanged" is structural rather than measured,
+     * and Mute writes a stream of zeroes rather than skipping the call, so the DMA
+     * ring keeps being fed and the drop and error counters keep meaning what they
+     * meant.
+     *
+     * Q16 fixed point, not float: EMU-001 in the project reference records that
+     * this port keeps the emulator's arithmetic integer throughout, and one 32-bit
+     * multiply per sample is cheaper than the conversion either way.
+     */
+    const int32_t gain = s_vol_applies ? s_vol_gain_q16[s_vol_ix] : 65536;
+
+    if (gain >= 65536)
     {
-        s_stream[2 * i] = mono[i];
-        s_stream[2 * i + 1] = mono[i];
+        for (int i = 0; i < frames; i++)
+        {
+            s_stream[2 * i] = mono[i];
+            s_stream[2 * i + 1] = mono[i];
+        }
+    }
+    else
+    {
+        for (int i = 0; i < frames; i++)
+        {
+            /* int16 * Q16 gain cannot overflow int32: 32767 * 65536 is below
+             * INT32_MAX. The shift is on a value the multiply already scaled. */
+            const int16_t v = (int16_t)(((int32_t)mono[i] * gain) >> 16);
+
+            s_stream[2 * i] = v;
+            s_stream[2 * i + 1] = v;
+        }
     }
 
     const size_t want = (size_t)frames * 2 * sizeof(int16_t);
@@ -850,6 +961,11 @@ void sound_stream_close(void)
         return;
 
     s_stream_open = false;
+
+    /* The on-glass volume control belongs to the stream that enabled it. Releasing
+     * it here means a slot B emulator cannot leave the watch muted for whatever
+     * runs next -- see s_vol_applies. */
+    s_vol_applies = false;
 
     /* Back to the beep's own rate, or the next BEL is pitched wrong. */
     set_std(SOUND_RATE_HZ, false);
