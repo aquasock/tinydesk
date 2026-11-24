@@ -1799,7 +1799,8 @@ bool pmini_start(const char *rom_path)
     }
 
     const char *path = rom_path ? rom_path
-                                  : sd_media(PM_ROM_DEFAULT, PM_ROM_FLAT);
+                                  : sd_media(PM_ROM_DEFAULT,
+                                             sd_media(PM_ROM_HB, PM_ROM_FLAT));
 
     int len = 0;
     s_rom = load_rom(path, &len);

@@ -1342,7 +1342,8 @@ bool gb_start(const char *rom_path)
     }
 
     const char *path = rom_path && *rom_path ? rom_path
-                                             : sd_media(GB_ROM_DEFAULT, GB_ROM_FLAT);
+                                             : sd_media(GB_ROM_DEFAULT,
+                                                        sd_media(GB_ROM_HB, GB_ROM_FLAT));
 
     FILE *fp = fopen(path, "rb");
     if (!fp)

@@ -72,6 +72,10 @@ static int s_prev_row = -1;
  * spend from this board's internal DRAM. */
 static uint16_t *s_rowbuf;
 
+/* Tagged "GBC name" / "GB  name" labels, in PSRAM -- see the note where they are
+ * built. Internal DRAM is this board's scarce resource. */
+static char *s_tagged;
+
 /* ---------------------------------------------------------------- scanning */
 
 static bool is_rom(const char *name)
@@ -152,16 +156,34 @@ static const char *base_name(const char *path)
     return slash ? slash + 1 : path;
 }
 
+/*
+ * THE CARD IS ORGANISED BY CONSOLE AND BY PROVENANCE, and the two directories
+ * that matter here are siblings:
+ *
+ *   /sd/media/gbc/{retail,homebrew,diagnostics}   Colour cartridges (.gbc)
+ *   /sd/media/gb/{retail,homebrew}                original Game Boy (.gb)
+ *
+ * BOTH ARE SCANNED. Until this the picker walked only /sd/media/gbc, which on a
+ * card arranged this way hides every DMG cartridge -- and the DMG path had never
+ * been exercised at all, so the first .gb launch is a real test of the core's
+ * hardware-type detection rather than another CGB run wearing a different name.
+ *
+ * `diagnostics` is included on purpose: RetroRegen and AccuracyCoin are the test
+ * cartridges, and a picker that cannot see the tests cannot run them.
+ *
+ * The depth is 2 because the cartridge sits one level below the console
+ * directory (`gbc/retail/x.gbc`), and 3 would reach into anything a person
+ * nested by hand without bound.
+ */
 static int scan_roms(void)
 {
     s_rom_n = 0;
 
-    /* /sd/media/gbc is where this project's cards keep cartridges
-     * (GB_ROM_DEFAULT lives under it), so it is walked two levels deep -- the
-     * cartridge sits in a `homebrew` subdirectory, which is one. Only if that
-     * turns up nothing is the card's root walked. */
     scan_dir("/sd/media/gbc", 2);
+    scan_dir("/sd/media/gb", 2);
 
+    /* Only if neither console directory turned up anything is the card's root
+     * walked, which catches a hand-organised card. */
     if (s_rom_n == 0)
         scan_dir("/sd", 2);
 
@@ -521,8 +543,39 @@ bool gbpick_run(char *out, size_t cap, const volatile bool *abort)
         return false;
     }
 
+    /*
+     * THE LABEL SAYS WHICH CONSOLE, because the list is now mixed and the two
+     * kinds are not interchangeable to a person: a .gb cartridge on a Colour
+     * machine runs in compatibility mode with its own palette, which is not the
+     * same picture. Four characters of prefix costs nothing a 39-column row
+     * cannot spare and answers "why does this one look different".
+     */
+    /*
+     * THE TAGGED LABELS LIVE IN PSRAM, AND THAT IS NOT FUSSINESS.
+     *
+     * The first version of this was a `static char s_tagged[64][96]` beside the
+     * loop, which is 6,144 bytes -- and `nm` put it in `.dram0.bss`, which on this
+     * board is the resource every optimisation attempt in the closed log ran out
+     * of. A list of names is read once per draw and never touched by anything
+     * time-critical, so PSRAM is the right pool for it.
+     */
+    if (!s_tagged)
+    {
+        s_tagged = heap_caps_malloc((size_t)PK_MAX_ROM * PK_NAME_MAX,
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_tagged)
+            return false;
+    }
+
     for (int i = 0; i < s_rom_n; i++)
-        s_labels[i] = base_name(s_roms[i]);
+    {
+        const bool dmg = strstr(s_roms[i], "/media/gb/") != NULL;
+        char *slot = s_tagged + (size_t)i * PK_NAME_MAX;
+
+        snprintf(slot, PK_NAME_MAX, "%s %s",
+                 dmg ? "GB  " : "GBC ", base_name(s_roms[i]));
+        s_labels[i] = slot;
+    }
 
     int sel = -1;
 

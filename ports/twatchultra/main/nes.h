@@ -18,8 +18,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define NES_ROM_DEFAULT  "/sd/media/nes/homebrew/game.nes"
+#define NES_ROM_DEFAULT  "/sd/media/nes/retail/game.nes"
 #define NES_ROM_FLAT     "/sd/game.nes"
+#define NES_ROM_HB       "/sd/media/nes/homebrew/game.nes"
 
 /* Where the picture lands on the panel.
  *

@@ -33,8 +33,11 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define GB_ROM_DEFAULT  "/sd/media/gbc/homebrew/Legend of Zelda, The - Link's Awakening DX (USA, Europe) (Rev 2) (SGB Enhanced) (GB Compatible).gbc"
+#define GB_ROM_DEFAULT  "/sd/media/gbc/retail/Legend of Zelda, The - Link's Awakening DX (USA, Europe) (Rev 2) (SGB Enhanced) (GB Compatible).gbc"
 #define GB_ROM_FLAT     "/sd/game.gbc"
+/* Same cartridge under the other provenance, in case the card is arranged
+ * homebrew-first. See the note in gbpick.c about the two directories. */
+#define GB_ROM_HB       "/sd/media/gbc/homebrew/Legend of Zelda, The - Link's Awakening DX (USA, Europe) (Rev 2) (SGB Enhanced) (GB Compatible).gbc"
 
 /*
  * 2x INTEGER SCALE, and it is the only scale that fits. 160 x 2 = 320, which is

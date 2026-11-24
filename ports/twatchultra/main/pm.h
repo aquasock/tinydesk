@@ -26,8 +26,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define PM_ROM_DEFAULT   "/sd/media/min/homebrew/Pokemon Pinball Mini (USA, Europe).min"
+#define PM_ROM_DEFAULT   "/sd/media/pokemini/retail/Pokemon Pinball Mini (USA, Europe).min"
 #define PM_ROM_FLAT      "/sd/pinball.min"
+#define PM_ROM_HB        "/sd/media/pokemini/homebrew/Pokemon Pinball Mini (USA, Europe).min"
 
 /* A retail BIOS dump, placed on the device by whoever owns one. It is not in
  * this repository and must not be: a retail cartridge needs the retail BIOS,

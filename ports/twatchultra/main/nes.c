@@ -1241,7 +1241,7 @@ bool nes_start(const char *rom_path)
     {
         /* The default lives in two places on the card -- the organised tree and
          * the flat root an older card has. See sdpaths.h. */
-        const char *def = sd_media(NES_ROM_DEFAULT, NES_ROM_FLAT);
+        const char *def = sd_media(NES_ROM_DEFAULT, sd_media(NES_ROM_HB, NES_ROM_FLAT));
 
         strncpy(s_rom_path, def, sizeof(s_rom_path) - 1);
         s_rom_path[sizeof(s_rom_path) - 1] = '\0';
