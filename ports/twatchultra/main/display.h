@@ -267,8 +267,17 @@ void display_margin_label(int col, int index, const char *text);
  *
  * Built for the Hold button, whose whole point is that five labels change together.
  * Same sole-writer requirement as display_margin_label().
+ *
+ * `last_slot` IS A STOP, NOT TIDINESS. The column's window can sit over a control the
+ * app has drawn -- on the Game Boy, A's right 22 px are under the right column at rows
+ * 341..414, which belong to slots 3 and 4. Repainting the full height there covers A,
+ * and the app then has to draw it again, which the operator saw as the clipped edge
+ * being clipped again and redrawn on every press of Hold. Passing the last slot whose
+ * words actually changed stops the window above A and leaves it untouched. Pass
+ * COL_N - 1 for the full column, and remember that a full repaint needs the app's
+ * controls redrawn afterwards.
  */
-void display_margin_labels(int col, const char *const *texts);
+void display_margin_labels(int col, const char *const *texts, int last_slot);
 
 /*
  * Nudge one column slot's label vertically by `dy` pixels, positive is down the

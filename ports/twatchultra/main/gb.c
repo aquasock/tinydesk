@@ -80,6 +80,18 @@ static const char *TAG = "gb";
 #define SLOT_START  2
 
 /*
+ * THE LAST SLOT WHOSE WORD IS EVER RELABELLED, AND THE ROW IT ENDS ON.
+ *
+ * Hold stops here. Everything the drawn cluster occupies -- A, B and the d-pad -- is
+ * BELOW this row, so a column repaint that stops here cannot cover any of it, and the
+ * `_Static_assert`s beside the cluster's geometry are what keep that true if anyone
+ * moves a control up or adds a slot.
+ */
+#define GB_COL_LAST_LABEL_SLOT SLOT_START
+#define GB_COL_WORD_BOTTOM \
+    (COL_Y0 + ((GB_COL_LAST_LABEL_SLOT + 1) * (COL_Y1 - COL_Y0 + 1)) / COL_N - 1)
+
+/*
  * BACKGLASS HOLD STATE.
  *
  * `s_hold` is written by the touch callback and read by the blit task, so it is
@@ -235,8 +247,8 @@ static void paint_column_state(void)
         " ", " ",
     };
 
-    display_margin_labels(0, left);
-    display_margin_labels(1, right);
+    display_margin_labels(0, left, GB_COL_LAST_LABEL_SLOT);
+    display_margin_labels(1, right, GB_COL_LAST_LABEL_SLOT);
 }
 
 static bool gb_draw_controls(void);
@@ -251,20 +263,12 @@ static bool gb_draw_controls(void);
  * held state wins because the volume word is blank while held, and the press itself
  * is refused in the callback.
  *
- * THE CONTROLS ARE REPAINTED AFTER THE COLUMNS, AND THAT IS NOT TIDYING.
- *
- * `paint_column()` paints its full height, which is deliberate -- it has to black out
- * the slots this app does not use or the desktop's labels survive underneath. But the
- * column is GLASS, not framebuffer, and the drawn cluster reaches past the
- * framebuffer's right wall into it: measured, A is at panel x 335..408 while the
- * right column's painter covers 386..431, so 22 px of A's right edge -- and the ring
- * of its circle -- live UNDER that column. The d-pad's leftmost column is shared the
- * same way with the left column, by 1 px, and has been since the volume button.
- *
- * So the layering that gb_start() establishes (margins first, controls last) has to be
- * repeated on every repaint, not just at start-up. The operator caught the absence of
- * it: pressing Hold cut the A button off against the right column, because Hold is the
- * first control that ever repainted that column while a game was running.
+ * THE COLUMN WINDOW STOPS ABOVE THE DRAWN CLUSTER, so the controls never have to be
+ * repainted to repair them. `paint_column_range()` paints only down to the last slot
+ * whose words changed, and GB_COL_WORD_BOTTOM's assertions below prove that is above A
+ * and the d-pad. The earlier version of this function called gb_draw_controls() after
+ * the columns instead, which worked but was visible: the column covered A's right
+ * 22 px and the repaint put it back, so every press showed a clip and a redraw.
  */
 static void paint_pending(void)
 {
@@ -278,7 +282,6 @@ static void paint_pending(void)
         return;
 
     paint_column_state();
-    gb_draw_controls();
 }
 
 static void gb_blit_task(void *arg)
@@ -1295,6 +1298,28 @@ static void gb_task(void *arg)
 #define GB_BTN_Y        (GB_CTL_Y + (GB_CTL_BAND - (2 * GB_BTN_D + GB_BTN_GAP)) / 2)
 #define GB_BTN_A_Y      (GB_BTN_Y + 4)  /* 296: four px down, by direction */
 #define GB_BTN_B_Y      (GB_BTN_Y + GB_BTN_D + GB_BTN_GAP)               /* 378 */
+
+/*
+ * A, B AND THE D-PAD MUST START BELOW THE COLUMN'S WORDS.
+ *
+ * This is the invariant that makes a partial column repaint safe, and it is asserted
+ * rather than commented because its absence is visible on the glass and nothing else
+ * would catch it. Measured 2026-11-24: A spans panel y 341..414 and the d-pad 343..490,
+ * against a word region that ends at GB_COL_WORD_BOTTOM = 293 -- 48 rows of clearance.
+ *
+ * IT WAS NOT ALWAYS TRUE. Repainting the full column DOES cover A: A spans panel
+ * x 335..408 and the right column starts at 387, so 22 px of A's right edge live under
+ * it. The first version of the Hold button repainted the full column and then redrew
+ * the controls, which worked but was visible -- every press showed A's edge being
+ * clipped and painted back, and the operator reported exactly that. Stopping the column
+ * window at the last word slot is the fix; these asserts are what keep it true.
+ */
+_Static_assert(GB_BTN_A_Y + DISPLAY_ORIGIN_Y > GB_COL_WORD_BOTTOM,
+               "A must not overlap the column's word region");
+_Static_assert(GB_BTN_B_Y + DISPLAY_ORIGIN_Y > GB_COL_WORD_BOTTOM,
+               "B must not overlap the column's word region");
+_Static_assert(GB_DPAD_Y + DISPLAY_ORIGIN_Y > GB_COL_WORD_BOTTOM,
+               "the d-pad must not overlap the column's word region");
 
 /* Three column slots, as the NES has: Start and Select plus a blank. Fewer slots
  * than the five this port shipped with, because the d-pad and circles now carry

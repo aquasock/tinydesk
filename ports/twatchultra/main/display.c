@@ -1610,9 +1610,9 @@ static bool label_is_glyph(const char *s)
     return p[extra + 1] == '\0';
 }
 
-static void paint_column(int x0, int x1, bool desk_right, label_rot_t rot,
-                         const char *(*label_at)(int),
-                         const char *const *ovr)
+static void paint_column_range(int x0, int x1, bool desk_right, label_rot_t rot,
+                               const char *(*label_at)(int),
+                               const char *const *ovr, int y_last)
 {
     /* One sacrificial row and column: exactly one pixel is lost at the top-left
      * of a window (docs/panel-geometry.md, "The first row and column are
@@ -1645,8 +1645,22 @@ static void paint_column(int x0, int x1, bool desk_right, label_rot_t rot,
      * painter runs before the app draws its controls, so anything it writes is
      * painted over a moment later. The A clipping the operator saw came from the
      * push band's own right edge, not from this window.
+     *
+     * AND THE WINDOW IS NOT ALWAYS THE WHOLE COLUMN ANY MORE. `y_last` lets a caller
+     * repaint only the slots whose words changed, which matters because the column is
+     * GLASS and a drawn control can sit under it: on the Game Boy, A's right 22 px
+     * live under the right column at rows 341..414, and those rows belong to slots 3
+     * and 4 -- the blank ones. Repainting the full height there means covering A and
+     * then having the app draw it again, which the operator could see as a clip and a
+     * redraw on every Hold press. Stopping at slot 2's last row does not touch A at
+     * all, so there is nothing to repair.
      */
-    const int height = COL_Y1 - wy + 1;             /* 417 */
+    int y_end = (y_last < COL_Y1) ? y_last : COL_Y1;
+
+    if (y_end < wy)
+        return;
+
+    const int height = y_end - wy + 1;
     const int band = (int)(sizeof(s_tx) / sizeof(s_tx[0])) / width;
     label_pos_t label[COL_N];
     int y = wy;
@@ -1772,6 +1786,25 @@ static void paint_column(int x0, int x1, bool desk_right, label_rot_t rot,
 
     gpio_set_level(LCD_CS, 1);
     spi_device_release_bus(s_spi);
+}
+
+/*
+ * A COLUMN, FULL HEIGHT. The common case, and the one that must clear the desktop's
+ * own words out of the slots an app does not use.
+ *
+ * ANY CALLER OF THIS THAT RUNS WHILE AN APP OWNS THE GLASS MUST REPAINT THE APP'S
+ * DRAWN CONTROLS AFTERWARDS. The window spans the full column height, which can sit
+ * over a control the app painted: on the Game Boy, A's right 22 px are under the right
+ * column at rows 341..414. `paint_column_range()` exists so a repaint that only
+ * changes words need not pay that, and this wrapper is kept for the cases that
+ * genuinely need the whole column -- start-up, mode changes, and a single-slot
+ * relabel.
+ */
+static void paint_column(int x0, int x1, bool desk_right, label_rot_t rot,
+                         const char *(*label_at)(int),
+                         const char *const *ovr)
+{
+    paint_column_range(x0, x1, desk_right, rot, label_at, ovr, COL_Y1);
 }
 
 /* All three margin groups, painted in the current mode.
@@ -1938,10 +1971,15 @@ void display_margin_label(int col, int index, const char *text)
  * cascade, which is the wrong way for a button whose entire purpose is that five
  * words change at the same instant.
  */
-void display_margin_labels(int col, const char *const *texts)
+void display_margin_labels(int col, const char *const *texts, int last_slot)
 {
     if (!s_fb || col < 0 || col > 1 || !texts)
         return;
+
+    if (last_slot < 0)
+        last_slot = 0;
+    if (last_slot > COL_N - 1)
+        last_slot = COL_N - 1;
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
 
@@ -1970,10 +2008,18 @@ void display_margin_labels(int col, const char *const *texts)
         return;
     }
 
+    /* Down to the last row of the last slot asked for. `col_slot_y(last_slot + 1)`
+     * is the first row of the NEXT slot, so subtracting one stops at this slot's
+     * bottom edge; for the last slot there is no next, and COL_Y1 is the stop. */
+    const int y_last = (last_slot + 1 < COL_N) ? col_slot_y(last_slot + 1) - 1
+                                               : COL_Y1;
+
     if (col == 0)
-        paint_column(LEFT_X0, LEFT_X1, true, LABEL_CW, left_label_app, overrides_for(0));
+        paint_column_range(LEFT_X0, LEFT_X1, true, LABEL_CW, left_label_app,
+                           overrides_for(0), y_last);
     else
-        paint_column(RIGHT_X0, RIGHT_X1, false, LABEL_CCW, right_label_app, overrides_for(1));
+        paint_column_range(RIGHT_X0, RIGHT_X1, false, LABEL_CCW, right_label_app,
+                           overrides_for(1), y_last);
 
     xSemaphoreGive(s_lock);
 }
