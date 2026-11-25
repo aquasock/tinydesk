@@ -69,6 +69,18 @@ static const char *TAG = "gb";
 #define VOL_SLOT 2
 
 /*
+ * THE LEFT COLUMN, BY NAME: Save on top, and Load in the volume slot.
+ *
+ * Save and Load only exist while Hold is down and the slot between them has no duty in
+ * either state -- Pause and Reset were placeholders and are gone. Load shares VOL_SLOT
+ * because the third button is the volume while the column is idle and Load during a
+ * hold; the two are never reachable at the same time, and the touch handler branches on
+ * `s_hold` to keep them apart.
+ */
+#define SLOT_SAVE 0
+#define SLOT_LOAD VOL_SLOT
+
+/*
  * THE RIGHT COLUMN, BY NAME: Hold at the top, then Select and Start.
  *
  * Hold is the emulator's own control and has no guest duty -- it blanks the other
@@ -215,28 +227,37 @@ static void gb_fill_row(void *ctx, int row, int col, uint16_t *dst, int n)
 /*
  * THE COLUMN WORDS, AS ONE STATE.
  *
- * Hold is a button you press and keep pressed, and while it is down the other five
- * column words are cleared; when it is released they come back. The held state is
- * one boolean, so the two states are written out in full rather than remembered and
- * restored: a restore path has to survive a press that arrives while a previous
- * restore is pending, and two full descriptions cannot disagree with each other.
+ * Hold is a button you press and keep pressed. While it is down the left column says "Save"
+ * at the top and "Load" in the third slot, and the guest's Select and Start are blank; on
+ * release the left column goes back to blank, blank and the volume word, and Select and
+ * Start return.
  *
- * CALLED ONLY FROM THE BLIT TASK, in both branches of its loop. The volume word is
- * read at the moment of painting, so what returns after a release is the CURRENT
- * position and not whatever it was when Hold went down.
+ * PAUSE AND RESET ARE GONE RATHER THAN BLANKED, by the operator's direction: they were
+ * placeholders for functions nobody wrote, and a word that describes a duty the code does
+ * not have is the label/duty lie this project has removed twice. Their slots are blank in
+ * every state, which is honest -- there is nothing there yet.
  *
- * TWO CALLS, NOT SIX. Each column is set and painted once, so all five words change
- * in the same push; six calls to the single-slot setter would paint the change as a
- * cascade down the glass (see display_margin_labels()).
+ * THE THIRD SLOT CARRIES TWO THINGS AT DIFFERENT TIMES, and that is deliberate rather
+ * than clever: it is the volume while the column is idle and Load while Hold is down. The
+ * volume is not reachable during a hold and Load is not reachable outside one, so the two
+ * duties cannot be confused, and the touch side enforces exactly the same split.
+ *
+ * The held state is one boolean, so both states are written out in full rather than one
+ * being remembered and restored. The volume word is read at the moment of painting, so what
+ * returns after a release is the CURRENT position and not whatever it was when Hold went
+ * down.
+ *
+ * CALLED ONLY FROM THE BLIT TASK, in both branches of its loop: only the task that owns the
+ * transmit path may paint (DSP-009).
  */
 static void paint_column_state(void)
 {
     const bool held = s_hold;
 
     const char *left[COL_N] = {
-        held ? " " : "Pause",
-        held ? " " : "Reset",
-        held ? " " : sound_volume_label(),
+        held ? "Save" : " ",
+        " ",
+        held ? "Load" : sound_volume_label(),
         " ", " ",
     };
 
@@ -539,6 +560,50 @@ static char s_save_path[256];
 static bool s_saveable;               /* cartridge has battery-backed RAM    */
 
 /*
+ * THE SAVESTATE FILE, AND WHY IT IS A SEPARATE FILE FROM THE BATTERY SAVE.
+ *
+ * The `.sav` beside it is the cartridge's OWN save RAM, written by the game and by
+ * the autosave path. A savestate is the whole machine -- CPU registers, RAM, sound
+ * channels, the mapper's banks, the RTC -- and it is something the wearer asks for, so
+ * it must not share a name with a file the emulator writes on its own. `.st0` in the
+ * same directory, beside the ROM's own name, for the same reason the `.sav` is: one
+ * file per cartridge and no catalogue to maintain.
+ */
+static char s_state_path[256];
+
+/*
+ * A SAVESTATE IS SERVICED BY THE GUEST TASK, LIKE THE SRAM SNAPSHOT.
+ *
+ * `gnuboy_save_state()` reads every piece of machine state and `gnuboy_load_state()`
+ * writes it, so running either from the touch callback or the blit task would race the
+ * guest over the very memory it is executing from -- the exact fault class that
+ * panicked the watch when the volume word was painted from the touch task (DSP-009),
+ * except that a torn savestate would be silent rather than loud.
+ *
+ * So the press sets a request and the guest task services it BETWEEN FRAMES, which is
+ * the shape `s_sram_req` already uses two definitions up. The cost is real and is
+ * recorded here rather than hidden: this board writes the card at about 270 KB/s over
+ * SPI, so a savestate of a few tens of kilobytes blocks that task for roughly 150 to
+ * 250 ms. That drops frames and underruns the audio ring, which is audible as a click.
+ * IT IS ACCEPTED, because the alternative -- splitting the write out to another task --
+ * would mean serialising machine state while the guest writes it, and a savestate that
+ * is quietly torn is worse than a hiccup on a deliberate button press.
+ */
+#define GB_STATE_NONE 0
+#define GB_STATE_SAVE 1
+#define GB_STATE_LOAD 2
+
+static volatile int s_state_req;
+static volatile int s_state_rc;       /* 0 ok, negative failed, -2 not yet     */
+static volatile int s_state_done;     /* which op the rc belongs to            */
+static volatile uint32_t s_state_us;  /* what the last one cost, milliseconds   */
+
+/* Rising-edge state for the two buttons, in the touch task only. The CST9217
+ * re-reports a held finger every 66 ms, and a held Save that re-saved on every
+ * report would write the card continuously. */
+static bool s_save_prev, s_load_prev;
+
+/*
  * THE LAST STOP'S SAVE OUTCOME, RECORDED RATHER THAN PRINTED.
  *
  * gb_stop() now has two callers in different tasks: the shell, and the Pusher
@@ -665,9 +730,10 @@ static volatile int s_sram_rc;
 static uint32_t s_sram_log[GB_SRAM_LOG];
 static volatile int s_sram_log_n;
 
-static void sram_path_for(const char *rom_path)
+static void save_paths_for(const char *rom_path)
 {
     s_save_path[0] = 0;
+    s_state_path[0] = 0;
 
     if (!rom_path || !*rom_path)
         return;
@@ -689,6 +755,12 @@ static void sram_path_for(const char *rom_path)
     (void)mkdir(GB_SAVE_DIR, 0777);
 
     snprintf(s_save_path, sizeof(s_save_path), "%s/%.*s.sav",
+             GB_SAVE_DIR, (int)n, base);
+
+    /* The savestate, beside it and named for the same cartridge. Built whether or
+     * not the cartridge has a battery: a savestate needs no battery RAM, so a
+     * cart without one can still save and restore its place. */
+    snprintf(s_state_path, sizeof(s_state_path), "%s/%.*s.st0",
              GB_SAVE_DIR, (int)n, base);
 }
 
@@ -1190,6 +1262,40 @@ static void gb_task(void *arg)
             }
         }
 
+        /*
+         * SAVESTATE: SAVE OR RESTORE, HERE AND NOWHERE ELSE.
+         *
+         * Placed with the SRAM snapshot and for the same reason: this task is the only
+         * writer of machine state, the guest is not executing at this point in the
+         * loop, and a savestate taken anywhere else would be torn. Unlike the SRAM
+         * snapshot this one also does the card I/O inline, because the file format
+         * lives inside the core and splitting it would mean serialising the machine to
+         * a buffer the core does not offer.
+         *
+         * THE REQUEST IS TAKEN BEFORE THE WORK, so a press that arrives while this one
+         * is running is queued rather than overwriting it. The touch side also refuses
+         * to ask while one is pending, so in practice the counter never exceeds one.
+         */
+        if (s_state_req != GB_STATE_NONE)
+        {
+            const int what = s_state_req;
+
+            s_state_req = GB_STATE_NONE;
+
+            const int64_t st0 = esp_timer_get_time();
+            const int rc = (what == GB_STATE_SAVE)
+                         ? gnuboy_save_state(s_state_path)
+                         : gnuboy_load_state(s_state_path);
+
+            s_state_us = (uint32_t)((esp_timer_get_time() - st0) / 1000);
+            s_state_rc = rc;
+            s_state_done = what;
+
+            ESP_LOGI(TAG, "%s %s: rc=%d in %lums",
+                     what == GB_STATE_SAVE ? "saved" : "loaded",
+                     s_state_path, rc, (unsigned long)s_state_us);
+        }
+
         /* Where the work ended. The delay that follows is not part of the
          * measurement -- see the top of the loop. */
         s_work_end_prev = esp_timer_get_time();
@@ -1468,6 +1574,8 @@ static bool gb_app_touch(void *user, const touch_frame_t *f)
     bool used = false;
     bool vol = false;
     bool hold = false;
+    bool save_pt = false;
+    bool load_pt = false;
 
     if (f)
     {
@@ -1485,13 +1593,17 @@ static bool gb_app_touch(void *user, const touch_frame_t *f)
                 display_margin_slot_live(1, HOLD_SLOT))
                 hold = true;
 
-            /* THE VOLUME BUTTON, LEFT COLUMN SLOT 2. Collected here and acted on
-             * AFTER the loop, so one frame is one decision whatever order the
-             * controller listed its points in -- the same reason the picker
-             * classifies a frame before it acts on it. */
-            if (f->p[i].region == EDGE_LEFT && f->p[i].index == VOL_SLOT &&
-                display_margin_slot_live(0, VOL_SLOT))
-                vol = true;
+            /* SAVE AND LOAD, LEFT COLUMN: the top slot and the third. Both are
+             * collected unconditionally and SPLIT AFTER the loop, because which of
+             * them a point means depends on whether Hold is down -- and that is only
+             * known once every point in the frame has been seen. */
+            if (f->p[i].region == EDGE_LEFT && f->p[i].index == SLOT_SAVE &&
+                display_margin_slot_live(0, SLOT_SAVE))
+                save_pt = true;
+
+            if (f->p[i].region == EDGE_LEFT && f->p[i].index == SLOT_LOAD &&
+                display_margin_slot_live(0, SLOT_LOAD))
+                load_pt = true;
 
             /* SELECT AND START, and NOT while Hold is down -- they are two of the
              * five words Hold blanks, so a press on one of them while it is blank
@@ -1507,17 +1619,13 @@ static bool gb_app_touch(void *user, const touch_frame_t *f)
     }
 
     /*
-     * HOLD CHANGES THE PAINTED STATE AND NOTHING ELSE, for now.
-     *
-     * The blanking is all this button does today -- the operator's instruction was
-     * that the functionality comes later -- so the callback records the state and
-     * the latch asks the blit task to repaint. It still counts as a control for the
-     * haptic, because the words on the glass do change under the thumb.
+     * HOLD MARKS THE STATE AND ASKS FOR THE REPAINT; it does not paint. The words
+     * change under the thumb, so the press counts as a control for the haptic.
      *
      * THE STATE IS RECORDED EVEN ON THE RELEASE FRAME, which arrives with no points:
-     * `hold` is then false and that IS the release. Writing it unconditionally means
-     * a finger that slides off the button, or a lifted finger, restores the words the
-     * same way. */
+     * `hold` is then false and that IS the release, so a finger that slides off the
+     * button or is lifted restores the words the same way.
+     */
     if (hold != s_hold)
     {
         s_hold = hold;
@@ -1527,27 +1635,52 @@ static bool gb_app_touch(void *user, const touch_frame_t *f)
     if (hold)
         used = true;
 
-    /* ONE PRESS, ONE STEP -- see sound_volume_cycle_on_press(), which owns the
-     * debounce because the controller re-reports a held finger every 66 ms and a
-     * held button that cycled five positions would land wherever the thumb left it.
+    /*
+     * SAVE AND LOAD ONLY EXIST WHILE HOLD IS DOWN. Outside a hold they are blank glass
+     * that does nothing and does not buzz; inside one the third slot means Load rather
+     * than volume, and the volume is refused, so the two duties on that slot cannot be
+     * confused.
      *
-     * REFUSED WHILE HELD, because the volume word is one of the five Hold blanks and
-     * a blank button must not act -- the phantom-button rule. The press is also not
-     * fed to the debounce, so the volume does not step silently under Hold and then
-     * show a word that moved while it was invisible.
-     *
-     * THE LABEL IS NOT PAINTED HERE. This callback runs on the touch task, and
-     * painting from it is a second writer on the SPI bus while the blit task is mid
-     * polling-transaction -- that panicked the watch on this button's first press in
-     * the previous cycle. See sound_volume_take_label_change() and DSP-009. */
-    if (!s_hold)
+     * RISING EDGES ONLY, for the reason the volume button needed them: the CST9217
+     * re-reports a held finger every 66 ms, and a held Save that fired on every report
+     * would write the card continuously. The edge state is cleared on every frame,
+     * including the empty release frame.
+     */
+    if (s_hold)
     {
+        const bool do_save = save_pt && !s_save_prev;
+        const bool do_load = load_pt && !s_load_prev;
+
+        if (save_pt || load_pt)
+            used = true;
+
+        /* One request slot, so a second press while the guest has not serviced the
+         * first is dropped rather than queued behind it -- a savestate is 150-250 ms
+         * of card I/O and the wearer gets no feedback until it finishes. Save wins if
+         * two fingers somehow land on both at once, which is arbitrary but stable. */
+        if (s_state_req == GB_STATE_NONE && (do_save || do_load))
+            s_state_req = do_save ? GB_STATE_SAVE : GB_STATE_LOAD;
+    }
+    else
+    {
+        /* ONE PRESS, ONE STEP -- sound.c owns this debounce, with the state.
+         *
+         * NOT FED TO THE DEBOUNCE WHILE HELD, so the volume cannot step silently under
+         * Hold and then show a word that moved while it was invisible.
+         *
+         * THE LABEL IS NOT PAINTED HERE: this is the touch task, and painting from it
+         * is a second writer on the SPI bus while the blit task is mid
+         * polling-transaction. That panicked the watch on this button's first press two
+         * cycles ago. See sound_volume_take_label_change() and DSP-009. */
         if (sound_volume_cycle_on_press(vol))
             used = true;
 
         if (vol)
             used = true;
     }
+
+    s_save_prev = save_pt;
+    s_load_prev = load_pt;
 
     s_pad = pad_from_frame(f);
     return used;
@@ -1740,7 +1873,7 @@ bool gb_start(const char *rom_path)
      * has no getter for it: -1 is "no battery or no RAM", -2 is "saveable but no
      * file yet", 0 is "loaded".
      */
-    sram_path_for(path);
+    save_paths_for(path);
     s_sram_saves = 0;
     s_sram_us = 0;
     s_sram_due_us = 0;
@@ -1748,6 +1881,14 @@ bool gb_start(const char *rom_path)
     s_sram_rc = 0;
     s_sram_pending = 0;
     s_sram_saves = 0;
+
+    /* A fresh session owes no savestate answer, and the two press edges start
+     * clear so a thumb already on the glass cannot fire one as its first act. */
+    s_state_req = GB_STATE_NONE;
+    s_state_rc = -2;
+    s_state_done = GB_STATE_NONE;
+    s_state_us = 0;
+    s_save_prev = s_load_prev = false;
     s_sram_us = 0;
     s_sram_snap_us = 0;
     s_sram_log_n = 0;
@@ -1831,20 +1972,24 @@ bool gb_start(const char *rom_path)
     display_margin_column_slots(GB_COL_SLOTS);
 
     /*
-     * THE THIRD LEFT BUTTON IS THE VOLUME, AND IT WAS A DEAD LABEL BEFORE IT.
+     * THE LEFT COLUMN: BLANK, BLANK, AND THE VOLUME -- and "Save" appears on top only
+     * while Hold is down.
      *
-     * `gb.c` has never handled `EDGE_LEFT` -- the left column has carried "Pause",
-     * "Reset" and "Save" since the port was written and not one of them was wired
-     * to anything, so those three boxes were the label/duty disagreement this
-     * project has written two records against: a drawn button that neither acted
-     * nor buzzed. Rather than leave a fourth label with no duty, the slot that had
-     * the least claim on a wearer's thumb -- Save, which is not implemented and has
-     * a shell command behind it -- now carries the one control a person reaches for
-     * while playing.
+     * `gb.c` never handled `EDGE_LEFT` before the volume button: the column carried
+     * "Pause", "Reset" and "Save" from the day the port was written and not one of them
+     * was wired to anything, so all three were drawn boxes describing duties nobody had
+     * written -- the label/duty disagreement this project has two records against.
      *
-     * THE OTHER TWO ARE LEFT ALONE AND STILL OWE THEIR DUTY. They are reported
-     * rather than quietly relabelled, because removing "Pause" and "Reset" would
-     * take away the promise that they are coming.
+     * THE FIRST TWO CARRY NOTHING NOW. They are placeholders for functions that still do
+     * not exist, and the operator's direction was to take the words off rather than
+     * leave them advertising something that does not happen. A blank label with the box
+     * still drawn is honest: there is a slot there, and nothing is in it yet. They stay
+     * inert in both states -- the touch handler collects nothing from them, so a press
+     * neither acts nor buzzes.
+     *
+     * THE THIRD SLOT IS THE VOLUME HERE AND "Load" DURING A HOLD. See paint_column_state()
+     * for the whole of both states; this only seeds the idle one, and the blit task owns
+     * every later change.
      *
      * RESET BEFORE THE LABEL, not after: the label is painted from the state, so the
      * screen and the audio have to agree at the moment of painting.
@@ -1852,9 +1997,9 @@ bool gb_start(const char *rom_path)
     sound_volume_reset();
     sound_volume_apply(true);
 
-    display_margin_label(0, 0, "Pause");
-    display_margin_label(0, 1, "Reset");
-    display_margin_label(0, 2, sound_volume_label());
+    display_margin_label(0, SLOT_SAVE, " ");
+    display_margin_label(0, 1, " ");
+    display_margin_label(0, SLOT_LOAD, sound_volume_label());
 
     for (int s = 3; s < COL_N; s++)
     {
@@ -2402,6 +2547,21 @@ static int cmd_gb(tdsh_session_t *session, int argc, char **argv)
                    (unsigned long)(s_sram_snap_us / 1000));
         else
             printf("sram none\n");
+
+        /*
+         * THE SAVESTATE'S LAST OUTCOME, because a press on the glass gives the wearer no
+         * feedback at all -- the column words are the same before and after, and the only
+         * visible effect is a short stutter. `-2` is "never asked for" and `0` is success,
+         * which is what the core returns; anything else is a failed open or a bad format.
+         * The path is printed because the two files sit beside each other and a load that
+         * silently found nothing is the failure this line exists to make visible.
+         */
+        if (s_state_done != GB_STATE_NONE)
+            printf("state %s rc=%d %lums %s\n",
+                   s_state_done == GB_STATE_SAVE ? "save" : "load",
+                   s_state_rc, (unsigned long)s_state_us, s_state_path);
+        else
+            printf("state none (no press yet)\n");
 
         /* What the last stop saved, which is the only report a Pusher A close
          * can give: it happens on the key task, where a print is lost. */
