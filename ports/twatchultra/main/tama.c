@@ -202,6 +202,21 @@ static char s_rom_path[256] = TAMA_ROM_DEFAULT;
  */
 static tama_ui_t s_ui;
 static volatile bool s_paused;
+
+/*
+ * WHETHER THE ARM IS DOWN RIGHT NOW, AND THE LATCH THAT REPAINTS FOR IT.
+ *
+ * `s_hold` is written by the TOUCH CALLBACK and read by the GUEST TASK, which is
+ * why it is volatile: the callback may record state and must not paint, because
+ * the guest task owns the panel's transmit path (DSP-009). The callback sets this
+ * and raises `s_hold_paint`; the guest task drains the flag and repaints.
+ *
+ * THE FLAG IS ONE BIT AND NOT A COUNTER because two Hold transitions inside one
+ * frame collapse to the state that is current when the paint happens, which is
+ * the state on the glass. A counter would repaint twice for one visible change.
+ */
+static volatile bool s_hold;
+static volatile bool s_hold_paint;
 static volatile int s_speed = 1;         /* 1, 2 or 4 -- a guest-cycle multiplier */
 /*
  * THE SOUND BUTTON CYCLES A VOLUME, not a mute toggle.
@@ -475,6 +490,21 @@ static bool tama_app_touch(void *user, const touch_frame_t *tf)
      */
     const bool armed = tama_ui_armed(&f);
 
+    /*
+     * RECORD THE ARM, AND ASK FOR ONE REPAINT. This is the whole of the touch
+     * task's part in the held state: it may not paint (DSP-009 -- the guest task
+     * owns the transmit path), so it writes the state and raises the latch.
+     *
+     * THE LATCH IS RAISED ON A TRANSITION ONLY. The controller re-reports a held
+     * finger several times a frame, and repainting on each report would push both
+     * columns twenty-odd times for one press.
+     */
+    if (armed != s_hold)
+    {
+        s_hold = armed;
+        s_hold_paint = true;
+    }
+
     for (int i = 0; i < tf->n && i < TOUCH_POINTS; i++)
     {
         if (tf->p[i].region == EDGE_BOTTOM &&
@@ -627,27 +657,49 @@ static bool save_checkpoint(void)
 /* --- actions -------------------------------------------------------------- */
 
 /*
- * Repaint the three toggles whose word changes.
+ * WRITE BOTH COLUMNS IN FULL, FROM THE CURRENT STATE.
  *
- * Pause/Resume, the rate Speed will select, and the sound level. A fixed label on
- * a toggle is the label/duty lie this port has removed twice already: a button
- * reading "Pause" that resumes is worse than an unlabelled one, because it is
- * confidently wrong.
+ * This is the Game Boy's shape (see paint_column_state() in gb.c) rather than one
+ * call per changed word, and the reason is the held state: Hold changes TWO words
+ * in one moment and blanks them again on release, so "remember what was there and
+ * put it back" would have to remember which of several states preceded the press.
+ * Both states are therefore written out in full every time, and the words that
+ * depend on state are read AT THE MOMENT OF PAINTING -- so what returns after a
+ * release is the CURRENT rate and volume, not whatever they were when Hold went
+ * down.
  *
- * THE SLOT NUMBERS ARE THE RIGHT COLUMN'S and come from the layout in
- * right_label_app(): sound at 2, rate at 3, Pause at 4. They moved here with the
- * controls. Every other cell in both columns is left to the tables -- this file
- * overrides only what it must, which is what keeps a stale word from surviving a
- * state change.
+ * SAVE AND LOAD ARE REVEALED BY THE ARM, NOT MERELY GATED BY IT. While Hold is up
+ * the two left slots are BLANK, and while it is down they read Save and Load. The
+ * earlier version left the words visible at all times and relied on the interlock
+ * to refuse an unarmed press -- correct, but it left two buttons on the glass
+ * whose whole duty was to do nothing unless a second finger was somewhere else.
+ * Blanking them is the stronger statement: what is not drawn cannot be pressed
+ * by accident, and the arm becomes the way to reach them rather than a condition
+ * on using them.
+ *
+ * THE BLANK IS A SPACE AND NOT A NULL. A NULL clears the override and falls back
+ * to the shared table, which reads "Save" -- the word this is trying to hide. See
+ * the same distinction in gb.c. A space is an override that says nothing.
+ *
+ * ONE PAINT PER COLUMN. `display_margin_label()` repaints the whole column per
+ * call, so writing five slots that way would push 46x417 pixels five times and
+ * show the change as a cascade about 14 ms apart -- the column coming apart
+ * rather than one state change. `display_margin_labels()` sets every override
+ * under one lock and paints the range once.
+ *
+ * THE FULL COLUMN IS SAFE HERE, unlike on the Game Boy. `last_slot` stops the
+ * window above an app's own controls, and the Game Boy needs that because its
+ * d-pad and A/B are drawn INSIDE the right column's window. This emulator's
+ * picture is 300 pixels inside a 320-pixel framebuffer at x 10..309 and both
+ * columns sit outside it, so a full-height repaint cannot cover the pet -- which
+ * is also why the picker's leftovers could be cleared the same way last cycle.
  */
-static void refresh_labels(void)
+static void paint_column_state(void)
 {
     char rate[8];
+    const bool held = s_hold;
 
     snprintf(rate, sizeof(rate), "%dx", s_speed);
-
-    display_margin_label(1, 4, s_paused ? "Resume" : "Pause");
-    display_margin_label(1, 3, rate);
 
     /*
      * SOUND READS THE CURRENT LEVEL rather than naming itself. A volume is a
@@ -656,14 +708,28 @@ static void refresh_labels(void)
      * differs from Speed, whose label shows the rate it will select because a
      * rate is momentary and the button's only meaning is "change it".
      */
-    {
-        int i = s_vol_i;
+    int vi = s_vol_i;
 
-        if (i < 0 || i >= S_VOL_N)
-            i = 0;
+    if (vi < 0 || vi >= S_VOL_N)
+        vi = 0;
 
-        display_margin_label(1, 2, s_vol[i].label);
-    }
+    const char *left[COL_N] = {
+        " ",
+        held ? "Save" : " ",
+        held ? "Load" : " ",
+        " ", " ",
+    };
+
+    const char *right[COL_N] = {
+        "Hold",
+        " ",
+        s_vol[vi].label,
+        rate,
+        s_paused ? "Resume" : "Pause",
+    };
+
+    display_margin_labels(0, left, COL_N - 1);
+    display_margin_labels(1, right, COL_N - 1);
 }
 
 static void apply_action(tama_act_t act)
@@ -752,7 +818,7 @@ static void apply_action(tama_act_t act)
         return;
     }
 
-    refresh_labels();
+    paint_column_state();
     ESP_LOGI(TAG, "%s", tama_ui_action_name(act));
 }
 
@@ -842,6 +908,27 @@ static void tama_task(void *arg)
                 tmc_button(s_m, e.index, e.down);
             else
                 apply_action((tama_act_t)(e.index - TAMA_BTN_N));
+        }
+
+        /*
+         * AND THE HELD STATE, DRAINED IN BOTH BRANCHES OF THE LOOP.
+         *
+         * This sits ABOVE the `s_paused` continue on purpose. A paused guest
+         * produces no frames, so a Hold press while paused would sit unreported for
+         * as long as the pause lasted -- and a pause is exactly when a player
+         * reaches for Save, which is now only reachable through Hold. Draining here
+         * means the idle branch cannot miss it either; the busy branch falls
+         * through the same place. DSP-009 records this as the drain that must be in
+         * both branches rather than one, and this is the third time it has applied
+         * in this port.
+         *
+         * ZERO TIMEOUT: this is a latch, not a wait. The task already blocks on the
+         * queue receive and its frame delay, so there is nothing to wait for here.
+         */
+        if (s_hold_paint)
+        {
+            s_hold_paint = false;
+            paint_column_state();
         }
 
         if (s_paused)
@@ -1198,32 +1285,25 @@ bool tama_start(const char *rom_path)
      * folder column blank, PgUp/PgDn and the two arrows on the right, Enter and
      * Up on the strip -- by setting LABEL OVERRIDES, and `paint_margins()`
      * consults those overrides BEFORE the app tables. So every slot the picker
-     * touched keeps the picker's word, and this file, which only overrides the
-     * three slots whose words change, never overwrites the rest: the right column
-     * read PgUp, PgDn, an up arrow and a down arrow where Hold, Shot, Sound,
-     * Reset and Exit belong, and the third strip bar read "Up" instead of the
-     * degree circle.
+     * touched keeps the picker's word, which is why the columns read PgUp, PgDn
+     * and two arrows where the emulator's own controls belong.
      *
-     * THE SECOND HALF IS THAT `display_margins_set()` CANNOT FIX IT HERE. The
-     * picker already put the driver in APP mode, so the call below returns on its
-     * own `mode == s_margin_mode` guard without repainting anything at all. The
-     * clear is therefore what actually repaints -- each `display_margin_label()`
-     * repaints synchronously when the mode is APP, which is exactly the state the
-     * picker left.
+     * WHAT IS CLEARED HERE IS THE STRIP AND THE CHROME. The columns are not: see
+     * the note at the bottom of this block.
      *
-     * THE CHROME IS RESTORED TOO, and that is not cosmetic: `s_nochrome` is
-     * driver state that both the app and the desktop paint paths read, so a slot
-     * left bare here would surface later as a button with no box.
+     * `display_margins_set()` CANNOT FIX ANY OF IT BY ITSELF. The picker already
+     * put the driver in APP mode, so the call below returns on its own
+     * `mode == s_margin_mode` guard without repainting anything at all -- the
+     * per-slot calls are what repaint, because each one paints synchronously when
+     * the mode is APP, which is exactly the state the picker left.
      *
      * NULL RESTORES THE SHARED TABLE, which is what puts the degree circle back on
      * all three strip bars: the V3's buttons have no short word that fits 41 px, so
      * the circle is the placeholder by design and is described ONCE, in edges.h.
      *
-     * ONE PAINT PER COLUMN, NOT FIVE. `display_margin_label()` repaints the whole
-     * column per call, so clearing ten slots with it would push 46x417 pixels ten
-     * times and read on the glass as the column coming apart. `display_margin_labels()`
-     * sets every override under one lock and paints the range once, which is the same
-     * reason it exists for the Game Boy's Hold button.
+     * THE CHROME IS RESTORED TOO, and that is not cosmetic: `s_nochrome` is
+     * driver state that both the app and the desktop paint paths read, so a slot
+     * left bare here would surface later as a button with no box.
      *
      * THE CHROME IS CHECKED RATHER THAN RESTORED BLINDLY. `s_nochrome` is driver
      * state that the app and desktop paint paths both read, so a slot left bare here
@@ -1232,8 +1312,6 @@ bool tama_start(const char *rom_path)
      * case there is nothing to do and `display_margin_slot_live()` says so without a
      * paint.
      */
-    static const char *const cleared[COL_N] = { NULL, NULL, NULL, NULL, NULL };
-
     for (int i = 0; i < COL_N; i++)
     {
         if (!display_margin_slot_live(0, i))
@@ -1251,9 +1329,18 @@ bool tama_start(const char *rom_path)
         display_margin_btn_label(i, NULL);
     }
 
-    display_margin_labels(0, cleared, COL_N - 1);
-    display_margin_labels(1, cleared, COL_N - 1);
-
+    /*
+     * THE COLUMNS ARE NOT CLEARED HERE ANY MORE, AND THAT IS A DELIBERATE
+     * SIMPLIFICATION rather than an omission. `paint_column_state()` writes all
+     * five slots of BOTH columns with explicit words, so it overwrites every
+     * override the picker could have left -- clearing first would be a second
+     * full-height paint per column, and worse, it would fall back to the shared
+     * tables and FLASH the words "Save" and "Load" on the glass for one frame
+     * before the idle state blanked them again.
+     *
+     * The strip still has to be cleared here: the picker leaves "Enter" and "Up"
+     * there as overrides and nothing below this point rewrites the strip's bars.
+     */
     display_margins_set(DISPLAY_MARGINS_APP);
 
     s_frames = 0;
@@ -1268,6 +1355,12 @@ bool tama_start(const char *rom_path)
      * repaints the columns from the tables and would overwrite an override
      * applied before it. */
     s_paused = false;
+    /* THE ARM STARTS UP, and so does its latch. A session that ended with a
+     * finger on Hold would otherwise leave `s_hold` set -- the same leak that once
+     * left the Game Boy's Select and Start dead on the next cartridge -- and the
+     * columns would come up reading Save and Load with nobody holding anything. */
+    s_hold = false;
+    s_hold_paint = false;
     s_speed = 1;
     s_vol_i = 0;            /* full volume on every start */
     s_shots = s_saves = s_loads = s_resets = 0;
@@ -1276,7 +1369,7 @@ bool tama_start(const char *rom_path)
     s_protect_save = false;
     tama_ui_init(&s_ui);
 
-    refresh_labels();
+    paint_column_state();
 
     /*
      * THE AUDIO STREAM, opened for the life of the run.
@@ -1393,6 +1486,12 @@ void tama_stop(void)
      * task drains, and the guest task is about to stop existing. */
     s_accept_input = false;
     s_run = false;
+
+    /* The held state is this file's own, and the column repaint above cleared the
+     * OVERRIDES rather than the state behind them. Left set, the next run would
+     * start believing the arm was down. */
+    s_hold = false;
+    s_hold_paint = false;
 
     /* Wait for the guest task to leave tmc_run() and delete itself before
      * touching the machine it was using. A one-second bound because a task that
