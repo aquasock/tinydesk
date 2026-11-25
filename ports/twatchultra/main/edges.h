@@ -207,7 +207,7 @@ static inline const char *left_label(int i)
 static inline const char *left_label_app(int i)
 {
     static const char *const labels[COL_N] = {
-        "", "Save", "Load", "", "",
+        "Save", "", "Load", "", "",
     };
 
     return i >= 0 && i < COL_N ? labels[i] : "";

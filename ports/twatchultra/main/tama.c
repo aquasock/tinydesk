@@ -714,8 +714,8 @@ static void paint_column_state(void)
         vi = 0;
 
     const char *left[COL_N] = {
-        " ",
         held ? "Save" : " ",
+        " ",
         held ? "Load" : " ",
         " ", " ",
     };

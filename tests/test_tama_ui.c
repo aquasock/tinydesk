@@ -143,7 +143,7 @@ static void test_gated_without_arm_is_refused(void)
      * Save and Load use it and a mechanism half-removed is worse than either
      * state. */
     static const struct { edge_region_t r; int i; tama_act_t a; } gated[] = {
-        { EDGE_LEFT, 1, TAMA_ACT_SAVE },
+        { EDGE_LEFT, 0, TAMA_ACT_SAVE },
         { EDGE_LEFT, 2, TAMA_ACT_LOAD },
     };
 
@@ -181,7 +181,7 @@ static void test_gated_with_arm_fires(void)
      * Save and Load use it and a mechanism half-removed is worse than either
      * state. */
     static const struct { edge_region_t r; int i; tama_act_t a; } gated[] = {
-        { EDGE_LEFT, 1, TAMA_ACT_SAVE },
+        { EDGE_LEFT, 0, TAMA_ACT_SAVE },
         { EDGE_LEFT, 2, TAMA_ACT_LOAD },
     };
 
@@ -228,7 +228,7 @@ static void test_arm_released_before_action_is_refused(void)
     tama_ui_init(&ui);
     step(&ui, frame1(ARM_R, ARM_I), NULL);
     step(&ui, empty_frame(), NULL);
-    CHECK_EQ(step(&ui, frame1(EDGE_LEFT, 1), NULL), 0);   /* Save  */
+    CHECK_EQ(step(&ui, frame1(EDGE_LEFT, 0), NULL), 0);   /* Save  */
     step(&ui, empty_frame(), NULL);
     CHECK_EQ(step(&ui, frame1(EDGE_LEFT, 2), NULL), 0);   /* Load  */
     CHECK(ui.refused >= 2);
@@ -279,8 +279,8 @@ static void test_haptic_follows_what_would_fire(void)
 
     /* GATED BUTTONS BUZZ ONLY WHEN ARMED. An unarmed Save does nothing, so a buzz
      * would claim otherwise -- the operator heard exactly that and rejected it. */
-    CHECK(!tama_ui_haptic_of(EDGE_LEFT, 1, false));    /* Save, unarmed */
-    CHECK( tama_ui_haptic_of(EDGE_LEFT, 1, true));     /* Save, armed   */
+    CHECK(!tama_ui_haptic_of(EDGE_LEFT, 0, false));    /* Save, unarmed */
+    CHECK( tama_ui_haptic_of(EDGE_LEFT, 0, true));     /* Save, armed   */
     CHECK(!tama_ui_haptic_of(EDGE_LEFT, 2, false));    /* Load, unarmed */
     CHECK( tama_ui_haptic_of(EDGE_LEFT, 2, true));     /* Load, armed   */
 
@@ -296,7 +296,7 @@ static void test_haptic_follows_what_would_fire(void)
     CHECK(!tama_ui_haptic_of(EDGE_RIGHT, 1, false));
 
     /* The left column's empty slots likewise. */
-    CHECK(!tama_ui_haptic_of(EDGE_LEFT, 0, true));
+    CHECK(!tama_ui_haptic_of(EDGE_LEFT, 1, true));
     CHECK(!tama_ui_haptic_of(EDGE_LEFT, 3, true));
     CHECK(!tama_ui_haptic_of(EDGE_LEFT, 4, true));
 

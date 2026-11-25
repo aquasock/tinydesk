@@ -29,8 +29,14 @@ static const ui_entry_t s_map[] = {
     /* Left column: Save and Load, the pair a player uses together, in the two
      * slots a thumb reaches after it has settled. The rest is empty rather than
      * filled with filler -- an unused box that looks like a button is worse than
-     * a blank one, and the label table asserts the pairing both ways. */
-    { EDGE_LEFT, 1, TAMA_ACT_SAVE },
+     * a blank one, and the label table asserts the pairing both ways.
+     *
+     * SAVE IS THE TOP SLOT, at the operator's direction; it sat one below for a
+     * cycle and read as the second of a pair rather than the first. Slot 1 stays
+     * blank so the two do not read as a block of adjacent buttons the way the
+     * right column's arm and its neighbours must not -- and so the column has the
+     * same shape as the Game Boy's, whose Save has always been top-left. */
+    { EDGE_LEFT, 0, TAMA_ACT_SAVE },
     { EDGE_LEFT, 2, TAMA_ACT_LOAD },
 
     /* Right column, top to bottom, at the operator's direction: the arm, a
