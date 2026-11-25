@@ -1572,7 +1572,6 @@ static bool gb_app_touch(void *user, const touch_frame_t *f)
         return false;
 
     bool used = false;
-    bool vol = false;
     bool hold = false;
     bool save_pt = false;
     bool load_pt = false;
@@ -1663,19 +1662,35 @@ static bool gb_app_touch(void *user, const touch_frame_t *f)
     }
     else
     {
-        /* ONE PRESS, ONE STEP -- sound.c owns this debounce, with the state.
+        /*
+         * ONE PRESS, ONE STEP, AND THE POINT COMES FROM `load_pt`.
          *
-         * NOT FED TO THE DEBOUNCE WHILE HELD, so the volume cannot step silently under
-         * Hold and then show a word that moved while it was invisible.
+         * The third left slot is TWO controls sharing one box: the volume here and Load
+         * during a hold. `load_pt` is the raw hit test on that slot, collected above
+         * unconditionally, and it is what the volume stepper must be fed -- feeding the
+         * `vol` variable this handler used to have was the bug that stopped the button
+         * working at all, because replacing the collection with Save/Load left it
+         * declared and never assigned, so the stepper was called with `false` on every
+         * frame and the press never registered.
          *
-         * THE LABEL IS NOT PAINTED HERE: this is the touch task, and painting from it
-         * is a second writer on the SPI bus while the blit task is mid
-         * polling-transaction. That panicked the watch on this button's first press two
-         * cycles ago. See sound_volume_take_label_change() and DSP-009. */
-        if (sound_volume_cycle_on_press(vol))
+         * THE SAME POINT IS FED WHILE HELD, as `false`, by simply not calling here. That
+         * keeps sound.c's rising-edge memory honest: a finger that lands on the slot
+         * during a hold is not a volume press, and one that is already on the slot when
+         * Hold goes down does not step it on release.
+         *
+         * sound.c owns the debounce, with the state, because the controller re-reports a
+         * held finger every 66 ms and a held button that cycled five positions would land
+         * wherever the thumb left it.
+         *
+         * THE LABEL IS NOT PAINTED HERE: this is the touch task, and painting from it is a
+         * second writer on the SPI bus while the blit task is mid polling-transaction.
+         * That panicked the watch on this button's first press two cycles ago. See
+         * sound_volume_take_label_change() and DSP-009.
+         */
+        if (sound_volume_cycle_on_press(load_pt))
             used = true;
 
-        if (vol)
+        if (load_pt)
             used = true;
     }
 
