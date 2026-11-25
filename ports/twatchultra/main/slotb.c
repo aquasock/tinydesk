@@ -470,9 +470,23 @@ static bool slotb_start_tama(const char *rom)
     return tama_start(s_tama_rom);
 }
 
+/*
+ * THE APPS THE MENU OFFERS, AND THE REASON THERE ARE THREE.
+ *
+ * The NES WAS HERE AND IS NOT, because it will not ship: 320x240 console output on
+ * a watch is not something a wearer can see, and a menu that offers a console
+ * nobody should use is a promise this port should not make. NOTHING WAS DELETED --
+ * `nes.c` is untouched and `nes` still runs from a Terminal in the desktop, which is
+ * where it belongs while it is on the backburner. What went is the menu row.
+ *
+ * REMOVING A ROW HERE REMOVES IT FROM TWO PLACES AT ONCE, deliberately: the menu
+ * draws this table directly, and `slotb play <key>` resolves through it, so an app
+ * cannot be launchable-but-invisible or visible-but-unlaunchable. A stored NVS key
+ * that no longer names a row falls back to the menu rather than failing, which is
+ * the path a wearer who rebooted mid-update would take.
+ */
 static const slotb_app_t s_apps[] = {
     { "Game Boy Color", "gb",  slotb_start_gb,   gb_stop,     gb_running,     gb_last_error },
-    { "NES",            "nes", nes_start,        nes_stop,    nes_running,    NULL },
     { "Pokemon Mini",   "pm",  slotb_start_pm,   pmini_stop,  pmini_running,  NULL },
     { "Tamagotchi V3",  "tama", slotb_start_tama, tama_stop,   tama_running,   NULL },
 };

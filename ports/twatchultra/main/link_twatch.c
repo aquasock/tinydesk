@@ -822,7 +822,7 @@ int link_write(const uint8_t *buf, int len)
 /* ------------------------------------------------- slot B from the start menu */
 
 /*
- * THE THREE SLOT B APPS ARE NATIVE APPS, NOT CARD-SIDE SCRIPTS.
+ * THE SLOT B APPS ARE NATIVE APPS, NOT CARD-SIDE SCRIPTS.
  *
  * See slotb_launch(): a `.tdlink` naming a Python script is opened by running it
  * in a TERMINAL, so the menu item showed a terminal, the echoed command and the
@@ -841,7 +841,6 @@ static void slotb_launch_or_say(const char *key)
 }
 
 static void launch_slotb_gb(void)  { slotb_launch_or_say("gb"); }
-static void launch_slotb_nes(void) { slotb_launch_or_say("nes"); }
 static void launch_slotb_pm(void)  { slotb_launch_or_say("pm"); }
 static void launch_slotb_tama(void) { slotb_launch_or_say("tama"); }
 
@@ -855,14 +854,22 @@ static void launch_slotb_tama(void) { slotb_launch_or_say("tama"); }
  * them, so they spent the two cells saying what the text already said.
  *
  *   ●■  Game Boy Color
- *   ●▲  NES
  *   ●♦  Pokemon Mini
  *   ●☼  Tamagotchi V3
  *
  * THE PREFIX IS SHARED AND THE SUFFIX IS NOT, which is the point: the circle says
  * "console" for every one of them, and the shape says which. That is the reason these
- * are not simply four pretty pairs -- a shared motif makes the menu read as one family,
+ * are not simply pretty pairs -- a shared motif makes the menu read as one family,
  * and a distinguishing suffix keeps it from reading as one repeated blob.
+ *
+ * THE NES IS NOT HERE, and its glyph is still in this comment only because the
+ * removal is recent enough to be worth explaining. It is on the backburner rather
+ * than deleted: `nes.c` is untouched and `nes` still runs from a Terminal in the
+ * desktop. What went is the MENU ENTRY, because the screen cannot do it justice --
+ * 320x240 console output on a watch is not a thing a wearer can see -- and a menu
+ * that offers a console nobody should use is a promise the port should not make.
+ * Its shape was U+25B2, so the three that remain are square, lozenge and rays and
+ * no two can be confused at this size.
  *
  * EVERY GLYPH WAS CHECKED AGAINST THE FONT TABLE BEFORE BEING USED HERE. It carries
  * 799 code points; a symbol it lacks renders as nothing at all, which in a menu looks
@@ -904,7 +911,6 @@ static void launch_slotb_tama(void) { slotb_launch_or_say("tama"); }
  * indistinguishable at a glance. The suffix was doing real work, not decoration.
  */
 static const td_app_t s_app_gb  = { "GBC",            launch_slotb_gb,  "\xe2\x97\x8f\xe2\x96\xa0" };  /* U+25CF U+25A0 */
-static const td_app_t s_app_nes = { "NES",            launch_slotb_nes, "\xe2\x97\x8f\xe2\x96\xb2" };  /* U+25CF U+25B2 */
 static const td_app_t s_app_pm  = { "Pok\xc3\xa9Mini",    launch_slotb_pm,  "\xe2\x97\x8f\xe2\x99\xa6" };  /* U+25CF U+2666 */
 static const td_app_t s_app_tama = { "Tama V3",        launch_slotb_tama, "\xe2\x97\x8f\xe2\x98\xbc" };  /* U+25CF U+263C */
 
@@ -916,7 +922,6 @@ void board_apps_register(void)
      * built-in apps, so these sit at the end beside Music and the user's own
      * entries -- which is where the card-side shortcuts used to be. */
     td_app_register(&s_app_gb);
-    td_app_register(&s_app_nes);
     td_app_register(&s_app_pm);
     td_app_register(&s_app_tama);
 }
