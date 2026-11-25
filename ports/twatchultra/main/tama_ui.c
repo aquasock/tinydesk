@@ -26,33 +26,28 @@ typedef struct
 } ui_entry_t;
 
 static const ui_entry_t s_map[] = {
-    /* Left column, top to bottom: the things a player reaches for mid-game. */
-    { EDGE_LEFT, 0, TAMA_ACT_PAUSE },
+    /* Left column: Save and Load, the pair a player uses together, in the two
+     * slots a thumb reaches after it has settled. The rest is empty rather than
+     * filled with filler -- an unused box that looks like a button is worse than
+     * a blank one, and the label table asserts the pairing both ways. */
     { EDGE_LEFT, 1, TAMA_ACT_SAVE },
     { EDGE_LEFT, 2, TAMA_ACT_LOAD },
-    { EDGE_LEFT, 3, TAMA_ACT_SPEED },
 
-    /* Right column: the arm at the top where a thumb naturally rests, the
-     * screenshot next to it because it is harmless, Sound directly under it,
-     * and Reset at the BOTTOM -- the last place a finger sliding down the glass
-     * arrives. Distance is not the guarantee (the arm is); it is the second line
-     * of defence.
+    /* Right column, top to bottom, at the operator's direction: the arm, a
+     * deliberate blank, the sound level, the rate, and Pause. See
+     * right_label_app() in edges.h for why the blank is there and why Pause and
+     * Speed moved off the left column rather than being copied.
      *
-     * RESET MOVED UP ONE SLOT to fill the gap Sound left behind when it moved,
-     * at the operator's request, so the column reads Hold / Shot / Sound / Reset
-     * with no hole and nothing at the bottom. The second-line-of-defence argument
-     * is weaker for it -- Reset is now two slots from the arm rather than four --
-     * and that is a deliberate trade for a tidier column, recorded so it is not
-     * mistaken for an oversight.
-     *
-     * SOUND MOVED HERE FROM THE LEFT COLUMN at the operator's request, so it sits
-     * under Shot rather than at the bottom of the left column. It is a MOVE and
-     * not a second button: two slots driving one action would both want to show
-     * the state, and the left column's last slot is now genuinely empty. */
-    { EDGE_RIGHT, 1, TAMA_ACT_SHOT },
+     * SHOT, RESET AND EXIT NO LONGER HAVE MARGIN SLOTS. They are not gone: all
+     * three still run from the shell (`tama do shot`, `do reset`), and EXIT is
+     * what Pusher A does from inside an app, which is the way out a wearer
+     * actually uses. Reset was gated behind the arm and is now unreachable from
+     * the glass, so the interlock protects nothing at the moment -- it stays
+     * because Save and Load are still gated and the mechanism must not be
+     * half-removed. */
     { EDGE_RIGHT, 2, TAMA_ACT_SOUND },
-    { EDGE_RIGHT, 3, TAMA_ACT_RESET },
-    { EDGE_RIGHT, 4, TAMA_ACT_EXIT },
+    { EDGE_RIGHT, 3, TAMA_ACT_SPEED },
+    { EDGE_RIGHT, 4, TAMA_ACT_PAUSE },
 };
 
 #define MAP_N ((int)(sizeof(s_map) / sizeof(s_map[0])))

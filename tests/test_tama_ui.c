@@ -136,10 +136,15 @@ static void test_labels_match_actions(void)
 
 static void test_gated_without_arm_is_refused(void)
 {
+    /* THE GATED SET IS SAVE AND LOAD ONLY, and that is a consequence of the
+     * layout rather than of the interlock changing. Reset and Exit no longer have
+     * margin slots (see the map in tama_ui.c), so nothing on the glass can reach
+     * them; the rule that protects them is still here and still swept, because
+     * Save and Load use it and a mechanism half-removed is worse than either
+     * state. */
     static const struct { edge_region_t r; int i; tama_act_t a; } gated[] = {
         { EDGE_LEFT, 1, TAMA_ACT_SAVE },
         { EDGE_LEFT, 2, TAMA_ACT_LOAD },
-        { EDGE_RIGHT, 3, TAMA_ACT_RESET },
     };
 
     for (size_t k = 0; k < sizeof(gated) / sizeof(gated[0]); k++)
@@ -169,10 +174,15 @@ static void test_gated_without_arm_is_refused(void)
 
 static void test_gated_with_arm_fires(void)
 {
+    /* THE GATED SET IS SAVE AND LOAD ONLY, and that is a consequence of the
+     * layout rather than of the interlock changing. Reset and Exit no longer have
+     * margin slots (see the map in tama_ui.c), so nothing on the glass can reach
+     * them; the rule that protects them is still here and still swept, because
+     * Save and Load use it and a mechanism half-removed is worse than either
+     * state. */
     static const struct { edge_region_t r; int i; tama_act_t a; } gated[] = {
         { EDGE_LEFT, 1, TAMA_ACT_SAVE },
         { EDGE_LEFT, 2, TAMA_ACT_LOAD },
-        { EDGE_RIGHT, 3, TAMA_ACT_RESET },
     };
 
     for (size_t k = 0; k < sizeof(gated) / sizeof(gated[0]); k++)
@@ -210,11 +220,11 @@ static void test_arm_released_before_action_is_refused(void)
 
     step(&ui, frame1(ARM_R, ARM_I), NULL);            /* arm down      */
     step(&ui, empty_frame(), NULL);                   /* arm lifted    */
-    CHECK_EQ(step(&ui, frame1(EDGE_RIGHT, 3), &act), 0);
+    CHECK_EQ(step(&ui, frame1(EDGE_LEFT, 2), &act), 0);   /* Load */
     CHECK(act == TAMA_ACT_NONE);
     CHECK(ui.refused > 0);
 
-    /* And the same for the other two, because they share the rule. */
+    /* And the same for the other one, because they share the rule. */
     tama_ui_init(&ui);
     step(&ui, frame1(ARM_R, ARM_I), NULL);
     step(&ui, empty_frame(), NULL);
@@ -273,19 +283,22 @@ static void test_haptic_follows_what_would_fire(void)
     CHECK( tama_ui_haptic_of(EDGE_LEFT, 1, true));     /* Save, armed   */
     CHECK(!tama_ui_haptic_of(EDGE_LEFT, 2, false));    /* Load, unarmed */
     CHECK( tama_ui_haptic_of(EDGE_LEFT, 2, true));     /* Load, armed   */
-    CHECK(!tama_ui_haptic_of(EDGE_RIGHT, 3, false));   /* Reset, unarmed */
-    CHECK( tama_ui_haptic_of(EDGE_RIGHT, 3, true));    /* Reset, armed   */
 
     /* Ungated buttons always buzz, armed or not: they fire either way. */
-    CHECK(tama_ui_haptic_of(EDGE_LEFT, 0, false));     /* Pause  */
-    CHECK(tama_ui_haptic_of(EDGE_LEFT, 3, false));     /* Speed  */
-    CHECK(tama_ui_haptic_of(EDGE_RIGHT, 1, false));    /* Shot   */
     CHECK(tama_ui_haptic_of(EDGE_RIGHT, 2, false));    /* Sound  */
+    CHECK(tama_ui_haptic_of(EDGE_RIGHT, 3, false));    /* Speed  */
+    CHECK(tama_ui_haptic_of(EDGE_RIGHT, 4, false));    /* Pause  */
 
-    /* Exit is gated like Reset: silence unarmed, a click when armed. The right
-     * column has no blank slot left -- all five are controls. */
-    CHECK(!tama_ui_haptic_of(EDGE_RIGHT, 4, false));
-    CHECK( tama_ui_haptic_of(EDGE_RIGHT, 4, true));
+    /* THE BLANK SLOT IS SILENT, which is what a blank has to be: a buzz there
+     * would advertise a button that does not exist. Right slot 1 is empty by
+     * design -- it separates the arm from everything that acts. */
+    CHECK(!tama_ui_haptic_of(EDGE_RIGHT, 1, true));
+    CHECK(!tama_ui_haptic_of(EDGE_RIGHT, 1, false));
+
+    /* The left column's empty slots likewise. */
+    CHECK(!tama_ui_haptic_of(EDGE_LEFT, 0, true));
+    CHECK(!tama_ui_haptic_of(EDGE_LEFT, 3, true));
+    CHECK(!tama_ui_haptic_of(EDGE_LEFT, 4, true));
 
     /* Below the last slot there is geometry but no control. */
     CHECK(!tama_ui_haptic_of(EDGE_RIGHT, COL_N, true));
@@ -298,10 +311,9 @@ static void test_haptic_follows_what_would_fire(void)
 static void test_ungated_need_no_arm(void)
 {
     static const struct { edge_region_t r; int i; tama_act_t a; } plain[] = {
-        { EDGE_LEFT, 0, TAMA_ACT_PAUSE },
-        { EDGE_LEFT, 3, TAMA_ACT_SPEED },
+        { EDGE_RIGHT, 4, TAMA_ACT_PAUSE },
+        { EDGE_RIGHT, 3, TAMA_ACT_SPEED },
         { EDGE_RIGHT, 2, TAMA_ACT_SOUND },
-        { EDGE_RIGHT, 1, TAMA_ACT_SHOT },
     };
 
     for (size_t k = 0; k < sizeof(plain) / sizeof(plain[0]); k++)
@@ -326,14 +338,14 @@ static void test_press_edge_only(void)
 
     tama_ui_init(&ui);
 
-    CHECK_EQ(step(&ui, frame1(EDGE_LEFT, 3), &act), 1);   /* Speed */
+    CHECK_EQ(step(&ui, frame1(EDGE_RIGHT, 3), &act), 1);   /* Speed */
     CHECK(act == TAMA_ACT_SPEED);
 
     for (int i = 0; i < 20; i++)
-        CHECK_EQ(step(&ui, frame1(EDGE_LEFT, 3), NULL), 0);
+        CHECK_EQ(step(&ui, frame1(EDGE_RIGHT, 3), NULL), 0);
 
     step(&ui, empty_frame(), NULL);
-    CHECK_EQ(step(&ui, frame1(EDGE_LEFT, 3), &act), 1);
+    CHECK_EQ(step(&ui, frame1(EDGE_RIGHT, 3), &act), 1);
     CHECK(act == TAMA_ACT_SPEED);
 }
 
@@ -346,7 +358,7 @@ static void test_two_plain_at_once(void)
 
     tama_ui_init(&ui);
 
-    tama_ui_frame_t f = frame2(EDGE_LEFT, 0, EDGE_RIGHT, 1);
+    tama_ui_frame_t f = frame2(EDGE_RIGHT, 4, EDGE_RIGHT, 3);
     int n = tama_ui_update(&ui, &f, out);
 
     CHECK_EQ(n, 2);

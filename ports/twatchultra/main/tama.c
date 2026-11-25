@@ -629,10 +629,16 @@ static bool save_checkpoint(void)
 /*
  * Repaint the three toggles whose word changes.
  *
- * Pause/Resume, the rate Speed will select, and whether sound is on. A fixed
- * label on a toggle is the label/duty lie this port has removed twice already:
- * a button reading "Pause" that resumes is worse than an unlabelled one, because
- * it is confidently wrong.
+ * Pause/Resume, the rate Speed will select, and the sound level. A fixed label on
+ * a toggle is the label/duty lie this port has removed twice already: a button
+ * reading "Pause" that resumes is worse than an unlabelled one, because it is
+ * confidently wrong.
+ *
+ * THE SLOT NUMBERS ARE THE RIGHT COLUMN'S and come from the layout in
+ * right_label_app(): sound at 2, rate at 3, Pause at 4. They moved here with the
+ * controls. Every other cell in both columns is left to the tables -- this file
+ * overrides only what it must, which is what keeps a stale word from surviving a
+ * state change.
  */
 static void refresh_labels(void)
 {
@@ -640,14 +646,15 @@ static void refresh_labels(void)
 
     snprintf(rate, sizeof(rate), "%dx", s_speed);
 
-    display_margin_label(0, 0, s_paused ? "Resume" : "Pause");
-    display_margin_label(0, 3, rate);
+    display_margin_label(1, 4, s_paused ? "Resume" : "Pause");
+    display_margin_label(1, 3, rate);
 
     /*
-     * SOUND LIVES ON THE RIGHT COLUMN, under Shot, and reads the current level.
-     * A volume is a standing property of what you are hearing, so showing what it
-     * IS beats showing what the next press would select -- see s_vol[] for why
-     * that differs from Speed.
+     * SOUND READS THE CURRENT LEVEL rather than naming itself. A volume is a
+     * standing property of what you are hearing, so showing what it IS beats
+     * showing what the next press would select -- see s_vol[] for why that
+     * differs from Speed, whose label shows the rate it will select because a
+     * rate is momentary and the button's only meaning is "change it".
      */
     {
         int i = s_vol_i;
@@ -1183,6 +1190,70 @@ bool tama_start(const char *rom_path)
      * each target about square and the pet's picture ends 14 rows above it. */
     display_margin_strip_tall(true);
 
+    /*
+     * CLEAR WHAT THE PICKER LEFT ON THE MARGINS, BEFORE ANYTHING ELSE.
+     *
+     * THIS IS A REGRESSION THE PICKER INTRODUCED, and it is invisible from the
+     * code that causes it. `gbpick_run_cfg()` paints its own furniture -- the
+     * folder column blank, PgUp/PgDn and the two arrows on the right, Enter and
+     * Up on the strip -- by setting LABEL OVERRIDES, and `paint_margins()`
+     * consults those overrides BEFORE the app tables. So every slot the picker
+     * touched keeps the picker's word, and this file, which only overrides the
+     * three slots whose words change, never overwrites the rest: the right column
+     * read PgUp, PgDn, an up arrow and a down arrow where Hold, Shot, Sound,
+     * Reset and Exit belong, and the third strip bar read "Up" instead of the
+     * degree circle.
+     *
+     * THE SECOND HALF IS THAT `display_margins_set()` CANNOT FIX IT HERE. The
+     * picker already put the driver in APP mode, so the call below returns on its
+     * own `mode == s_margin_mode` guard without repainting anything at all. The
+     * clear is therefore what actually repaints -- each `display_margin_label()`
+     * repaints synchronously when the mode is APP, which is exactly the state the
+     * picker left.
+     *
+     * THE CHROME IS RESTORED TOO, and that is not cosmetic: `s_nochrome` is
+     * driver state that both the app and the desktop paint paths read, so a slot
+     * left bare here would surface later as a button with no box.
+     *
+     * NULL RESTORES THE SHARED TABLE, which is what puts the degree circle back on
+     * all three strip bars: the V3's buttons have no short word that fits 41 px, so
+     * the circle is the placeholder by design and is described ONCE, in edges.h.
+     *
+     * ONE PAINT PER COLUMN, NOT FIVE. `display_margin_label()` repaints the whole
+     * column per call, so clearing ten slots with it would push 46x417 pixels ten
+     * times and read on the glass as the column coming apart. `display_margin_labels()`
+     * sets every override under one lock and paints the range once, which is the same
+     * reason it exists for the Game Boy's Hold button.
+     *
+     * THE CHROME IS CHECKED RATHER THAN RESTORED BLINDLY. `s_nochrome` is driver
+     * state that the app and desktop paint paths both read, so a slot left bare here
+     * would surface later as a button with no box -- but the picker draws every slot
+     * it touches and every emulator restores the chrome on stop, so in the normal
+     * case there is nothing to do and `display_margin_slot_live()` says so without a
+     * paint.
+     */
+    static const char *const cleared[COL_N] = { NULL, NULL, NULL, NULL, NULL };
+
+    for (int i = 0; i < COL_N; i++)
+    {
+        if (!display_margin_slot_live(0, i))
+            display_margin_chrome(0, i, true);
+        if (!display_margin_slot_live(1, i))
+            display_margin_chrome(1, i, true);
+    }
+
+    for (int i = 0; i < BTN_N; i++)
+    {
+        if (!display_margin_slot_live(2, i))
+            display_margin_chrome(2, i, true);
+
+        /* One call per bar: the strip repaints whole whichever bar changed. */
+        display_margin_btn_label(i, NULL);
+    }
+
+    display_margin_labels(0, cleared, COL_N - 1);
+    display_margin_labels(1, cleared, COL_N - 1);
+
     display_margins_set(DISPLAY_MARGINS_APP);
 
     s_frames = 0;
@@ -1397,6 +1468,14 @@ static void tama_teardown(void)
         display_margin_label(0, i, NULL);
         display_margin_label(1, i, NULL);
     }
+
+    /* THE STRIP TOO, WHICH THIS MISSED. The same fault one row down: the picker
+     * leaves "Enter" and "Up" on the strip as overrides, this file never touched
+     * them, and `paint_margins()` honours overrides in DESKTOP mode as well -- so
+     * the desktop's strip came back reading a picker's words. Game Boy clears
+     * these on stop for exactly this reason. */
+    for (int i = 0; i < BTN_N; i++)
+        display_margin_btn_label(i, NULL);
 
     /* Restore the margins FIRST, while the pixels are still claimed: the call
      * paints synchronously and needs to be the only writer, which ownership

@@ -207,20 +207,36 @@ static inline const char *left_label(int i)
 static inline const char *left_label_app(int i)
 {
     static const char *const labels[COL_N] = {
-        "Pause", "Save", "Load", "Speed", "",
+        "", "Save", "Load", "", "",
     };
 
     return i >= 0 && i < COL_N ? labels[i] : "";
 }
 
+/*
+ * THE RIGHT COLUMN, TOP TO BOTTOM, IS THE OPERATOR'S ARRANGEMENT: Hold, a blank,
+ * the sound level, the rate, and Pause at the bottom.
+ *
+ * THE ARM STAYS AT THE TOP because that is where a thumb rests without being
+ * asked to, and the interlock is only usable if holding it is comfortable.
+ * SLOT 2 IS DELIBERATELY EMPTY and is not an oversight: it separates the arm from
+ * everything that acts, so a thumb settling on Hold cannot also be on a button,
+ * and the column reads as two groups rather than five equal boxes.
+ *
+ * PAUSE AND SPEED CAME HERE FROM THE LEFT COLUMN. They are MOVES, not copies:
+ * two slots driving one action would each want to show the state and could
+ * disagree about it, which is the duplication this project has paid for before.
+ * The left column keeps Save and Load, which are the pair a player uses
+ * together.
+ */
 static inline const char *right_label_app(int i)
 {
     static const char *const labels[COL_N] = {
         "Hold",                 /* the arm: held for a gated button */
-        "Shot",
-        "Sound",                /* cycle 100/75/50/25/Mute              */
-        "Reset",                /* gated: needs the arm                 */
-        "Exit",                 /* gated: needs the arm                 */
+        "",                     /* deliberately empty: see above        */
+        "Sound",                /* shows the level; cycles 100..Mute    */
+        "Speed",                /* shows the rate; cycles 1x/2x/4x      */
+        "Pause",                /* shows Resume while paused            */
     };
 
     return i >= 0 && i < COL_N ? labels[i] : "";
