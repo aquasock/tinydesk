@@ -48,4 +48,22 @@ bool statusbar_app_text(const char *text);
  * False when no app holds it. */
 bool statusbar_app_text_get(char *out, size_t cap);
 
+/*
+ * Whether this personality has a clock to put in the strip at all.
+ *
+ * SLOT B DOES NOT. That is not an opinion: `fill_sysinfo()` -- the call that gives
+ * `td_sysinfo()->time_now` its implementation -- runs in app_main AFTER
+ * `board_startup_override()`, and slot B never returns from its own boot, so the
+ * time source stays NULL there for the life of the run. A strip left on its own
+ * devices would sit on `--/--  --:--` for ever, which reads as damage.
+ *
+ * So slot B says so, and the strip then shows an app's text and NOTHING else --
+ * blank glass when nothing holds it. That also happens to be the operator's
+ * direction for the one app that uses the claim: no watch time, only the pet's.
+ *
+ * Defaults to true, which is the desktop's behaviour, so a caller that never calls
+ * this is unaffected.
+ */
+void statusbar_clock_present(bool present);
+
 #endif /* TWATCH_STATUSBAR_H */

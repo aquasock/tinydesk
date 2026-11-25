@@ -50,6 +50,7 @@
 #include "power.h"
 #include "pwrkey.h"
 #include "slotb.h"
+#include "statusbar.h"
 #include "tdsh.h"
 #include "tdsh_board.h"
 #include "tdsh_espidf.h"
@@ -701,6 +702,30 @@ static void slotb_run(const char *board_conf)
     /* Take the glass away from the painter display_init() just started, so the
      * emulator's frames are not drawn over by a terminal nobody is reading. */
     display_pixels_claim(true);
+
+    /*
+     * THE TOP STRIP, WHICH THIS PERSONALITY HAS NEVER HAD.
+     *
+     * `statusbar_start()` lives in `link_init()`, and slot B NEVER REACHES IT:
+     * `board_startup_override()` runs in app_main long before `hal_start()` calls
+     * link_init(), and this path does not return. So slot B has always run with no
+     * strip at all -- and, because `display_init()` above blacks the whole panel
+     * including rows 0..43, with those rows simply dark.
+     *
+     * That is invisible until an app wants to say something there, which is what
+     * the Tamagotchi's up-time label does. Started HERE and not earlier because
+     * display_init()'s panel_fill() would wipe it: the same ordering rule link_init()
+     * documents.
+     *
+     * NO CLOCK, so the strip is told so: `fill_sysinfo()` -- the source of
+     * `td_sysinfo()->time_now` -- runs in app_main after this override, and this
+     * path never returns to it. Without that flag the strip would paint `--/--`
+     * placeholders here for ever, which reads as damage rather than as absence.
+     */
+    statusbar_clock_present(false);
+
+    if (!statusbar_start())
+        ESP_LOGW(TAG, "status strip did not start");
 
     /* Touch, haptics and Pusher A. Without this the emulator is a picture with
      * no way to play it -- measured, not assumed: see the note on

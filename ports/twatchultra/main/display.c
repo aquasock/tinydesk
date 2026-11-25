@@ -678,7 +678,7 @@ static void push_pixels(int x, int y, int w, int h)
     push_pixels_raw(x + FB_X + PANEL_COL_OFFSET, y + FB_Y, w, h);
 }
 
-static void push_pixels_raw_buf(int cx, int cy, int w, int h, uint16_t *buf)
+static bool push_pixels_raw_buf(int cx, int cy, int w, int h, uint16_t *buf)
 {
     size_t npix = (size_t)w * h;
     uint16_t *p = buf;
@@ -738,7 +738,7 @@ static void push_pixels_raw_buf(int cx, int cy, int w, int h, uint16_t *buf)
     {
         s_bus_misses++;
         s_bus_phase = BUS_PH_IDLE;
-        return;
+        return false;
     }
 
     {
@@ -824,16 +824,30 @@ static void push_pixels_raw_buf(int cx, int cy, int w, int h, uint16_t *buf)
     s_us_xmit += esp_timer_get_time() - t_x0;
     s_bus_phase = BUS_PH_DONE;
     s_bus_phase_us = esp_timer_get_time();
+
+    /*
+     * THE RETURN VALUE IS THE WHOLE POINT OF THIS FUNCTION BEING `bool`.
+     *
+     * A dropped band is survivable for a picture -- one lost band of one frame is
+     * a cosmetic glitch, which is why this used to say nothing -- but it is NOT
+     * survivable for a one-line label: the top strip paints eight bands, calls it
+     * a success, records the text as shown, and never tries again. The label then
+     * never appears, while every counter in the system reports a healthy paint.
+     * `display_panel_push()` now reports this, so a caller that cares can retry.
+     */
+    return remaining == 0 && err == ESP_OK;
 }
 
 static void push_pixels_raw(int cx, int cy, int w, int h)
 {
-    push_pixels_raw_buf(cx, cy, w, h, s_tx);
+    /* A picture band, where losing one band is cosmetic. See the return-value
+     * note in push_pixels_raw_buf() for why the strip cannot ignore it. */
+    (void)push_pixels_raw_buf(cx, cy, w, h, s_tx);
 }
 
 static void push_pixels_buf(int x, int y, int w, int h, uint16_t *buf)
 {
-    push_pixels_raw_buf(x + FB_X + PANEL_COL_OFFSET, y + FB_Y, w, h, buf);
+    (void)push_pixels_raw_buf(x + FB_X + PANEL_COL_OFFSET, y + FB_Y, w, h, buf);
 }
 
 static const struct {
@@ -2230,8 +2244,10 @@ bool display_panel_push(int cx, int cy, int w, int h, const uint16_t *pixels)
         cy + h > DISPLAY_PANEL_H)
         return false;
 
-    push_pixels_raw_buf(cx, cy, w, h, (uint16_t *)pixels);
-    return true;
+    /* AND THE BAND'S OWN RESULT, which used to be discarded. A caller that is
+     * drawing a one-line label needs to know a band was dropped, because the
+     * alternative is recording the label as painted when it is not on the glass. */
+    return push_pixels_raw_buf(cx, cy, w, h, (uint16_t *)pixels);
 }
 
 /*

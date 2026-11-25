@@ -207,6 +207,26 @@ static bool s_app_on;
 static portMUX_TYPE s_app_mux = portMUX_INITIALIZER_UNLOCKED;
 
 /*
+ * BANDS THE PANEL REFUSED, AND THIS COUNTER IS THE POINT OF THE CHANGE THAT ADDED IT.
+ *
+ * A band is refused when another task is mid-transaction on the panel bus
+ * (LCD-014: `spi_device_acquire_bus()` answers ESP_ERR_INVALID_STATE rather than
+ * waiting). Before `display_panel_push()` reported that, the strip could paint
+ * eight bands, lose six of them, call the result a success, record the text as
+ * shown, and never try again -- a label that is not on the glass while every
+ * counter says it is. This number makes that visible instead of inferable.
+ */
+static volatile uint32_t s_bands_lost;
+
+/* Whether this personality has a clock at all. See statusbar_clock_present(). */
+static bool s_clock_present = true;
+
+void statusbar_clock_present(bool present)
+{
+    s_clock_present = present;
+}
+
+/*
  * THE TASK'S STACK, IN ONE PLACE, AND ITS HANDLE.
  *
  * The size is used by the create call and reported by `statusbar`, so the
@@ -423,6 +443,12 @@ static int sb_build(sb_field_t f[SB_NFIELDS], int64_t *minute_out)
     if (statusbar_app_text_get(f[0].text, sizeof(f[0].text)))
         return 1;
 
+    /* NOTHING TO SHOW AND NO CLOCK TO SHOW IT WITH: see statusbar_clock_present().
+     * Slot B is the personality this exists for -- its strip is there for an app's
+     * text and would otherwise sit on placeholders for ever. */
+    if (!s_clock_present)
+        return 0;
+
     sb_refresh_tz(si);
 
     if (s_tz_valid && si && si->time_now && si->time_now(&utc))
@@ -520,6 +546,19 @@ static bool sb_ink(int x, int y, const sb_field_t *f, int left, int top)
  * field's, which is at most 224 px against 128 for the widest single field -- 8
  * bands of 4 rows instead of 8 of 8. Once a minute, on a 5.6 MB/s bus.
  */
+/*
+ * A REFUSED BAND IS RETRIED IN PLACE, briefly, before it is counted as lost.
+ *
+ * The refusal is momentary by definition: it means another task was mid
+ * transaction on the panel bus at that instant, and those last milliseconds. Four
+ * attempts five milliseconds apart is well inside one panel refresh and costs
+ * nothing on the common path, where the first one succeeds. Waiting for the task's
+ * next one-second tick instead would leave a half-painted label on the glass for
+ * up to a second every time the emulator happened to be blitting.
+ */
+#define SB_PUSH_TRIES  4
+#define SB_PUSH_GAP_MS 5
+
 static bool sb_paint(const sb_field_t f[], int n, const int left[],
                      const int top[])
 {
@@ -557,6 +596,8 @@ static bool sb_paint(const sb_field_t f[], int n, const int left[],
     if (w <= 0 || w > SB_MAX_W || h <= 0 || h > SB_GLYPH_H * 2)
         return false;
 
+    bool ok = true;
+
     for (int row = 0; row < h; row += SB_PUSH_ROWS)
     {
         const int rows = h - row > SB_PUSH_ROWS ? SB_PUSH_ROWS : h - row;
@@ -583,15 +624,76 @@ static bool sb_paint(const sb_field_t f[], int n, const int left[],
             }
         }
 
-        if (!display_panel_push(PANEL_COL_OFFSET + x0, y0 + row, w, rows, s_band))
-            return false;
+        bool band = false;
+
+        for (int attempt = 0; attempt < SB_PUSH_TRIES && !band; attempt++)
+        {
+            if (attempt)
+                vTaskDelay(pdMS_TO_TICKS(SB_PUSH_GAP_MS));
+
+            band = display_panel_push(PANEL_COL_OFFSET + x0, y0 + row, w, rows, s_band);
+        }
+
+        if (!band)
+        {
+            /* ATTEMPT EVERY BAND ANYWAY, and remember that one was lost.
+             *
+             * Returning at the first refused band used to look equivalent, and it
+             * is not: the caller keeps `s_prev` at the last SUCCESSFUL rectangle so
+             * the retry covers where the line used to be, and a partially painted
+             * line leaves glyph fragments behind. Pushing the remaining bands costs
+             * a few hundred microseconds and leaves fewer fragments for the retry
+             * to clean up. */
+            ok = false;
+            s_bands_lost++;
+        }
     }
+
+    /* THE RECTANGLE IS ONLY REMEMBERED WHEN EVERY BAND LANDED. If it is remembered
+     * after a dropped band, the retry's union shrinks to the new line alone and the
+     * old line's pixels are stranded on the glass for ever -- which is exactly how
+     * a strip that "painted successfully" ends up showing the previous text. */
+    if (!ok)
+        return false;
 
     s_prev_x0 = x0;
     s_prev_x1 = x1;
     s_prev_valid = true;
 
     return true;
+}
+
+/* Blank whatever the strip last drew, for the no-clock personality when nothing
+ * holds the claim. Idempotent: it returns immediately when the glass is already
+ * empty, so it can run on every tick. If a band is refused it leaves
+ * `s_prev_valid` set, which is what makes the next tick try again -- the same rule
+ * sb_paint() follows. */
+static void sb_blank(void)
+{
+    if (!s_prev_valid)
+        return;
+
+    const int w = s_prev_x1 - s_prev_x0 + 1;
+
+    if (w <= 0 || w > SB_MAX_W)
+    {
+        s_prev_valid = false;
+        return;
+    }
+
+    for (int row = 0; row < SB_GLYPH_H; row += SB_PUSH_ROWS)
+    {
+        const int rows = SB_GLYPH_H - row > SB_PUSH_ROWS ? SB_PUSH_ROWS : SB_GLYPH_H - row;
+
+        for (int i = 0; i < rows * w; i++)
+            s_band[i] = SB_BG;
+
+        if (!display_panel_push(PANEL_COL_OFFSET + s_prev_x0, SB_TOP_Y + row,
+                                w, rows, s_band))
+            return;                  /* try again next tick */
+    }
+
+    s_prev_valid = false;
 }
 
 static void sb_task(void *arg)
@@ -630,6 +732,17 @@ static void sb_task(void *arg)
 
             if (!s_wm_build || wm < s_wm_build)
                 s_wm_build = wm;
+        }
+
+        /* NOTHING TO DRAW: blank the strip if anything is on it and go round again.
+         * This is the no-clock personality with no app claim, which is slot B's
+         * idle state. */
+        if (nf == 0)
+        {
+            sb_blank();
+            s_ticks++;
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
         }
 
         sb_layout(f, nf, left, top);
@@ -736,6 +849,7 @@ static int cmd_statusbar(tdsh_session_t *session, int argc, char **argv)
            p ? (int)p->date_format : -1, p ? (int)p->clock_12h : -1);
     printf("pushes=%lu ticks=%lu shown='%s'\n",
            (unsigned long)s_pushed, (unsigned long)s_ticks, s_shown);
+    printf("bands lost=%lu\n", (unsigned long)s_bands_lost);
     printf("left=%d,%d glass-cx=%d\n", left[0], nf > 1 ? left[1] : 0,
            SB_GLASS_CX);
 
