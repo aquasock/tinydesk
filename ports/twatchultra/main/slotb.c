@@ -418,10 +418,38 @@ static bool slotb_start_gb(const char *rom)
     return ok;
 }
 
+/*
+ * POKEMON MINI GETS THE SAME CHOOSER, through the same navigator with its own
+ * table: one root, `.min` files. There is no second picker here -- pk_pm is a
+ * config, not a copy -- so the paging, the margin handling and the Up bar cannot
+ * drift from Game Boy's behaviour.
+ *
+ * THE PATH BUFFER IS THE SAME SIZE FOR THE SAME REASON as Game Boy's: a bucket
+ * directory plus a long cartridge name. Pokemon Mini's retail set is small and
+ * flat today, but the card is the user's to organise and a 96-byte buffer is
+ * exactly the bug the Game Boy picker already paid for.
+ */
+static char s_pm_rom[256];
+
+static bool slotb_start_pm(const char *rom)
+{
+    (void)rom;
+
+    if (!gbpick_run_cfg(&pk_pm, s_pm_rom, sizeof(s_pm_rom), &s_exit_req))
+        return false;
+
+    /* THE SAME RECORD GAME BOY MAKES, and for the same reason: it names the path
+     * the picker handed over, so a later "did not start" can be told apart from a
+     * picker that built the wrong path. */
+    slotb_record("pick", s_pm_rom);
+
+    return pmini_start(s_pm_rom);
+}
+
 static const slotb_app_t s_apps[] = {
     { "Game Boy Color", "gb",  slotb_start_gb, gb_stop,    gb_running,    gb_last_error },
     { "NES",            "nes", nes_start,      nes_stop,   nes_running,   NULL },
-    { "Pokemon Mini",   "pm",  pmini_start,    pmini_stop, pmini_running, NULL },
+    { "Pokemon Mini",   "pm",  slotb_start_pm, pmini_stop, pmini_running, NULL },
 };
 
 #define SLOTB_APP_N ((int)(sizeof(s_apps) / sizeof(s_apps[0])))

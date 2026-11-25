@@ -134,13 +134,18 @@ static void pick_fail(const char *why, const char *path)
 
 /* ---------------------------------------------------------------- scanning */
 
-static bool is_rom(const char *name)
+static bool is_rom(const char *name, const pk_cfg_t *cfg)
 {
     const char *dot = strrchr(name, '.');
 
     if (!dot || name[0] == '.')
         return false;
-    return !strcasecmp(dot, ".gbc") || !strcasecmp(dot, ".gb");
+
+    for (int i = 0; cfg->exts[i]; i++)
+        if (!strcasecmp(dot, cfg->exts[i]))
+            return true;
+
+    return false;
 }
 
 /*
@@ -216,7 +221,7 @@ static const char *base_name(const char *path)
  * climb to, and blank where there is not. A row that exists only to be left is
  * one more line to read past on every screen of a 1,143-cartridge library.
  */
-static int list_dir(const char *dir)
+static int list_dir(const char *dir, const pk_cfg_t *cfg)
 {
     s_ent_n = 0;
     s_truncated = false;
@@ -233,7 +238,7 @@ static int list_dir(const char *dir)
         if (e->d_name[0] == '.')
             continue;                       /* ".", ".." and dotfiles */
 
-        const bool rom = is_rom(e->d_name);
+        const bool rom = is_rom(e->d_name, cfg);
         char probe[PK_PATH_MAX];
         bool dirp = false;
 
@@ -331,16 +336,35 @@ static void path_up(char *path)
 
 /* The console directories the picker offers at its root, filtered to those that
  * exist so a card with only one console does not present an empty branch. */
-static const struct
-{
-    const char *label;
-    const char *path;
-} k_roots[] = {
+/* Game Boy offers BOTH trees, because a card can carry either or both and the
+ * firmware decides the machine type from where the cartridge lives. Pokemon Mini
+ * has one tree; with a single root the console list is skipped entirely, which
+ * the navigator already does. */
+static const pk_root_t k_gb_roots[] = {
     { "Game Boy Color", "/sd/media/gbc" },
     { "Game Boy",       "/sd/media/gb"  },
 };
 
-#define PK_ROOT_N ((int)(sizeof(k_roots) / sizeof(k_roots[0])))
+static const pk_root_t k_pm_roots[] = {
+    { "Pokemon Mini",   "/sd/media/pokemini" },
+};
+
+static const char *const k_gb_exts[] = { ".gbc", ".gb", NULL };
+static const char *const k_pm_exts[] = { ".min", NULL };
+
+const pk_cfg_t pk_gb = {
+    .console = "Game Boy",
+    .exts    = k_gb_exts,
+    .roots   = k_gb_roots,
+    .n_roots = (int)(sizeof(k_gb_roots) / sizeof(k_gb_roots[0])),
+};
+
+const pk_cfg_t pk_pm = {
+    .console = "Pokemon Mini",
+    .exts    = k_pm_exts,
+    .roots   = k_pm_roots,
+    .n_roots = (int)(sizeof(k_pm_roots) / sizeof(k_pm_roots[0])),
+};
 
 /*
  * THE CONSOLE LIST HAS ITS OWN LABEL STORAGE, AND IT HAS TO.
@@ -354,10 +378,11 @@ static const struct
  * appears to open the wrong one.
  *
  * Two arrays, because they are two different lists and sharing one storage was
- * the whole fault. Declared here because PK_ROOT_N is not known until k_roots.
+ * the whole fault. Declared here because PK_MAX_ROOTS is what sizes them and
+ * the console tables are defined above.
  */
-static char s_root_lbl[PK_ROOT_N][24];
-static const char *s_root_ptr[PK_ROOT_N];
+static char s_root_lbl[PK_MAX_ROOTS][24];
+static const char *s_root_ptr[PK_MAX_ROOTS];
 
 /* ----------------------------------------------------------------- drawing */
 
@@ -803,6 +828,15 @@ bool gbpick_list_run(const char *title, const char *const *labels, int n,
 
 bool gbpick_run(char *out, size_t cap, const volatile bool *abort)
 {
+    return gbpick_run_cfg(&pk_gb, out, cap, abort);
+}
+
+bool gbpick_run_cfg(const pk_cfg_t *cfg, char *out, size_t cap,
+                    const volatile bool *abort)
+{
+    if (!cfg || !cfg->exts || !cfg->roots || cfg->n_roots <= 0)
+        return false;
+
     if (!out || cap == 0)
         return false;
 
@@ -829,16 +863,16 @@ bool gbpick_run(char *out, size_t cap, const volatile bool *abort)
 
     /* THE ROOT LIST IS THE CONSOLES THAT ARE ACTUALLY THERE, so a card with only
      * Game Boy does not offer a Colour branch that opens on nothing. `root_ix`
-     * maps a row of this list back to k_roots: the rows are compacted, so the row
-     * number is NOT the console index when the first directory is missing -- the
-     * previous version used the row number for k_roots and would have opened
+     * maps a row of this list back to cfg->roots: the rows are compacted, so the
+     * row number is NOT the console index when the first directory is missing --
+     * the previous version used the row number for the table and would have opened
      * `/sd/media/gbc` for a card that only had Game Boy. */
     int root_n = 0;
-    int root_ix[PK_ROOT_N];
+    int root_ix[PK_MAX_ROOTS];
 
-    for (int i = 0; i < PK_ROOT_N; i++)
+    for (int i = 0; i < cfg->n_roots && i < PK_MAX_ROOTS; i++)
     {
-        DIR *d = opendir(k_roots[i].path);
+        DIR *d = opendir(cfg->roots[i].path);
 
         if (!d)
             continue;
@@ -846,15 +880,15 @@ bool gbpick_run(char *out, size_t cap, const volatile bool *abort)
         closedir(d);
         root_ix[root_n] = i;
         snprintf(s_root_lbl[root_n], sizeof(s_root_lbl[0]), "%s",
-                 k_roots[i].label);
+                 cfg->roots[i].label);
         s_root_ptr[root_n] = s_root_lbl[root_n];
         root_n++;
     }
 
     if (root_n == 0)
     {
-        pick_fail("no console directories", "/sd/media");
-        gbpick_message("No cartridges found", "looked in /sd/media");
+        pick_fail("no console directories", cfg->roots[0].path);
+        gbpick_message("No cartridges found", "check the card is seated");
         return false;
     }
 
@@ -886,7 +920,12 @@ bool gbpick_run(char *out, size_t cap, const volatile bool *abort)
         {
             int sel = -1;
 
-            if (!gbpick_list_run("Game Boy - select a console", s_root_ptr,
+            char pick_title[48];
+
+            snprintf(pick_title, sizeof(pick_title), "%s - select a console",
+                     cfg->console);
+
+            if (!gbpick_list_run(pick_title, s_root_ptr,
                                  root_n, false, cur, &sel, NULL, abort))
                 return false;
 
@@ -896,7 +935,7 @@ bool gbpick_run(char *out, size_t cap, const volatile bool *abort)
             cur = sel;
         }
 
-        snprintf(s_cwd, PK_PATH_MAX, "%s", k_roots[root_ix[cur]].path);
+        snprintf(s_cwd, PK_PATH_MAX, "%s", cfg->roots[root_ix[cur]].path);
         /* `s_root_lbl` and `console` are both 24 bytes, so the copy cannot
          * truncate -- but the compiler only knows the SOURCE is at most 24 and
          * the destination exactly 24, so the width is stated. */
@@ -927,7 +966,7 @@ bool gbpick_run(char *out, size_t cap, const volatile bool *abort)
 
             const bool at_root = (strcmp(s_cwd, root_base) == 0);
 
-            if (list_dir(s_cwd) == 0)
+            if (list_dir(s_cwd, cfg) == 0)
             {
                 pick_fail("empty directory", s_cwd);
                 gbpick_message("No cartridges here", base_name(s_cwd));
