@@ -68,6 +68,30 @@ static const char *TAG = "gb";
  */
 #define VOL_SLOT 2
 
+/*
+ * THE RIGHT COLUMN, BY NAME: Hold at the top, then Select and Start.
+ *
+ * Hold is the emulator's own control and has no guest duty -- it blanks the other
+ * five column words while it is down (see paint_column_state()). Select and Start
+ * are the Game Boy's, and they live lower because that is where a thumb reaches.
+ */
+#define HOLD_SLOT   0
+#define SLOT_SELECT 1
+#define SLOT_START  2
+
+/*
+ * BACKGLASS HOLD STATE.
+ *
+ * `s_hold` is written by the touch callback and read by the blit task, so it is
+ * volatile; `s_hold_paint` is the one-bit latch that tells the blit task a repaint is
+ * owed. THE LATCH EXISTS BECAUSE ONLY THE BLIT TASK MAY PAINT (DSP-009): the callback
+ * runs on tdtouch while this task holds the panel's SPI device mid-transaction, and
+ * painting from there asserted at `spi_master.c:1310` on the volume button's first
+ * press in the previous cycle.
+ */
+static volatile bool s_hold;
+static volatile bool s_hold_paint;
+
 /* Two frame buffers: the guest renders into one while core 1 pushes the other.
  * 160x144 at 2 bytes is 46,080 bytes each. Both in PSRAM, because the guest
  * writes them every frame and PSRAM is where the NES and PM keep theirs. */
@@ -176,6 +200,87 @@ static void gb_fill_row(void *ctx, int row, int col, uint16_t *dst, int n)
 
 /* Defined with the controls further down, where `s_gp` exists. */
 
+/*
+ * THE COLUMN WORDS, AS ONE STATE.
+ *
+ * Hold is a button you press and keep pressed, and while it is down the other five
+ * column words are cleared; when it is released they come back. The held state is
+ * one boolean, so the two states are written out in full rather than remembered and
+ * restored: a restore path has to survive a press that arrives while a previous
+ * restore is pending, and two full descriptions cannot disagree with each other.
+ *
+ * CALLED ONLY FROM THE BLIT TASK, in both branches of its loop. The volume word is
+ * read at the moment of painting, so what returns after a release is the CURRENT
+ * position and not whatever it was when Hold went down.
+ *
+ * TWO CALLS, NOT SIX. Each column is set and painted once, so all five words change
+ * in the same push; six calls to the single-slot setter would paint the change as a
+ * cascade down the glass (see display_margin_labels()).
+ */
+static void paint_column_state(void)
+{
+    const bool held = s_hold;
+
+    const char *left[COL_N] = {
+        held ? " " : "Pause",
+        held ? " " : "Reset",
+        held ? " " : sound_volume_label(),
+        " ", " ",
+    };
+
+    const char *right[COL_N] = {
+        "Hold",
+        held ? " " : "Select",
+        held ? " " : "Start",
+        " ", " ",
+    };
+
+    display_margin_labels(0, left);
+    display_margin_labels(1, right);
+}
+
+static bool gb_draw_controls(void);
+
+/*
+ * Drain whatever the touch task recorded, and paint ONCE.
+ *
+ * Two things can ask for a repaint -- the volume moving and Hold changing -- and
+ * both write the same two columns, so handling them separately would paint the
+ * column twice for a change that happens in one moment. Taking both flags and
+ * painting one state is also what makes a volume press DURING a hold harmless: the
+ * held state wins because the volume word is blank while held, and the press itself
+ * is refused in the callback.
+ *
+ * THE CONTROLS ARE REPAINTED AFTER THE COLUMNS, AND THAT IS NOT TIDYING.
+ *
+ * `paint_column()` paints its full height, which is deliberate -- it has to black out
+ * the slots this app does not use or the desktop's labels survive underneath. But the
+ * column is GLASS, not framebuffer, and the drawn cluster reaches past the
+ * framebuffer's right wall into it: measured, A is at panel x 335..408 while the
+ * right column's painter covers 386..431, so 22 px of A's right edge -- and the ring
+ * of its circle -- live UNDER that column. The d-pad's leftmost column is shared the
+ * same way with the left column, by 1 px, and has been since the volume button.
+ *
+ * So the layering that gb_start() establishes (margins first, controls last) has to be
+ * repeated on every repaint, not just at start-up. The operator caught the absence of
+ * it: pressing Hold cut the A button off against the right column, because Hold is the
+ * first control that ever repainted that column while a game was running.
+ */
+static void paint_pending(void)
+{
+    const bool vol = sound_volume_take_label_change();
+    const bool hold = s_hold_paint;
+
+    if (hold)
+        s_hold_paint = false;
+
+    if (!vol && !hold)
+        return;
+
+    paint_column_state();
+    gb_draw_controls();
+}
+
 static void gb_blit_task(void *arg)
 {
     (void)arg;
@@ -187,20 +292,19 @@ static void gb_blit_task(void *arg)
         if (xQueueReceive(s_filled_q, &slot, pdMS_TO_TICKS(50)) != pdTRUE)
         {
             /*
-             * THE VOLUME LABEL, AND THIS IS THE ONLY TASK THAT MAY PAINT IT.
+             * THE COLUMN, AND THIS IS THE ONLY TASK THAT MAY PAINT IT.
              *
              * `gb_blit_task` owns the panel's transmit path; the touch callback only
-             * records the state. Relabelling from the touch task was a second writer
-             * on the SPI bus and panicked the watch on the button's first press -- see
-             * sound_volume_take_label_change() for the coredump.
+             * records state. Relabelling from the touch task was a second writer on
+             * the SPI bus and panicked the watch on the volume button's first press --
+             * see sound_volume_take_label_change() for the coredump, and DSP-009.
              *
              * THE IDLE BRANCH IS NOT A FALLBACK. A paused or idle cartridge produces
-             * no frames, so a label that waited for the next blit would sit stale for
+             * no frames, so a word that waited for the next blit would sit stale for
              * as long as nothing was moving -- which is exactly when a person reaches
-             * for the volume.
+             * for the volume or holds the button.
              */
-            if (sound_volume_take_label_change())
-                display_margin_label(0, VOL_SLOT, sound_volume_label());
+            paint_pending();
 
             continue;
         }
@@ -231,8 +335,7 @@ static void gb_blit_task(void *arg)
         /* And on the busy path, after the push has completed and the bus released.
          * Without this a running cartridge -- which always has a frame waiting --
          * would never reach the idle branch above. */
-        if (sound_volume_take_label_change())
-            display_margin_label(0, VOL_SLOT, sound_volume_label());
+        paint_pending();
     }
 
     /* CLEAR THE HANDLE BEFORE LEAVING, which is what makes gb_stop()'s wait on
@@ -1141,9 +1244,17 @@ static void gb_task(void *arg)
  * needed a 7 px inset to put its leftmost painted pixel on that axis, and an
  * upright one needs none. A and B sit at the NES's columns of 236 and 208, with A
  * moved two cells (32 px) right to 268 at the operator's direction, which puts it
- * 22 px past the framebuffer wall and against the right column's inner edge. It is
- * fully painted because the whole cluster sits below the side columns, where the
- * push spans the entire glass.
+ * 22 px past the framebuffer wall and against the right column's inner edge.
+ *
+ * MIND THE ORDER, NOT THE POSITION. This comment used to claim A was fully painted
+ * because "the whole cluster sits below the side columns", and that reasoning is
+ * wrong: the columns run the full height of the framebuffer, and A sits BESIDE them,
+ * not below. What actually keeps A whole is that gb_draw_controls() runs LAST, and
+ * its second push spans the entire glass width -- so it repaints the strip of A that
+ * the column shares. Any column repaint after it covers A's right 22 px, which is
+ * exactly the fault the operator found when Hold first repainted a column mid-game.
+ * Every path that repaints a column must re-push the controls afterwards; see
+ * paint_pending().
  */
 #define GB_GLASS_BOT    (DISPLAY_PANEL_H - DISPLAY_ORIGIN_Y)              /* 457 */
 #define GB_CTL_Y        (GB_HEIGHT * GB_SCALE)                            /* 288 */
@@ -1297,14 +1408,25 @@ static int pad_from_frame(const touch_frame_t *f)
         default:                             break;
         }
 
-        if (ctl == GP_NONE && f->p[i].region == EDGE_RIGHT)
+        /* HOLD BLANKS THE COLUMN AND THE BLANKED SLOTS DO NOT ACT.
+         *
+         * `display_margin_slot_live()` cannot answer for this: liveness reads the
+         * chrome flag, and the chrome stays ON here because the request was to
+         * clear the WORDS, not to remove the boxes. So inertness is enforced where
+         * the button would actually do something, which is this function and the
+         * volume branch of gb_app_touch().
+         *
+         * THE D-PAD AND THE DRAWN A/B ARE NOT AFFECTED. Only the column slots that
+         * Hold blanked are held down; the picture's own controls are separate
+         * glass and stay live, because nothing asked for them to stop. */
+        if (ctl == GP_NONE && f->p[i].region == EDGE_RIGHT && !s_hold)
         {
             /* SECOND AND THIRD SLOTS, BY THE OPERATOR'S DIRECTION: Select above
-             * Start, with the top slot left empty. Slot 0 therefore has no duty
-             * at all, and the pair that a thumb actually reaches for sits lower
-             * on the glass than it used to. */
-            if (f->p[i].index == 1) pad |= GB_PAD_SELECT;
-            if (f->p[i].index == 2) pad |= GB_PAD_START;
+             * Start, with the top slot carrying Hold. Slot 0 has no GUEST duty at
+             * all -- it is a button for the emulator's own controls, not a Game Boy
+             * button -- which is why it is excluded here by name. */
+            if (f->p[i].index == SLOT_SELECT) pad |= GB_PAD_SELECT;
+            if (f->p[i].index == SLOT_START)  pad |= GB_PAD_START;
         }
     }
 
@@ -1320,6 +1442,7 @@ static bool gb_app_touch(void *user, const touch_frame_t *f)
 
     bool used = false;
     bool vol = false;
+    bool hold = false;
 
     if (f)
     {
@@ -1330,6 +1453,13 @@ static bool gb_app_touch(void *user, const touch_frame_t *f)
             if (gb_controls_hit(f->p[i].x, f->p[i].y) != GP_NONE)
                 used = true;
 
+            /* HOLD IS COLLECTED FIRST AND UNCONDITIONALLY -- it is the one control
+             * that must be seen even while it is blanking the others, and its state
+             * is what decides whether they act at all. */
+            if (f->p[i].region == EDGE_RIGHT && f->p[i].index == HOLD_SLOT &&
+                display_margin_slot_live(1, HOLD_SLOT))
+                hold = true;
+
             /* THE VOLUME BUTTON, LEFT COLUMN SLOT 2. Collected here and acted on
              * AFTER the loop, so one frame is one decision whatever order the
              * controller listed its points in -- the same reason the picker
@@ -1338,31 +1468,61 @@ static bool gb_app_touch(void *user, const touch_frame_t *f)
                 display_margin_slot_live(0, VOL_SLOT))
                 vol = true;
 
-            /* SLOTS 1 AND 2, NOT 0 AND 1. This is the same predicate as the
-             * mapping above, written separately, and the two have to agree: a
-             * slot counted as live here but given no bit there would buzz
-             * without acting, and one given a bit but not counted live would
-             * act without being felt. */
-            if (f->p[i].region == EDGE_RIGHT && f->p[i].index >= 1 &&
-                f->p[i].index <= 2 &&
-                display_margin_slot_live(1, f->p[i].index))
+            /* SELECT AND START, and NOT while Hold is down -- they are two of the
+             * five words Hold blanks, so a press on one of them while it is blank
+             * must not fire a guest button the wearer cannot see. This is the same
+             * predicate the mapping in pad_from_frame() applies, written separately:
+             * a slot counted as live here but given no bit there would buzz without
+             * acting, and one given a bit but not counted live would act unfelt. */
+            if (f->p[i].region == EDGE_RIGHT &&
+                (f->p[i].index == SLOT_SELECT || f->p[i].index == SLOT_START) &&
+                display_margin_slot_live(1, f->p[i].index) && !hold)
                 used = true;
         }
     }
+
+    /*
+     * HOLD CHANGES THE PAINTED STATE AND NOTHING ELSE, for now.
+     *
+     * The blanking is all this button does today -- the operator's instruction was
+     * that the functionality comes later -- so the callback records the state and
+     * the latch asks the blit task to repaint. It still counts as a control for the
+     * haptic, because the words on the glass do change under the thumb.
+     *
+     * THE STATE IS RECORDED EVEN ON THE RELEASE FRAME, which arrives with no points:
+     * `hold` is then false and that IS the release. Writing it unconditionally means
+     * a finger that slides off the button, or a lifted finger, restores the words the
+     * same way. */
+    if (hold != s_hold)
+    {
+        s_hold = hold;
+        s_hold_paint = true;
+    }
+
+    if (hold)
+        used = true;
 
     /* ONE PRESS, ONE STEP -- see sound_volume_cycle_on_press(), which owns the
      * debounce because the controller re-reports a held finger every 66 ms and a
      * held button that cycled five positions would land wherever the thumb left it.
      *
-     * THE LABEL IS NOT PAINTED HERE. `display_margin_label()` from this callback is a
-     * second writer on the SPI bus while the blit task is mid polling-transaction,
-     * and that panicked the watch on the first press -- see
-     * sound_volume_take_label_change() for the coredump. The frame loop relabels. */
-    if (sound_volume_cycle_on_press(vol))
-        used = true;
+     * REFUSED WHILE HELD, because the volume word is one of the five Hold blanks and
+     * a blank button must not act -- the phantom-button rule. The press is also not
+     * fed to the debounce, so the volume does not step silently under Hold and then
+     * show a word that moved while it was invisible.
+     *
+     * THE LABEL IS NOT PAINTED HERE. This callback runs on the touch task, and
+     * painting from it is a second writer on the SPI bus while the blit task is mid
+     * polling-transaction -- that panicked the watch on this button's first press in
+     * the previous cycle. See sound_volume_take_label_change() and DSP-009. */
+    if (!s_hold)
+    {
+        if (sound_volume_cycle_on_press(vol))
+            used = true;
 
-    if (vol)
-        used = true;
+        if (vol)
+            used = true;
+    }
 
     s_pad = pad_from_frame(f);
     return used;
@@ -1678,25 +1838,36 @@ bool gb_start(const char *rom_path)
     }
 
     /*
-     * THE RIGHT COLUMN: EMPTY, SELECT, START -- top to bottom.
+     * THE RIGHT COLUMN: HOLD, SELECT, START -- top to bottom.
      *
-     * Moved one slot down by the operator's direction from Start/Select/empty,
-     * so the pair a thumb reaches for sits lower on the glass and the vacant
-     * slot is now the TOP. All three keep their boxes, so the column still reads
-     * as the same three-button stack as the other two emulators, and only slots
-     * 1 and 2 have a duty: `pad_from_frame()` and `gb_app_touch()` answer for
-     * those two and nothing else. The top box does nothing, which is the
-     * pattern this file already accepted for the vacant slot before the move --
-     * a box that does nothing is honest, where blank glass that fires a button
-     * is the fault this project has reported twice.
+     * Select and Start sat one slot down by an earlier direction, so the pair a
+     * thumb reaches for is lower on the glass; the TOP slot was the vacant one and
+     * now carries Hold, which is the emulator's own control rather than a Game Boy
+     * button. All three keep their boxes, so the column still reads as the same
+     * three-button stack as the other two emulators.
+     *
+     * HOLD BLANKS THE OTHER FIVE COLUMN WORDS WHILE IT IS DOWN. That is all it does
+     * today: the operator asked for the button now and the functionality later, so
+     * the blanking is the honest whole of it rather than a placeholder pretending to
+     * be a feature. The five blanked slots are also made INERT -- see the `!s_hold`
+     * guards in pad_from_frame() and gb_app_touch() -- because a blank button that
+     * still fires is the phantom-button fault this project has reported twice, and a
+     * second finger can be down while Hold is held.
      *
      * SET TOGETHER ON PURPOSE. A label and its duty lived in two places in this
      * function once, which is how the swapped index in paint_column() went
-     * unnoticed; anything that moves a slot should move all three lines.
+     * unnoticed; anything that moves a slot should move all three lines, which is
+     * now why every index here is a name (HOLD_SLOT, SLOT_SELECT, SLOT_START).
      */
-    display_margin_label(1, 0, " ");
-    display_margin_label(1, 1, "Select");
-    display_margin_label(1, 2, "Start");
+    display_margin_label(1, HOLD_SLOT, "Hold");
+    display_margin_label(1, SLOT_SELECT, "Select");
+    display_margin_label(1, SLOT_START, "Start");
+
+    /* A FRESH SESSION STARTS UNHELD, and the latch starts clean. Without this, a
+     * session that ended with a finger on Hold would leave s_hold set and the next
+     * cartridge would open with five blank words and two dead guest buttons. */
+    s_hold = false;
+    s_hold_paint = false;
 
     /* The column slots past the drawn ones, and the whole bottom strip: blank and
      * not live, so blank glass cannot fire a button. The strip's touch area is
@@ -2105,6 +2276,13 @@ void gb_stop(void)
         display_margin_label(0, i, NULL);
         display_margin_label(1, i, NULL);
     }
+
+    /* A SESSION THAT ENDED WITH A FINGER ON HOLD MUST NOT LEAK IT. The overrides
+     * above are cleared, but s_hold is this file's own state and it decides whether
+     * the guest's Select and Start work -- so a stop taken while Hold was down would
+     * otherwise leave the next cartridge with those two buttons dead. */
+    s_hold = false;
+    s_hold_paint = false;
 
     for (int i = 0; i < BTN_N; i++)
     {

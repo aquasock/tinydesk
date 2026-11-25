@@ -253,6 +253,24 @@ display_margins_t display_margins_get(void);
 void display_margin_label(int col, int index, const char *text);
 
 /*
+ * Set a WHOLE COLUMN's labels and repaint it ONCE.
+ *
+ * `texts` is COL_N strings; a NULL or empty entry clears that slot's override, as
+ * display_margin_label() does.
+ *
+ * WHY THIS EXISTS rather than COL_N calls to display_margin_label(). Each of those
+ * repaints the entire column, so relabelling five slots would push 46x417 pixels
+ * five times AND show the change as a cascade -- the first word gone, then the
+ * second, each about 14 ms apart, which on the glass reads as the column coming
+ * apart rather than as one state change. This sets every override under one lock
+ * and then paints the column once.
+ *
+ * Built for the Hold button, whose whole point is that five labels change together.
+ * Same sole-writer requirement as display_margin_label().
+ */
+void display_margin_labels(int col, const char *const *texts);
+
+/*
  * Nudge one column slot's label vertically by `dy` pixels, positive is down the
  * glass; 0 restores the centred position. For a short word at the top of a
  * column, whose centring leaves more slack above than the eye wants.

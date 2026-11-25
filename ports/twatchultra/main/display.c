@@ -1930,6 +1930,55 @@ void display_margin_label(int col, int index, const char *text)
 }
 
 /*
+ * A WHOLE COLUMN'S LABELS, PAINTED ONCE.
+ *
+ * The same override channel as display_margin_label(), with the repaint hoisted out
+ * of the loop. See the header for why the distinction is not cosmetic: six calls to
+ * the single-slot setter would push the column six times and show the change as a
+ * cascade, which is the wrong way for a button whose entire purpose is that five
+ * words change at the same instant.
+ */
+void display_margin_labels(int col, const char *const *texts)
+{
+    if (!s_fb || col < 0 || col > 1 || !texts)
+        return;
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+
+    for (int i = 0; i < COL_N; i++)
+    {
+        const char *text = texts[i];
+
+        if (text && *text)
+        {
+            strncpy(s_ovr[col][i], text, OVR_MAX - 1);
+            s_ovr[col][i][OVR_MAX - 1] = '\0';
+            s_ovr_set[col][i] = true;
+        }
+        else
+        {
+            s_ovr[col][i][0] = '\0';
+            s_ovr_set[col][i] = false;
+        }
+    }
+
+    /* Only an app's own column is overridable, and only in APP mode -- the same
+     * rule, and the same early exit, as the single-slot setter. */
+    if (s_margin_mode != DISPLAY_MARGINS_APP)
+    {
+        xSemaphoreGive(s_lock);
+        return;
+    }
+
+    if (col == 0)
+        paint_column(LEFT_X0, LEFT_X1, true, LABEL_CW, left_label_app, overrides_for(0));
+    else
+        paint_column(RIGHT_X0, RIGHT_X1, false, LABEL_CCW, right_label_app, overrides_for(1));
+
+    xSemaphoreGive(s_lock);
+}
+
+/*
  * Push a caller's pixels to an arbitrary panel rectangle, WITH NO OWNERSHIP
  * REQUIREMENT.
  *
