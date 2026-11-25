@@ -33,6 +33,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "display.h"
 #include "font8x16.h"
@@ -96,11 +97,34 @@ extern unsigned long g_exec_count;
 #define PM_SAMPLES_PER_FRAME \
     ((int)(((int64_t)PM_AUDIO_HZ * PM_FRAME_CYCLES) / PM_CLOCK_HZ))
 
-/* THE LEFT COLUMN'S THIRD BUTTON IS THE VOLUME. Declared up here rather than beside
- * PM_LEFT because the touch handler -- which reads it -- is earlier in the file than
- * the label table, and an index written as a bare `2` in one place and a named
- * constant in the other is how a press ends up on the wrong box. */
+/* THE LEFT COLUMN'S THIRD BUTTON: THE VOLUME BY DEFAULT, LOAD DURING A HOLD.
+ *
+ * Declared up here because the touch handler -- which reads it -- comes earlier in the
+ * file than the label code, and an index written as a bare `2` in one place and a named
+ * constant in the other is how a press ends up on the wrong box. That was literally the
+ * case with the old PM_LEFT table: the two had to be kept in step by hand. */
 #define VOL_SLOT   2
+
+/*
+ * THE COLUMN SLOTS, BY NAME, AND THE LAYOUT IS THE GAME BOY'S.
+ *
+ * The operator's direction after comparing the two emulators: Save in the TOP-LEFT
+ * slot, blank beneath it, and Load sharing the third with the volume -- which is
+ * exactly the Game Boy's arrangement, so the two emulators read the same way.
+ *
+ * "Exit" AND "Sound" ARE GONE RATHER THAN BLANKED IN PLACE. Both were labels with
+ * no duty behind them, which is the disagreement this project removed from the Game
+ * Boy's Pause and Reset in entry 17; the operator asked for Sound's text to go and
+ * for the rest to match the Game Boy, and matching it means those slots carry
+ * nothing in either state.
+ *
+ * C KEEPS ITS SLOT AND ITS DUTY. It is a real Pokemon Mini button and the Game Boy
+ * has no equivalent, so it stays -- but Hold blanks it and makes it inert while
+ * pressed, exactly as Hold does to the Game Boy's Select and Start. */
+#define SLOT_SAVE  0
+#define SLOT_LOAD  VOL_SLOT      /* the third left slot: volume idle, Load held    */
+#define SLOT_HOLD  0             /* right column, top                              */
+#define SLOT_C     2             /* right column, third                            */
 
 /* More sub-slices than this and the frame budget is spent on slicing rather
  * than on sound; the ceiling exists so a mistyped argument cannot thrash the
@@ -152,9 +176,93 @@ static int16_t s_pcm[PM_SAMPLES_PER_FRAME + 1];   /* the +1 is the 613th */
 static bool s_run;
 static TaskHandle_t s_task;
 static SemaphoreHandle_t s_frame;
+
+/* --- the Hold button, and the savestate controls it reveals ---------------- */
+
+/*
+ * HOLD, SAVE AND LOAD, BUILT THE WAY THE GAME BOY BUILT THEM.
+ *
+ * There is no second design here on purpose. The Game Boy's Hold is a press-and-hold
+ * gate that blanks part of the margin and makes the blanked slots inert; its Save and
+ * Load are savestates serviced by the GUEST TASK between frames, never by the touch
+ * callback, because both read and write every piece of machine state and racing the
+ * guest over that would tear the snapshot silently. The Pokemon Mini has the same
+ * three problems and gets the same three answers, so a reader who knows one file knows
+ * the other.
+ *
+ * WHY THE GUEST TASK AND NOT THE TOUCH TASK, CONCRETELY: `PokeMini_SaveSSFile()` walks
+ * PM_RAM, PM_IO, the CPU, the IRQ controller and the sound block. Called from
+ * pm_app_touch() it would run on tdtouch while pm_task executed MinxCPU_Run() over the
+ * same structures. It would also be a second writer on the panel bus if it painted,
+ * which is DSP-009 exactly.
+ *
+ * AND WHY PAINTING IS ALSO THE BLIT TASK'S: `display_margin_label()` takes the SPI bus
+ * synchronously on the caller's task, so a relabel from the touch callback asserts
+ * while pm_blit_task is mid polling-transaction. That fault cost a panic in entry 14.
+ */
+static volatile bool s_hold;
+static volatile bool s_hold_paint;
+
+/* Rising edges for the two savestate buttons, in the touch task only: the controller
+ * re-reports a held finger every 66 ms and a held Save must not write the card on
+ * every report. */
+static bool s_save_prev, s_load_prev;
+
+#define PM_STATE_NONE 0
+#define PM_STATE_SAVE 1
+#define PM_STATE_LOAD 2
+
+static volatile int s_state_req;
+static volatile int s_state_rc;       /* 0 ok, else failed; -2 never asked      */
+static volatile int s_state_done;     /* which op the rc belongs to             */
+static volatile uint32_t s_state_ms;  /* what the last one cost, milliseconds    */
+
+/* The path the state is written to, derived from the ROM's own name. Sized like the
+ * ROM path it comes from. */
+static char s_state_path[256];
+
+/* 
+ * WHERE THE STATE LIVES: one file per cartridge, named for the ROM, in a directory of
+ * its own. The same shape the Game Boy uses, and for the same reasons -- a savestate is
+ * only meaningful for the cartridge that produced it, so the filename has to carry that
+ * identity; and `PokeMini_CheckSSFile()` verifies the core's own ID but NOT the ROM, it
+ * only hands the stored ROM path back, so the comparison is this port's job and the
+ * naming is what makes it a non-issue.
+ */
+#define PM_STATE_DIR "/sd/saves/pokemini"
+
+static void pm_state_path_for(const char *rom_path)
+{
+    s_state_path[0] = 0;
+
+    if (!rom_path || !*rom_path)
+        return;
+
+    const char *base = strrchr(rom_path, '/');
+    base = base ? base + 1 : rom_path;
+
+    size_t n = strlen(base);
+    const char *dot = strrchr(base, '.');
+
+    if (dot && dot > base)
+        n = (size_t)(dot - base);
+
+    /* Created on demand: a save that fails because a directory was never made is a
+     * support call, not a policy. */
+    (void)mkdir(PM_STATE_DIR, 0777);
+
+    snprintf(s_state_path, sizeof(s_state_path), "%s/%.*s.st0",
+             PM_STATE_DIR, (int)(n > 120 ? 120 : n), base);
+}
+
 static esp_timer_handle_t s_tick;
 static uint8_t *s_rom;
-static char s_rom_path[128];
+/* 256, NOT 128, AND THE PICKER IS WHY. This was sized for the default cartridge's
+ * 66-character path; now that Pokemon Mini goes through the cartridge chooser the path
+ * can carry a bucket directory and a long name, and `snprintf` would TRUNCATE it
+ * silently -- producing a path that opens nothing and reads as a broken cartridge, which
+ * is the fault PK_NAME_MAX was already raised for on the Game Boy side. */
+static char s_rom_path[256];
 
 /* The pad, shared with the touch task: one aligned int, read whole or not at all,
  * for the reason nes.c records -- a multi-field update would need a lock and the
@@ -427,6 +535,78 @@ static void pm_handoff(void)
 }
 
 /* Core 1. Pushes finished frames and gives each buffer back afterwards. */
+/*
+ * THE COLUMN WORDS, AS ONE STATE.
+ *
+ * Four states in two columns, and they are the Game Boy's exactly:
+ *
+ *   not held   left  " " / " " / volume      right  "Hold" / " " / "C"
+ *   held       left  "Save" / " " / "Load"   right  "Hold" / " " / " "
+ *
+ * Written out in full for each state rather than remembered and restored, because a
+ * restore path has to survive a press that arrives while a previous restore is
+ * pending and two full descriptions cannot disagree with each other.
+ *
+ * THE THIRD LEFT SLOT CARRIES TWO THINGS AT DIFFERENT TIMES -- the volume while the
+ * column is idle, Load during a hold -- which is safe because the two are never
+ * reachable at once and the touch handler branches on the same held flag this paints
+ * from. The volume word is read at the moment of painting, so what returns after a
+ * release is the CURRENT position and not whatever it was when Hold went down.
+ *
+ * CALLED ONLY FROM THE BLIT TASK, in both branches of its loop. One gate per picture
+ * and never per band, for the reason entry 20 records about the display path; here it
+ * is one gate per RELABEL, which is the same rule one level up.
+ */
+#define PM_LAST_LABEL_SLOT 2
+
+static void pm_paint_state(void)
+{
+    const bool held = s_hold;
+
+    const char *left[COL_N] = {
+        held ? "Save" : " ",
+        " ",
+        held ? "Load" : sound_volume_label(),
+        " ", " ",
+    };
+
+    const char *right[COL_N] = {
+        "Hold",
+        " ",
+        held ? " " : "C",
+        " ", " ",
+    };
+
+    /* TWO CALLS, NOT SIX. Each column is set and painted once, so every word changes
+     * in the same push; the single-slot setter would paint the change as a cascade
+     * down the glass. The stop slot keeps the window above the drawn controls, so a
+     * relabel can never clip the d-pad or a circle -- the fault the Game Boy paid for
+     * twice in entries 18 and 19. */
+    display_margin_labels(0, left, PM_LAST_LABEL_SLOT);
+    display_margin_labels(1, right, PM_LAST_LABEL_SLOT);
+}
+
+/*
+ * Drain whatever the touch task recorded, and paint ONCE.
+ *
+ * Two things can ask for a repaint -- the volume moving and Hold changing -- and both
+ * write the same two columns, so handling them separately would paint the column twice
+ * for a change that happens in one moment.
+ */
+static void pm_paint_pending(void)
+{
+    const bool vol = sound_volume_take_label_change();
+    const bool hold = s_hold_paint;
+
+    if (hold)
+        s_hold_paint = false;
+
+    if (!vol && !hold)
+        return;
+
+    pm_paint_state();
+}
+
 static void pm_blit_task(void *arg)
 {
     (void)arg;
@@ -437,15 +617,15 @@ static void pm_blit_task(void *arg)
 
         if (xQueueReceive(s_filled_q, &idx, pdMS_TO_TICKS(50)) != pdTRUE)
         {
-            /* THE VOLUME LABEL, ON THE IDLE PATH AS WELL AS THE BUSY ONE.
+            /* THE COLUMN, ON THE IDLE PATH AS WELL AS THE BUSY ONE.
              *
              * This is the task that owns the panel's transmit path, so it is the one
-             * that may relabel a margin slot; the touch callback only records the
-             * state. The idle branch is where a press lands when the picture is not
-             * changing -- a paused or sleeping cartridge produces no frames at all, and
-             * a label that waited for the next blit would sit stale for ever. */
-            if (sound_volume_take_label_change())
-                display_margin_label(0, VOL_SLOT, sound_volume_label());
+             * that may relabel a margin slot; the touch callback only records state.
+             * The idle branch is where a press lands when the picture is not changing
+             * -- a sleeping cartridge draws no frames at all, and a word that waited
+             * for the next blit would sit stale for ever, which is exactly when a
+             * person is reaching for the button. */
+            pm_paint_pending();
 
             continue;
         }
@@ -456,10 +636,8 @@ static void pm_blit_task(void *arg)
          * strand one. */
         xQueueSend(s_free_q, &idx, 0);
 
-        /* And on the busy path, after the push has completed and the bus is
-         * released. */
-        if (sound_volume_take_label_change())
-            display_margin_label(0, VOL_SLOT, sound_volume_label());
+        /* And on the busy path, after the push has completed and the bus released. */
+        pm_paint_pending();
     }
 
     s_blit_task = NULL;
@@ -567,7 +745,14 @@ static int pad_from_frame(const touch_frame_t *f)
          * The column's last two slots are blank and bare, so nothing else here
          * claims them.
          */
-        if (f->p[i].region == EDGE_RIGHT && f->p[i].index == 2)
+        /* C IS BLANKED AND INERT WHILE HOLD IS DOWN, on the operator's direction and
+         * for the Game Boy's reason: a blank button must not fire. This is the same
+         * predicate the painter uses -- pm_paint_state() blanks C from the same flag --
+         * so "not drawn" and "not live" cannot drift apart.
+         *
+         * The index is SLOT_C, not the literal 3 an earlier comment claimed; the label
+         * table has C at index 2 and always has. */
+        if (f->p[i].region == EDGE_RIGHT && f->p[i].index == SLOT_C && !s_hold)
             pad |= PMK_C;
     }
 
@@ -592,59 +777,119 @@ static bool pm_app_touch(void *user, const touch_frame_t *f)
     if (!s_run)
         return false;
 
-    s_pad = pad_from_frame(f);
-
     if (!f)
         return false;
 
     /*
-     * THE VOLUME, LEFT COLUMN SLOT 2, AND IT RUNS BEFORE THE DRAWN CONTROLS.
+     * ONE PASS TO COLLECT, THEN ONE PASS TO ACT.
      *
-     * The drawn-control loop below returns early when it hits the pad, so a volume
-     * press counted after it would be missed by any frame that also touched the
-     * d-pad -- and a missed frame is not just a lost press: the debounce in sound.c
-     * would not see the finger, so the NEXT report of the same held press would look
-     * like a fresh one and step again. Ordering it first makes a chord harmless.
+     * HOLD, SAVE AND LOAD ALL DEPEND ON THE HELD STATE, and which duty a point in the
+     * third left slot has is only known once every point in the frame has been seen --
+     * so they are collected first and split after, the same shape the Game Boy uses and
+     * the same reason the picker classifies a frame before acting on it.
      *
-     * This column used to buzz for every live slot and act for none of them, so a
-     * press here now does something rather than only feeling like it did.
-     *
-     * THE LABEL IS NOT PAINTED HERE. This is the touch task, and `pm_blit_task` is
-     * the task that owns the panel's transmit path; painting the column from here is
-     * a second writer on the SPI bus and panicked the watch on the first press (see
-     * sound_volume_take_label_change()). The blit task relabels.
+     * THE THIRD LEFT SLOT IS TWO CONTROLS SHARING ONE BOX: the volume while the column
+     * is idle and Load during a hold. Collected once as `slot2`, then branched.
      */
-    bool vol = false;
+    bool used = false;
+    bool hold = false;
+    bool save_pt = false;
+    bool slot2_pt = false;
 
     for (int i = 0; i < f->n && i < TOUCH_POINTS; i++)
     {
-        if (f->p[i].region == EDGE_LEFT && f->p[i].index == VOL_SLOT &&
-            display_margin_slot_live(0, VOL_SLOT))
-            vol = true;
+        /* Hold is seen unconditionally -- it is the control that blanks the others, so
+         * it cannot be gated by them. */
+        if (f->p[i].region == EDGE_RIGHT && f->p[i].index == SLOT_HOLD &&
+            display_margin_slot_live(1, SLOT_HOLD))
+            hold = true;
+
+        if (f->p[i].region == EDGE_LEFT && f->p[i].index == SLOT_SAVE &&
+            display_margin_slot_live(0, SLOT_SAVE))
+            save_pt = true;
+
+        if (f->p[i].region == EDGE_LEFT && f->p[i].index == SLOT_LOAD &&
+            display_margin_slot_live(0, SLOT_LOAD))
+            slot2_pt = true;
     }
 
-    if (sound_volume_cycle_on_press(vol))
+    /*
+     * HOLD MARKS THE STATE AND ASKS FOR THE REPAINT; IT DOES NOT PAINT. The words change
+     * under the thumb, so the press is felt.
+     *
+     * THE STATE IS RECORDED EVEN ON THE RELEASE FRAME, which arrives with no points:
+     * `hold` is then false and that IS the release, so a lifted finger or one that
+     * slides off restores the words the same way.
+     */
+    if (hold != s_hold)
     {
-        /* The button acted. It is also FELT: return true unconditionally, because
-         * `vol` is what the driver's haptic follows and a volume press whose first
-         * frame is swallowed would step silently. */
+        s_hold = hold;
+        s_hold_paint = true;
+    }
+
+    if (hold)
+        used = true;
+
+    if (s_hold)
+    {
+        /*
+         * SAVE AND LOAD EXIST ONLY DURING A HOLD, which is what makes the column honest:
+         * outside one the top slot is blank glass and the third is the volume, and
+         * inside one they are the two savestate controls.
+         *
+         * RISING EDGES ONLY. The controller re-reports a held finger every 66 ms, so a
+         * held Save that fired on every report would write the card continuously. The
+         * edges are cleared on every frame, including the empty release frame.
+         *
+         * ONE REQUEST SLOT, so a press arriving while the guest has not serviced the
+         * last one is dropped rather than queued: a savestate is card I/O and the wearer
+         * gets no feedback until it finishes. Save wins if both somehow land at once,
+         * which is arbitrary but stable.
+         *
+         * NOTHING IS PAINTED HERE -- this is the touch task, and pm_blit_task owns the
+         * transmit path (DSP-009). The blit task drains s_hold_paint.
+         */
+        const bool do_save = save_pt && !s_save_prev;
+        const bool do_load = slot2_pt && !s_load_prev;
+
+        if (save_pt || slot2_pt)
+            used = true;
+
+        if (s_state_req == PM_STATE_NONE && (do_save || do_load))
+            s_state_req = do_save ? PM_STATE_SAVE : PM_STATE_LOAD;
+    }
+    else
+    {
+        /* ONE PRESS, ONE STEP -- sound.c owns this debounce, with the state, because a
+         * held button that cycled five positions would land wherever the thumb left it.
+         * The press is not fed to the debounce while held, so the volume cannot step
+         * silently under Hold and then show a word that moved while it was invisible. */
+        if (sound_volume_cycle_on_press(slot2_pt))
+            used = true;
+
+        if (slot2_pt)
+            used = true;
+    }
+
+    s_save_prev = save_pt;
+    s_load_prev = slot2_pt;
+
+    /* THE PAD STATE IS BUILT AFTER THE HELD STATE IS KNOWN, because pad_from_frame()
+     * gates C on it: built before, it would use the previous frame's answer and a press
+     * landing on the same frame as a Hold release would be judged against the older
+     * state. */
+    s_pad = pad_from_frame(f);
+
+    if (used)
         return true;
-    }
-
-    if (vol)
-        return true;            /* a repeat report of the same held press */
 
     for (int i = 0; i < f->n && i < TOUCH_POINTS; i++)
-    {
         if (pm_button_at(f->p[i].x, f->p[i].y) != GP_NONE)
             return true;
-    }
 
-    /* The margins, using the same per-region column index the mapping uses. This
-     * used to be three near-identical lines with the constants written out, which
-     * is how a wrong index survives: nothing ties them to pad_from_frame()'s
-     * switch. */
-    for (int i = 0; f && i < f->n && i < TOUCH_POINTS; i++)
+    /* The margins, using the same per-region column index the mapping uses, so a press
+     * on a live slot is felt even when it is not one this handler acts on. */
+    for (int i = 0; i < f->n && i < TOUCH_POINTS; i++)
     {
         int col;
 
@@ -846,6 +1091,72 @@ static void pm_task(void *arg)
             memcpy(s_prev, s_dot[s_cur], PM_DOTS);
             s_have_prev = true;
             pm_handoff();
+        }
+
+        /*
+         * SAVESTATE: SAVE OR RESTORE, HERE AND NOWHERE ELSE.
+         *
+         * At the end of a completed frame, when the guest is not executing, because
+         * `PokeMini_SaveSSFile()` and `PokeMini_LoadSSFile()` walk PM_RAM, PM_IO, the
+         * CPU, the IRQ controller and the sound block. From the touch callback they
+         * would race this task over the memory it is running from -- and a torn
+         * savestate is silent rather than loud, which is worse than the panic DSP-009
+         * produced when the same mistake was made with the panel.
+         *
+         * DONE INLINE RATHER THAN HANDED TO ANOTHER TASK, unlike the Game Boy's SRAM
+         * write. The core writes the file itself and offers no way to serialise the
+         * machine into a caller's buffer, so a separate writer would mean splitting a
+         * format this port does not own. The cost is a stall of the card write on this
+         * task, which is accepted: it happens on a deliberate button press and the
+         * picture simply freezes for it.
+         *
+         * A LOAD THAT NAMES A DIFFERENT CARTRIDGE IS REFUSED. `CheckSSFile()` returns
+         * the stored ROM path and verifies nothing about it, so the comparison has to
+         * happen here; without it a state from another game would be poured over this
+         * one's memory and the result would be a crash somewhere unrelated.
+         */
+        if (s_state_req != PM_STATE_NONE)
+        {
+            const int what = s_state_req;
+            const int64_t st0 = esp_timer_get_time();
+            int rc = -1;
+
+            s_state_req = PM_STATE_NONE;
+
+            if (s_state_path[0])
+            {
+                if (what == PM_STATE_SAVE)
+                {
+                    rc = PokeMini_SaveSSFile(s_state_path, s_rom_path) ? 0 : -1;
+                }
+                else
+                {
+                    char stored_rom[128];
+
+                    stored_rom[0] = 0;
+
+                    if (!PokeMini_CheckSSFile(s_state_path, stored_rom))
+                    {
+                        rc = -2;    /* no file, or not a PokeMini state */
+                    }
+                    else if (stored_rom[0] && strcmp(stored_rom, s_rom_path) != 0)
+                    {
+                        rc = -3;    /* a state from a different cartridge */
+                    }
+                    else
+                    {
+                        rc = PokeMini_LoadSSFile(s_state_path) ? 0 : -1;
+                    }
+                }
+            }
+
+            s_state_ms = (uint32_t)((esp_timer_get_time() - st0) / 1000);
+            s_state_rc = rc;
+            s_state_done = what;
+
+            ESP_LOGI(TAG, "%s %s: rc=%d in %lums",
+                     what == PM_STATE_SAVE ? "saved" : "loaded",
+                     s_state_path, rc, (unsigned long)s_state_ms);
         }
 
         s_frames++;
@@ -1795,10 +2106,18 @@ static bool pm_draw_dpad(void)
  * still matters -- it is what the slot falls back to, and leaving a stale "Load"
  * there is how a slot ends up describing a duty it no longer has.
  */
-#define VOL_LABEL  "Mute"
-
-static const char *const PM_LEFT[COL_N]  = { "Exit", "Save", VOL_LABEL, PM_BLANK, PM_BLANK };
-static const char *const PM_RIGHT[COL_N] = { "Hold", "Sound", "C", PM_BLANK, PM_BLANK };
+/*
+ * THE TWO COLUMNS ARE NO LONGER STATIC TABLES.
+ *
+ * They were PM_LEFT/PM_RIGHT, and the words in them did not depend on anything -- which
+ * was true while nothing in this column worked. Now the left column changes with the
+ * held state (blank / volume when idle, Save / Load when held), so the labels live in
+ * pm_paint_state() where the state is, and this file has one description of them
+ * instead of a table plus an override that had to be kept in step with it.
+ *
+ * THE BOTTOM STRIP IS STILL A TABLE, because it is still all blank: this app draws no
+ * bars, and an empty strip is the honest picture of that.
+ */
 static const char *const PM_BOTTOM[BTN_N] = { PM_BLANK, PM_BLANK, PM_BLANK };
 
 /*
@@ -1826,16 +2145,10 @@ static const bool PM_BARE_BOTTOM[BTN_N] = { true, true, true };
  * display_margins_set() then does is the one that shows all twelve at once. */
 static void pm_label_margins(void)
 {
-    for (int i = 0; i < COL_N; i++)
-    {
-        display_margin_label(0, i, PM_LEFT[i]);
-        display_margin_label(1, i, PM_RIGHT[i]);
-    }
-
-    /* THE LIVE WORD OVER THE TABLE'S FALLBACK, after the loop that wrote it, so the
-     * repaint `display_margin_label()` does carries the state the multiply is
-     * actually using. */
-    display_margin_label(0, VOL_SLOT, sound_volume_label());
+    /* THE COLUMNS COME FROM THE STATE, not from a table -- see pm_paint_state(). At
+     * this point the margin mode is not yet APP, so these set the overrides and skip
+     * the repaint; display_margins_set() below does the one paint that shows them. */
+    pm_paint_state();
 
     for (int i = 0; i < BTN_N; i++)
         display_margin_btn_label(i, PM_BOTTOM[i]);
@@ -1851,14 +2164,16 @@ static void pm_label_margins(void)
     for (int i = 0; i < BTN_N; i++)
         display_margin_chrome(2, i, !PM_BARE_BOTTOM[i]);
 
-    /* THE SHORT TOP WORDS SIT LOW ON PURPOSE.
+    /* THE TOP WORDS SIT LOW ON PURPOSE.
      *
-     * "Exit" and "Hold" are four characters stood on end in a 61-row face, and
-     * centring leaves the eye reading them as high in the button -- the operator's
-     * words were that both should "render a bit lower". One character width is
-     * 8 px, the width of the 8x16 label font, and it is a nudge rather than a new
-     * alignment rule: display_margin_label_dy() adds to the centred position and
-     * clamps inside the face, so this cannot grow into a layout of its own. */
+     * "Hold" on the right and the left slot that carries "Save" are short words stood on
+     * end in a 61-row face, and centring leaves the eye reading them as high in the
+     * button -- the operator's words, when these were "Exit" and "Hold", were that both
+     * should "render a bit lower". The nudge outlives "Exit" because the slots it applies
+     * to are the same two. One character width is 8 px, the width of the 8x16 label
+     * font, and it is a nudge rather than a new alignment rule:
+     * display_margin_label_dy() adds to the centred position and clamps inside the face,
+     * so this cannot grow into a layout of its own. */
     display_margin_label_dy(0, 0, PM_TOP_DY);
     display_margin_label_dy(1, 0, PM_TOP_DY);
 }
@@ -2146,7 +2461,22 @@ bool pmini_start(const char *rom_path)
     }
 
     snprintf(s_rom_path, sizeof(s_rom_path), "%s", path);
-    ESP_LOGI(TAG, "running %s (%d bytes)", path, len);
+
+    /* THE SAVESTATE PATH, AND A FRESH SESSION OWES NO ANSWER FROM THE LAST ONE. The two
+     * press edges start clear so a thumb already on the glass cannot fire a save as its
+     * first act, and `s_hold` starts held-out so a cartridge cannot open with the column
+     * showing Save and Load and C dead. */
+    pm_state_path_for(s_rom_path);
+    s_state_req = PM_STATE_NONE;
+    s_state_rc = -2;
+    s_state_done = PM_STATE_NONE;
+    s_state_ms = 0;
+    s_hold = false;
+    s_hold_paint = false;
+    s_save_prev = s_load_prev = false;
+
+    ESP_LOGI(TAG, "running %s (%d bytes), state %s", path, len,
+             s_state_path[0] ? s_state_path : "(none)");
     return true;
 
 fail:
@@ -2346,6 +2676,20 @@ static int cmd_pm(tdsh_session_t *session, int argc, char **argv)
                    (unsigned)sound_stream_dropped());
         else
             printf("    audio off\n");
+
+        /* THE SAVESTATE'S LAST OUTCOME, because a press on the glass gives no feedback:
+         * the column words are identical before and after and the only visible effect is
+         * a short freeze. -2 is "never asked for"; -3 is a state file belonging to a
+         * different cartridge, which is the failure this record exists to make visible
+         * rather than let a load pour one game over another. */
+        if (s_state_done != PM_STATE_NONE)
+            printf("    state %s rc=%d %lums %s\n",
+                   s_state_done == PM_STATE_SAVE ? "save" : "load",
+                   s_state_rc, (unsigned long)s_state_ms,
+                   s_state_path[0] ? s_state_path : "(no path)");
+        else
+            printf("    state none (no press yet) %s\n",
+                   s_state_path[0] ? s_state_path : "(no path)");
 
         /* WHAT RATE THE CARTRIDGE ACTUALLY DRAWS AT.
          *
