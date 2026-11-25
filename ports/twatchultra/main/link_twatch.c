@@ -844,12 +844,57 @@ static void launch_slotb_gb(void)  { slotb_launch_or_say("gb"); }
 static void launch_slotb_nes(void) { slotb_launch_or_say("nes"); }
 static void launch_slotb_pm(void)  { slotb_launch_or_say("pm"); }
 
-/* The names match what the card-side launchers were called, so nothing the
- * operator learned about the menu changes; "(B)" stays on the Pokemon Mini
- * because the desktop has its own Pokemon Mini entry beside it. */
-static const td_app_t s_app_gb  = { "Game Boy Color",   launch_slotb_gb,  "GB" };
-static const td_app_t s_app_nes = { "NES",              launch_slotb_nes, "NE" };
-static const td_app_t s_app_pm  = { "Pokemon Mini (B)", launch_slotb_pm,  "PM" };
+/*
+ * THE ICONS ARE A MOTIF, NOT INITIALS: a filled circle and then a shape.
+ *
+ * The field is a TWO-CELL glyph and the desktop counts CHARACTERS rather than bytes
+ * (`td_textn()` walks UTF-8 in the menu's own drawing path), so two multi-byte symbols
+ * fit exactly -- which two letters never did anything with except repeat the name
+ * underneath them. "GB", "NE" and "PM" were the initials of the entry sitting beside
+ * them, so they spent the two cells saying what the text already said.
+ *
+ *   ●■  Game Boy Color
+ *   ●▲  NES
+ *   ●◆  Pokemon Mini
+ *
+ * THE PREFIX IS SHARED AND THE SUFFIX IS NOT, which is the point: the circle says
+ * "console" for all three, and the shape says which. That is the reason these are not
+ * simply three pretty pairs -- a shared motif makes the menu read as one family, and a
+ * distinguishing suffix keeps it from reading as one repeated blob.
+ *
+ * EVERY GLYPH WAS CHECKED AGAINST THE FONT TABLE BEFORE BEING USED HERE. It carries
+ * 799 code points; a symbol it lacks renders as nothing at all, which in a menu looks
+ * like a formatting fault rather than a missing glyph. U+25A0, U+25B2 and U+2666 are
+ * all present, and U+25C6 -- the obvious "diamond" answer -- is NOT, which is why
+ * Pokemon Mini gets U+2666.
+ *
+ * TWO FILLED SHAPES SIDE BY SIDE CAN BLOB AT THIS SIZE, so the prefix alternates in
+ * kind rather than in weight: a circle then a shape with corners reads as two marks,
+ * where two solid squares would read as one smudge.
+ *
+ * THE NAMES ARE SHORT NOW, which the icons made possible: the icon carries the
+ * identity, so the text does not have to spell out a console name in a 21-column menu.
+ * "Game Boy Color" was thirteen characters doing the same job as two glyphs.
+ *
+ * "Pok\xc3\xa9Mini" CARRIES THE ACUTE ACCENT because that is how the product is spelled,
+ * and it is written as a UTF-8 escape rather than a literal byte so the file's encoding
+ * cannot change what the menu says. U+00E9 is in the port's font -- the table carries
+ * the whole Latin-1 Supplement range -- so it renders rather than falling through to a
+ * box; a name is not a place to discover a missing glyph.
+ *
+ * THE "(B)" SUFFIX IS GONE, and the reason it existed is gone with it. It was there
+ * because the desktop had its own Pokemon Mini entry -- a `.tdlink` to `/root/Apps/pm.py`
+ * -- so two rows read the same name and one needed marking. The operator has removed
+ * that entry (it started the emulator INSIDE the desktop, which slot B's picker now
+ * does better), so there is one Pokemon Mini in the menu and the suffix had nothing
+ * left to disambiguate.
+ *
+ * WORTH KNOWING IF IT EVER COMES BACK: two rows with the same name and no suffix are
+ * indistinguishable at a glance. The suffix was doing real work, not decoration.
+ */
+static const td_app_t s_app_gb  = { "GBC",            launch_slotb_gb,  "\xe2\x97\x8f\xe2\x96\xa0" };  /* U+25CF U+25A0 */
+static const td_app_t s_app_nes = { "NES",            launch_slotb_nes, "\xe2\x97\x8f\xe2\x96\xb2" };  /* U+25CF U+25B2 */
+static const td_app_t s_app_pm  = { "Pok\xc3\xa9Mini",    launch_slotb_pm,  "\xe2\x97\x8f\xe2\x99\xa6" };  /* U+25CF U+2666 */
 
 void board_apps_register(void)
 {
