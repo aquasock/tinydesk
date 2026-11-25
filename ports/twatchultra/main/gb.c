@@ -2605,6 +2605,19 @@ static int cmd_gb(tdsh_session_t *session, int argc, char **argv)
                    (unsigned long)waitmax, (unsigned long)miss);
         }
 
+        /* THE TEARING-EFFECT SYNC, which is otherwise invisible. `edges` is what the
+         * panel delivered and `waits` what the blitter asked for; zero edges beside a
+         * non-zero timeout count means the pin never fired and every push paid the full
+         * timeout, which no frame-rate number would show. */
+        {
+            uint32_t edges = 0, waits = 0, timeouts = 0, wmax = 0;
+
+            display_te_stats(&edges, &waits, &timeouts, &wmax);
+            printf("te: edges=%lu waits=%lu timeout=%lu waitmax=%luus\n",
+                   (unsigned long)edges, (unsigned long)waits,
+                   (unsigned long)timeouts, (unsigned long)wmax);
+        }
+
         if (s_blit_leak)
             printf("blitter wedged -- frames leaked, reboot to clear\n");
 

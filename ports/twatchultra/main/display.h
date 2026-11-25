@@ -224,6 +224,18 @@ bool display_fill(uint16_t colour);
 void display_cursor_draw(bool on);
 
 /*
+ * How the tearing-effect synchronisation is doing, for a status line.
+ *
+ * `edges` counts interrupts from the panel, `waits` the pictures that asked for a frame
+ * boundary, `timeouts` the waits that gave up, and `wait_max_us` the longest successful
+ * one. The pair that matters is edges against waits: ZERO EDGES WITH A NON-ZERO TIMEOUT
+ * COUNT means the pin is not delivering and every push is paying the full timeout, which
+ * is a fault the frame rate alone would not name. Any pointer may be NULL.
+ */
+void display_te_stats(uint32_t *edges, uint32_t *waits, uint32_t *timeouts,
+                      uint32_t *wait_max_us);
+
+/*
  * What the margin buttons say, and by implication what they do.
  *
  * DESKTOP is the default: the columns carry their key names and the strip

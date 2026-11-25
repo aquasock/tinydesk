@@ -52,6 +52,7 @@
 #define LCD_D3    45
 #define LCD_CS    41
 #define LCD_RST   37
+#define LCD_TE    6     /* tearing-effect output from the CO5300, active high */
 #define LCD_SPI_HZ (80 * 1000 * 1000)   /* LilyGo runs this panel at 80 MHz */
 
 /* The panel's own coordinate space. The glass is 410x502; DISPLAY_W/H in
@@ -548,6 +549,129 @@ static void set_window_bus(int x, int y, int w, int h)
 static void push_pixels_raw(int cx, int cy, int w, int h);
 static void push_pixels_buf(int x, int y, int w, int h, uint16_t *buf);
 
+/*
+ * TEARING-EFFECT SYNCHRONISATION: WAIT FOR THE PANEL'S OWN FRAME BOUNDARY.
+ *
+ * WHY THIS EXISTS. A whole-picture update leaves as a run of band transactions, and
+ * that run is not aligned to the panel's scanout: the top of the glass carries the new
+ * content while the bottom still carries the previous one, which on the glass is one
+ * torn frame per full-screen change (LCD-015). The CO5300 emits a synchronisation pulse
+ * for exactly this -- this driver has been ENABLING it since the init table was written,
+ * with TEON (0x35) M=0, and nothing has ever listened to the pin.
+ *
+ * THE SHAPE IS LILYGO'S, TAKEN FROM THEIR DRIVER RATHER THAN INVENTED. GPIO 6 is a plain
+ * input, the interrupt is on the RISING edge, and the wait DRAINS the semaphore before
+ * taking it. The drain is the part that makes the wait mean anything: a give left over
+ * from an earlier frame would otherwise satisfy the take immediately and the "sync" would
+ * be silent nonsense.
+ *
+ * IT FAILS OPEN ON PURPOSE. The take is bounded at TE_WAIT_MS -- a little over one
+ * refresh at 60 Hz -- and a timeout logs nothing and continues with the push. A picture
+ * that is one frame late is a glitch; a pusher blocked for ever on an edge that never
+ * comes is a frozen watch, and this project has already paid for one of those. The count
+ * is kept so that "TE never fired and we waited the timeout on every frame" is visible
+ * rather than inferred from a frame rate.
+ *
+ * ONE WAIT PER PICTURE, NOT PER BAND. The wait sits at the top of a whole-picture push;
+ * waiting per band would cost up to a full refresh PER BAND and turn a 8 ms frame into
+ * 300 ms.
+ */
+#define TE_WAIT_MS 20
+
+static SemaphoreHandle_t s_te_sem;
+static volatile uint32_t s_te_edges;      /* interrupts seen                     */
+static volatile uint32_t s_te_waits;      /* pictures that waited for one        */
+static volatile uint32_t s_te_timeouts;   /* waits that gave up                  */
+static volatile uint32_t s_te_wait_max_us;
+
+static void IRAM_ATTR te_isr(void *arg)
+{
+    (void)arg;
+
+    s_te_edges++;
+
+    if (s_te_sem)
+    {
+        BaseType_t woken = pdFALSE;
+        xSemaphoreGiveFromISR(s_te_sem, &woken);
+
+        if (woken == pdTRUE)
+            portYIELD_FROM_ISR();
+    }
+}
+
+/* Arm the pin and the interrupt. Called from panel_init() once the panel is out of
+ * reset, so the first edge this sees is a real one. */
+static bool te_init(void)
+{
+    if (!s_te_sem)
+        s_te_sem = xSemaphoreCreateBinary();
+
+    if (!s_te_sem)
+        return false;
+
+    gpio_config_t te = {
+        .pin_bit_mask = 1ULL << LCD_TE,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_POSEDGE,
+    };
+
+    if (gpio_config(&te) != ESP_OK)
+        return false;
+
+    /* The service is installed by power.c and reports already-installed as an error
+     * rather than failing, so the return is not checked; the handler add is. */
+    (void)gpio_install_isr_service(0);
+
+    if (gpio_isr_handler_add((gpio_num_t)LCD_TE, te_isr, NULL) != ESP_OK)
+        return false;
+
+    ESP_LOGI(TAG, "TE sync armed on GPIO %d", LCD_TE);
+    return true;
+}
+
+/* One frame boundary, or a bounded give-up. Returns true when an edge arrived. */
+static bool te_wait(void)
+{
+    if (!s_te_sem)
+        return false;
+
+    while (xSemaphoreTake(s_te_sem, 0) == pdTRUE)
+        ;                                   /* drain stale gives */
+
+    const int64_t t0 = esp_timer_get_time();
+
+    s_te_waits++;
+
+    if (xSemaphoreTake(s_te_sem, pdMS_TO_TICKS(TE_WAIT_MS)) == pdTRUE)
+    {
+        const uint32_t us = (uint32_t)(esp_timer_get_time() - t0);
+
+        if (us > s_te_wait_max_us)
+            s_te_wait_max_us = us;
+
+        return true;
+    }
+
+    s_te_timeouts++;
+    return false;
+}
+
+void display_te_stats(uint32_t *edges, uint32_t *waits, uint32_t *timeouts,
+                      uint32_t *wait_max_us)
+{
+    if (edges)
+        *edges = s_te_edges;
+    if (waits)
+        *waits = s_te_waits;
+    if (timeouts)
+        *timeouts = s_te_timeouts;
+    if (wait_max_us)
+        *wait_max_us = s_te_wait_max_us;
+}
+
 /* Push w*h byte-swapped pixels from s_tx, CS held across the whole stream. */
 static void push_pixels(int x, int y, int w, int h)
 {
@@ -768,6 +892,20 @@ static bool panel_init(void)
             vTaskDelay(pdMS_TO_TICKS(120));
     }
     reg_write(0x51, &bright, 1);
+
+    /*
+     * ARM TE LAST, AFTER THE PANEL IS AWAKE AND SCANNING. TEON (0x35) went out in the
+     * init table above, so the panel is already emitting its pulse; arming the input
+     * after the display-on command means the first edge this sees corresponds to a
+     * frame the panel is actually drawing.
+     *
+     * A FAILURE HERE IS NOT A FAILURE TO BOOT. Without TE the picture tears exactly as
+     * it always has, which is a cosmetic fault this port shipped for months; refusing to
+     * start would trade a cosmetic fault for a dead watch.
+     */
+    if (!te_init())
+        ESP_LOGW(TAG, "TE sync not armed; tearing will be unsynchronised");
+
     return true;
 }
 
@@ -2754,6 +2892,20 @@ bool display_picture_rows(void *ctx, int x, int y, int w, int h, display_row_fn 
         band = BAND_ROWS;
     if (band < 1)
         band = 1;
+
+    /*
+     * ONE FRAME BOUNDARY BEFORE THE FIRST BAND -- see te_wait().
+     *
+     * Every other push in this file is a small rectangle whose cost is a fraction of a
+     * refresh, so tearing there is invisible. This function is the whole-picture path,
+     * the one an emulator uses, and the one whose band run straddles a refresh boundary
+     * for long enough to be seen (LCD-015). Waiting once here costs at most TE_WAIT_MS
+     * and puts the entire run inside one scanout window.
+     *
+     * IT IS DELIBERATELY NOT IN push_pixels_buf(). That is per band, so a gate there
+     * would wait up to a full refresh eighteen times a frame.
+     */
+    te_wait();
 
     for (int yy = y0; yy < y1; yy += band)
     {
