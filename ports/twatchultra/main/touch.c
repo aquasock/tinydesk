@@ -453,7 +453,20 @@ static void to_cell(int x, int y, int *col, int *row)
  *   3  F6       the window switcher, the only way to change focus
  *   4  Super+D  show the desktop, and again to bring it all back -- the only way
  *               to restore a minimised window, since F6 skips hidden ones
- *   5  F11      full screen for the focused window
+ *   5  (none)   was F11, full screen for the focused window
+ *
+ * THE FIFTH SLOT IS INERT, AND NULL IS HOW. It used to send F11 so the focused
+ * window could fill the screen -- which stopped meaning anything once every app
+ * began opening maximised (`TD_OPEN_MAXIMIZED`, set in `project_include.cmake`):
+ * a key whose only outcome is that the window grows to the size it already is.
+ * The operator retired it rather than keep a button that does nothing visible.
+ *
+ * A NULL IN THIS TABLE IS THE INERT MECHANISM, not a placeholder: the hit test
+ * below returns early on it, so a press neither sends a key nor buzzes -- the
+ * same path the right column's reserved slot already takes. Blanking the LABEL
+ * alone would have left the slot live and silent-looking, which is the phantom
+ * button this project has recorded twice. `left_label()` in edges.h carries the
+ * matching empty string, so the word and the duty went together.
  *
  * Super+D goes in xterm's modifyOtherKeys form, ESC [ 27 ; 9 ; d ~, because
  * there is no single byte for it and the parser already understands that shape.
@@ -464,7 +477,7 @@ static const char *const s_fkey[COL_N] = {
     "\x1b",                 /* Esc     cancel */
     "\x1b[17~",             /* F6      window switcher */
     "\x1b[27;9;100~",       /* Super+D show desktop */
-    "\x1b[23~",             /* F11     full screen */
+    NULL,                   /* retired: was F11, full screen */
 };
 
 /* The right column, top to bottom: nothing, Left, Right, Up, Down.

@@ -470,7 +470,12 @@ static int utf8_decode_first(const char *s, unsigned *cp)
 static void test_margin_labels(void)
 {
     static const char *const desk_strip[BTN_N] = { "Tab", "Enter", "Ctrl+Q" };
-    static const char *const desk_left[COL_N] = { "F10", "Esc", "F6", "Super+D", "F11" };
+    /* THE FIFTH SLOT IS BLANK, and that is the point of it: F11 was retired, so
+     * the word and the duty went together. The DUTY side is a NULL in touch.c's
+     * s_fkey, which this file cannot see -- but a label here with no key there is
+     * exactly the drift this pairing exists to catch, so if that NULL ever turns
+     * back into a string, the fix is to put a word back here in the same commit. */
+    static const char *const desk_left[COL_N] = { "F10", "Esc", "F6", "Super+D", "" };
     unsigned cp = 0;
     int i;
 
@@ -480,6 +485,11 @@ static void test_margin_labels(void)
         CHECK(strcmp(btn_label(i), desk_strip[i]) == 0);
     for (i = 0; i < COL_N; i++)
         CHECK(strcmp(left_label(i), desk_left[i]) == 0);
+
+    /* The retired slot is blank and not merely missing from the array: an index
+     * past the end also returns "", so this checks the slot itself. */
+    CHECK(left_label(4)[0] == '\0');
+    CHECK(left_label(3)[0] != '\0');
 
     /* The right column is a reserved blank slot and then four arrows. Slot 0
      * being empty is not a defect -- it is the reservation -- so the check is

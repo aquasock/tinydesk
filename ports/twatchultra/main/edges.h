@@ -149,12 +149,29 @@ static inline const char *right_label(int i)
     return i >= 0 && i < COL_N ? labels[i] : "";
 }
 
-/* The left column, top to bottom: the five keys it sends.
+/* The left column, top to bottom: the keys it sends, and one blank slot.
  *
  * The labels name the key, not the action, for the same reason the bottom
  * strip's do -- F10 is what a finger will read, and it is honest about being a
  * key. They are stood on end, which is the only way they fit: this column is
  * 41 px across inside its border and "Super+D" is 56 px wide.
+ *
+ * THE FIFTH SLOT IS BLANK AND INERT FROM NOW ON, and it used to send F11. It was
+ * full screen for the focused window, which stopped meaning anything once every
+ * app began opening maximised (`TD_OPEN_MAXIMIZED`, set in
+ * `project_include.cmake`): a key whose only outcome is that the window grows to
+ * the size it already is. The operator removed it rather than leave a word
+ * advertising a no-op, which is the label/duty disagreement this file exists to
+ * prevent.
+ *
+ * THE BOX STAYS, AND THAT IS THE SAME SHAPE AS THE RIGHT COLUMN'S RESERVED SLOT.
+ * Slot geometry is shared by both columns and by the emulator screens -- 416 rows
+ * over COL_N slots, one formula for the painter and the hit test -- so the
+ * alternative, re-dividing this column into four taller buttons, would mean the
+ * slot height became per-column. That is the sort of change that lets a drawn
+ * button and its touch target drift apart, and `display.c`'s `s_col_n` already
+ * records the house rule for a column that wants fewer buttons: it is a COUNT,
+ * not a height, and the buttons keep the size every other screen gives them.
  *
  * The column has the room the bottom strip does not. Its buttons are 81 to 83
  * rows tall, so a seven-character label needs 56 rows of the 61 between the
@@ -167,7 +184,7 @@ static inline const char *right_label(int i)
  * other side rather than a different arrangement. */
 static inline const char *left_label(int i)
 {
-    static const char *const labels[COL_N] = { "F10", "Esc", "F6", "Super+D", "F11" };
+    static const char *const labels[COL_N] = { "F10", "Esc", "F6", "Super+D", "" };
 
     return i >= 0 && i < COL_N ? labels[i] : "";
 }
@@ -183,9 +200,13 @@ static inline const char *left_label(int i)
  * Enter is exactly the label/duty disagreement this file was built to prevent,
  * so the label has to stop claiming a job it is not doing.
  *
- * The degree circle on the strip is the shape the buttons will take when they
- * are wired to the guest, which is the next cycle's work; showing it now makes
- * the difference between "disabled" and "broken" visible at a glance.
+ * The degree circle on the strip is the shape the buttons take WHEN THEY DRIVE
+ * THE GUEST, which they have done since the bottom strip was wired: a bar press
+ * reaches the pet's own three buttons positionally. It was written as a
+ * placeholder -- "the next cycle's work" -- and the cycle happened, so the
+ * circle is now the control rather than a promise of one. A drawn shape that
+ * does nothing and a drawn shape that does the thing look identical on the
+ * glass, which is why this note says which it is.
  *
  * U+00B0 is written as UTF-8 by hand because the label machinery decodes UTF-8
  * into code points and the font has the glyph at 0x00B0. It is one character
@@ -234,7 +255,7 @@ static inline const char *right_label_app(int i)
     static const char *const labels[COL_N] = {
         "Hold",                 /* the arm: held for a gated button */
         "",                     /* deliberately empty: see above        */
-        "Sound",                /* shows the level; cycles 100..Mute    */
+        "Sound",                /* shows the level; steps Mute..Max     */
         "Speed",                /* shows the rate; cycles 1x/2x/4x      */
         "Pause",                /* shows Resume while paused            */
     };
