@@ -190,6 +190,23 @@ static bool s_prev_valid;
 static char s_shown[SB_KEY_MAX];
 
 /*
+ * AN APP'S CLAIM ON THE WHOLE STRIP.
+ *
+ * ONE SLOT, because there is one strip. The claim is a copy of a short string
+ * rather than a pointer, so the caller's buffer can go away the moment the call
+ * returns -- which matters because the caller is an emulator's guest task and its
+ * buffers are PSRAM it owns.
+ *
+ * THE LOCK IS A SPINLOCK AND NOT A MUTEX because the critical sections are a
+ * memcpy and a flag each; a mutex here would put a scheduler call between the
+ * touch path and the strip for nothing. It is taken from two tasks that never
+ * block while holding it.
+ */
+static char s_app_text[SB_FIELD_MAX];
+static bool s_app_on;
+static portMUX_TYPE s_app_mux = portMUX_INITIALIZER_UNLOCKED;
+
+/*
  * THE TASK'S STACK, IN ONE PLACE, AND ITS HANDLE.
  *
  * The size is used by the create call and reported by `statusbar`, so the
@@ -379,7 +396,7 @@ static void sb_refresh_tz(const td_sysinfo_t *si)
  * and reverted -- the function sits on the taskbar's paint path, and retrying
  * there turned one failed open into an open per tick forever.
  */
-static void sb_build(sb_field_t f[SB_NFIELDS], int64_t *minute_out)
+static int sb_build(sb_field_t f[SB_NFIELDS], int64_t *minute_out)
 {
     const td_sysinfo_t *si = td_sysinfo();
     const td_clock_prefs_t *p = td_clock_prefs();
@@ -391,6 +408,20 @@ static void sb_build(sb_field_t f[SB_NFIELDS], int64_t *minute_out)
 
     f[0].scale = SB_SCALE;
     f[1].scale = SB_SCALE;
+
+    /*
+     * AN APP THAT HAS TAKEN THE STRIP REPLACES THE WHOLE LINE, and this is the
+     * earliest exit on purpose: while an app holds it there is no date to format
+     * and no clock to read, so the work below is not done at all rather than done
+     * and discarded.
+     *
+     * NO MINUTE INDEX IS REPORTED, because a minute is a property of the clock and
+     * the clock is not on this line any more. The string comparison in the task
+     * loop is what repaints, which is what makes an age that changes on its own
+     * schedule -- 4x faster at 4x speed -- visible without a second rule.
+     */
+    if (statusbar_app_text_get(f[0].text, sizeof(f[0].text)))
+        return 1;
 
     sb_refresh_tz(si);
 
@@ -417,16 +448,19 @@ static void sb_build(sb_field_t f[SB_NFIELDS], int64_t *minute_out)
 
     sb_date(f[0].text, sizeof(f[0].text), p, ok, mo, d);
     sb_clock(f[1].text, sizeof(f[1].text), p, ok, h, mi);
+
+    return SB_NFIELDS;
 }
 
-/* Lay the two fields out across the band: widths from the text, every field
- * centred on the band's centre row, the pair centred on the chamfer. */
-static void sb_layout(const sb_field_t f[SB_NFIELDS], int left[SB_NFIELDS],
-                      int top[SB_NFIELDS])
+/* Lay the fields out across the band: widths from the text, every field
+ * centred on the band's centre row, the group centred on the chamfer. `n` is 2
+ * for the date and clock and 1 for an app's claim, which is why it is a
+ * parameter and not SB_NFIELDS. */
+static void sb_layout(const sb_field_t f[], int n, int left[], int top[])
 {
-    int total = SB_GAP * (SB_NFIELDS - 1);
+    int total = SB_GAP * (n - 1);
 
-    for (int i = 0; i < SB_NFIELDS; i++)
+    for (int i = 0; i < n; i++)
     {
         total += (int)strlen(f[i].text) * SB_FONT_W * f[i].scale;
         top[i] = SB_TOP_Y;
@@ -434,7 +468,7 @@ static void sb_layout(const sb_field_t f[SB_NFIELDS], int left[SB_NFIELDS],
 
     int x = SB_GLASS_CX - total / 2;
 
-    for (int i = 0; i < SB_NFIELDS; i++)
+    for (int i = 0; i < n; i++)
     {
         left[i] = x;
         x += (int)strlen(f[i].text) * SB_FONT_W * f[i].scale + SB_GAP;
@@ -486,13 +520,13 @@ static bool sb_ink(int x, int y, const sb_field_t *f, int left, int top)
  * field's, which is at most 224 px against 128 for the widest single field -- 8
  * bands of 4 rows instead of 8 of 8. Once a minute, on a 5.6 MB/s bus.
  */
-static bool sb_paint(const sb_field_t f[SB_NFIELDS], const int left[SB_NFIELDS],
-                     const int top[SB_NFIELDS])
+static bool sb_paint(const sb_field_t f[], int n, const int left[],
+                     const int top[])
 {
     int x0 = left[0], x1 = left[0] + (int)strlen(f[0].text) * SB_FONT_W * f[0].scale - 1;
     int y0 = top[0], y1 = top[0] + SB_FONT_H * f[0].scale - 1;
 
-    for (int i = 1; i < SB_NFIELDS; i++)
+    for (int i = 1; i < n; i++)
     {
         const int l = left[i];
         const int r = l + (int)strlen(f[i].text) * SB_FONT_W * f[i].scale - 1;
@@ -536,7 +570,7 @@ static bool sb_paint(const sb_field_t f[SB_NFIELDS], const int left[SB_NFIELDS],
                 const int x = x0 + c;
                 bool ink = false;
 
-                for (int i = 0; i < SB_NFIELDS; i++)
+                for (int i = 0; i < n; i++)
                 {
                     if (sb_ink(x, y, &f[i], left[i], top[i]))
                     {
@@ -589,7 +623,7 @@ static void sb_task(void *arg)
         int64_t minute = 0;
         char key[SB_KEY_MAX];
 
-        sb_build(f, &minute);
+        const int nf = sb_build(f, &minute);
 
         {
             const uint32_t wm = (uint32_t)uxTaskGetStackHighWaterMark(NULL);
@@ -598,15 +632,20 @@ static void sb_task(void *arg)
                 s_wm_build = wm;
         }
 
-        sb_layout(f, left, top);
+        sb_layout(f, nf, left, top);
 
-        snprintf(key, sizeof(key), "%s|%s", f[0].text, f[1].text);
+        /* THE KEY CARRIES WHICH MODE BUILT IT, so taking the strip and giving it
+         * back repaint even when the text happens to be the same length. */
+        if (nf == 1)
+            snprintf(key, sizeof(key), "app|%s", f[0].text);
+        else
+            snprintf(key, sizeof(key), "%s|%s", f[0].text, f[1].text);
 
         if (minute != last_minute || strcmp(key, s_shown) != 0)
         {
             const int64_t t0 = esp_timer_get_time();
 
-            const bool painted = sb_paint(f, left, top);
+            const bool painted = sb_paint(f, nf, left, top);
 
             {
                 const uint32_t wm = (uint32_t)uxTaskGetStackHighWaterMark(NULL);
@@ -681,20 +720,24 @@ static int cmd_statusbar(tdsh_session_t *session, int argc, char **argv)
     int left[SB_NFIELDS], top[SB_NFIELDS];
     int64_t minute = 0;
 
-    sb_build(f, &minute);
-    sb_layout(f, left, top);
+    const int nf = sb_build(f, &minute);
+    sb_layout(f, nf, left, top);
 
     int64_t us_w = 0, us_x = 0;
     uint32_t dpush = 0;
     display_push_stats(&us_w, &us_x, &dpush);
 
-    printf("date=%s clock=%s\n", f[0].text, f[1].text);
+    if (nf == 1)
+        printf("app='%s' date and clock suppressed\n", f[0].text);
+    else
+        printf("date=%s clock=%s\n", f[0].text, f[1].text);
     printf("utc=%lld tz=%ld have=%d fmt=%d 12h=%d\n",
            (long long)utc, tz, have ? 1 : 0,
            p ? (int)p->date_format : -1, p ? (int)p->clock_12h : -1);
     printf("pushes=%lu ticks=%lu shown='%s'\n",
            (unsigned long)s_pushed, (unsigned long)s_ticks, s_shown);
-    printf("left=%d,%d glass-cx=%d\n", left[0], left[1], SB_GLASS_CX);
+    printf("left=%d,%d glass-cx=%d\n", left[0], nf > 1 ? left[1] : 0,
+           SB_GLASS_CX);
 
     /* What the last paint actually covered, which is the union of the current line
      * and the previous one. This is the number that catches a stale pixel: if it is
@@ -770,6 +813,77 @@ void statusbar_push_stats(uint32_t *pushes, uint32_t *last_ms, int64_t *since_ms
     if (since_ms)
         *since_ms = s_last_push_us ?
                    (esp_timer_get_time() - s_last_push_us) / 1000 : -1;
+}
+
+/*
+ * The claim's two halves, and neither of them paints.
+ *
+ * THE SETTER REFUSES A TEXT IT CANNOT HOLD rather than truncating it: a
+ * truncated age reads as a different age, which is the same reason
+ * tama_age_format() refuses a short buffer. It also returns false so a caller can
+ * tell "the strip is yours" from "the strip did not take it" -- the difference
+ * between an app that knows its number is on the glass and one that does not.
+ *
+ * THE GETTER IS THE STRIP TASK'S ONLY VIEW OF THE CLAIM, and it copies under the
+ * lock so a setter on another core cannot change the bytes mid-copy. A
+ * non-reentrant memcpy out of a buffer another core writes is the kind of fault
+ * that appears once a fortnight as one wrong character.
+ */
+bool statusbar_app_text(const char *text)
+{
+    const size_t n = text ? strlen(text) : 0;
+
+    if (n >= SB_FIELD_MAX)
+        return false;
+
+    portENTER_CRITICAL(&s_app_mux);
+
+    if (n == 0)
+    {
+        s_app_text[0] = '\0';
+        s_app_on = false;
+    }
+    else
+    {
+        memcpy(s_app_text, text, n + 1);
+        s_app_on = true;
+    }
+
+    portEXIT_CRITICAL(&s_app_mux);
+
+    return true;
+}
+
+bool statusbar_app_text_get(char *out, size_t cap)
+{
+    bool on;
+
+    if (!out || cap == 0)
+        return false;
+
+    portENTER_CRITICAL(&s_app_mux);
+
+    on = s_app_on;
+
+    if (on)
+    {
+        const size_t n = strlen(s_app_text);
+
+        if (n >= cap)
+        {
+            /* The strip's field is the same size as the claim's, so this cannot
+             * happen from the setter -- but a caller that asked for less gets no
+             * text rather than half of one. */
+            out[0] = '\0';
+            on = false;
+        }
+        else
+            memcpy(out, s_app_text, n + 1);
+    }
+
+    portEXIT_CRITICAL(&s_app_mux);
+
+    return on;
 }
 
 bool statusbar_start(void)

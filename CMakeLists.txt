@@ -491,6 +491,15 @@ if(TD_BUILD_TESTS)
     target_compile_options(test_tama_ui PRIVATE ${TD_WARNINGS})
     add_test(NAME test_tama_ui COMMAND test_tama_ui)
 
+    # The pet's up time: the formatting arithmetic and the sidecar's 16 bytes.
+    # Both are integer-division edges and a byte layout, which are exactly the
+    # things that go wrong quietly -- a wrong age looks exactly like a right one.
+    add_executable(test_tama_age tests/test_tama_age.c ports/twatchultra/main/tama_age.c)
+    target_include_directories(test_tama_age PRIVATE ports/twatchultra/main)
+    set_target_properties(test_tama_age PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+    target_compile_options(test_tama_age PRIVATE ${TD_WARNINGS})
+    add_test(NAME test_tama_age COMMAND test_tama_age)
+
     # The gamepad decoder, against a real controller's descriptor and reports.
     # The file it tests needs ESP headers, so it is compiled with stub includes
     # that provide only what it references -- which is the point: if the decoder

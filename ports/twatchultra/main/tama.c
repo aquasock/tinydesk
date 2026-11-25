@@ -28,6 +28,7 @@
 #include "tama.h"
 
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -41,6 +42,8 @@
 #include "freertos/task.h"
 #include "sound.h"
 #include "sdpaths.h"
+#include "statusbar.h"
+#include "tama_age.h"
 #include "tama_ui.h"
 #include "touch.h"
 #include "tdsh.h"
@@ -54,11 +57,21 @@ static const char *TAG = "tama";
 #define TAMA_SAVE_PATH  "/sd/saves/tama/tama.sav"
 #define TAMA_SAVE_FLAT  "/sd/tama.sav"
 
+/* The age sidecar, which rides beside the checkpoint. See tama_age.h for why it
+ * cannot live inside it. */
+#define TAMA_AGE_PATH   "/sd/saves/tama/tama.age"
+#define TAMA_AGE_FLAT   "/sd/tama.age"
+
 /* The checkpoint, wherever the card keeps it. Resolved per call rather than
  * cached, because `tama load` may run long after the card was swapped. */
 static const char *save_path(void)
 {
     return sd_media(TAMA_SAVE_PATH, TAMA_SAVE_FLAT);
+}
+
+static const char *age_path(void)
+{
+    return sd_media(TAMA_AGE_PATH, TAMA_AGE_FLAT);
 }
 #define TAMA_REPORT     sd_out("/sd/diag", "tama.txt")
 
@@ -282,6 +295,38 @@ static uint32_t s_saves;
 static uint32_t s_loads;
 static uint32_t s_resets;
 
+/*
+ * THE PET'S UP TIME, AS GUEST SECONDS ACCUMULATED BEFORE THIS MACHINE STARTED.
+ *
+ * The guest's own cycle count is the clock: it is reset to zero by every rebuild
+ * of the machine, whether that rebuild is a Reset or a Load, so it can only ever
+ * measure the CURRENT run. This base carries what earlier runs accumulated, and
+ * the age at any moment is `s_age_base + s_cycles / TMC_CLOCK_HZ`.
+ *
+ * WHY THE BASE AND NOT A TICKING TIMER. A timer that incremented on its own would
+ * need a rule for pause and a rule for the 4x multiplier, and would fall behind
+ * the guest the moment the board could not keep up. Derived from cycles, all
+ * three of those are automatic -- a paused guest is stepped zero times, and a 4x
+ * run advances four times as many cycles per frame -- and the number always
+ * agrees with the pet it describes.
+ *
+ * Set to zero by a Reset, restored from the sidecar by a Load or by any start that
+ * restored the checkpoint, and written only where the checkpoint is written.
+ */
+static uint64_t s_age_base;
+
+/* The whole MINUTE last pushed to the top strip, so the strip is touched once per
+ * guest minute rather than once per frame. A minute and not an hour because the
+ * label carries minutes: an hours-only latch would leave a fresh pet looking
+ * frozen for an hour, which reads as broken on a wrist. UINT64_MAX means
+ * "nothing pushed yet". */
+static uint64_t s_age_shown_min = UINT64_MAX;
+
+/* Defined with the rest of the up-time handling further down, and declared here
+ * because report() needs it and sits above them -- the same shape, and for the
+ * same reason, as the forward declaration of tama_teardown() beside s_torn_down. */
+static uint64_t age_seconds(void);
+
 /* A Reset makes a fresh pet without touching the checkpoint, so quitting after
  * one must not overwrite that checkpoint with the fresh pet -- otherwise the
  * button would silently destroy the very save it was meant to be safe from.
@@ -344,15 +389,24 @@ static void report(const char *what, const char *extra)
      * second, so printing both would invite the wrong inference; the caller
      * can compare this against uptime itself. */
     if (s_m)
-        fprintf(f, "cycles=%llu guest_s=%llu.%03llu paused=%d speed=%dx sound=%d "
-                   "shots=%lu saves=%lu loads=%lu resets=%lu refused=%u beeps=%lu\n",
+    {
+        char age[16];
+
+        if (tama_age_format(age_seconds(), age, sizeof(age)) == 0)
+            snprintf(age, sizeof(age), "?");
+
+        fprintf(f, "cycles=%llu guest_s=%llu.%03llu age_s=%llu age=%s paused=%d "
+                   "speed=%dx sound=%d "
+                "shots=%lu saves=%lu loads=%lu resets=%lu refused=%u beeps=%lu\n",
                 (unsigned long long)cyc,
                 (unsigned long long)(cyc / TMC_CLOCK_HZ),
                 (unsigned long long)((cyc % TMC_CLOCK_HZ) / 1000),
+                (unsigned long long)age_seconds(), age,
                 s_paused ? 1 : 0, s_speed, s_vol[s_vol_i].pct,
                 (unsigned long)s_shots, (unsigned long)s_saves,
                 (unsigned long)s_loads, (unsigned long)s_resets,
                 s_ui.refused, (unsigned long)s_beeps);
+    }
     fclose(f);
 }
 
@@ -592,6 +646,99 @@ static void write_bmp(const char *path)
     fclose(f);
 }
 
+/* --- the pet's up time ---------------------------------------------------- */
+
+/* Guest seconds the pet has been up, including everything accumulated before this
+ * run.
+ *
+ * READ FROM `s_cycles`, NOT FROM `tmc_cycles(s_m)`. That snapshot is the contract
+ * this file already has with the shell, and it is the single value that the 4x
+ * multiplier and a pause both act through -- the loop feeds
+ * `TMC_FRAME_CYCLES * s_speed` and stores what came back. Reading it here means
+ * the age on the strip cannot disagree with the cycle count `tama status` prints,
+ * and it keeps every read of the machine on the guest task. */
+static uint64_t age_seconds(void)
+{
+    return s_age_base + s_cycles / TMC_CLOCK_HZ;
+}
+
+/* The sidecar, if it is there and valid.
+ *
+ * A MISSING FILE IS A FIRST RUN and is silent. A file that is present but does not
+ * parse is REPORTED and starts the count at zero: a stale age paired with a fresh
+ * pet is the one outcome a reader cannot detect, where a count that is obviously
+ * new tells them exactly what happened. */
+static uint64_t age_load(void)
+{
+    uint8_t buf[TAMA_AGE_FILE_BYTES];
+    uint64_t sec = 0;
+    FILE *f = fopen(age_path(), "rb");
+    size_t n;
+
+    if (!f)
+        return 0;
+
+    n = fread(buf, 1, sizeof(buf), f);
+    fclose(f);
+
+    if (!tama_age_unpack(buf, n, &sec))
+    {
+        ESP_LOGW(TAG, "age file unreadable; the count starts at zero");
+        return 0;
+    }
+
+    return sec;
+}
+
+static void age_store(uint64_t sec)
+{
+    uint8_t buf[TAMA_AGE_FILE_BYTES];
+    FILE *f;
+
+    tama_age_pack(sec, buf);
+    f = fopen(age_path(), "wb");
+
+    if (!f)
+    {
+        ESP_LOGW(TAG, "age file could not be written");
+        return;
+    }
+
+    if (fwrite(buf, 1, sizeof(buf), f) != sizeof(buf))
+        ESP_LOGW(TAG, "age file short write");
+
+    fclose(f);
+}
+
+/*
+ * Put the pet's up time on the top strip, and remember which minute is showing.
+ *
+ * CALLED FROM THE GUEST TASK, and that is why the strip has a setter rather than
+ * reading the age for itself: the machine belongs to the guest task, and
+ * `statusbar_app_text()` copies a string under a lock without painting anything.
+ * The strip's own task does the push, so this cannot become the DSP-009 fault of a
+ * second painter taking the panel bus.
+ *
+ * The text is at most eleven characters -- "9999d23h59m" -- for any day count a
+ * wrist will reach, which is inside the strip's twelve-character field. The refusal
+ * below is therefore unreachable in practice and is logged rather than asserted,
+ * because an assertion here would panic a wristwatch over a formatting edge.
+ */
+static void age_publish(void)
+{
+    char text[16];
+
+    const uint64_t sec = age_seconds();
+
+    if (tama_age_format(sec, text, sizeof(text)) == 0)
+        return;
+
+    if (!statusbar_app_text(text))
+        ESP_LOGW(TAG, "strip refused the age text '%s'", text);
+
+    s_age_shown_min = sec / 60;
+}
+
 /* Start the machine over: a fresh guest, optionally seeded from the checkpoint.
  *
  * Rebuilt rather than reset because tmc_core exposes no reset -- and rebuilding
@@ -607,6 +754,8 @@ static bool restart_guest(bool from_save)
     if (tmc_new(s_rom, TMC_ROM_BYTES, s_frame, &fresh) != TMC_OK)
         return false;
 
+    bool restored = false;
+
     if (from_save)
     {
         uint8_t save[TMC_EEPROM_BYTES];
@@ -615,7 +764,10 @@ static bool restart_guest(bool from_save)
         if (f)
         {
             if (fread(save, 1, sizeof(save), f) == sizeof(save))
+            {
                 tmc_eeprom_load(fresh, save, sizeof(save));
+                restored = true;
+            }
             fclose(f);
         }
         else
@@ -626,6 +778,16 @@ static bool restart_guest(bool from_save)
             s_loads--;
         }
     }
+
+    /*
+     * THE AGE TRAVELS WITH THE PET, and `restored` is what makes that literal.
+     *
+     * A Load that found a checkpoint resumes the count; a Load that found nothing,
+     * and every Reset, starts it at zero -- because those paths also leave the pet
+     * fresh. The two are read from separate files but they are decided here by one
+     * flag, so an age can never describe a pet other than the one on the glass.
+     */
+    s_age_base = restored ? age_load() : 0;
 
     tmc_free(s_m);
     s_m = fresh;
@@ -651,6 +813,24 @@ static bool save_checkpoint(void)
     bool ok = fwrite(save, 1, sizeof(save), f) == sizeof(save);
 
     fclose(f);
+
+    /*
+     * THE AGE IS WRITTEN ONLY AFTER THE PET IS, and only if the pet's write
+     * succeeded.
+     *
+     * These are two files and there is no atomic pair, so the rule is an order
+     * rather than a transaction: the checkpoint lands first, and the age follows
+     * it. A failed age write leaves the PREVIOUS age beside the NEW pet, which is
+     * a count that is too short rather than one that describes a pet nobody has --
+     * and it says so in the log.
+     *
+     * The alternative, writing the age first, would leave a longer age against the
+     * older pet on a failed checkpoint, which reads as progress that did not
+     * happen.
+     */
+    if (ok)
+        age_store(age_seconds());
+
     return ok;
 }
 
@@ -930,6 +1110,25 @@ static void tama_task(void *arg)
             s_hold_paint = false;
             paint_column_state();
         }
+
+        /*
+         * THE UP TIME ON THE TOP STRIP, REPUBLISHED WHEN THE GUEST MINUTE ROLLS OVER.
+         *
+         * Above the pause branch for the same reason the hold latch is: the two
+         * branches must not differ about it. It costs nothing while paused -- the
+         * age cannot change, so the test is false -- and it is 4x more frequent at
+         * 4x speed, both of which are consequences of reading the age from cycles
+         * rather than from a wall clock with a multiplier bolted on.
+         *
+         * Once per guest minute and not once per frame because the strip repaints
+         * when its text changes; republishing every frame would rewrite the same
+         * string sixteen times a second for no change on the glass. A minute is the
+         * finest field the label carries, so this is the coarsest latch that still
+         * cannot miss a change -- at 1x it is the same once-a-minute cost the clock
+         * this replaced had.
+         */
+        if (age_seconds() / 60 != s_age_shown_min)
+            age_publish();
 
         if (s_paused)
         {
@@ -1214,13 +1413,23 @@ bool tama_start(const char *rom_path)
     {
         uint8_t save[TMC_EEPROM_BYTES];
         FILE *f = fopen(save_path(), "rb");
+        bool restored = false;
 
         if (f)
         {
             if (fread(save, 1, sizeof(save), f) == sizeof(save))
+            {
                 tmc_eeprom_load(s_m, save, sizeof(save));
+                restored = true;
+            }
             fclose(f);
         }
+
+        /* The age is restored WITH the pet and only with it, on the same rule
+         * restart_guest() applies to a Load. A start that found no checkpoint is a
+         * first boot, so the count starts at zero rather than picking up whatever
+         * sidecar happened to be lying on the card. */
+        s_age_base = restored ? age_load() : 0;
     }
 
     /* Claim BEFORE the first blit, or the painter repaints the cells it still
@@ -1371,6 +1580,14 @@ bool tama_start(const char *rom_path)
 
     paint_column_state();
 
+    /* The strip carries the pet's up time for as long as this app owns the glass,
+     * and it is published HERE rather than on the first frame so the number is on
+     * the glass from the moment the pet appears -- not one frame of the watch's
+     * clock later. A run that was reset shows 0d00h00m; one that resumed a
+     * checkpoint shows where it left off. */
+    s_age_shown_min = UINT64_MAX;
+    age_publish();
+
     /*
      * THE AUDIO STREAM, opened for the life of the run.
      *
@@ -1514,6 +1731,13 @@ static void tama_teardown(void)
     if (!claim_teardown())
         return;
 
+    /* Give the top strip back FIRST, so it starts reverting to the date and clock
+     * while the rest of the teardown runs, and so no exit path can leave the pet's
+     * up time on a watch that is no longer keeping a pet. Exit comes through here
+     * from the guest task and `tama stop` comes through it from the shell, which is
+     * why this is the one place and not two. */
+    (void)statusbar_app_text(NULL);
+
     /*
      * The automatic checkpoint, skipped after a Reset.
      *
@@ -1637,6 +1861,19 @@ static int cmd_tama(tdsh_session_t *session, int argc, char **argv)
             printf("emu=%luus audio=%d beeps=%lu\n",
                    (unsigned long)s_emu_us, s_audio ? 1 : 0,
                    (unsigned long)s_beeps);
+
+            /* The pet's up time, and the base it resumed from -- together they say
+             * whether a number that looks wrong came from this run or from a
+             * checkpoint, which is the only question this ever gets asked. */
+            {
+                char age[16];
+
+                if (tama_age_format(age_seconds(), age, sizeof(age)) == 0)
+                    snprintf(age, sizeof(age), "?");
+
+                printf("age=%s base=%llus\n", age,
+                       (unsigned long long)s_age_base);
+            }
         }
         report("status", NULL);
         return 0;
