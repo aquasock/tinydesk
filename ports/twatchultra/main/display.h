@@ -209,6 +209,21 @@ bool display_pixels_claimed(void);
 bool display_fill(uint16_t colour);
 
 /*
+ * Paint the terminal's block cursor on the glass, or leave the cell alone.
+ *
+ * OFF by default, and that is the fix for a long-standing artifact: the render layer
+ * shows and homes the cursor when it leaves a full-screen screen, which leaves
+ * `cursor_visible` true at cell (0,0), and the painter draws the cursor by inverting
+ * the cell's colours -- a solid light block, exactly one character, in the top-left
+ * corner of the framebuffer, that stays there.
+ *
+ * Nothing on this port needs a block cursor: the desktop draws cells and a terminal
+ * window's caret is the shell's own content. Call with true only for a screen that
+ * genuinely wants a text caret.
+ */
+void display_cursor_draw(bool on);
+
+/*
  * What the margin buttons say, and by implication what they do.
  *
  * DESKTOP is the default: the columns carry their key names and the strip

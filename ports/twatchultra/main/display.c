@@ -773,6 +773,34 @@ static bool panel_init(void)
 
 /* ---- painting ---------------------------------------------------------- */
 
+/*
+ * WHETHER THE TERMINAL'S BLOCK CURSOR IS PAINTED ON THE GLASS.
+ *
+ * OFF, and this is a fix rather than a default. The desktop's render layer shows the
+ * cursor and homes it when it leaves a full-screen screen (`ESC[?25h` ... `ESC[H` in
+ * src/render.c and tdsh_nano.c), which leaves `cursor_visible` true at cell (0,0) -- the
+ * top-left of the framebuffer. `paint_cell()` draws the cursor by INVERTING the cell's
+ * colours, so a dark cell with a light foreground becomes a solid light block: white,
+ * exactly one character, in the corner, and permanent, because the paint loop keeps
+ * honouring it once the cursor stops moving.
+ *
+ * That is the artifact the operator reported: "a single solid white block char appears
+ * in the top left corner of the FB when the watch reboots into slot A", present for a
+ * long time and on no other boot path.
+ *
+ * NOTHING ON THIS PORT NEEDS IT. The desktop is a window manager drawing cells; a
+ * terminal window's caret is the shell's own cell content, not this block, and slot B's
+ * screens draw their own furniture. So the cursor cell is left as its content says and
+ * the glass has one fewer artifact. display_cursor_draw(true) restores it if some future
+ * screen wants a text caret.
+ */
+static bool s_cursor_draw;
+
+void display_cursor_draw(bool on)
+{
+    s_cursor_draw = on;
+}
+
 static void paint_cell(int col, int row, td_vcell_t c, bool cursor)
 {
     const uint8_t *glyph = font8x16_glyph(c.ch);
@@ -2381,7 +2409,7 @@ static void paint_task(void *arg)
             {
                 td_vcell_t want;
                 td_vcell_t *have = &s_shown[r * TD_VT_MAX_COLS + c];
-                bool cur = s_vt->cursor_visible &&
+                bool cur = s_cursor_draw && s_vt->cursor_visible &&
                            s_vt->cx == c && s_vt->cy == r;
 
                 want = s_vt->cells[r * TD_VT_MAX_COLS + c];
@@ -3010,7 +3038,7 @@ void display_check_cells(int *fb_bad, int *shown_bad, int *first_col, int *first
             /* What the cell SHOULD look like, byte for byte. The cursor is
              * excluded: it blinks, so its inversion is legitimately not what
              * the grid says at any given instant. */
-            if (s_vt->cursor_visible && s_vt->cx == c && s_vt->cy == r)
+            if (s_cursor_draw && s_vt->cursor_visible && s_vt->cx == c && s_vt->cy == r)
                 continue;
 
             const uint8_t *glyph = font8x16_glyph(want.ch);
