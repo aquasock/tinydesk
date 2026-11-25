@@ -50,9 +50,10 @@ typedef struct
     int n_roots;
 } pk_cfg_t;
 
-/* The two consoles this port emulates. */
+/* The consoles this port emulates. */
 extern const pk_cfg_t pk_gb;
 extern const pk_cfg_t pk_pm;
+extern const pk_cfg_t pk_tama;
 
 /*
  * Scan, draw, and wait for a tap. Writes the chosen cartridge's full path into

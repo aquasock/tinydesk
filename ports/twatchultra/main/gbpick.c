@@ -363,8 +363,9 @@ static void path_up(char *path)
  * exist so a card with only one console does not present an empty branch. */
 /* Game Boy offers BOTH trees, because a card can carry either or both and the
  * firmware decides the machine type from where the cartridge lives. Pokemon Mini
- * has one tree; with a single root the console list is skipped entirely, which
- * the navigator already does. */
+ * and Tamagotchi have one tree each; with a single root the console list is
+ * skipped entirely, which the navigator already does -- so the one-ROM case costs
+ * no extra tap before the row it is there to show. */
 static const pk_root_t k_gb_roots[] = {
     { "Game Boy Color", "/sd/media/gbc" },
     { "Game Boy",       "/sd/media/gb"  },
@@ -374,8 +375,25 @@ static const pk_root_t k_pm_roots[] = {
     { "Pokemon Mini",   "/sd/media/pokemini" },
 };
 
+/* ONE ROM TODAY, and the tree is offered anyway rather than the single file
+ * being hard-coded. The Tamagotchi image is a fixed 512 KiB dump and there is
+ * one of it in the card's default layout, so this table buys nothing yet -- but
+ * it is the same table every other console uses, and the day a second image
+ * lands beside the first it appears in the picker without a code change. A
+ * hard-coded path would have to be taught about it instead.
+ *
+ * `.bin` IS THE ONLY FILTER and it is deliberately as wide as the emulator's own
+ * acceptance: read_rom() takes the first TMC_ROM_BYTES of whatever it is given
+ * and refuses anything shorter, so the firmware decides validity and this list
+ * only decides what is worth offering. `strcasecmp` matches it case-insensitively
+ * so a card that spells a file `.BIN` is not invisible. */
+static const pk_root_t k_tama_roots[] = {
+    { "Tamagotchi",     "/sd/media/tama" },
+};
+
 static const char *const k_gb_exts[] = { ".gbc", ".gb", NULL };
 static const char *const k_pm_exts[] = { ".min", NULL };
+static const char *const k_tama_exts[] = { ".bin", NULL };
 
 const pk_cfg_t pk_gb = {
     .console = "Game Boy",
@@ -389,6 +407,13 @@ const pk_cfg_t pk_pm = {
     .exts    = k_pm_exts,
     .roots   = k_pm_roots,
     .n_roots = (int)(sizeof(k_pm_roots) / sizeof(k_pm_roots[0])),
+};
+
+const pk_cfg_t pk_tama = {
+    .console = "Tamagotchi",
+    .exts    = k_tama_exts,
+    .roots   = k_tama_roots,
+    .n_roots = (int)(sizeof(k_tama_roots) / sizeof(k_tama_roots[0])),
 };
 
 /*

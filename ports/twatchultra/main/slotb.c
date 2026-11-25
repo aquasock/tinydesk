@@ -45,6 +45,7 @@
 #include "gbpick.h"
 #include "nes.h"
 #include "pm.h"
+#include "tama.h"
 #include "haptic.h"
 #include "power.h"
 #include "pwrkey.h"
@@ -446,10 +447,33 @@ static bool slotb_start_pm(const char *rom)
     return pmini_start(s_pm_rom);
 }
 
+/* THE PATH BUFFER IS 256 FOR THE REASON Game Boy's and Pokemon Mini's are: a
+ * bucket directory plus a long ROM name. The Tamagotchi's own default is a short
+ * literal (`/sd/media/tama/rom.bin`), which is exactly the case that HIDES the
+ * problem -- the picker hands over whatever the card holds, and tama.c's internal
+ * copy of this path was 64 bytes until this cycle. */
+static char s_tama_rom[256];
+
+static bool slotb_start_tama(const char *rom)
+{
+    (void)rom;
+
+    /* THE SAME CONFIGURED NAVIGATOR, not a copy of it. The Tamagotchi has one
+     * image on the card today and the tree is offered anyway, so a second one
+     * shows up in the picker without touching this function. */
+    if (!gbpick_run_cfg(&pk_tama, s_tama_rom, sizeof(s_tama_rom), &s_exit_req))
+        return false;
+
+    slotb_record("pick", s_tama_rom);
+
+    return tama_start(s_tama_rom);
+}
+
 static const slotb_app_t s_apps[] = {
-    { "Game Boy Color", "gb",  slotb_start_gb, gb_stop,    gb_running,    gb_last_error },
-    { "NES",            "nes", nes_start,      nes_stop,   nes_running,   NULL },
-    { "Pokemon Mini",   "pm",  slotb_start_pm, pmini_stop, pmini_running, NULL },
+    { "Game Boy Color", "gb",  slotb_start_gb,   gb_stop,     gb_running,     gb_last_error },
+    { "NES",            "nes", nes_start,        nes_stop,    nes_running,    NULL },
+    { "Pokemon Mini",   "pm",  slotb_start_pm,   pmini_stop,  pmini_running,  NULL },
+    { "Tamagotchi V3",  "tama", slotb_start_tama, tama_stop,   tama_running,   NULL },
 };
 
 #define SLOTB_APP_N ((int)(sizeof(s_apps) / sizeof(s_apps[0])))
@@ -707,6 +731,7 @@ static void slotb_run(const char *board_conf)
     gb_install_touch_hook();
     nes_install_touch_hook();
     pm_install_touch_hook();
+    tama_install_touch_hook();
 
     /* Pusher A, armed before the menu so the press can leave slot B from the
      * menu itself. */

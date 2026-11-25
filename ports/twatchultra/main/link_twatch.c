@@ -843,6 +843,7 @@ static void slotb_launch_or_say(const char *key)
 static void launch_slotb_gb(void)  { slotb_launch_or_say("gb"); }
 static void launch_slotb_nes(void) { slotb_launch_or_say("nes"); }
 static void launch_slotb_pm(void)  { slotb_launch_or_say("pm"); }
+static void launch_slotb_tama(void) { slotb_launch_or_say("tama"); }
 
 /*
  * THE ICONS ARE A MOTIF, NOT INITIALS: a filled circle and then a shape.
@@ -855,22 +856,32 @@ static void launch_slotb_pm(void)  { slotb_launch_or_say("pm"); }
  *
  *   ●■  Game Boy Color
  *   ●▲  NES
- *   ●◆  Pokemon Mini
+ *   ●♦  Pokemon Mini
+ *   ●☼  Tamagotchi V3
  *
  * THE PREFIX IS SHARED AND THE SUFFIX IS NOT, which is the point: the circle says
- * "console" for all three, and the shape says which. That is the reason these are not
- * simply three pretty pairs -- a shared motif makes the menu read as one family, and a
- * distinguishing suffix keeps it from reading as one repeated blob.
+ * "console" for every one of them, and the shape says which. That is the reason these
+ * are not simply four pretty pairs -- a shared motif makes the menu read as one family,
+ * and a distinguishing suffix keeps it from reading as one repeated blob.
  *
  * EVERY GLYPH WAS CHECKED AGAINST THE FONT TABLE BEFORE BEING USED HERE. It carries
  * 799 code points; a symbol it lacks renders as nothing at all, which in a menu looks
- * like a formatting fault rather than a missing glyph. U+25A0, U+25B2 and U+2666 are
- * all present, and U+25C6 -- the obvious "diamond" answer -- is NOT, which is why
- * Pokemon Mini gets U+2666.
+ * like a formatting fault rather than a missing glyph. U+25A0, U+25B2, U+2666 and
+ * U+263C are all present, and U+25C6 -- the obvious "diamond" answer -- is NOT, which
+ * is why Pokemon Mini gets U+2666. The same check is why no heart was used for the
+ * Tamagotchi: U+2665 and U+2661 are both absent from the table.
  *
  * TWO FILLED SHAPES SIDE BY SIDE CAN BLOB AT THIS SIZE, so the prefix alternates in
  * kind rather than in weight: a circle then a shape with corners reads as two marks,
  * where two solid squares would read as one smudge.
+ *
+ * THE TAMAGOTCHI TOOK THE ONLY GLYPH THAT IS NOT GEOMETRY, and it had to be checked
+ * rather than chosen: the font has no heart, no star and no hollow circle, so the
+ * obvious answers for a virtual pet were all absent and would have rendered as
+ * exactly nothing. What it does carry is U+263C, and a sun beside a filled circle
+ * is distinct at 8x16 from every suffix already in use (U+25A0, U+25B2, U+2666),
+ * which is the whole requirement. The four suffixes are now square, triangle,
+ * lozenge and rays -- and no two can be confused at this size.
  *
  * THE NAMES ARE SHORT NOW, which the icons made possible: the icon carries the
  * identity, so the text does not have to spell out a console name in a 21-column menu.
@@ -895,6 +906,7 @@ static void launch_slotb_pm(void)  { slotb_launch_or_say("pm"); }
 static const td_app_t s_app_gb  = { "GBC",            launch_slotb_gb,  "\xe2\x97\x8f\xe2\x96\xa0" };  /* U+25CF U+25A0 */
 static const td_app_t s_app_nes = { "NES",            launch_slotb_nes, "\xe2\x97\x8f\xe2\x96\xb2" };  /* U+25CF U+25B2 */
 static const td_app_t s_app_pm  = { "Pok\xc3\xa9Mini",    launch_slotb_pm,  "\xe2\x97\x8f\xe2\x99\xa6" };  /* U+25CF U+2666 */
+static const td_app_t s_app_tama = { "Tama V3",        launch_slotb_tama, "\xe2\x97\x8f\xe2\x98\xbc" };  /* U+25CF U+263C */
 
 void board_apps_register(void)
 {
@@ -906,6 +918,7 @@ void board_apps_register(void)
     td_app_register(&s_app_gb);
     td_app_register(&s_app_nes);
     td_app_register(&s_app_pm);
+    td_app_register(&s_app_tama);
 }
 
 const char *board_platform(void)

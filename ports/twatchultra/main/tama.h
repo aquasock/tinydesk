@@ -50,6 +50,11 @@ bool tama_running(void);
  * other. */
 bool tama_register_command(void);
 
+/* The touch consumer alone, without the shell command: slot B has no shell but
+ * still needs the strip's bars to reach the guest. Additive and safe to call
+ * once per process; the handler declines while the emulator is not running. */
+void tama_install_touch_hook(void);
+
 /* How many of the strip's three bars map to the guest, left to right. */
 #define TAMA_BTN_N 3
 

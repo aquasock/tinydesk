@@ -185,7 +185,14 @@ static QueueHandle_t s_btn_q;
 static volatile bool s_accept_input;   /* false between stop and start */
 static uint32_t s_presses;             /* accepted presses, for the report */
 static uint32_t s_btn_drops;           /* events the queue would not take */
-static char s_rom_path[64] = TAMA_ROM_DEFAULT;
+/* Where the ROM path is kept for the life of the process. 256, NOT THE 64 THIS
+ * USED TO BE: the shell command passes a literal, but the picker hands over a
+ * full card path, and a bucket directory plus a ROM name runs well past 64. The
+ * old size would have TRUNCATED SILENTLY -- strncpy below caps and NUL-terminates,
+ * so the result is a well-formed path to the wrong file, which reads as "no ROM"
+ * and would have been blamed on the card. Game Boy's picker paid for exactly this
+ * with a 96-byte buffer; the new size matches gb.c's and pm.c's s_state_path. */
+static char s_rom_path[256] = TAMA_ROM_DEFAULT;
 
 /* --- the app's own controls ----------------------------------------------
  *
@@ -1646,14 +1653,26 @@ static const tdsh_command_t s_tama_cmd = {
     TDSH_CMD_INTERACTIVE,
 };
 
+/* The touch consumer without the shell command; see pm_install_touch_hook().
+ *
+ * SLOT B HAS NO SHELL, so registering the command there would be the only thing
+ * that happened; what it actually needs is the consumer, which is what turns a
+ * press on the strip's bars into a guest key. Split for the same reason the NES
+ * and Pokemon Mini were split, and additive because the handler declines
+ * everything while the emulator is not running. */
+void tama_install_touch_hook(void)
+{
+    if (!touch_add_app_touch(tama_app_touch, NULL))
+        ESP_LOGW(TAG, "touch consumer table full");
+}
+
 bool tama_register_command(void)
 {
     /* Registered for the life of the process, not per run: see touch.h. The
      * handler declines everything while the emulator is not running, which is
      * the same behaviour as being unregistered, without a window in which the
      * driver holds a pointer to something that has gone away. */
-    if (!touch_add_app_touch(tama_app_touch, NULL))
-        ESP_LOGW(TAG, "touch consumer table full");
+    tama_install_touch_hook();
 
     return tdsh_register_command(&s_tama_cmd) == 0;
 }
