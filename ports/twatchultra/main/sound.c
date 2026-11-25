@@ -746,12 +746,20 @@ static volatile bool s_vol_label_dirty;
  * WHETHER THE ON-GLASS CONTROL GOVERNS THIS STREAM AT ALL.
  *
  * The button is drawn on slot B's three emulators, and it must not reach an
- * emulator that has no such button -- the Tamagotchi keeps its own Sound toggle
- * from the desktop, and if it inherited a Mute it could not undo there would be no
- * way to get sound back on the watch without launching slot B first. So an
+ * emulator that has no such button -- one that inherited a Mute it could not undo
+ * would leave no way to get sound back without launching slot B first. So an
  * emulator that draws the control ENABLES it, and one that does not simply leaves
  * it alone: off means gain is unity, which is exactly the behaviour before this
  * control existed.
+ *
+ * THE TAMAGOTCHI NOW ENABLES IT TOO, and that is a correction rather than a new
+ * exception. This paragraph used to cite the Tamagotchi as the reason the flag
+ * existed at all -- "it keeps its own Sound toggle from the desktop". That stopped
+ * being true in entry 26, which gave it a Sound button on the glass's right column.
+ * It went on carrying a private five-position stepper that started at FULL volume
+ * and cycled 100/75/50/25/Mute: the same idea, implemented twice, running in the
+ * opposite direction from this one. There is nothing left to protect it from, since
+ * a button it can press is what makes a mute undoable.
  *
  * SOUND_STREAM_CLOSE() CLEARS IT, so the lifetime is the stream's rather than a
  * rule every emulator has to remember on its way out. Every emulator in the port
@@ -790,9 +798,25 @@ bool sound_volume_cycle_on_press(bool held)
     if (!edge)
         return false;
 
+    sound_volume_step();
+    return true;
+}
+
+void sound_volume_step(void)
+{
     s_vol_ix = (s_vol_ix + 1) % VOL_N;
     s_vol_label_dirty = true;
-    return true;
+}
+
+bool sound_volume_muted(void)
+{
+    /* BOTH TERMS MATTER. A control that does not govern this stream leaves the gain
+     * at unity, so the output is audible even though the position reads Mute -- and
+     * a caller that used the position alone would skip rendering and write a stale
+     * buffer to a stream that is about to play it. Answering the question the caller
+     * actually asks -- "will this come out silent" -- is what makes the answer safe
+     * to act on. */
+    return s_vol_applies && s_vol_ix == 0;
 }
 
 bool sound_volume_take_label_change(void)

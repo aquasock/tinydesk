@@ -18,4 +18,4 @@
 # leaving the loader to catch it on the board.
 inst=0x42ae0000
 data=0x3cce0000
-app=3125264
+app=3125072

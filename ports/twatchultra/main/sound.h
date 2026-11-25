@@ -135,6 +135,26 @@ const char *sound_volume_label(void);
 /* The position, 0 (Mute) to 4 (Max), for a status line. */
 int sound_volume_index(void);
 
+/* True when the control is at Mute, so a caller can skip rendering audio that
+ * would come out silent. This is the one question the Tamagotchi needs in order to
+ * keep its own optimisation: a muted guest is stepped with no rendering at all,
+ * because muting must not change how fast the pet runs. */
+bool sound_volume_muted(void);
+
+/*
+ * One step, unconditionally, wrapping from Max back to Mute.
+ *
+ * THE EDGE-DETECTING VERSION BELOW IS FOR A RAW TOUCH POINT; this one is for a
+ * caller that has ALREADY decided a press happened. The Tamagotchi is exactly that
+ * caller: its margin buttons go through `tama_ui_update()`, which fires on press
+ * edges, and then through a queue the guest task drains (EMU-019). Letting it call
+ * the `held` form would make the volume depend on whether the touch task had seen
+ * the same finger on this report -- a coupling neither file wants.
+ *
+ * Mute is position 0 and the wrap target, so a freshly reset control is silent and
+ * five presses bring it back to silence. */
+void sound_volume_step(void);
+
 /*
  * One press, one step. `held` is whether the glass is under a finger on this
  * frame; the step happens on the transition from not-held to held and nowhere

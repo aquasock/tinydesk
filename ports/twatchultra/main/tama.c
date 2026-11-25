@@ -231,59 +231,33 @@ static volatile bool s_paused;
 static volatile bool s_hold;
 static volatile bool s_hold_paint;
 static volatile int s_speed = 1;         /* 1, 2 or 4 -- a guest-cycle multiplier */
+
 /*
- * THE SOUND BUTTON CYCLES A VOLUME, not a mute toggle.
+ * THE SOUND BUTTON IS THE SHARED ONE, and this file no longer has a volume of its
+ * own.
  *
- * 100 -> 75 -> 50 -> 25 -> Mute -> 100. The percentages are of the CONTROL'S
- * TRAVEL, which is what a volume knob's numbers mean, and NOT the amplitude:
- * dividing the samples by the percentage is what made the steps uneven.
+ * It used to. `s_vol[]` here was a five-position stepper -- 100, 75, 50, 25, Mute --
+ * starting at FULL volume, with a -4 dB taper and its own gain multiply in the
+ * audio path. `sound.c` has a five-position stepper too: Mute, 25, 50, 75, Max,
+ * starting MUTED, with a cubic taper (AUD-001), and it is what Game Boy, NES and
+ * Pokemon Mini all use. Two implementations of one idea, running in opposite
+ * directions, differing in their taper and in which end they start at -- exactly
+ * the duplication this port has already paid for twice, once with a second
+ * cartridge picker and once with a control whose label and duty lived apart.
  *
- * THE EAR IS LOGARITHMIC, AND LINEAR STEPS SOUND WRONG. Scaling the samples
- * linearly gave steps of 2.5 dB, 3.5 dB and 6.0 dB -- so 100% and 75% were
- * barely distinguishable, and the drop from 50% to 25% was obvious. Reported on
- * the glass exactly that way, and the arithmetic agrees: 20*log10(0.75) is
- * -2.50 dB against 20*log10(0.50) at -6.02. The steps are equal in amplitude and
- * nothing like equal in loudness.
+ * THE DIRECTION IS THE OPERATOR'S CORRECTION, and it is also the safer of the two.
+ * Booting at full volume means every launch of a pet makes a noise at whatever the
+ * speaker's last setting was; booting muted means silence until someone asks. The
+ * shared control also steps UPWARD, so each press is louder until Max wraps round
+ * to Mute, which is what a volume button is expected to do.
  *
- * So each step is a fixed 4 dB instead, and the amplitude follows from that. The
- * gain column is 10^(dB/20) in thousandths: 1.000, 0.631, 0.398, 0.251. Integer
- * thousandths keep the hot loop as one multiply and divide, and the ratios
- * between adjacent steps are all 0.631, so every press sounds like the same
- * change.
- *
- * MUTE IS NOT A dB STEP. It is silence, which has no finite ratio to the step
- * above it, so it is the last entry in the cycle rather than a fifth level.
- *
- * THE LABEL SHOWS THE CURRENT LEVEL, not the next one. Speed shows the rate a
- * press will select because a rate is momentary and the button's only meaning is
- * "change it"; a volume is a standing property of what you are hearing, and a
- * label reading "75%" while the watch is plainly at full volume would be the
- * label/duty split this project has removed twice already.
+ * WHAT THIS FILE STILL OWNS is the decision to skip rendering while muted. That is
+ * a Tamagotchi-specific optimisation -- the guest must be stepped either way, and
+ * running `tmc_run_audio()` to fill a buffer that would be multiplied by zero costs
+ * the frame budget for nothing -- so it asks `sound_volume_muted()` rather than
+ * carrying a gain it applies itself. The gain itself now belongs to
+ * `sound_stream_write()`.
  */
-static const struct { uint8_t pct; uint16_t gain; const char *label; }
-    s_vol[] = {
-        { 100, 1000, "100%" },   /*   0 dB */
-        {  75,  631,  "75%" },    /*  -4 dB */
-        {  50,  398,  "50%" },    /*  -8 dB */
-        {  25,  251,  "25%" },    /* -12 dB */
-        {   0,    0, "Mute" },
-    };
-
-#define S_VOL_N ((int)(sizeof(s_vol) / sizeof(s_vol[0])))
-
-/* Index into s_vol. Volatile because the shell reads it while the guest task
- * writes it, and an aligned int is atomic on this core. */
-static volatile int s_vol_i;
-
-static int vol_gain(void)
-{
-    int i = s_vol_i;
-
-    if (i < 0 || i >= S_VOL_N)
-        i = 0;
-
-    return s_vol[i].gain;      /* thousandths; 0 is mute */
-}
 static uint32_t s_shots;
 
 /* The guest's cycle count as of the last frame, so the shell can report
@@ -396,13 +370,13 @@ static void report(const char *what, const char *extra)
             snprintf(age, sizeof(age), "?");
 
         fprintf(f, "cycles=%llu guest_s=%llu.%03llu age_s=%llu age=%s paused=%d "
-                   "speed=%dx sound=%d "
+                   "speed=%dx sound=%s "
                 "shots=%lu saves=%lu loads=%lu resets=%lu refused=%u beeps=%lu\n",
                 (unsigned long long)cyc,
                 (unsigned long long)(cyc / TMC_CLOCK_HZ),
                 (unsigned long long)((cyc % TMC_CLOCK_HZ) / 1000),
                 (unsigned long long)age_seconds(), age,
-                s_paused ? 1 : 0, s_speed, s_vol[s_vol_i].pct,
+                s_paused ? 1 : 0, s_speed, sound_volume_label(),
                 (unsigned long)s_shots, (unsigned long)s_saves,
                 (unsigned long)s_loads, (unsigned long)s_resets,
                 s_ui.refused, (unsigned long)s_beeps);
@@ -876,22 +850,17 @@ static bool save_checkpoint(void)
  */
 static void paint_column_state(void)
 {
+    /*
+     * SOUND READS THE CURRENT LEVEL, which the shared control already reports: its
+     * label is the position the control is AT, not the one a press would select.
+     * That is the distinction this column's own comment used to make, and it still
+     * holds -- a volume is a standing property of what you are hearing, where Speed
+     * shows the rate it will select because a rate is momentary.
+     */
     char rate[8];
     const bool held = s_hold;
 
     snprintf(rate, sizeof(rate), "%dx", s_speed);
-
-    /*
-     * SOUND READS THE CURRENT LEVEL rather than naming itself. A volume is a
-     * standing property of what you are hearing, so showing what it IS beats
-     * showing what the next press would select -- see s_vol[] for why that
-     * differs from Speed, whose label shows the rate it will select because a
-     * rate is momentary and the button's only meaning is "change it".
-     */
-    int vi = s_vol_i;
-
-    if (vi < 0 || vi >= S_VOL_N)
-        vi = 0;
 
     const char *left[COL_N] = {
         held ? "Save" : " ",
@@ -903,7 +872,7 @@ static void paint_column_state(void)
     const char *right[COL_N] = {
         "Hold",
         " ",
-        s_vol[vi].label,
+        sound_volume_label(),
         rate,
         s_paused ? "Resume" : "Pause",
     };
@@ -925,14 +894,18 @@ static void apply_action(tama_act_t act)
         break;
 
     case TAMA_ACT_SOUND:
-        {   /* 100 -> 75 -> 50 -> 25 -> Mute -> 100. */
-            int i = s_vol_i + 1;
-
-            if (i >= S_VOL_N)
-                i = 0;
-
-            s_vol_i = i;
-        }
+        /*
+         * ONE STEP UP, WRAPPING FROM MAX TO MUTE -- the shared control's own step,
+         * not a cycle index kept here. Mute, 25, 50, 75, Max, and a press from Max
+         * is silence again.
+         *
+         * THE LABEL IS REPAINTED BY THE TAIL OF THIS FUNCTION, so no latch is
+         * needed on this path: `apply_action()` ends in `paint_column_state()`, and
+         * this runs on the guest task, which is the task allowed to paint. That is
+         * the same reason the shared control's `sound_volume_take_label_change()`
+         * exists for slot B's three -- they have no equivalent tail to hang it off.
+         */
+        sound_volume_step();
         break;
 
     case TAMA_ACT_SHOT:
@@ -1182,25 +1155,26 @@ static void tama_task(void *arg)
          *
          * Muted, the guest is stepped with no rendering at all -- muting must not
          * change how fast the pet runs, and `tmc_run` reaches the same target.
+         *
+         * NO GAIN IS APPLIED HERE ANY MORE. `sound_stream_write()` multiplies by the
+         * shared control's Q16 gain, which is enabled for this stream by
+         * `sound_volume_apply(true)` in `tama_start()`. Scaling again here would
+         * square it -- Max would stay correct and every step below it would be too
+         * quiet, which is the kind of fault that sounds plausible until it is
+         * measured against the other three emulators.
          */
-        const int gain = vol_gain();      /* thousandths, 0 = mute */
+        const bool muted = sound_volume_muted();
 
-        if (s_audio && gain > 0)
+        if (s_audio && !muted)
         {
             int nonzero = 0;
 
             tmc_run_audio(s_m, total, s_pcm, samples);
 
-            /* SCALE, DON'T SILENCE. The waveform and its pitch come from the
-             * guest's own timer registers, so attenuating the samples preserves
-             * both and only changes loudness. The gain is the equal-dB taper in
-             * thousandths -- see s_vol[] for why it is not the percentage. */
-            if (gain != 1000)
-            {
-                for (int i = 0; i < samples; i++)
-                    s_pcm[i] = (int16_t)(((int32_t)s_pcm[i] * gain) / 1000);
-            }
-
+            /* THE WAVEFORM AND ITS PITCH come from the guest's own timer registers,
+             * so attenuating the samples preserves both and only changes loudness.
+             * That attenuation now happens downstream, in the one funnel every
+             * emulator's audio passes through. */
             for (int i = 0; i < samples; i++)
                 if (s_pcm[i])
                     nonzero++;
@@ -1571,7 +1545,22 @@ bool tama_start(const char *rom_path)
     s_hold = false;
     s_hold_paint = false;
     s_speed = 1;
-    s_vol_i = 0;            /* full volume on every start */
+    /*
+     * THE VOLUME STARTS MUTED, on the shared control's own reset, and this stream
+     * is put under that control's charge. Both calls are what Game Boy, NES and
+     * Pokemon Mini do when they open their streams.
+     *
+     * MUTED AND NOT MAXIMUM, which is the operator's correction: a pet launched at
+     * full volume makes a noise at whatever the speaker was last left at, and on a
+     * wrist with no obvious way to find the button that is worse than silence. The
+     * button ramps upward from here, so sound is one press away.
+     *
+     * THE RESET MUST COME BEFORE `paint_column_state()` below, or the column would
+     * be painted from the previous session's position and the label would lie for a
+     * frame.
+     */
+    sound_volume_reset();
+    sound_volume_apply(true);
     s_shots = s_saves = s_loads = s_resets = 0;
     s_beeps = 0;
     s_cycles = 0;
@@ -1853,7 +1842,7 @@ static int cmd_tama(tdsh_session_t *session, int argc, char **argv)
                    (unsigned long long)cyc,
                    (unsigned long long)(cyc / TMC_CLOCK_HZ),
                    (unsigned long long)((cyc % TMC_CLOCK_HZ) / 1000),
-                   s_paused ? 1 : 0, s_speed, s_vol_i == S_VOL_N - 1 ? "mute" : "on");
+                   s_paused ? 1 : 0, s_speed, sound_volume_label());
 
             /* The guest step, with audio on and slicing at one sample period.
              * A 16 Hz frame budget is 62,500 us, so this is the number that says
