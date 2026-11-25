@@ -123,19 +123,210 @@ writes whichever slot is not running, so an image has to fit the smaller of the
 two; 3 MB against 3008 KB meant the budget was 3008 KB while the table looked
 like it promised 3 MB.
 
-**NVS is 64 KB because 24 KB ran out of headroom.** Measured on the hardware in
-November 2026: the old 24 KB region had five of its six pages full or active,
-420 of 756 entry slots used and page sequence numbers of 66/100/101/102, so
-garbage collection never stopped. What happens at the end of that is silent —
-`nvs_flash_init()` returns `ESP_ERR_NVS_NO_FREE_PAGES` and `app_main()` answers
-with `nvs_flash_erase()`, which deletes every account, saved network and
-Bluetooth bond without saying anything. The TinyDesk author flagged this on
-issue 20; every other ESP32 port here already gave NVS 64 KB.
+**Nothing above 0xC00000 moves**, so the four regions are independent: an app
+slot can be re-flashed, or `storage` resized, without touching `modules` and
+`moddata` or relinking a codec blob. Within region 1 the bootloader, the
+partition table, NVS and `phy_init` all sit below 0x20000, which is why `ota_0`
+starts there rather than at 0x10000.
 
-**Nothing above 0x600000 moves between layouts**, so changing the two app slots
-and NVS costs no littlefs migration and no module relink. The 24 KB at
-0x1A000-0x20000 is deliberately unused: two 3008 KB slots that end on the
-coredump boundary must start at 0x20000 and 0x310000.
+**The 24 KB at 0x1A000-0x20000 IS NOT UNUSED, and `partitions.csv` still says it
+is.** The table calls it deliberate padding that puts `ota_0` on a 64 KB
+boundary, and it is that -- but slot B writes its stage trail at 0x1A000 and its
+launch record at 0x1B000, both in the same range. The conflict is real and known:
+both writes are instruments kept for diagnosing a personality with no console,
+both are on the decision log's removal list, and a future cleanup has to decide
+whether the padding is a boundary or a scratch area rather than claiming both.
+
+## Slot B — a second personality from the same image
+
+**The same app image is flashed into BOTH OTA slots.** Which slot the bootloader
+picked decides which personality runs, and nothing else does:
+
+```
+ota_0   the desktop. board_startup_override() returns false and app_main()
+        carries on exactly as it always has.
+ota_1   slot B. A bare emulator personality -- the three emulators and the
+        display, touch, audio and card drivers they need. No desktop, no shell,
+        no WiFi, no SSH. The littlefs at `/` is never mounted.
+```
+
+**One image and two boot paths, not a second firmware.** A separate build forked
+from this one would carry its own copy of `display.c`, and that file is where this
+port's hardest-won panel defects live -- so the two copies would have to be kept in
+step by hand, which is the exact drift `scripts/tamacore-sync.sh` exists to police
+for another file. It would also need a second `sdkconfig`, and TOL-008 records
+what a regenerated `sdkconfig` silently does to this board. A second boot path in
+one binary costs flash and nothing else: the image is 3.0 MB against a 3968 KB
+slot, so ~900 KB is free either way. What slot B saves is **runtime** -- no
+`esp_wifi_init()` (41,500 bytes of internal DMA-capable RAM, SOC-005), no wolfSSH
+heap floor, no littlefs mount, no desktop painter and no shell stacks competing
+with the emulator for a core.
+
+### How it is entered
+
+Three paths, all ending in the same place:
+
+- **The Start menu.** `●■ GBC`, `●♦ PokéMini` and `●☼ Tama V3` are native apps
+  registered in `board_apps_register()` that call `slotb_launch(key)`. That
+  writes the key to NVS, sets `ota_1` as the boot partition, claims the pixels,
+  blacks the panel and restarts -- so the wearer sees black and then a game, not
+  a reboot.
+- **`slotb play <key>`** from a shell, which is the same switch, and
+  **`slotb start`**, which clears the key and gives slot B's own menu.
+- **`ota rollback` works too**, but it is not what the port uses: "rollback"
+  means "the other slot", which is true only by accident, and it has a branch
+  that marks the running image invalid when it is pending verification -- not
+  what someone who wants to play a game is asking for.
+
+**A shortcut boots straight into its app and never shows the menu.** The key is
+read once and erased, so it is a one-shot instruction; leaving it set would make
+every later entry start that app. If the cartridge then fails to load, the path
+goes back to the desktop rather than falling through to the menu -- a wearer who
+tapped "Game Boy Color" and picked a cartridge should not be shown a choice they
+have already made.
+
+### What is in it
+
+The menu is drawn by `gbpick_list_run()` -- the same list renderer the cartridge
+picker uses, so it gets the same paging, touch and margin behaviour for free.
+Three apps, in this order:
+
+```
+Game Boy Color   pk_gb     the navigator wrapper, then gb_start()
+Pokemon Mini     pk_pm     .min under /sd/media/pokemini
+Tamagotchi V3    pk_tama   .bin under /sd/media/tama
+```
+
+**Each app is a row in `s_apps[]` and nothing else.** A row is what the menu
+draws AND what `slotb play <key>` resolves through, so an app there cannot be
+launchable-but-invisible or visible-but-unlaunchable -- and removing a row
+changes two menus at once, deliberately. Each app's touch consumer is installed
+once at start-up (`gb_install_touch_hook()` and its three siblings) and declines
+unless it is the one running, which is what lets the menu hand the glass between
+apps without touching the drivers again.
+
+**Every path buffer is 256 bytes** (`s_gb_rom`, `s_pm_rom`, `s_tama_rom`). A
+bucket directory plus a long cartridge name runs past 130, and a shorter buffer
+fails *silently*: `strncpy` caps and NUL-terminates, producing a well-formed path
+to the wrong file, which reads as "no ROM" and gets blamed on the card.
+
+**Each start records the path the picker handed over** (`slotb_record("pick", ...)`)
+*before* the emulator can refuse it, so a later "did not start" can be told apart
+from a picker that built the wrong path.
+
+### Peripheral bring-up, and the order that matters
+
+`slotb_run()` re-raises everything `app_main()` would have raised after the
+override returned, because slot B never returns to it:
+
+```
+board_power_rails_preinit()   SD rail (ALDO1), IMU rail, NFC/LoRa/SD CS parked high
+tdsh_board_load()             board.conf, because the shell that loads it is absent
+display_boot_pattern()        from board.conf, default off
+display_init()                SPI2, the CO5300 init table, panel_fill(), paint task
+display_pixels_claim(true)    take the glass from the painter display_init() began
+statusbar_clock_present(false); statusbar_start()      the top strip
+slotb_peripherals():          board_display_power_on()   PMU rail, then XL9555 P07
+                              board_touch_reset_release()  P08, in reset until now
+                              touch_init()                 the poll task
+                              board_haptic_power_on(); haptic_init()
+                              charge_watch_enable()
+tdsh_sdcard_mount()           the card
+gb/pm/tama_install_touch_hook()  one per app; each declines if not running
+pwrkey_init(); pwrkey_set_app_key()   Pusher A
+```
+
+**THE ORDER ABOVE IS WHAT THE CODE DOES, AND IT DISAGREES WITH ITS OWN COMMENT.**
+`slotb_peripherals()` documents its list as "the panel's rail and its expander
+switch before `display_init()` touches the bus, or the driver drives a dark
+panel" -- but `display_init()` is called in `slotb_run()` before
+`slotb_peripherals()` runs at all, so the rail is raised *after* the panel driver
+has started. The same comment admits why it works anyway: the XL9555's CONFIG and
+LATCH registers survive an MCU reset, so a warm reboot leaves P07 driving the
+panel on. On a cold boot every expander pin is an input, and the comment says so
+in as many words -- the panel coming up was "luck as well as the rail being set".
+This is written down here rather than silently reordered because it is a latent
+cold-boot fault, not a documentation preference, and moving the call is a hardware
+change that wants a test on a genuinely cold board.
+
+**The first run of this module had dead touch, dead haptics and a dead Pusher A
+while picture, audio and emulation were perfect**, and the cause was one mistake
+repeated: it registered hooks into drivers whose tasks had never been started.
+`touch_add_app_touch()` and `pwrkey_set_app_key()` install a consumer into an
+existing poll loop; the loop is created by `touch_init()` and `pwrkey_init()`,
+which only the desktop's `link_init()` was calling. Audio escaped because
+`sound_stream_open()` calls `sound_init()` itself. **Registering a hook is not
+starting a task.**
+
+### How it is left
+
+**Pusher A.** The press only raises a flag; the boot task then calls the app's
+`stop()`, which writes SRAM and waits for its own tasks to leave, and only then
+returns to the desktop. Doing the stop on the key task instead would reboot on
+top of the save it had just started. That is why slot B installs its own key hook
+rather than `gb.c`'s.
+
+**Where "back" goes depends on where the wearer came from**, and that is a
+parameter rather than a remembered local -- the previous version kept it in a
+local that one path lost, which is how tapping "Game Boy Color" and picking a
+cartridge ended up at the app menu. From a shortcut, every way out is the
+desktop. From the menu, backing out of a game returns to the menu, so changing
+games costs a tap and not a boot.
+
+**Leaving erases `otadata` rather than pointing it at `ota_0`,** and the reason
+is rollback protection. With `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` on, writing
+a fresh `ota_0` entry makes it PENDING_VERIFY on the next boot; reset inside the
+30-second trial and the bootloader sees an unconfirmed image, marks it ABORTED
+and falls back to the other valid one -- which after a game session is slot B.
+Landing in the emulator when you meant to be at the desktop is correct firmware
+behaviour and bad user experience, and a wearer putting the watch down after a
+game is exactly the person who power cycles within 30 seconds. With `otadata`
+erased there is no second valid image for a rollback to choose, measured: a reset
+at t=12 s still came up on the desktop. The cost is that `ota status` reports no
+sequence number afterwards -- a report, not a behaviour.
+
+**A broken slot B cannot brick the watch** for the same reason. `slotb_confirm()`
+cancels the rollback and is called from exactly one place: inside `slotb_app_go()`
+once an app has actually started. So a slot B that dies before that -- on the way
+up, or sitting on its own menu -- is rolled back to the desktop by the bootloader
+on the next reset.
+
+### What it does not have
+
+**No console and no log.** `CONFIG_ESP_CONSOLE_NONE` is set for the whole image,
+and a picture owning the panel kills the USB mirror anyway (DSP-003). A hard hang
+writes no coredump -- measured on the first run of this module, where the
+coredump partition read back empty while the desktop returned.
+
+**Two instruments exist for exactly that**, both read from a host with a
+four-second `esptool read_flash`, and both on the decision log's removal list:
+
+```
+0x1A000  stage trail   magic "SLBS", one 4 KB sector, rewritten at each stage.
+                       A value with no later stage after it is the only thing
+                       that tells "stopped here" from "never started".
+0x1B000  launch record magic "SBRC", {uptime_ms, why[48], path[256]}. Written
+                       once per launch and once per failure -- for the one error
+                       the glass cannot carry, because "cannot open the
+                       cartridge" is 26 characters and the path that decides the
+                       answer is 40 to 130 against a 38-character row.
+```
+
+**It does start the status strip**, which it did not until recently. The strip's
+task lives in `statusbar_start()` inside `link_init()`, and `slotb_run()` runs
+before `link_init()` is ever reached -- so for many cycles the top 44 rows were
+simply dark in the personality that runs the emulators. It is started here, after
+`display_init()` (whose `panel_fill()` would wipe it), with
+`statusbar_clock_present(false)` because slot B never reaches `fill_sysinfo()`
+and has no clock: with nothing claiming it the strip stays blank rather than
+painting `--/--` placeholders, and the Tamagotchi claims it for its up-time
+counter.
+
+**No WiFi, no SSH, no shell, and no `board.conf` from the card.** Slot B takes the
+built-in `board.conf` text that `app_main()` passes down, because the device copy
+at `/etc/board.conf` lives on the littlefs the shell would have mounted. The one
+setting that still works from there is `lcd.boot_pattern`, which is why the boot
+bands are diagnosed identically on both personalities.
 
 ## Wiring
 
