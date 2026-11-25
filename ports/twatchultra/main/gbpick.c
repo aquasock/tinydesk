@@ -101,7 +101,32 @@ static bool s_registered;
  * report. A release arrives as a frame with no points, which clears all of it.
  */
 static bool s_prev_up, s_prev_down, s_prev_enter, s_prev_back;
+static bool s_prev_pgup, s_prev_pgdn;
 static int s_prev_row = -1;
+
+/*
+ * THE RIGHT COLUMN, BY NAME: two page buttons above the two arrows.
+ *
+ * PgUp and PgDn move the highlight by a whole screen; the arrows move it by one row.
+ * They sit directly above the arrows because that is a pair above a pair, so the
+ * column reads page-up, page-down, up, down from the top.
+ *
+ * WHY THEY SAY "PgUp" AND "PgDn" RATHER THAN "Pg" AND AN ARROW GLYPH, which is the
+ * obvious way to write it: THIS COLUMN ROTATES ITS LABELS. `label_is_glyph()` exempts
+ * a label from the rotation only when it is EXACTLY ONE multibyte character, so a
+ * mixed string like "Pg" plus U+2191 is rotated with everything else -- and rotating
+ * an arrow does not stand it on end, it turns it into a different arrow. The table in
+ * display.c measured this: a transposed U+2191 comes out pointing LEFT. So a page
+ * button written that way would have shown a left arrow, which is worse than a word.
+ *
+ * The words are drawn rotated like every other column label, four characters standing
+ * on end, which is the same treatment "Select" and "Start" get on the Game Boy side.
+ */
+#define SLOT_BLANK 0            /* top: drawn, inert                       */
+#define SLOT_PGUP  1
+#define SLOT_PGDN  2
+#define SLOT_UP    3
+#define SLOT_DOWN  4
 
 /* Whether this run draws the bottom strip's "Up" bar, and where to say so when
  * it is pressed. Only the cartridge navigator has a parent to climb to; the app
@@ -582,16 +607,18 @@ static void setup_margins(bool can_up)
         display_margin_label(0, i, " ");
     }
 
-    for (int i = 0; i <= 2; i++)
-    {
-        display_margin_chrome(1, i, true);
-        display_margin_label(1, i, " ");
-    }
+    display_margin_chrome(1, SLOT_PGUP, true);
+    display_margin_label(1, SLOT_PGUP, "PgUp");
+    display_margin_chrome(1, SLOT_PGDN, true);
+    display_margin_label(1, SLOT_PGDN, "PgDn");
 
-    display_margin_chrome(1, 3, true);
-    display_margin_label(1, 3, "\xe2\x86\x91");   /* U+2191 up   */
-    display_margin_chrome(1, 4, true);
-    display_margin_label(1, 4, "\xe2\x86\x93");   /* U+2193 down */
+    display_margin_chrome(1, SLOT_UP, true);
+    display_margin_label(1, SLOT_UP, "\xe2\x86\x91");   /* U+2191 up   */
+    display_margin_chrome(1, SLOT_DOWN, true);
+    display_margin_label(1, SLOT_DOWN, "\xe2\x86\x93");   /* U+2193 down */
+
+    display_margin_chrome(1, SLOT_BLANK, true);
+    display_margin_label(1, SLOT_BLANK, " ");
 
     display_margin_chrome(2, 0, true);
     display_margin_btn_label(0, " ");
@@ -656,6 +683,7 @@ static bool list_touch(void *user, const touch_frame_t *f)
      * result depend on the order the controller listed the points in, and a
      * frame can carry two fingers. */
     bool up = false, down = false, enter = false, back = false;
+    bool pgup = false, pgdn = false;
     int row = -1;
 
     if (f && f->n > 0)
@@ -664,9 +692,15 @@ static bool list_touch(void *user, const touch_frame_t *f)
         {
             if (f->p[i].region == EDGE_RIGHT)
             {
-                if (f->p[i].index == 3)
+                /* BY NAME, so a slot that moves cannot leave a press on the old
+                 * index sending the arrow it used to be. */
+                if (f->p[i].index == SLOT_PGUP)
+                    pgup = true;
+                else if (f->p[i].index == SLOT_PGDN)
+                    pgdn = true;
+                else if (f->p[i].index == SLOT_UP)
                     up = true;
-                else if (f->p[i].index == 4)
+                else if (f->p[i].index == SLOT_DOWN)
                     down = true;
                 continue;
             }
@@ -703,16 +737,33 @@ static bool list_touch(void *user, const touch_frame_t *f)
     /* RISING EDGES ONLY. A held finger changes nothing after its first report. */
     const bool fire_up = up && !s_prev_up;
     const bool fire_down = down && !s_prev_down;
+    const bool fire_pgup = pgup && !s_prev_pgup;
+    const bool fire_pgdn = pgdn && !s_prev_pgdn;
     const bool fire_enter = enter && !s_prev_enter;
     const bool fire_back = back && !s_prev_back;
     const bool fire_row = row >= 0 && row != s_prev_row;
 
     s_prev_up = up;
     s_prev_down = down;
+    s_prev_pgup = pgup;
+    s_prev_pgdn = pgdn;
     s_prev_enter = enter;
     s_prev_back = back;
     s_prev_row = row;
 
+    /* PAGE BEFORE ROW: if a frame somehow carries both, the coarser move wins and the
+     * single row of an arrow is not silently lost -- a page press is the deliberate one,
+     * and an arrow press that arrives with it is a finger resting on the column. */
+    if (fire_pgup)
+    {
+        move_sel(-PK_ROWS);
+        return true;
+    }
+    if (fire_pgdn)
+    {
+        move_sel(+PK_ROWS);
+        return true;
+    }
     if (fire_up)
     {
         move_sel(-1);
@@ -789,6 +840,7 @@ bool gbpick_list_run(const char *title, const char *const *labels, int n,
     s_sel = (sel_init >= 0 && sel_init < n) ? sel_init : -1;
     s_page = s_sel >= 0 ? s_sel / PK_ROWS : 0;
     s_prev_up = s_prev_down = s_prev_enter = s_prev_back = false;
+    s_prev_pgup = s_prev_pgdn = false;
     s_prev_row = -1;
     snprintf(s_title, sizeof(s_title), "%s", title ? title : "");
 
