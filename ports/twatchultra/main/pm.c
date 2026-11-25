@@ -970,7 +970,22 @@ static uint8_t *load_rom(const char *path, int *out_len)
  * The horizontal inset stays 16, matching the picture's own PM_OX, so the d-pad
  * lines up with the left edge of the game above it.
  */
-#define PM_DPAD_S      168
+/*
+ * THE D-PAD IS THE GAME BOY'S, SIZE AND POSITION BOTH, by the operator's direction
+ * after comparing the two emulators on the glass.
+ *
+ * 148 px on a 168 px pitch, at framebuffer (-1, 298) -- the same numbers as GB_DPAD_S
+ * and GB_DPAD_X/Y. It fits with room to spare because this console's picture is
+ * SHORTER, not because the glass is bigger: Pokemon Mini draws 96x64 at 3x, which is
+ * 192 rows, against the Game Boy's 288. The control band here is therefore 265 rows
+ * against 169, and the Game Boy's layout sits inside it with 5 rows to spare below B.
+ *
+ * THE TOUCH DISC SCALES WITH IT. 94 px, which is the Game Boy's GB_DPAD_HIT_R -- its
+ * drawn half-extent plus a 20 percent reach -- so a thumb has the same target here as
+ * there rather than a larger one that would overlap A and B.
+ */
+#define PM_DPAD_S      148
+#define PM_DPAD_HIT_R  94
 #define PM_DPAD_ARM    (PM_DPAD_S / 3)
 #define PM_DPAD_MLFT   16                                                 /* 16 */
 
@@ -995,13 +1010,9 @@ static uint8_t *load_rom(const char *path, int *out_len)
  * which is panel 472, and the leftmost is framebuffer 6, which is panel 73 --
  * both comfortably on the glass.
  */
-#define PM_DPAD_NUDGE_DOWN  20
-#define PM_DPAD_NUDGE_LEFT  20
-
-#define PM_DPAD_Y      (PM_H * PM_SCALE +                                        \
-                        ((PM_GLASS_BOT - PM_H * PM_SCALE) - PM_DPAD_S) / 2 \
-                        + PM_DPAD_NUDGE_DOWN)                                /* 260 */
-#define PM_DPAD_X      (PM_DPAD_MLFT - PM_DPAD_NUDGE_LEFT)                /* -4 */
+#define PM_DPAD_Y      298    /* the Game Boy's GB_DPAD_Y, by direction */
+#define PM_DPAD_X      (-1)   /* and its GB_DPAD_X: the d-pad's left arm sits one
+                               * column outside the framebuffer, on visible glass */
 
 /* Kept as a name for the circle layout below, which still measures its gap from
  * the d-pad's old relationship rather than from the new margins. */
@@ -1038,7 +1049,7 @@ static uint16_t s_dpad_ink;    /* arrows   -- the buttons' label  */
  *
  * PM_GRID stays 16 because that is the increment `pattern 1` uses, and it is what
  * "one cell" has meant throughout this layout's history -- the cell offsets in
- * s_pad_off[] are still measured in it, so the grid's increment and the layout's
+ * The grid's increment and the layout's
  * unit must not drift apart even while the lines are invisible.
  */
 #define PM_GRID      16
@@ -1238,16 +1249,14 @@ static bool dpad_core(int x, int y)
  * beside the d-pad. `C` is already a margin button on the right. If these are
  * meant to be something else, the label table is the only thing to change.
  */
-/* cos(45 degrees) in 16.16 fixed point, shared by both rotations -- the d-pad's
- * clockwise one and the A/B labels' counter-clockwise one. Exactly representable
- * and identical run to run, which matters because these shapes are rasterised
- * once and any drift would show as a different edge. */
-#define PM_ROT_K     46341
+/* There is no rotation constant any more: the d-pad is upright and the A/B
+ * labels have always been drawn by the shared gamepad label sampler, which needs
+ * no angle. */
 
 /*
  * THE TWO CIRCLES ARE PLACED INDEPENDENTLY, in grid cells.
  *
- * They began as one column -- same x, y separated by PM_PAD_GAP -- which was
+ * They began as one column -- same x, a gap apart -- which was
  * right while they were a pair beside the d-pad. The operator now positions each
  * one separately, and positions them by counting GRID SQUARES on the glass rather
  * than in pixels, because the grid is the coordinate system a person can actually
@@ -1264,16 +1273,36 @@ static bool dpad_core(int x, int y)
  * 0 and 1 everywhere -- in the label table, in pad_inside(), in pad_cy() -- so the
  * offset tables are indexed the same way and cannot get out of step.
  */
-#define PM_PAD_D0    68                       /* the diameter both started at */
-#define PM_PAD_D     84                       /* grown by one cell           */
-#define PM_PAD_XBASE 224
-#define PM_PAD_YBASE (PM_DPAD_Y)                                      /* 260 */
-#define PM_PAD_GAP   ((PM_DPAD_S - 2 * PM_PAD_D0))                    /* 32  */
+/*
+ * THE TWO CIRCLES ARE THE GAME BOY'S, SIZE AND POSITION BOTH, matching its
+ * GB_BTN_D, GB_BTN_HIT_D, GB_BTN_A_X/Y and GB_BTN_B_X/Y. The sizes are copied
+ * rather than derived from this layout, because the instruction was to make the two
+ * emulators look and feel the same and any derivation here would drift from that.
+ */
+#define PM_PAD_D     74                       /* 74 px drawn, as GB_BTN_D        */
 
-/* Cells. One cell is PM_GRID. Positive x is right, positive y is down. */
-#define PM_PAD_CELL   PM_GRID
+/* One and a half times the drawn diameter, the Game Boy's ratio (GB_BTN_HIT_D is
+ * GB_BTN_D * 3 / 2). See s_gp for how the overlap is resolved. */
+#define PM_PAD_HIT_D (PM_PAD_D * 3 / 2)                               /* 111 */
 
-typedef struct { int cx, cy; int dx; } pad_off_t;
+/* Absolute, in framebuffer coordinates, as on the Game Boy. A's right edge reaches
+ * fb 342, which is past the 320 px framebuffer and onto visible glass -- the lower
+ * push band is full glass width, which is why that is drawable at all. */
+#define PM_PAD_A_X   268
+#define PM_PAD_A_Y   296
+#define PM_PAD_B_X   208
+#define PM_PAD_B_Y   378
+
+/*
+ * THE CELL OFFSETS ARE GONE, and that is a simplification rather than a loss.
+ *
+ * They existed because the circles were once positioned by counting grid squares
+ * on the glass, with a half-cell escape hatch for a nudge cells could not express.
+ * The layout is now the Game Boy's, in absolute pixels, so there is nothing left to
+ * offset FROM: PM_PAD_A_X/Y and PM_PAD_B_X/Y are the positions. If a future nudge is
+ * wanted, change those four numbers -- a table of deltas on top of absolute values
+ * is two places for one answer to live.
+ */
 
 /*
  * PLACEMENT AND SIZE ARE PER CIRCLE, and the diameter is now independent of the
@@ -1318,44 +1347,19 @@ typedef struct { int cx, cy; int dx; } pad_off_t;
  * room for a taller flat edge; it is one cell at a time because the evidence is
  * the operator's eyes on the glass, not a counter.
  */
-#define PM_PAD_A_XOFF   1                     /* 1 cell right of the base */
-#define PM_PAD_A_XNUDGE (PM_PAD_CELL / -2)    /* then half a cell back left */
-#define PM_PAD_B_XOFF  (-2)   /* 2 cells left of the base */
-#define PM_PAD_A_YOFF   0   /* on the base row: top level with the d-pad top */
-#define PM_PAD_B_YOFF   0                     /* up one from where it was */
-
-static const pad_off_t s_pad_off[2] = {
-    /* A: base column, on the base row, half a cell back towards the d-pad */
-    { .cx = PM_PAD_A_XOFF, .cy = PM_PAD_A_YOFF, .dx = PM_PAD_A_XNUDGE },
-    /* B: base column, on the base row -- up one cell from where it was */
-    { .cx = PM_PAD_B_XOFF, .cy = PM_PAD_B_YOFF, .dx = 0 },
+/*
+ * Top-left of circle i, in framebuffer coordinates -- the Game Boy's own positions,
+ * stated once. A and B are index 0 and 1 everywhere: in the label table, in
+ * pad_inside(), in pad_cy(), in the hit test through s_gp. One table, read by one
+ * function, is what keeps those from disagreeing.
+ */
+static const struct { int x, y; } s_pad_pos[2] = {
+    { PM_PAD_A_X, PM_PAD_A_Y },
+    { PM_PAD_B_X, PM_PAD_B_Y },
 };
 
-/* Top-left of circle i, in framebuffer coordinates. B starts one OLD diameter plus
- * one gap below A's base, which is the column the pair was built as; the offsets
- * then move each from there. Using the original 68 and not the new 84 matters:
- * the base row is a fixed reference, so growing a circle does not silently shift
- * the other one.
- *
- * `dx` IS THE HALF-CELL CHANNEL. Cells alone cannot express a half-cell step, and
- * the operator wanted one: A needed to come back towards the d-pad by 8 px, not
- * 16. Rather than re-basing the whole table on 8 px units -- which would have
- * turned B's -2 into -4 and made every reading in the comments wrong -- the cell
- * count keeps its meaning and the leftover pixels go in dx. It is also the escape
- * hatch for any future sub-cell nudge, and 0 for everything that lands on the
- * grid.
- */
-static int pad_x(int i)
-{
-    return PM_PAD_XBASE + s_pad_off[i].cx * PM_PAD_CELL + s_pad_off[i].dx;
-}
-
-static int pad_y(int i)
-{
-    const int base = PM_PAD_YBASE + (i ? PM_PAD_D0 + PM_PAD_GAP : 0);
-
-    return base + s_pad_off[i].cy * PM_PAD_CELL;
-}
+static int pad_x(int i) { return s_pad_pos[i & 1].x; }
+static int pad_y(int i) { return s_pad_pos[i & 1].y; }
 
 static const uint16_t s_pad_label[2] = { 'A', 'B' };
 
@@ -1379,25 +1383,50 @@ static int pad_cx(int i) { return pad_x(i) + PM_PAD_D / 2; }
  * glass outside the framebuffer. The touchable area is therefore the disc, and the
  * DRAWING is unchanged.
  *
- * `pad_hit_d` is left 0, so the circles keep their drawn size as their target:
- * nothing here has been tuned by thumb yet, and inventing a larger target before
- * the operator has used it would be guesswork. It is one field if that changes.
+ * `pad_hit_d` WAS left 0 for a long time -- "the circles keep their drawn size as
+ * their target, and inventing a larger one before the operator has used it would
+ * be guesswork". The operator has now used it and asked for the Game Boy's
+ * arrangement, so the targets are 1.5x the drawn disc. That is the one field this
+ * comment predicted would change.
  */
 static const gamepad_t s_gp = {
     .cx = PM_DPAD_X + PM_DPAD_S / 2,
     .cy = PM_DPAD_Y + PM_DPAD_S / 2,
     .size = PM_DPAD_S,
-    .rot_k = PM_ROT_K,          /* 16.16 cos of 45 degrees */
-    .rot_s = PM_ROT_K,          /* and the sine, which equals it at 45 degrees.
-                                 * Stated explicitly: the field defaults to zero,
-                                 * which would draw an upright pad. */
+    /* UPRIGHT, which is cosine 65536 and sine 0 -- no rotation at all. This MUST
+     * agree with pm_dpad_row(), which now translates instead of rotating; if the
+     * two ever disagree, the arms that are drawn and the arms that answer a press
+     * point different ways, which is the fault this module exists to prevent. */
+    .rot_k = 65536,
+    .rot_s = 0,
     .line = 2,
     .tip_r = PM_DPAD_R,
+
+    /* THE D-PAD'S TOUCH DISC IS WIDER THAN THE DRAWN CROSS, as on the Game Boy:
+     * 94 px against a drawn half-extent of 74. The default would be size/2 + 4 =
+     * 78, which is what a layout that says nothing gets; this one says 94 for the
+     * same reason GB does -- a thumb sliding between arms should not fall into a
+     * dead wedge. */
+    .dpad_hit_r = PM_DPAD_HIT_R,
 
     .pad_cx = { 0, 0 },         /* filled per-circle below, since pad_cx() is a function */
     .pad_cy = { 0, 0 },
     .pad_d = { PM_PAD_D, PM_PAD_D },
-    .pad_hit_d = { 0, 0 },      /* 0 = same as drawn */
+
+    /* THE TOUCH TARGET IS BIGGER THAN THE DRAWN CIRCLE, as on the Game Boy: one
+     * and a half times the diameter, 84 to 126, so a thumb need not land on the
+     * visible disc. The drawn size is deliberately untouched; this changes only
+     * what answers a press.
+     *
+     * THE TWO TARGETS DO OVERLAP, BY 18 PX, AND THAT IS FINE. Measured on this
+     * layout: the centres are 107.7 px apart (A at 274,302; B at 234,402) against
+     * a summed radius of 126, so the discs intersect. `gamepad_hit()` resolves
+     * that by NEAREST CENTRE rather than by index order, which is the behaviour a
+     * finger expects -- the button you are closer to is the one you meant -- and it
+     * was written for precisely this case, the Game Boy's own overlap being 14 px.
+     * An earlier draft of this comment claimed the targets could not overlap; that
+     * was arithmetic I asserted instead of doing, and it was wrong. */
+    .pad_hit_d = { PM_PAD_HIT_D, PM_PAD_HIT_D },
     .pad_label = { 'A', 'B' },
 
     .bg = 0x0000,
@@ -1486,55 +1515,40 @@ static bool pad_label_ink(int i, int x, int y)
  * THE D-PAD IS ROTATED 45 DEGREES CLOCKWISE, and the whole thing rotates with it
  * -- arms and arrows both.
  *
- * The implementation is an inverse transform rather than a rotated rasteriser:
- * every pixel is mapped back into the unrotated frame and tested there, so
- * dpad_inside() and the arrow sampler are unchanged and cannot drift apart from
- * the shape. One rotation, one place.
+ * THE PAD IS UPRIGHT, AND IT IS NO LONGER A TRANSFORM AT ALL.
  *
- * SCREEN -> SHAPE is the inverse of the rotation, which is why the sign looks
- * backwards: a point in the upper-right of the screen is mapped to the TOP arm.
- * With dx, dy measured from the d-pad's centre and k = cos45:
+ * It was drawn as a 45-degree diamond for a long time: every pixel was mapped
+ * back into the unrotated frame by an inverse rotation, and tested there, so
+ * dpad_inside() and the arrow sampler never needed to know. That worked, and the
+ * operator has now asked for the pad back in its normal orientation -- so the
+ * transform is GONE rather than set to identity, because a multiply that
+ * provably does nothing is a place a future reader has to check.
  *
- *     u = (dx + dy) * k        v = (dy - dx) * k
+ * THE SHAPE IS UNCHANGED, only its orientation: dpad_cross(), the rounded tip
+ * table, the two-pixel outline and the arrow placement all work in the shape's
+ * own 0..PM_DPAD_S frame and are untouched. What changed is that a framebuffer
+ * point now maps into that frame by a translation instead of a rotation, which is
+ * exactly what `gamepad.c` does for the hit test when rot_k is 65536 and rot_s is
+ * zero -- see s_gp, and note the two must agree or the drawn arms and the working
+ * arms point different ways.
  *
- * and the result is tested at (u + S/2, v + S/2) in the shape's own 0..S frame.
+ * THE ARROWS FOLLOW THE SAME RULE and needed no change either: they are sampled
+ * from the font in shape space, so they now render upright instead of being
+ * resampled on a diagonal. A 16x32 glyph drawn at 45 degrees is a smear; upright
+ * it is the glyph the font actually contains.
  *
- * THE ARROWS ROTATE TOO, and they are the reason this is done as a transform of
- * the input rather than as a dance of pre-rotated tables: the four glyphs are
- * sampled in shape space, so they come out pointing into the rotated arms'
- * directions without a second copy of the font or a rotated bitmap to maintain.
- * At 45 degrees a 16x32 arrow is resampled on a diagonal, which is expected and
- * is what "rotate the entire dpad" means.
- *
- * PM_ROT_HALF is the rotated shape's bounding half-extent: the cross's extremes
- * are its arm tips, and the largest |u| among them is 84 * sqrt(2) / 1.5 =
- * 79.2, plus one row for the 2 px border's outer edge. The region below is built
- * from it, so the rotated d-pad cannot be clipped.
- *
- * Fixed point, not float: k is 46341 in 16.16, which is cos45 to within one
- * part in 65536. The whole shape is rasterised once at start, so the arithmetic
- * cost is irrelevant and an exactly-representable integer keeps the rendering
- * identical run to run.
+ * The old code carried PM_ROT_HALF, a rotated bounding half-extent, and four
+ * PM_ROT_X0..Y1 constants built from it. They are DELETED rather than updated:
+ * nothing referenced them any more -- the painted region became the two bands
+ * below -- and a stale constant named after a rotation that no longer happens is
+ * a comment that lies in the shape of code.
  */
-#define PM_ROT_HALF  81               /* rotated bounding half-extent */
 
-static void dpad_unrotate(int x, int y, int *u, int *v)
-{
-    /* x, y are relative to the d-pad's centre, in framebuffer pixels. */
-    *u = ((x + y) * PM_ROT_K) >> 16;
-    *v = ((y - x) * PM_ROT_K) >> 16;
-}
-
-/* The whole control cluster as one region: the d-pad plus the two circles to its
- * right. One push, not two, because they are adjacent, they never change, and two
- * windows would be two bus acquisitions and two transfers for one static image. */
+/* The d-pad's centre, in framebuffer pixels. Everything below measures from here,
+ * and so does the hit test through s_gp's cx/cy -- the same two numbers, which is
+ * what keeps the drawn arms and the answering arms in agreement. */
 #define PM_DPAD_CX  (PM_DPAD_X + PM_DPAD_S / 2)                    /* 100 */
 #define PM_DPAD_CY  (PM_DPAD_Y + PM_DPAD_S / 2)                    /* 324 */
-
-#define PM_ROT_X0   (PM_DPAD_CX - PM_ROT_HALF)                     /* 19  */
-#define PM_ROT_Y0   (PM_DPAD_CY - PM_ROT_HALF)                     /* 243 */
-#define PM_ROT_X1   (PM_DPAD_CX + PM_ROT_HALF)                     /* 181 */
-#define PM_ROT_Y1   (PM_DPAD_CY + PM_ROT_HALF)                     /* 405 */
 
 /* THE REGION IS THE WHOLE AREA BELOW THE PICTURE, not just the controls' bounding
  * box, because the background is now the grid and a grid has to reach the edges
@@ -1584,8 +1598,13 @@ static int s_row_y0;
 #define PM_COL_BOT    (COL_Y0 + (PM_COL_SLOTS * (COL_Y1 - COL_Y0 + 1)) / COL_N - 1)
 
 #define PM_CTL_Y      (PM_H * PM_SCALE)                                /* 192 */
-#define PM_CTL_Y1     (PM_PAD_YBASE + PM_PAD_D0 + PM_PAD_GAP +                     \
-                       PM_PAD_B_YOFF * PM_PAD_CELL + PM_PAD_D)         /* 443 */
+/* The lowest row the cluster paints: derived from whichever circle ends lower, so
+ * moving one down cannot leave the push band short of it. This used to be a chain of
+ * the old base-plus-gap-plus-cell arithmetic; with absolute positions the honest
+ * question is simply "which bottom is furthest down". */
+#define PM_CTL_Y1     ((PM_PAD_A_Y + PM_PAD_D > PM_PAD_B_Y + PM_PAD_D              \
+                        ? PM_PAD_A_Y + PM_PAD_D : PM_PAD_B_Y + PM_PAD_D) - 1)     \
+                      /* 451 */
 
 /* Upper band: framebuffer width, from the picture down to the column bottom. */
 #define PM_UP_X       0
@@ -1616,9 +1635,9 @@ static void pm_dpad_row(void *ctx, int row, int col, uint16_t *dst, int n)
 
         uint16_t c = pm_grid(fx, fy);
 
-        /* --- the d-pad, rotated ------------------------------------------- */
-        int u, v;
-        dpad_unrotate(fx - PM_DPAD_CX, fy - PM_DPAD_CY, &u, &v);
+        /* --- the d-pad, upright -------------------------------------------- */
+        const int u = fx - PM_DPAD_CX;
+        const int v = fy - PM_DPAD_CY;
 
         const int dx0 = u + PM_DPAD_S / 2;
         const int dy0 = v + PM_DPAD_S / 2;
