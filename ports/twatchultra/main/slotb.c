@@ -486,7 +486,12 @@ static bool slotb_start_tama(const char *rom)
 static bool slotb_start_map(const char *path)
 {
     (void)path;
-    return maps_start(NULL);
+
+    /* MAPS_ANY lets the set say where it begins, from start.txt beside the tiles.
+     * A compiled default coordinate would mean a rebuild to look somewhere else, and
+     * (0,0) is a tile in the Atlantic, which reads as "no map" rather than as "no
+     * start". */
+    return maps_start(MAPS_ANY, MAPS_ANY);
 }
 
 /*
@@ -795,6 +800,7 @@ static void slotb_run(const char *board_conf)
     nes_install_touch_hook();
     pm_install_touch_hook();
     tama_install_touch_hook();
+    maps_install_touch_hook();
 
     /* Pusher A, armed before the menu so the press can leave slot B from the
      * menu itself. */

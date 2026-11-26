@@ -78,61 +78,82 @@ static void put32(uint8_t *p, uint32_t v)
         p[i] = (uint8_t)(v >> (8 * i));
 }
 
-static void good_header(uint8_t *h)
+static void good_header(uint8_t *h, int32_t tx, int32_t ty)
 {
     h[0] = 'T'; h[1] = 'M'; h[2] = 'A'; h[3] = 'P';
     put16(h + 4, MAPS_VERSION);
     put16(h + 6, MAPS_FORMAT_RGB565);
-    put16(h + 8, DISPLAY_W);
-    put16(h + 10, DISPLAY_H);
+    put16(h + 8, MAPS_TILE);
+    put16(h + 10, MAPS_TILE);
     put32(h + 12, 0xA5A5A5A5u);
+    put32(h + 16, (uint32_t)tx);
+    put32(h + 20, (uint32_t)ty);
 }
 
 static void test_header_accepts_the_real_thing(void)
 {
     uint8_t h[MAPS_HEADER_BYTES];
-    uint16_t w = 0, hh = 0;
-    uint32_t crc = 0;
+    maps_hdr_t m;
 
-    good_header(h);
+    /* A real z15 coordinate, so a sign or endianness fault has room to show. */
+    good_header(h, 6183, 13150);
 
-    CHECK(maps_header_parse(h, &w, &hh, &crc));
-    CHECK_EQ(w, DISPLAY_W);
-    CHECK_EQ(hh, DISPLAY_H);
-    CHECK_EQ(crc, 0xA5A5A5A5u);
+    CHECK(maps_header_parse(h, &m, MAPS_ANY, MAPS_ANY));
+    CHECK_EQ(m.w, MAPS_TILE);
+    CHECK_EQ(m.h, MAPS_TILE);
+    CHECK_EQ(m.crc, 0xA5A5A5A5u);
+    CHECK_EQ(m.tx, 6183);
+    CHECK_EQ(m.ty, 13150);
+
+    /* Told which tile to expect, it agrees. */
+    CHECK(maps_header_parse(h, &m, 6183, 13150));
+
+    /* Told the wrong one, it refuses -- this is the check that catches a tile
+     * generated for a neighbouring coordinate and mis-named. */
+    CHECK(!maps_header_parse(h, &m, 6184, 13150));
+    CHECK(!maps_header_parse(h, &m, 6183, 13151));
 }
 
 static void test_header_refuses_what_it_should(void)
 {
     uint8_t h[MAPS_HEADER_BYTES];
-    uint16_t w = 0, hh = 0;
-    uint32_t crc = 0;
+    maps_hdr_t m;
+
+    good_header(h, 100, 200);
 
     /* Bad magic. */
-    good_header(h);
     h[0] = 'X';
-    CHECK(!maps_header_parse(h, &w, &hh, &crc));
+    CHECK(!maps_header_parse(h, &m, MAPS_ANY, MAPS_ANY));
 
-    /* A future version. */
-    good_header(h);
+    /* A future version, and the phase-1 version. */
+    good_header(h, 100, 200);
     put16(h + 4, MAPS_VERSION + 1);
-    CHECK(!maps_header_parse(h, &w, &hh, &crc));
+    CHECK(!maps_header_parse(h, &m, MAPS_ANY, MAPS_ANY));
+
+    good_header(h, 100, 200);
+    put16(h + 4, 1);
+    CHECK(!maps_header_parse(h, &m, MAPS_ANY, MAPS_ANY));
 
     /* A format this app cannot draw. */
-    good_header(h);
+    good_header(h, 100, 200);
     put16(h + 6, MAPS_FORMAT_RGB565 + 1);
-    CHECK(!maps_header_parse(h, &w, &hh, &crc));
+    CHECK(!maps_header_parse(h, &m, MAPS_ANY, MAPS_ANY));
 
-    /* A picture that is not the framebuffer's size, in either direction. These
-     * are the cases the packer could plausibly produce and the app must not
-     * blit: a narrower image would leave desktop cells showing at the edges. */
-    good_header(h);
-    put16(h + 8, DISPLAY_W - 1);
-    CHECK(!maps_header_parse(h, &w, &hh, &crc));
+    /* A 320x416 image is the phase-1 format and must be REFUSED, not half-read:
+     * the window arithmetic assumes tile-sized source rows. */
+    good_header(h, 100, 200);
+    put16(h + 8, DISPLAY_W);
+    put16(h + 10, DISPLAY_H);
+    CHECK(!maps_header_parse(h, &m, MAPS_ANY, MAPS_ANY));
 
-    good_header(h);
-    put16(h + 10, DISPLAY_H + 1);
-    CHECK(!maps_header_parse(h, &w, &hh, &crc));
+    /* One pixel off in either direction. */
+    good_header(h, 100, 200);
+    put16(h + 8, MAPS_TILE - 1);
+    CHECK(!maps_header_parse(h, &m, MAPS_ANY, MAPS_ANY));
+
+    good_header(h, 100, 200);
+    put16(h + 10, MAPS_TILE + 1);
+    CHECK(!maps_header_parse(h, &m, MAPS_ANY, MAPS_ANY));
 }
 
 int main(void)
