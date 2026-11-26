@@ -47,7 +47,9 @@
  * So the YEAR and the BATTERY are gone, by operator direction, and every field is
  * back at the one scale the strip has ever been accepted at. The whole line is now
  * at most 224 px of the 261 available in the worst case (a 12-hour clock with a
- * two-digit hour), leaving 24 px of clearance on the left and 21 on the right.
+ * two-digit hour), and it is centred 8 px right of the chamfered centre at the
+ * operator's direction -- see SB_GLASS_CX for the clearance that leaves, which was
+ * measured against the font rather than assumed.
  *
  * THIS IS A DELIBERATE NARROWING, NOT A LIMIT, and restoring either is small: the
  * year is one `%04d` in sb_date() and the battery is a gauge read plus four
@@ -129,15 +131,39 @@ static const char *TAG = "statusbar";
 #define SB_GLYPH_H     (SB_FONT_H * SB_SCALE)       /* 32 on the glass        */
 
 /*
- * THE CHAMFERED CENTRE, not the glass centre.
+ * WHERE THE LINE IS CENTRED, AND WHY IT IS NOT THE GLASS CENTRE.
  *
  * The glass is 410 columns but the cuts take the corners, and the strip lives at
- * the very top where they bind hardest. The visible span at row 10 is x 70..330,
- * which is 261 px inclusive; the glass's own centre is 205 but that span's centre
- * is 200. Centreing on 200 is what puts equal margin against both cuts rather than
- * 5 px more against the left.
+ * the very top where they bind hardest. The visible span at the row where ink
+ * first appears -- row 10, for a scale-2 glyph block starting at row 6 -- is
+ * x 70..330, which is 261 px inclusive. The glass's own centre is 205 and that
+ * span's centre is 200.
+ *
+ * IT IS NO LONGER CENTRED ON EITHER, AT THE OPERATOR'S DIRECTION: half a
+ * character to the right. A character is SB_GLYPH_W = 16 px at scale 2, so half
+ * is 8, and 200 + 8 = 208. The operator asked for exactly that offset and gave no
+ * reason beyond wanting the line moved right, which is recorded here rather than
+ * given a motive it did not have; the effect is to trade margin from the left cut
+ * to the right.
+ *
+ * WHAT THAT COSTS, MEASURED RATHER THAN ESTIMATED. A host script compiled this
+ * file's font table and every string sb_build() can produce, then checked each
+ * inked pixel against the two chamfer lines (`x + y >= 80` and
+ * `410 - x + y >= 90`). At the old centre the worst case -- a 12-hour clock with
+ * a two-digit hour beside a five-character date, 224 px -- inked x 104..309 with
+ * nothing outside. At 208 it inks x 112..317, still with nothing outside: 42 px
+ * of clearance on the left against 13 on the right at that row. The margin is now
+ * asymmetric by design, and the right side is the side with less of it, so this
+ * constant is not free to raise again without re-running that check.
+ *
+ * Rows 6..9 are inside the band and above the worst case's ink, which is why the
+ * binding row is 10 and not the band's top. Every character these strings draw
+ * starts at glyph row 2 or below -- digits, letters, `-`, `/` and `:` -- so the
+ * topmost ink is row 10. A glyph with ink in its first two rows would instead
+ * meet the cut at row 6, where the right limit is x <= 326 rather than 330; the
+ * worst case's ink reaches 317, so even that would clear by 9 px.
  */
-#define SB_GLASS_CX    200
+#define SB_GLASS_CX    208
 
 /* Centred in the band: (43 - 32) / 2 = 5, so rows 6..37 with 6 clear below. */
 #define SB_TOP_Y       (SB_ROW_TOP + (SB_BAND_ROWS - SB_GLYPH_H) / 2)   /* 6 */
