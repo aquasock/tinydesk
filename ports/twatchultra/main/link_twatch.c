@@ -925,7 +925,30 @@ static const td_app_t s_app_tama = { "Tama V3",        launch_slotb_tama, "\xe2\
  * distinct from ■, ♦ and ☼ at 8x16, and a triangle is what a map puts on a
  * peak. A map entry is not a console, but the shared circle keeps the menu
  * reading as one family rather than starting a second motif. */
-static const td_app_t s_app_map  = { "Map",            launch_slotb_map,  "\xe2\x97\x8f\xe2\x96\xb2" };  /* U+25CF U+25B2 */
+static const td_app_t s_app_map  = { "Maps",           launch_slotb_map,  "\xe2\x97\x8f\xe2\x96\xb2" };  /* U+25CF U+25B2 */
+
+/*
+ * Register a port app and SAY SO IF IT IS REFUSED.
+ *
+ * `td_app_register()` answers -1 when `s_app_count` has reached TD_MAX_APPS, and
+ * nothing anywhere reports it -- the app simply does not appear in the Start menu,
+ * which looks exactly like an app whose code was never built. That is not
+ * hypothetical: this port now registers FOUR apps on top of the desktop's
+ * twenty-eight, and TD_MAX_APPS is 32, so the table is FULL. Adding a fifth app
+ * would vanish silently and the person adding it would go looking for a linker
+ * problem.
+ *
+ * The count is checked rather than the return value alone so the log line can say
+ * how full the table is, which is the number the next person needs.
+ */
+static void port_app_register(const td_app_t *app)
+{
+    const int before = td_app_count();
+
+    if (td_app_register(app) != 0)
+        ESP_LOGE(TAG, "app '%s' REFUSED: the app table is full (%d/%d)",
+                 app->name, before, TD_MAX_APPS);
+}
 
 void board_apps_register(void)
 {
@@ -934,10 +957,16 @@ void board_apps_register(void)
     /* Registration order is start-menu order, and this hook runs after the
      * built-in apps, so these sit at the end beside Music and the user's own
      * entries -- which is where the card-side shortcuts used to be. */
-    td_app_register(&s_app_gb);
-    td_app_register(&s_app_pm);
-    td_app_register(&s_app_tama);
-    td_app_register(&s_app_map);
+    port_app_register(&s_app_gb);
+    port_app_register(&s_app_pm);
+    port_app_register(&s_app_tama);
+    port_app_register(&s_app_map);
+
+    /* ONE LINE, ONCE, at the only moment the answer is knowable. A wearer cannot
+     * count a menu that scrolls, and the table being exactly full is the kind of
+     * fact that is worth having in the log before it becomes a mystery. */
+    ESP_LOGI(TAG, "start menu: %d/%d app slots used",
+             td_app_count(), TD_MAX_APPS);
 }
 
 const char *board_platform(void)

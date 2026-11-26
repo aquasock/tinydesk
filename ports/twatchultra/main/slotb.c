@@ -517,7 +517,7 @@ static const slotb_app_t s_apps[] = {
      * have always had. `maps_last_error()` is its why hook: the glass has one
      * line, and "map did not start" alone cannot tell a missing file from a bad
      * checksum from a short read. */
-    { "Map",            "map",  slotb_start_map,  maps_stop,   maps_running,   maps_last_error },
+    { "Maps",           "map",  slotb_start_map,  maps_stop,   maps_running,   maps_last_error },
 };
 
 #define SLOTB_APP_N ((int)(sizeof(s_apps) / sizeof(s_apps[0])))
