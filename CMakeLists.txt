@@ -500,6 +500,15 @@ if(TD_BUILD_TESTS)
     target_compile_options(test_tama_age PRIVATE ${TD_WARNINGS})
     add_test(NAME test_tama_age COMMAND test_tama_age)
 
+    # The map image's checksum, against vectors from zlib. If this disagrees with
+    # tools/maps_tile.py every image is refused, and the symptom looks like a bad
+    # card rather than like an arithmetic bug.
+    add_executable(test_maps_crc tests/test_maps_crc.c)
+    target_include_directories(test_maps_crc PRIVATE ports/twatchultra/main)
+    set_target_properties(test_maps_crc PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+    target_compile_options(test_maps_crc PRIVATE ${TD_WARNINGS})
+    add_test(NAME test_maps_crc COMMAND test_maps_crc)
+
     # The gamepad decoder, against a real controller's descriptor and reports.
     # The file it tests needs ESP headers, so it is compiled with stub includes
     # that provide only what it references -- which is the point: if the decoder

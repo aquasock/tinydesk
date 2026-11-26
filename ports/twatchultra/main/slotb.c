@@ -42,6 +42,7 @@
 #include "display.h"
 #include "charge.h"
 #include "gb.h"
+#include "maps.h"
 #include "gbpick.h"
 #include "nes.h"
 #include "pm.h"
@@ -471,7 +472,25 @@ static bool slotb_start_tama(const char *rom)
 }
 
 /*
- * THE APPS THE MENU OFFERS, AND THE REASON THERE ARE THREE.
+ * THE MAP VIEWER TAKES NO CARTRIDGE, so this is the simplest start in the table:
+ * one call, one default path. It is here rather than reaching maps_start()
+ * directly from the table because every row's start has the same signature --
+ * `const char *rom` -- and the rows that ignore it say so explicitly rather than
+ * making the table's shape uneven.
+ *
+ * IT HAS NO PICKER, deliberately. A picker over /sd/media/maps would be the
+ * fourth config on the same navigator and is cheap, but there is one image on
+ * the card today and a picker that chooses between one thing teaches nobody
+ * anything. Pan, zoom and a tile selector are the phase after this one.
+ */
+static bool slotb_start_map(const char *path)
+{
+    (void)path;
+    return maps_start(NULL);
+}
+
+/*
+ * THE APPS THE MENU OFFERS, AND WHY EACH ONE IS HERE.
  *
  * The NES WAS HERE AND IS NOT, because it will not ship: 320x240 console output on
  * a watch is not something a wearer can see, and a menu that offers a console
@@ -489,6 +508,11 @@ static const slotb_app_t s_apps[] = {
     { "Game Boy Color", "gb",  slotb_start_gb,   gb_stop,     gb_running,     gb_last_error },
     { "Pokemon Mini",   "pm",  slotb_start_pm,   pmini_stop,  pmini_running,  NULL },
     { "Tamagotchi V3",  "tama", slotb_start_tama, tama_stop,   tama_running,   NULL },
+    /* NOT A CONSOLE, and it sits after them so the emulators keep the order they
+     * have always had. `maps_last_error()` is its why hook: the glass has one
+     * line, and "map did not start" alone cannot tell a missing file from a bad
+     * checksum from a short read. */
+    { "Map",            "map",  slotb_start_map,  maps_stop,   maps_running,   maps_last_error },
 };
 
 #define SLOTB_APP_N ((int)(sizeof(s_apps) / sizeof(s_apps[0])))

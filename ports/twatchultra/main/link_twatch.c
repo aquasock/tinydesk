@@ -51,6 +51,7 @@
 #include "gps.h"
 #include "nfc.h"
 #include "sound.h"
+#include "maps.h"
 #include "nes.h"
 #include "tama.h"
 #include "pmbench.h"
@@ -691,6 +692,11 @@ bool link_init(void)
     /* The launcher's command. See slotb.h. */
     slotb_register_command();
 
+    /* The map viewer is reachable from the shell as well as from slot B, which is
+     * how a blit fault is told apart from a bad image without rebooting twice. */
+    if (!maps_register_command())
+        ESP_LOGW(TAG, "maps command did not register");
+
     if (!pmini_register_command())
         ESP_LOGW(TAG, "pm command did not register");
 
@@ -843,6 +849,7 @@ static void slotb_launch_or_say(const char *key)
 static void launch_slotb_gb(void)  { slotb_launch_or_say("gb"); }
 static void launch_slotb_pm(void)  { slotb_launch_or_say("pm"); }
 static void launch_slotb_tama(void) { slotb_launch_or_say("tama"); }
+static void launch_slotb_map(void)  { slotb_launch_or_say("map"); }
 
 /*
  * THE ICONS ARE A MOTIF, NOT INITIALS: a filled circle and then a shape.
@@ -913,6 +920,12 @@ static void launch_slotb_tama(void) { slotb_launch_or_say("tama"); }
 static const td_app_t s_app_gb  = { "GBC",            launch_slotb_gb,  "\xe2\x97\x8f\xe2\x96\xa0" };  /* U+25CF U+25A0 */
 static const td_app_t s_app_pm  = { "Pok\xc3\xa9Mini",    launch_slotb_pm,  "\xe2\x97\x8f\xe2\x99\xa6" };  /* U+25CF U+2666 */
 static const td_app_t s_app_tama = { "Tama V3",        launch_slotb_tama, "\xe2\x97\x8f\xe2\x98\xbc" };  /* U+25CF U+263C */
+/* ●▲  Map. U+25B2 is the glyph the NES release freed, and it earns its place
+ * here on the same test every other suffix passed: it is in the font, it is
+ * distinct from ■, ♦ and ☼ at 8x16, and a triangle is what a map puts on a
+ * peak. A map entry is not a console, but the shared circle keeps the menu
+ * reading as one family rather than starting a second motif. */
+static const td_app_t s_app_map  = { "Map",            launch_slotb_map,  "\xe2\x97\x8f\xe2\x96\xb2" };  /* U+25CF U+25B2 */
 
 void board_apps_register(void)
 {
@@ -924,6 +937,7 @@ void board_apps_register(void)
     td_app_register(&s_app_gb);
     td_app_register(&s_app_pm);
     td_app_register(&s_app_tama);
+    td_app_register(&s_app_map);
 }
 
 const char *board_platform(void)
