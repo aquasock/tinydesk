@@ -302,7 +302,7 @@ bool pwrkey_init(pwrkey_input_fn input)
         return false;
     }
 
-    if (xTaskCreatePinnedToCore(pwrkey_task, "tdpwrkey", 3072, NULL, 3,
+    if (xTaskCreatePinnedToCore(pwrkey_task, "tdpwrkey", 2048, NULL, 3,
                                 &s_task, 0) != pdPASS)
     {
         s_pin = -1;

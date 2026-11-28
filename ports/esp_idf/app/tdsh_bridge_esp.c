@@ -42,6 +42,26 @@
  * input stream is heap, not static RAM.
  */
 #define IN_BUFFER      2048
+
+/*
+ * THE SHELL'S STACK SIZE, OVERRIDABLE BY THE BOARD.
+ *
+ * `TDSH_SHELL_TASK_STACK` is 24,576 in tdsh_espidf.h, and that file belongs to
+ * the tdsh SUBMODULE pinned to tinydesk-project/tinydesk-shell -- a repository
+ * this project must never push to, so editing it would leave a submodule state
+ * that no clean clone could fetch.
+ *
+ * The PORT creates this task, though, and this line is in the fork. So the size
+ * is a guarded override: a board that says nothing gets the upstream value, and
+ * the T-Watch Ultra passes its own measured one from main/CMakeLists.txt.
+ *
+ * MEASURED ON THE BOARD (`mem tasks`, usStackHighWaterMark -- the deepest point
+ * ever reached, over a session that ran shell commands and a `py -c`): 9,476
+ * bytes used of 24,576. The port asks for 16,384, which leaves 6,908 above the
+ * deepest observed use. */
+#ifndef TDSH_BRIDGE_SHELL_STACK
+#define TDSH_BRIDGE_SHELL_STACK TDSH_SHELL_TASK_STACK
+#endif
 #define OUT_BUFFER     2048
 #define SHELL_PRIORITY 4        /* below the UI task, so typing stays smooth */
 
@@ -194,10 +214,10 @@ static int backend_start(void *ctx, int cols, int rows)
     if (!s_in || !s_out || !s_out_lock)
         return -1;
     board_shell_task_prepare();
-    if (xTaskCreate(shell_task, "tdsh", TDSH_SHELL_TASK_STACK, NULL, SHELL_PRIORITY, NULL) != pdPASS)
+    if (xTaskCreate(shell_task, "tdsh", TDSH_BRIDGE_SHELL_STACK, NULL, SHELL_PRIORITY, NULL) != pdPASS)
     {
         ESP_LOGE(TAG, "cannot create the shell task (%u-byte stack; internal largest %u)",
-                 (unsigned)TDSH_SHELL_TASK_STACK,
+                 (unsigned)TDSH_BRIDGE_SHELL_STACK,
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
         return -1;
     }

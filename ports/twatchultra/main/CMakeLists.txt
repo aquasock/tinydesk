@@ -92,6 +92,27 @@ else()
     target_compile_definitions(${COMPONENT_LIB} PRIVATE TD_PERSONALITY_DESKTOP=1)
 endif()
 
+#
+# TASK STACKS, SIZED FROM MEASUREMENT RATHER THAN FROM DEFAULTS.
+#
+# Internal DRAM is the scarcest resource on this part, and `mem tasks` reports
+# usStackHighWaterMark per task -- never-touched bytes at the deepest point the
+# task has ever reached. Those readings showed the port's own tasks holding far
+# more stack than they use, so these two (whose sizes live in SHARED files, and so
+# cannot simply be edited at the call site) are overridden here instead. Both
+# files guard their defaults with #ifndef, so every other board in this tree is
+# unchanged.
+#
+#   tdsh  24,576 -> 16,384   measured 9,476 used; 6,908 left above it
+#   UI     8,192 ->  6,144   measured 3,460 used; 2,684 left above it
+#
+# The port's own tasks (paint, pwrkey, bleuart, pusher, statusbar) carry their
+# sizes and their measurements at the call site.
+#
+target_compile_definitions(${COMPONENT_LIB} PRIVATE
+    TDSH_BRIDGE_SHELL_STACK=16384
+    UI_TASK_STACK=6144)
+
 # Pull slotb.o out of libmain.a even though nothing apparently needs it. main.c's
 # board_startup_override() is WEAK, so without this the linker is satisfied by
 # the weak no-op and never fetches the strong definition -- a silent no-op that

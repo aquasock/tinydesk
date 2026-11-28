@@ -292,6 +292,17 @@ static int s_col_n = COL_N;
 #define BAND_ROWS 16
 
 /*
+ * THE PAINTER'S STACK, SIZED FROM ITS HIGH-WATER MARK RATHER THAN FROM HABIT.
+ *
+ * It was 4,096. Measured on the board (`mem tasks`, FreeRTOS
+ * usStackHighWaterMark, so the deepest point the task has ever reached): 1,276
+ * bytes used, 2,820 never touched. 3,072 leaves 1,796 bytes of margin over the
+ * deepest observed use, which is the margin this port asks for when the task is
+ * a short loop over bands with no recursion. See main/slotb.h for the split that
+ * made internal DRAM worth measuring at all. */
+#define PAINT_STACK 3072
+
+/*
  * The SPI DMA source: one full-width band, byte-swapped and pushed.
  *
  * STATIC, in internal DRAM, and deliberately not allocated. It has to be
@@ -2765,7 +2776,7 @@ bool display_init(display_reply_fn reply)
      * grid starts as a value no real cell can hold. */
     memset(s_shown, 0xFF, TD_VT_MAX_ROWS * TD_VT_MAX_COLS * sizeof(*s_shown));
 
-    if (xTaskCreatePinnedToCore(paint_task, "tdpaint", 4096, NULL, 4,
+    if (xTaskCreatePinnedToCore(paint_task, "tdpaint", PAINT_STACK, NULL, 4,
                                 &s_paint_task, 1) != pdPASS)
     {
         ESP_LOGE(TAG, "the painter did not start");

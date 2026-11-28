@@ -493,8 +493,10 @@ bool bleuart_start(void)
         return false;
     }
 
+    /* 2,048: measured high-water mark on the board was 856 bytes used of 3,072.
+     * The task only moves bytes from a stream buffer to the notify path. */
     if (!s_tx_task &&
-        xTaskCreate(tx_task, "bleuart", 3072, NULL, 3, NULL) != pdPASS)
+        xTaskCreate(tx_task, "bleuart", 2048, NULL, 3, NULL) != pdPASS)
     {
         ESP_LOGE(TAG, "no task");
         return false;

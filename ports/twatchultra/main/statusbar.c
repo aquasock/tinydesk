@@ -262,7 +262,12 @@ void statusbar_clock_present(bool present)
  * apart is uxTaskGetStackHighWaterMark() -- never-touched bytes at the deepest
  * point the task has ever reached.
  */
-#define SB_STACK       8192
+/* 6,144, DOWN FROM 8,192. Measured high-water mark on the board: 4,624 bytes
+ * unused of 8,192, so 3,568 used. The earlier recorded worst case for this task
+ * was 3,644, which agrees. 6,144 leaves 2,576 bytes above the deepest observed
+ * use, and 2,500 above the older worst-case figure. This is the task that paints
+ * the top strip once a minute, so it is shallow by construction. */
+#define SB_STACK       6144
 static TaskHandle_t s_task;
 
 /*

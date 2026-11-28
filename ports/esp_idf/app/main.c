@@ -66,10 +66,21 @@
 #include "usb_hid.h"
 #endif
 
+/*
+ * A BOARD MAY SIZE THIS ITSELF. The ESP32/S3 default below is generous because
+ * "RAM is plentiful" was true of a board with nothing else competing for it;
+ * on the T-Watch Ultra internal DRAM is the scarcest resource on the part, so
+ * the port passes its own measured value in main/CMakeLists.txt instead of
+ * accepting this one. The guard keeps every other board in this tree unchanged.
+ */
 #if CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S3
+#ifndef UI_TASK_STACK
 #define UI_TASK_STACK 8192   /* Xtensa frames are bigger; RAM is plentiful (PSRAM) */
+#endif
 #else
+#ifndef UI_TASK_STACK
 #define UI_TASK_STACK 5120   /* measured on the C6: about 1.8 KB used */
+#endif
 #endif
 #define TZ_NAME          "/.tdsh_tz"   /* TinyDesk Shell's per-user `tz` setting, in the home */
 #define UI_TASK_PRIORITY 5

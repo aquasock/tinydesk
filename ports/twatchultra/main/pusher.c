@@ -169,7 +169,10 @@ bool pusher_init(pusher_input_fn input)
         return false;
     }
 
-    if (xTaskCreatePinnedToCore(pusher_task, "tdpusher", 2560, NULL, 3,
+    /* 2,048: measured high-water mark on the board was 740 bytes used of 2,560.
+     * Kept above 1,536 because this task marshals touch frames into key events
+     * and the extra 512 costs less than being wrong about a deep path. */
+    if (xTaskCreatePinnedToCore(pusher_task, "tdpusher", 2048, NULL, 3,
                                 &s_task, 0) != pdPASS)
     {
         s_pin = -1;
