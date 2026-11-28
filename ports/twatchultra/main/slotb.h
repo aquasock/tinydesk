@@ -1,41 +1,65 @@
 /*
- * slotb.h - the watch's second boot personality.
+ * slotb.h - the watch's two boot personalities, and the boundary between them.
  *
- * The same app image is flashed into BOTH OTA slots. Which slot the bootloader
- * picked decides which personality runs:
+ * THE TWO OTA SLOTS HOLD DIFFERENT IMAGES:
  *
- *   ota_0   the desktop. Unchanged: this module returns false and app_main
- *           carries on exactly as it always has.
- *   ota_1   slot B. A bare Game Boy firmware -- the port's own emulator and the
- *           display, touch, audio and card drivers it needs, and nothing else:
- *           no desktop, no shell, no status strip, no WiFi and no SSH. Both
- *           cores carry only what the emulator creates.
+ *   ota_0   the desktop. tinydesk's window manager, the shell, WiFi, telnet and
+ *           SSH, Bluetooth, the music player, and LAUNCHERS for slot B's apps.
+ *           It contains no emulator core, no cartridge picker and no map viewer.
  *
- * WHY ONE IMAGE AND TWO SLOTS, RATHER THAN A SECOND FIRMWARE.
+ *   ota_1   slot B, the emulator personality. The port's four apps (Game Boy,
+ *           Pokemon Mini, Tamagotchi, Maps), the display, touch, audio and card
+ *           drivers they need, and nothing else: no desktop, no shell, no status
+ *           strip, no WiFi, no SSH. Both cores carry only what the apps create.
  *
- * The alternative is a separate build, forked from this one, linked against its
- * own copy of the display and touch drivers. That copy is the cost: display.c
- * holds this project's hardest-won panel defects, and a second copy would have
- * to be kept in step with the first by hand -- the fault `scripts/tamacore-sync.sh`
- * exists only to police. It also needs a second sdkconfig, and TOL-008 records
- * what a regenerated sdkconfig silently does to this board.
+ * WHY ASYMMETRIC, AND WHY IT CHANGED. The slots held the SAME image while the
+ * slot B design was being proved, so that a bad slot B still left a working
+ * desktop and so that one flash covered both.
  *
- * A second BOOT PATH in one binary costs neither. The code that is not called
- * costs flash and nothing else, and this board's slot is 4 MB against a 3.1 MB
- * image. What slot B saves is RUNTIME: no `esp_wifi_init()` (41,500 bytes,
- * SOC-005), no wolfSSH floor, no littlefs, no shell stacks, and no desktop or
- * status task competing with the emulator for a core.
+ * The cost of that symmetry was that the desktop linked every emulator core to
+ * run menu items that only set a boot partition and restart -- 35 KB of internal
+ * DRAM in `.bss` for code it never calls, in the scarcest memory on the board,
+ * plus ~300 KB of image written into BOTH slots. Slot B is now proven on the
+ * glass, so the scaffolding is gone.
  *
- * HOW IT IS ENTERED AND LEFT. Entry is the desktop's own `ota rollback`, which
- * calls `esp_ota_set_boot_partition()` on the slot that is not running and
- * restarts. Exit is the same call in reverse from this module. Neither needs a
- * new command.
+ * BUILDING THEM. One sdkconfig, one source tree, two build directories:
+ *    idf.py -B build-desktop -DTD_PERSONALITY=desktop build
+ *    idf.py -B build-slotb   -DTD_PERSONALITY=slotb   build
+ * A second sdkconfig would be the TOL-008 trap, so there is only one: ESP-IDF
+ * keeps it at the PROJECT root, not per build directory, so both personalities
+ * read the same generated file and cannot drift apart. What can silently drift
+ * is which SOURCES each build compiles, so check_personality.py reads the two
+ * linked ELFs and asserts the desktop has no emulator entry points and the weak
+ * board hook, and that slot B has the strong one.
  *
- * HOW A BROKEN SLOT B CANNOT BRICK THE WATCH. `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`
- * is on, so an image that has been switched to but never confirmed is rolled
- * back by the bootloader on the next reset. Slot B confirms itself only once it
- * is actually running (slotb_confirm()), so a slot B that dies before then
- * returns the watch to the desktop on its own.
+ * sdkconfig.defaults must still carry every setting that matters. That file is
+ * tracked and sdkconfig is not, so a value living only in the generated copy is
+ * lost on a clean checkout -- the FAT and -O2 blocks in sdkconfig.defaults say
+ * so at length because both were nearly lost that way.
+ *
+ * WHAT SLOT B STILL CANNOT DO, WHICH IS THE PRICE OF THE SPLIT: nothing in the
+ * desktop can call an emulator. `gb start`, `nes`, `tama do ...`, `maps` and the
+ * two benchmark commands no longer exist in the desktop build; they are slot B
+ * apps now, reached through the Start menu or `slotb play <key>`. That is the
+ * intent -- everything needed to run an emulator lives in the image that runs
+ * one -- but it IS a behaviour change and it is recorded as one.
+ *
+ * HOW IT IS ENTERED. The desktop calls slotb_launch() (slotbl.c), which writes
+ * the chosen app key to NVS and switches the boot partition, then restarts.
+ *
+ * HOW A BROKEN SLOT B IS HANDLED. `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` is on,
+ * so an image switched to but never confirmed is rolled back by the bootloader on
+ * the next reset. Slot B confirms itself only once it is actually running
+ * (slotb_confirm()), so a slot B that dies before then returns the watch to the
+ * desktop on its own. That is now the ONLY automatic way back and it is why the
+ * confirmation still sits where it does.
+ *
+ * THE DANGER THAT IS NEW WITH ASYMMETRIC SLOTS: ota_1 can hold an image from a
+ * different build than ota_0 -- after a flash that wrote one slot, or an
+ * interrupted install. The two would then disagree about which apps exist. Both
+ * the desktop launcher and the `slotb` command compare the two app descriptors'
+ * version strings before switching and refuse rather than booting into a
+ * personality that cannot do what was asked; see slotb_launch().
  */
 #ifndef TWATCH_SLOTB_H
 #define TWATCH_SLOTB_H
@@ -76,12 +100,22 @@ void slotb_return_to_desktop(void);
  * two-line script and printed "rebooting into ota_1" before anything happened.
  * A native app calls this instead and nothing is shown but black.
  *
- * `key` names the app (see the table in slotb.c) or is NULL for slot B's menu.
- * Returns false when slot B holds no image or the key is not an app, and in that
- * case NOTHING IS CHANGED -- the caller can still put a message on the glass.
+ * `key` names the app (see slotb_apps.h) or is NULL for slot B's menu.
+ * Returns false when slot B holds no image, holds an image from a different
+ * build, or the key is not an app -- and in every one of those cases NOTHING IS
+ * CHANGED, so the caller can still put a message on the glass.
  * On success this does not return.
+ *
+ * DEFINED IN slotbl.c AND COMPILED INTO THE DESKTOP ONLY.
  */
 bool slotb_launch(const char *key);
+
+/*
+ * Why the last slotb_launch() refused, as a sentence the glass can carry.
+ * "slot B holds no image" and "slot B is version X, not Y" are different faults
+ * with different fixes, and the Start menu has one line to say so in.
+ */
+const char *slotb_last_error(void);
 
 /*
  * The `slotb` shell command: enter slot B on purpose.

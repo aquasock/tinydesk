@@ -674,6 +674,24 @@ bool link_init(void)
     if (tdsh_register_command(&s_repaint_cmd) != 0)
         ESP_LOGW(TAG, "repaint command did not register");
 
+    /* The launcher's command. See slotb.h. */
+    slotb_register_command();
+
+    /*
+     * THE EMULATORS ARE NOT COMMANDS IN THIS IMAGE ANY MORE.
+     *
+     * In the desktop personality every one of these registered a shell command
+     * so an emulator could be started in-process from a Terminal. The desktop no
+     * longer links any emulator core, so those symbols do not exist in this
+     * build and these registrations would not link. The emulators are slot B
+     * apps now: the Start menu launches them, and `slotb play <key>` does the
+     * same from the shell.
+     *
+     * The guard is not dead weight in the slot B build: link_init() is never
+     * reached there (board_startup_override() runs first and does not return),
+     * so this block exists only to prove the symbols still link. See slotb.h.
+     */
+#if TD_PERSONALITY_SLOTB
     if (!tama_register_command())
         ESP_LOGW(TAG, "tama command did not register");
 
@@ -689,9 +707,6 @@ bool link_init(void)
     if (!gb_register_command())
         ESP_LOGW(TAG, "gb command did not register");
 
-    /* The launcher's command. See slotb.h. */
-    slotb_register_command();
-
     /* The map viewer is reachable from the shell as well as from slot B, which is
      * how a blit fault is told apart from a bad image without rebooting twice. */
     if (!maps_register_command())
@@ -699,6 +714,7 @@ bool link_init(void)
 
     if (!pmini_register_command())
         ESP_LOGW(TAG, "pm command did not register");
+#endif
 
     if (!touch_register_command())
         ESP_LOGW(TAG, "touchdump command did not register");
@@ -843,7 +859,7 @@ int link_write(const uint8_t *buf, int len)
 static void slotb_launch_or_say(const char *key)
 {
     if (!slotb_launch(key))
-        td_msgbox("Slot B", "Slot B has no image to boot.", "OK", NULL, NULL);
+        td_msgbox("Slot B", slotb_last_error(), "OK", NULL, NULL);
 }
 
 static void launch_slotb_gb(void)  { slotb_launch_or_say("gb"); }

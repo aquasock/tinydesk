@@ -51,6 +51,7 @@
 #include "power.h"
 #include "pwrkey.h"
 #include "slotb.h"
+#include "slotb_apps.h"
 #include "statusbar.h"
 #include "tdsh.h"
 #include "tdsh_board.h"
@@ -377,8 +378,6 @@ static volatile bool s_exit_req;
  */
 typedef struct
 {
-    const char *label;
-    const char *key;                     /* the name `slotb play <key>` takes */
     bool (*start)(const char *rom);      /* NULL rom means the app's default */
     void (*stop)(void);
     bool (*running)(void);
@@ -510,17 +509,27 @@ static bool slotb_start_map(const char *path)
  * the path a wearer who rebooted mid-update would take.
  */
 static const slotb_app_t s_apps[] = {
-    { "Game Boy Color", "gb",  slotb_start_gb,   gb_stop,     gb_running,     gb_last_error },
-    { "Pokemon Mini",   "pm",  slotb_start_pm,   pmini_stop,  pmini_running,  NULL },
-    { "Tamagotchi V3",  "tama", slotb_start_tama, tama_stop,   tama_running,   NULL },
+    { slotb_start_gb,   gb_stop,     gb_running,     gb_last_error },
+    { slotb_start_pm,   pmini_stop,  pmini_running,  NULL },
+    { slotb_start_tama, tama_stop,   tama_running,   NULL },
     /* NOT A CONSOLE, and it sits after them so the emulators keep the order they
      * have always had. `maps_last_error()` is its why hook: the glass has one
      * line, and "map did not start" alone cannot tell a missing file from a bad
      * checksum from a short read. */
-    { "Maps",           "map",  slotb_start_map,  maps_stop,   maps_running,   maps_last_error },
+    { slotb_start_map,  maps_stop,   maps_running,   maps_last_error },
 };
 
-#define SLOTB_APP_N ((int)(sizeof(s_apps) / sizeof(s_apps[0])))
+/*
+ * THE NAMES ARE NOT IN THIS TABLE ANY MORE. They live in slotb_apps.h, because
+ * the DESKTOP has to validate a key before it switches the boot partition and
+ * the desktop no longer contains this file. The two tables are joined by
+ * POSITION: row i of s_apps runs row i of slotb_app_descs[]. That is a promise
+ * nothing checked, so it is a compile error instead -- if one table gains a row
+ * the other does not, this build stops here rather than shipping a menu entry
+ * that launches the wrong app.
+ */
+_Static_assert(sizeof(s_apps) / sizeof(s_apps[0]) == (size_t)SLOTB_APP_N,
+               "s_apps[] and slotb_app_descs[] must have the same length");
 
 
 static bool slotb_key(void *user)
@@ -571,56 +580,14 @@ static void slotb_fail(uint32_t stage, uint16_t colour)
  * corrupted -- falls back to the menu rather than failing, because a menu is
  * always a usable answer and a refused boot is not.
  */
-#define SLOTB_NVS_NS   "slotb"
-#define SLOTB_NVS_KEY  "app"
-
-static void slotb_app_set(const char *key)
-{
-    nvs_handle_t h;
-
-    if (nvs_open(SLOTB_NVS_NS, NVS_READWRITE, &h) != ESP_OK)
-    {
-        ESP_LOGW(TAG, "nvs: open failed; the next boot will show the menu");
-        return;
-    }
-
-    if (key && *key)
-        nvs_set_str(h, SLOTB_NVS_KEY, key);
-    else
-        nvs_erase_key(h, SLOTB_NVS_KEY);
-
-    nvs_commit(h);
-    nvs_close(h);
-}
-
-/* Returns the stored key, or an empty string. */
-static void slotb_app_get(char *out, size_t cap)
-{
-    nvs_handle_t h;
-    size_t len = cap;
-
-    out[0] = '\0';
-
-    if (nvs_open(SLOTB_NVS_NS, NVS_READONLY, &h) != ESP_OK)
-        return;
-
-    if (nvs_get_str(h, SLOTB_NVS_KEY, out, &len) != ESP_OK)
-        out[0] = '\0';
-
-    nvs_close(h);
-}
-
-static int slotb_app_index(const char *key)
-{
-    if (!key || !*key)
-        return -1;
-
-    for (int i = 0; i < SLOTB_APP_N; i++)
-        if (!strcmp(s_apps[i].key, key))
-            return i;
-
-    return -1;
-}
+/*
+ * THE NVS ACCESSORS AND THE KEY LIST ARE IN slotb_apps.h, and they are inline
+ * there rather than duplicated here. The launcher writes this key and slot B
+ * reads it, and the two files are compiled into DIFFERENT images now, so a
+ * second copy of the namespace and the key name is exactly how they drift apart
+ * without a diff to point at. slotb_app_index() is the header's too, over the
+ * shared name table; this file uses it and does not define it.
+ */
 
 /*
  * Run one app from start to stop. Returns true when slot B should leave for the
@@ -664,16 +631,16 @@ static bool slotb_app_go(int sel, bool direct)
         const bool have_why = why && *why;
         char l1[48];
 
-        snprintf(l1, sizeof(l1), "%s did not start", app->label);
+        snprintf(l1, sizeof(l1), "%s did not start", slotb_app_descs[sel].label);
         gbpick_message(l1, have_why ? why : "no ROM? put one in /sd/media");
-        ESP_LOGW(TAG, "%s did not start%s%s", app->label,
+        ESP_LOGW(TAG, "%s did not start%s%s", slotb_app_descs[sel].label,
                  have_why ? ": " : "", have_why ? why : "");
         vTaskDelay(pdMS_TO_TICKS(SLOTB_ERR_HOLD_MS));
 
         return direct;
     }
 
-    ESP_LOGI(TAG, "running %s", app->label);
+    ESP_LOGI(TAG, "running %s", slotb_app_descs[sel].label);
     slotb_mark(SLOTB_STAGE_EMU_START);
 
     /* The firmware is demonstrably working, so take it off the bootloader's
@@ -822,7 +789,7 @@ static void slotb_run(const char *board_conf)
         static const char *labels[SLOTB_APP_N];
 
         for (int i = 0; i < SLOTB_APP_N; i++)
-            labels[i] = s_apps[i].label;
+            labels[i] = slotb_app_descs[i].label;
 
         /* A SHORTCUT ON THE DESKTOP ARRIVES HERE AS A NAME, so the wearer who
          * tapped "Game Boy" gets the Game Boy and not a menu asking which app.
@@ -830,13 +797,13 @@ static void slotb_run(const char *board_conf)
          * would make every later entry into slot B start that app. */
         char want[16];
 
-        slotb_app_get(want, sizeof(want));
+        slotb_app_load(want, sizeof(want));
         const int direct = slotb_app_index(want);
 
         if (direct >= 0)
         {
-            slotb_app_set(NULL);
-            ESP_LOGI(TAG, "booting straight into %s", s_apps[direct].label);
+            slotb_app_store(NULL);
+            ESP_LOGI(TAG, "booting straight into %s", slotb_app_descs[direct].label);
 
             /*
              * NO MENU IN THIS PATH, AT ALL -- and the reason has to be structural
@@ -901,187 +868,15 @@ bool board_startup_override(const char *board_conf)
     return true;
 }
 
-/* ------------------------------------------------- slot B from the start menu */
-
 /*
- * BOOT SLOT B WITHOUT SHOWING THE MACHINERY.
+ * THE LAUNCHER IS NOT HERE ANY MORE.
  *
- * The Start menu entry for a slot B app used to be a `.tdlink` naming a Python
- * script. The desktop opens a script by running it in a TERMINAL, so the wearer
- * saw a terminal window, the echoed command, a two-line script and the line
- * "rebooting into ota_1" before the reboot -- for a menu item whose only visible
- * outcome is a game.
+ * slotb_launch(), the `slotb` shell command and the whole slot B -> desktop
+ * switch live in slotbl.c, because they are the DESKTOP's half of this
+ * subsystem and the desktop is a different image now. Nothing in this file can
+ * reach them, and nothing in this file needs to: the launch path ends in
+ * esp_restart(), so the two halves never run at the same time.
  *
- * Two things are wrong with that beyond the cosmetics. `td_script_run()` is the
- * only path a `.py` target has, and it is a terminal by construction. And the
- * launcher lived on the card's littlefs, so a full-image flash or a factory
- * restore deleted it -- the handover notes had to carry the three `echo` lines
- * that recreate them.
- *
- * A native app has neither problem: it is in the image, and it draws nothing.
- *
- * EVERYTHING THAT CAN FAIL HAPPENS BEFORE THE PANEL IS BLANKED. Writing the NVS
- * key and setting the boot partition are the fallible steps, and doing them
- * first means a failure leaves a desktop the wearer can still use, with a message
- * from the caller, rather than a black screen and nothing to press.
+ * What this file keeps is everything that runs INSIDE slot B: the app table,
+ * the peripheral bring-up, the per-app run loop and the way back out.
  */
-bool slotb_launch(const char *key)
-{
-    const esp_partition_t *sb = esp_partition_find_first(
-        ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, NULL);
-
-    esp_app_desc_t d;
-
-    if (!sb || esp_ota_get_partition_description(sb, &d) != ESP_OK)
-        return false;                   /* slot B is empty: nothing to boot */
-
-    if (key && *key && slotb_app_index(key) < 0)
-        return false;                   /* not an app this table knows */
-
-    slotb_app_set(key);
-
-    if (esp_ota_set_boot_partition(sb) != ESP_OK)
-    {
-        /* Leave the key cleared so a later entry into slot B shows the menu
-         * rather than an app nobody asked for. */
-        slotb_app_set(NULL);
-        return false;
-    }
-
-    /*
-     * NOW BLANK IT. Claiming the pixels stops the desktop repainting over the
-     * black, and `display_fill()` pushes synchronously, so the panel is already
-     * black when the restart happens. The short delay is for the last band to
-     * leave the SPI engine -- the panel is write-only and cannot be asked.
-     */
-    display_pixels_claim(true);
-    display_fill(0x0000);
-
-    vTaskDelay(pdMS_TO_TICKS(150));
-    esp_restart();
-    return true;                        /* not reached */
-}
-
-/* ------------------------------------------------------------ shell command */
-
-/*
- * `slotb` - enter the emulator-only personality.
- *
- * This is what the Start menu's launcher runs. It is deliberately not
- * `ota rollback`: that command means "the other slot", which is true only by
- * coincidence, and it marks the running image invalid when that image is
- * pending verification -- so running it from the desktop within 30 s of boot
- * would condemn the desktop it is about to leave.
- *
- * The check that matters is that ota_1 actually HOLDS an image. Switching to an
- * empty slot would reboot into nothing, which from the outside is a brick.
- */
-static int cmd_slotb(tdsh_session_t *session, int argc, char **argv)
-{
-    (void)session;
-
-    const esp_partition_t *run = esp_ota_get_running_partition();
-    const esp_partition_t *sb = esp_partition_find_first(
-        ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, NULL);
-
-    const char *sub = argc >= 2 ? argv[1] : NULL;
-
-    if (sub && !strcmp(sub, "status"))
-    {
-        esp_app_desc_t d;
-
-        printf("running: %s\n", run ? run->label : "unknown");
-        if (sb && esp_ota_get_partition_description(sb, &d) == ESP_OK)
-            printf("slot B:  %s, version %s\n", sb->label, d.version);
-        else
-            printf("slot B:  empty -- no image to boot\n");
-        return 0;
-    }
-
-    /* `play <key>`: boot slot B straight into one app. `start`: slot B's menu. */
-    const char *play = NULL;
-
-    if (sub && !strcmp(sub, "play"))
-    {
-        play = argc >= 3 ? argv[2] : NULL;
-
-        if (slotb_app_index(play) < 0)
-        {
-            printf("slotb play <app>   apps:");
-            for (int i = 0; i < SLOTB_APP_N; i++)
-                printf(" %s", s_apps[i].key);
-            printf("\n");
-            return 1;
-        }
-    }
-    else if (sub && strcmp(sub, "start") != 0)
-    {
-        printf("slotb [start | play <app> | status]\n");
-        printf("  start       reboot into slot B's app menu\n");
-        printf("  play <app>  reboot into one app:");
-        for (int i = 0; i < SLOTB_APP_N; i++)
-            printf(" %s", s_apps[i].key);
-        printf("\n");
-        return 1;
-    }
-
-    if (!sb)
-    {
-        printf("slotb: no ota_1 partition in this table\n");
-        return 1;
-    }
-
-    esp_app_desc_t d;
-    if (esp_ota_get_partition_description(sb, &d) != ESP_OK)
-    {
-        printf("slotb: slot B is empty -- flash an image to %s first\n", sb->label);
-        return 1;
-    }
-
-    if (run && run->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_1)
-    {
-        printf("slotb: already running from slot B\n");
-        return 0;
-    }
-
-    /* The key is written BEFORE the boot partition, so a switch that succeeds
-     * but whose write failed is still a coherent state -- it lands on the menu. */
-    slotb_app_set(play);
-
-    if (play)
-    {
-        int idx = slotb_app_index(play);
-        printf("slotb: rebooting into %s, running %s\n", sb->label, s_apps[idx].label);
-    }
-    else
-    {
-        printf("slotb: rebooting into %s (%s)\n", sb->label, d.version);
-    }
-    fflush(stdout);
-
-    if (esp_ota_set_boot_partition(sb) != ESP_OK)
-    {
-        printf("slotb: could not set the boot partition\n");
-        return 1;
-    }
-
-    /* Long enough for the line above to reach the terminal, which is the only
-     * report the operator gets -- the screen is about to become a reboot. */
-    vTaskDelay(pdMS_TO_TICKS(400));
-    esp_restart();
-    return 0;
-}
-
-static const tdsh_command_t s_slotb_cmd = {
-    "slotb",
-    "slotb [start | status]",
-    "Slot B: the bare Game Boy personality",
-    cmd_slotb,
-    0,
-};
-
-void slotb_register_command(void)
-{
-    if (tdsh_register_command(&s_slotb_cmd) != 0)
-        ESP_LOGW(TAG, "slotb command did not register");
-}
