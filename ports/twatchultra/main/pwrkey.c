@@ -302,7 +302,12 @@ bool pwrkey_init(pwrkey_input_fn input)
         return false;
     }
 
-    if (xTaskCreatePinnedToCore(pwrkey_task, "tdpwrkey", 2048, NULL, 3,
+    /* 4,096 -- ENTRY 39 CUT THIS TO 2,048 AND ENTRY 41 RAISED IT ABOVE THE
+     * ORIGINAL 3,072. Measured worst case 1,208 bytes used; 3,072 (what upstream
+     * shipped) left only 1,864 free, below the 2,048 the port now requires at a
+     * task's worst observed point. This is the power key: a deep path there is a
+     * wake-up that does not happen, and it is worth 1,024 bytes. */
+    if (xTaskCreatePinnedToCore(pwrkey_task, "tdpwrkey", 4096, NULL, 3,
                                 &s_task, 0) != pdPASS)
     {
         s_pin = -1;

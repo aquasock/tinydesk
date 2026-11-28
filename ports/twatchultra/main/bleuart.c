@@ -493,10 +493,12 @@ bool bleuart_start(void)
         return false;
     }
 
-    /* 2,048: measured high-water mark on the board was 856 bytes used of 3,072.
-     * The task only moves bytes from a stream buffer to the notify path. */
+    /* 3,072 -- ENTRY 39 CUT THIS TO 2,048 AND ENTRY 41 PUT IT BACK. Measured
+     * worst case 852 bytes used, but the cut left 1,196 free against the port's
+     * >=2,048 rule. The notify path marshals into NimBLE, whose own call depth is
+     * not visible from here, so the margin is worth more than the 1,024 bytes. */
     if (!s_tx_task &&
-        xTaskCreate(tx_task, "bleuart", 2048, NULL, 3, NULL) != pdPASS)
+        xTaskCreate(tx_task, "bleuart", 3072, NULL, 3, NULL) != pdPASS)
     {
         ESP_LOGE(TAG, "no task");
         return false;

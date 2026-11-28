@@ -292,15 +292,22 @@ static int s_col_n = COL_N;
 #define BAND_ROWS 16
 
 /*
- * THE PAINTER'S STACK, SIZED FROM ITS HIGH-WATER MARK RATHER THAN FROM HABIT.
+ * THE PAINTER'S STACK. It was 4,096 and it is 4,096 again, and the round trip is
+ * the point.
  *
- * It was 4,096. Measured on the board (`mem tasks`, FreeRTOS
- * usStackHighWaterMark, so the deepest point the task has ever reached): 1,276
- * bytes used, 2,820 never touched. 3,072 leaves 1,796 bytes of margin over the
- * deepest observed use, which is the margin this port asks for when the task is
- * a short loop over bands with no recursion. See main/slotb.h for the split that
- * made internal DRAM worth measuring at all. */
-#define PAINT_STACK 3072
+ * Enter entry 39 cut this to 3,072 on a measured high-water mark of 1,276 bytes
+ * used. Re-measured after a session that actually exercised the desktop, the
+ * deep point was still 1,276 -- but the cut left only 1,796 bytes of margin, and
+ * entry 41 established the rule this port now applies: every task keeps at least
+ * 2,048 bytes of never-touched stack at its WORST observed point, and a task
+ * that runs arbitrary code keeps 4,096. This task draws; it does not run user
+ * code, but it does call into the font and band code with a frame on the stack.
+ * 4,096 costs 1,024 bytes of internal DRAM and buys the margin back.
+ *
+ * THE LESSON IS RECORDED HERE BECAUSE IT IS CHEAPER TO READ THAN TO RE-LEARN: a
+ * high-water mark is a record of where a task HAS BEEN, not where it can go. One
+ * session's measurement is evidence, not a bound. */
+#define PAINT_STACK 4096
 
 /*
  * The SPI DMA source: one full-width band, byte-swapped and pushed.

@@ -103,14 +103,22 @@ endif()
 # files guard their defaults with #ifndef, so every other board in this tree is
 # unchanged.
 #
-#   tdsh  24,576 -> 16,384   measured 9,476 used; 6,908 left above it
-#   UI     8,192 ->  6,144   measured 3,460 used; 2,684 left above it
+#   tdsh  24,576 -> 20,480   worst observed 12,660 used; 7,820 free
+#   UI     8,192 ->  6,144   worst observed  3,440 used; 2,704 free
+#
+# ENTRY 39 FIRST CUT THE SHELL TO 16,384 ON A 9,476-BYTE READING, AND ENTRY 41
+# PUT IT BACK UP. Running real MicroPython (`py -c` over a file on the card) drove
+# the shell to 12,660 bytes, which left 3,724 free -- BELOW the 4,096 that tdsh
+# itself warns under. The reading that justified 16,384 was taken before those
+# paths were exercised, and a high-water mark only records where a task has been.
+# The rule this port applies from entry 41 is 2,048 bytes free at the worst
+# observed point for any task, and 4,096 for one that runs arbitrary code.
 #
 # The port's own tasks (paint, pwrkey, bleuart, pusher, statusbar) carry their
 # sizes and their measurements at the call site.
 #
 target_compile_definitions(${COMPONENT_LIB} PRIVATE
-    TDSH_BRIDGE_SHELL_STACK=16384
+    TDSH_BRIDGE_SHELL_STACK=20480
     UI_TASK_STACK=6144)
 
 # Pull slotb.o out of libmain.a even though nothing apparently needs it. main.c's

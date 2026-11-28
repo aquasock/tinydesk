@@ -169,10 +169,13 @@ bool pusher_init(pusher_input_fn input)
         return false;
     }
 
-    /* 2,048: measured high-water mark on the board was 740 bytes used of 2,560.
-     * Kept above 1,536 because this task marshals touch frames into key events
-     * and the extra 512 costs less than being wrong about a deep path. */
-    if (xTaskCreatePinnedToCore(pusher_task, "tdpusher", 2048, NULL, 3,
+    /* 3,072 -- ENTRY 39 CUT THIS TO 2,048 AND ENTRY 41 RAISED IT ABOVE THE
+     * ORIGINAL. Measured worst case 752 bytes used; the upstream 2,560 left only
+     * 1,808 free, which is BELOW the 2,048 the port now requires at a task's worst
+     * observed point. 3,072 gives 2,320. The task turns touch frames into key
+     * events, and its deepest path is the desktop's key dispatch -- code this
+     * file does not own, so its depth is not visible here. */
+    if (xTaskCreatePinnedToCore(pusher_task, "tdpusher", 3072, NULL, 3,
                                 &s_task, 0) != pdPASS)
     {
         s_pin = -1;
